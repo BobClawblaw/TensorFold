@@ -8,6 +8,7 @@ const bench = @import("bench.zig");
 const oracle_tests = @import("oracle_tests.zig");
 const fn_fixtures = @import("fn_fixtures.zig");
 const fn_ext = @import("fn_ext.zig");
+const fn_run = @import("fn_run.zig");
 const libs_tests = @import("libs_tests.zig");
 const sample_tests = @import("sample_tests.zig");
 
@@ -81,6 +82,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "fn-triton")) return fn_fixtures.tritonRegions(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-ext")) return fn_ext.extCall(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-uid")) return fn_run.writeUid(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-run")) return fn_run.decode(gpu, rest);
+    if (std.mem.eql(u8, cmd, "fn-gen")) return fn_run.generate(gpu, rest);
+    if (std.mem.eql(u8, cmd, "fn-check")) return fn_run.checkChunk(gpu, rest);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
 }

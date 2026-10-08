@@ -1,0 +1,121 @@
+//! Flash Next's n-gram rows on the host (ngram.py and host_table.FP8Table): hashed row ids for tokens after a
+//! history (EOS resets the n-grams, int64 products wrap, floor modulo), and their table rows as bf16 bits.
+
+const std = @import("std");
+
+const CACHE = ".cache/tensorfold-qwen38-int4mixed/cb2ebf0540f42604e2759b2ddef497861e928248";
+
+pub const NGram = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    n: usize,
+    per: usize,
+    heads: usize,
+    eos: i64,
+    width: usize,
+    sizes: []i64,
+    offsets: []i64,
+    mult: []i64,
+    starts: []i64,
+    lut: [256]u16,
+    files: []std.Io.File,
+    offs: []u64,
+    history: [8]i64 = undefined,
+    hlen: usize = 0,
+    vocab_offset: i64 = 0,
+
+    pub fn ints(gpa: std.mem.Allocator, v: std.json.Value) ![]i64 {
+        const a = v.array.items;
+        const out = try gpa.alloc(i64, a.len);
+        for (a, 0..) |x, i| out[i] = x.integer;
+        return out;
+    }
+
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !NGram {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+        const p = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+        const o = p.value.object;
+        var g: NGram = .{ .gpa = gpa, .io = io, .n = @intCast(o.get("n").?.integer), .per = @intCast(o.get("per_ngram").?.integer),
+            .heads = @intCast(o.get("heads").?.integer), .eos = o.get("eos").?.integer, .width = @intCast(o.get("width").?.integer),
+            .sizes = try ints(gpa, o.get("head_sizes").?), .offsets = try ints(gpa, o.get("head_offsets").?),
+            .mult = try ints(gpa, o.get("multipliers").?), .starts = try ints(gpa, o.get("starts").?), .lut = undefined,
+            .files = undefined, .offs = undefined, .vocab_offset = o.get("vocab_offset").?.integer };
+        for (o.get("lut").?.array.items, 0..) |x, i| g.lut[i] = @intCast(x.integer);
+        const shards = o.get("shards").?.array.items;
+        g.files = try gpa.alloc(std.Io.File, shards.len);
+        g.offs = try gpa.alloc(u64, shards.len);
+        for (shards, 0..) |s, i| {
+            const f = s.object.get("file").?.string;           // a container path under /cache/tf
+            const host = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ CACHE, f["/cache/tf/".len..] });
+            g.files[i] = try std.Io.Dir.cwd().openFile(io, host, .{});
+            g.offs[i] = @intCast(s.object.get("offset").?.integer);
+        }
+        for (o.get("initial_history").?.array.items, 0..) |x, i| g.history[i] = x.integer;
+        g.hlen = o.get("initial_history").?.array.items.len;
+        return g;
+    }
+
+    pub fn reset(self: *NGram) void {
+        for (0..self.hlen) |i| self.history[i] = self.eos;
+    }
+
+    /// Row ids [tokens.len * heads] for ``tokens`` after the current history.
+    pub fn ids(self: *const NGram, tokens: []const i64, out: []i64) !void {
+        const gpa = self.gpa;
+        const w = self.hlen + tokens.len;
+        const seq = try gpa.alloc(i64, w);
+        defer gpa.free(seq);
+        @memcpy(seq[0..self.hlen], self.history[0..self.hlen]);
+        @memcpy(seq[self.hlen..], tokens);
+        const seg = try gpa.alloc(i64, w);
+        defer gpa.free(seg);
+        var last_eos: i64 = -1;                     // the latest EOS strictly before p
+        for (0..w) |p| {
+            seg[p] = @as(i64, @intCast(p)) - (last_eos + 1);
+            if (seq[p] == self.eos) last_eos = @intCast(p);
+        }
+        const first_row = self.hlen;
+        for (first_row..w) |p| {
+            const r = p - first_row;
+            var col: usize = 0;
+            var ngram: usize = 2;
+            while (ngram <= self.n) : (ngram += 1) {
+                var mixed: i64 = self.shifted(seq, seg, p, 0) *% self.mult[0];
+                var q: usize = 1;
+                while (q < ngram) : (q += 1) mixed ^= self.shifted(seq, seg, p, q) *% self.mult[q];
+                const first = (ngram - 2) * self.per;
+                for (0..self.per) |h| {
+                    out[r * self.heads + col] = @mod(mixed, self.sizes[first + h]) + self.offsets[first + h];
+                    col += 1;
+                }
+            }
+        }
+    }
+
+    fn shifted(self: *const NGram, seq: []const i64, seg: []const i64, p: usize, shift: usize) i64 {
+        if (p < shift or seg[p] < @as(i64, @intCast(shift))) return self.eos;
+        return seq[p - shift];
+    }
+
+    /// The rows of ``row_ids`` as bf16 bits, ``width`` values each.
+    pub fn gather(self: *const NGram, row_ids: []const i64, out: []u16) !void {
+        var raw: [4096]u8 = undefined;
+        for (row_ids, 0..) |id, i| {
+            var s: usize = 0;
+            while (s + 1 < self.starts.len and self.starts[s + 1] <= id) s += 1;
+            const local: u64 = @intCast(id - self.starts[s]);
+            const n = try self.files[s].readPositionalAll(self.io, raw[0..self.width], self.offs[s] + local * self.width);
+            if (n != self.width) return error.ShortRead;
+            for (0..self.width) |j| out[i * self.width + j] = self.lut[raw[j]];
+        }
+    }
+
+    /// After a commit of ``tokens``: the history keeps the last n - 1 tokens.
+    pub fn advance(self: *NGram, tokens: []const i64) void {
+        for (tokens) |t| {
+            var i: usize = 0;
+            while (i + 1 < self.hlen) : (i += 1) self.history[i] = self.history[i + 1];
+            if (self.hlen > 0) self.history[self.hlen - 1] = t;
+        }
+    }
+};
