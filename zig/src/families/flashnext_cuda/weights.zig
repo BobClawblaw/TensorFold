@@ -75,7 +75,11 @@ const Ckpt = struct {
     }
 
     fn deinit(ck: *Ckpt) void {
-        for (ck.files.items) |f| f.close(ck.io);
+        // the shards are read once: their page cache would starve NCCL's first registration (and the n-gram tables)
+        for (ck.files.items) |f| {
+            _ = std.os.linux.fadvise(f.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
+            f.close(ck.io);
+        }
         ck.files.deinit(ck.gpa);
         ck.paths.deinit(ck.gpa);
         ck.entries.deinit();
