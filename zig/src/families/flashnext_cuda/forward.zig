@@ -319,7 +319,90 @@ pub const Engine = struct {
     rowbuf: []i64,
     valbuf: []u16,
     confidence: f64 = 0,
+    /// Verify windows and MTP head steps as CUDA graphs (each width, DeltaNet parity and attention geometry).
+    use_graphs: bool = true,
+    stage_ms: f64 = 0, // host time staging windows (ids, n-gram rows)
+    gpu_ms: f64 = 0, // GPU time of verify windows (events around the step), when ``timing``
+    timing: bool = false,
+    split: [3]f64 = .{ 0, 0, 0 }, // staging: ids upload, n-gram ids, table rows
+    graphs: std.AutoHashMap(GKey, cuda.graph.Exec) = undefined,
 };
+
+const GKey = struct { kind: u8, rows: i64, par: u1, sig: [3]i64, seq: usize };
+
+/// The attention launches' geometry at ``keys`` attended keys: score programs, chunk count, selector width.
+fn geometry(keys: i64, nb: i64) [3]i64 {
+    const blocks = @min(nb, @max(1, cdiv(keys, 4)));
+    return .{ cdiv(blocks, 64), @min(5, cdiv(@min(keys, 2051), 512)), @intCast(std.math.ceilPowerOfTwo(u64, @intCast(blocks)) catch unreachable) };
+}
+
+/// The step's GPU work (capturable): a verify window's forward, head and candidates; or the MTP head over its rows.
+fn body(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
+    if (kind == 0) {
+        const b = &e.buf;
+        const pending = try mainForward(e, b, s, R);
+        _ = try finish(e, b, e.mixer, R, pending);
+        try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, R, b.kpart);
+        try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
+    } else try mtpCompute(e, &e.mbuf, s, R);
+}
+
+/// Captures (without running) every verify width at both DeltaNet parities and every MTP head width, at the
+/// sequence's current geometry: the rounds that follow launch graphs only (until the context grows past it).
+pub fn warm(e: *Engine, s: *Seq, widths: u32) !void {
+    if (!e.use_graphs) return;
+    const cur = s.cur;
+    defer s.cur = cur;
+    for (1..@as(usize, widths) + 1) |r| {
+        for ([_]u1{ 0, 1 }) |par| {
+            s.cur = @splat(par);
+            try capture(e, 0, s, @intCast(r));
+        }
+        try capture(e, 1, s, @intCast(r));
+    }
+}
+
+fn keyOf(e: *Engine, kind: u8, s: *Seq, R: i64) GKey {
+    const keys = (if (kind == 0) s.pos else s.mtp_len) + R;
+    return .{ .kind = kind, .rows = R, .par = if (kind == 0) s.cur[0] else 0, .sig = geometry(keys, e.buf.nb), .seq = @intFromPtr(s) };
+}
+
+/// ``body`` captured into this key's graph (a new geometry replaces the width's older graph: the context only grows).
+fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
+    const key = keyOf(e, kind, s, R);
+    if (e.graphs.contains(key)) return;
+    var it = e.graphs.iterator();
+    var stale: ?GKey = null;
+    while (it.next()) |en| {
+        const o = en.key_ptr.*;
+        if (o.kind == key.kind and o.rows == key.rows and o.par == key.par and o.seq == key.seq) stale = o;
+    }
+    if (stale) |o| {
+        var ex = e.graphs.fetchRemove(o).?.value;
+        ex.deinit();
+    }
+    try cuda.graph.beginCapture(e.k.stream, .thread_local);
+    body(e, kind, s, R) catch |err| {
+        if (cuda.graph.endCapture(e.k.stream)) |g| {
+            var gg = g;
+            gg.deinit();
+        } else |_| {}
+        return err;
+    };
+    var g = try cuda.graph.endCapture(e.k.stream);
+    defer g.deinit();
+    const ex = try g.instantiate();
+    try ex.upload(e.k.stream);
+    try e.graphs.put(key, ex);
+}
+
+/// ``body`` from its graph (captured the first time this width, parity and geometry run).
+fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
+    if (!e.use_graphs or e.k.sync_each) return body(e, kind, s, R);
+    try capture(e, kind, s, R);
+    return e.graphs.get(keyOf(e, kind, s, R)).?.launchOn(e.k.stream);
+}
+
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Kernels, store: *const api.Store, opts: Options) !*Engine {
     const e = try gpa.create(Engine);
@@ -374,6 +457,11 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.idbuf = try gpa.alloc(i32, @intCast(PREFILL_ROWS));
     e.rowbuf = try gpa.alloc(i64, @intCast(PREFILL_ROWS * 16));
     e.valbuf = try gpa.alloc(u16, @intCast(PREFILL_ROWS * 16 * 160));
+    e.use_graphs = true;
+    e.confidence = 0;
+    e.stage_ms = 0;
+    e.split = .{ 0, 0, 0 };
+    e.graphs = .init(gpa);
     return e;
 }
 
@@ -423,6 +511,14 @@ pub fn newSeq(e: *Engine) !*Seq {
 }
 
 pub fn freeSeq(e: *Engine, s: *Seq) void {
+    var gone: std.ArrayList(GKey) = .empty;
+    defer gone.deinit(e.gpa);
+    var it = e.graphs.iterator();
+    while (it.next()) |en| if (en.key_ptr.seq == @intFromPtr(s)) gone.append(e.gpa, en.key_ptr.*) catch {};
+    for (gone.items) |key| {
+        var ex = e.graphs.fetchRemove(key).?.value;
+        ex.deinit();
+    }
     s.mem.free();
     e.gpa.destroy(s);
 }
@@ -624,14 +720,22 @@ fn readPicks(e: *Engine, b: *Buffers, rows: i64, out: []Pick) !void {
 
 /// stage: the window's token ids and each row's n-gram table rows into the buffers (host gathers, then uploads).
 fn stage(e: *Engine, b: *Buffers, s: *const Seq, tokens: []const i64) !void {
+    const t0 = std.Io.Timestamp.now(e.io, .awake);
+    defer e.stage_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
     const n = tokens.len;
     for (tokens, 0..) |t, i| e.idbuf[i] = @intCast(t);
     try e.k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..n]));
+    const t1 = std.Io.Timestamp.now(e.io, .awake);
     const heads = e.ng.heads;
     try e.ng.ids(&s.hist, tokens, e.rowbuf[0 .. n * heads]);
+    const t2 = std.Io.Timestamp.now(e.io, .awake);
     try e.ng.gather(e.rowbuf[0 .. n * heads], e.valbuf[0 .. n * heads * e.ng.width]);
+    const t3 = std.Io.Timestamp.now(e.io, .awake);
+    e.split[0] += @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6;
+    e.split[1] += @as(f64, @floatFromInt(t1.durationTo(t2).toNanoseconds())) / 1e6;
+    e.split[2] += @as(f64, @floatFromInt(t2.durationTo(t3).toNanoseconds())) / 1e6;
+    // pageable sources: the async copy returns once they are staged, so the buffers can be reused at once
     try e.k.upload(b.ple_v, std.mem.sliceAsBytes(e.valbuf[0 .. n * heads * e.ng.width]));
-    try e.k.stream.synchronize(); // the host staging buffers are reused by the next call
 }
 
 fn mainForward(e: *Engine, b: *Buffers, s: *Seq, R: i64) !Pending {
@@ -736,7 +840,6 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
             for (nxt, 0..) |t, i| e.idbuf[i] = @intCast(t);
             try e.k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..nxt.len]));
             try e.k.copy(b.mtp_in, b.streams, @intCast(nn * WIDE * 2));
-            try e.k.stream.synchronize();
             try mtpCompute(e, b, s, nn);
             try setMtpLen(e, s, s.mtp_len + nn);
         }
@@ -761,10 +864,19 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     var toks: [16]i64 = undefined;
     for (ids, 0..) |t, i| toks[i] = t;
     try stage(e, b, s, toks[0..ids.len]);
-    const pending = try mainForward(e, b, s, R);
-    _ = try finish(e, b, e.mixer, R, pending);
-    try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, R, b.kpart);
-    try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
+    var ev: [2]cuda.Event = undefined;
+    if (e.timing) {
+        ev[0] = try cuda.Event.init(e.ctx.d, true);
+        ev[1] = try cuda.Event.init(e.ctx.d, true);
+        try ev[0].record(e.k.stream);
+    }
+    try step(e, 0, s, R);
+    if (e.timing) try ev[1].record(e.k.stream);
+    defer if (e.timing) {
+        e.gpu_ms += cuda.Event.elapsedMs(ev[0], ev[1]) catch 0;
+        ev[0].deinit();
+        ev[1].deinit();
+    };
     var picks: [16]Pick = undefined;
     try readPicks(e, b, R, picks[0..ids.len]);
     for (out[0..ids.len], picks[0..ids.len]) |*o, p| o.* = @intCast(p.tok);
@@ -810,8 +922,7 @@ pub fn draftUpTo(e: *Engine, s: *Seq, follow: []const u32, depth: u32, confidenc
         try k.copy(b.mtp_in, s.last_streams, WIDE * 2);
         s.fresh = false;
     } else try k.copy(b.mtp_in, e.buf.streams, @intCast(n * WIDE * 2));
-    try k.stream.synchronize();
-    try mtpCompute(e, b, s, n);
+    try step(e, 1, s, n);
     try setMtpLen(e, s, s.mtp_len + n);
     var got: usize = 0;
     var j: u32 = 0;
@@ -828,8 +939,7 @@ pub fn draftUpTo(e: *Engine, s: *Seq, follow: []const u32, depth: u32, confidenc
             e.idbuf[0] = @intCast(pick[0].tok);
             try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..1]));
             try k.copy(b.mtp_in, prev, WIDE * 2);
-            try k.stream.synchronize();
-            try mtpCompute(e, b, s, 1);
+            try step(e, 1, s, 1);
             try setMtpLen(e, s, s.mtp_len + 1);
             s.mtp_drafted += 1;
         }

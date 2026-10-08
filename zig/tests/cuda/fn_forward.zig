@@ -35,11 +35,24 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     }
     const t0 = std.Io.Timestamp.now(io, .awake);
     var kernels = try fwd.api_.Kernels.load(gpa, io, gpu.d, gpu.ctx.device, args[3]);
-    var store = try fwd.devstore.load(gpa, io, gpu.d, args[4], args[5], args[6], args[7]);
     var ctx: fwd.api_.Ctx = .{ .d = gpu.d, .ctx = gpu.ctx, .stream = stream, .nccl = &nccl, .comm = comm, .rank = rank };
+    // weights: "ckpt:<dir>" loads the converted checkpoint (weights.load), else a Python pack (bin, index)
+    var store = if (std.mem.startsWith(u8, args[4], "ckpt:"))
+        try @import("flashnext_weights").load(gpa, io, &ctx, &kernels, args[4][5..], rank)
+    else
+        try fwd.devstore.load(gpa, io, gpu.d, args[4], args[5], args[6], args[7]);
     const e = try fwd.init(gpa, io, &ctx, &kernels, &store, .{ .context = 16384, .max_rows = 16, .depth = 15 });
     try fwd.prefetchTables(e);
     e.k.sync_each = std.mem.indexOf(u8, args[1], "sync") != null or (args.len > 9 and std.mem.eql(u8, args[args.len - 1], "sync"));
+    // "nographs" among the trailing words: verify and draft steps eager (the graphs' A/B)
+    for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "nographs")) {
+        e.use_graphs = false;
+    };
+    std.debug.print("rank {d}: n-gram tables locked {d} of {d} GiB\n", .{ rank, e.ng.locked >> 30, blk: {
+        var t: usize = 0;
+        for (e.ng.tables) |x| t += x.len;
+        break :blk t >> 30;
+    } });
     std.debug.print("rank {d}: engine up in {d:.1} s\n", .{ rank, @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e9 });
 
     std.debug.print("rank {d}: reading {s}\n", .{ rank, args[8] });
@@ -57,6 +70,12 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     const prefill_ms = @as(f64, @floatFromInt(tp.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
     std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len, prefill_ms, first, want[0] });
 
+    const tw = std.Io.Timestamp.now(io, .awake);
+    try fwd.warm(e, s, 7);
+    std.debug.print("warmed graphs in {d:.0} ms\n", .{@as(f64, @floatFromInt(tw.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6});
+    e.timing = true;
+    e.stage_ms = 0;
+    e.split = .{ 0, 0, 0 };
     // decode.mtp_decode: depth 6, confidence 0.7, as the reference ran
     const depth: usize = 6;
     const count = want.len;
@@ -64,6 +83,9 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     try out.append(gpa, first);
     var drafts: [16]u32 = undefined;
     var nd: usize = 0;
+    var t_verify: f64 = 0;
+    var t_keep: f64 = 0;
+    var t_draft: f64 = 0;
     var rounds: usize = 0;
     var drafted: usize = 0;
     var accepted: usize = 0;
@@ -75,20 +97,26 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         @memcpy(tokens[1 .. 1 + nd], drafts[0..nd]);
         const R = 1 + nd;
         var sampled: [16]u32 = undefined;
+        var tq = std.Io.Timestamp.now(io, .awake);
         try fwd.verify(e, s, tokens[0..R], sampled[0..R]);
+        t_verify += @as(f64, @floatFromInt(tq.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
         var keep: usize = 1;
         for (drafts[0..nd], 0..) |d, i| {
             if (sampled[i] != d) break;
             keep += 1;
         }
+        tq = std.Io.Timestamp.now(io, .awake);
         try fwd.keep(e, s, @intCast(R), @intCast(keep));
+        t_keep += @as(f64, @floatFromInt(tq.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
         rounds += 1;
         drafted += nd;
         accepted += keep - 1;
         try out.appendSlice(gpa, sampled[0..keep]);
         if (out.items.len >= count) break;
         const n = @min(depth, count - out.items.len);
+        tq = std.Io.Timestamp.now(io, .awake);
         nd = try fwd.draftUpTo(e, s, sampled[0..keep], @intCast(n), 0.7, &drafts);
+        t_draft += @as(f64, @floatFromInt(tq.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
     }
     try stream.synchronize();
     const secs = @as(f64, @floatFromInt(ts.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e9;
@@ -98,9 +126,11 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         same += 1;
     }
     std.debug.print("tokens: {any}\n", .{out.items[0..@min(12, out.items.len)]});
-    std.debug.print("MTP decode (native forward, eager): {d} tokens in {d:.3} s = {d:.1} tok/s; {d} rounds, {d} drafted, {d} accepted (Python: {d}, {d}, {d})\n", .{
-        count - 1, secs, @as(f64, @floatFromInt(count - 1)) / secs, rounds, drafted, accepted,
+    std.debug.print("MTP decode (native forward, {s}): {d} tokens in {d:.3} s = {d:.1} tok/s; {d} rounds, {d} drafted, {d} accepted (Python: {d}, {d}, {d})\n", .{
+        if (e.use_graphs) "graphs" else "eager", count - 1, secs, @as(f64, @floatFromInt(count - 1)) / secs, rounds, drafted, accepted,
         ref.get("rounds").?.integer, ref.get("drafted").?.integer, ref.get("accepted").?.integer });
+    std.debug.print("time: verify {d:.1} ms ({d:.2} a round, staging {d:.1} ms, GPU {d:.1} ms), keep {d:.1} ms, draft {d:.1} ms\n", .{ t_verify, t_verify / @as(f64, @floatFromInt(rounds)), e.stage_ms, e.gpu_ms, t_keep, t_draft });
+    std.debug.print("staging split: ids upload {d:.1} ms, n-gram ids {d:.1} ms, table rows {d:.1} ms\n", .{ e.split[0], e.split[1], e.split[2] });
     fwd.freeSeq(e, s);
     // other prompt lengths: their first tokens (prefixes of the reference prompt), checked by the caller's list
     var i: usize = 9;

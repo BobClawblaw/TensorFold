@@ -50,6 +50,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, bin: []co
         try store.put(t.get("name").?.string, tensor);
         at += std.mem.alignForward(u64, bytes, 256);
     }
+    // the pack is read once: its page cache would only push the n-gram tables out
+    _ = std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
     try store.host.put(try gpa.dupe(u8, "ngram.json"), try std.Io.Dir.cwd().readFileAlloc(io, ngram_json, gpa, .limited(1 << 24)));
     try store.host.put(try gpa.dupe(u8, "ngram_root"), try gpa.dupe(u8, ngram_root));
     return store;
