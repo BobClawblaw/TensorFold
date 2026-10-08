@@ -126,6 +126,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
+    // the Flash Next weight loader alone (tf-cuda-test fn-weights checks it against a Python pack)
+    const fn_weights = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext_cuda/weights.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    fn_weights.addImport("cuda", cuda);
+    runner.addImport("flashnext_weights", fn_weights);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer, build_options, true);
 }
