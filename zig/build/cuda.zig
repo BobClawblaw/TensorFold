@@ -21,6 +21,14 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_ops", .flags = &.{"-O3"} }, // ours: Nemotron's layouts and the serial feed
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
+    // Flash Next (qwen4_exp): device copies of the Python engine's extensions (zig/tests/cuda/flashnext/gen_copies.py)
+    .{ .name = "fn_experts", .src = "flashnext/experts", .flags = &.{"-O3"} }, // cuda/experts.py, tensorfold_experts_v7
+    .{ .name = "fn_experts_prefill", .src = "flashnext/experts_prefill", .flags = &.{"-O3"} },
+    .{ .name = "fn_gdn_prefill", .src = "flashnext/gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // tensorfold_gdn_v2
+    .{ .name = "fn_qmm", .src = "flashnext/qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
+    .{ .name = "fn_qmm_prefill", .src = "flashnext/qmm_prefill", .flags = &.{"-O3"} },
+    .{ .name = "fn_gdn", .src = "flashnext/fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py
+    .{ .name = "fn_gdn_io", .src = "flashnext/gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
