@@ -21,6 +21,7 @@ pub const NGram = struct {
     files: []std.Io.File,
     offs: []u64,
     tables: [][]const u8 = &.{},        // each shard's rows, memory-mapped (``map``)
+    locked: usize = 0,                  // bytes of the tables mlock kept resident
     history: [8]i64 = undefined,
     hlen: usize = 0,
     vocab_offset: i64 = 0,
@@ -75,6 +76,13 @@ pub const NGram = struct {
             self.tables[i] = whole[self.offs[i]..][0 .. rows * self.width];
         }
         if (!prefetch) return;
+        defer { // keep them resident when memory allows (the Python server locks them too); a refusal leaves them paged
+            var locked: usize = 0;
+            for (self.tables) |t| {
+                if (std.os.linux.mlock(t.ptr, t.len) == 0) locked += t.len;
+            }
+            self.locked = locked;
+        }
         const Touch = struct {
             fn run(tables: []const []const u8, first: usize, step: usize, sum: *u64) void {
                 var acc: u64 = 0;
