@@ -291,7 +291,11 @@ const Builder = struct {
         const s = try readF32(b.ck, b.gpa, sn);
         defer b.gpa.free(s);
         const sb = try select(b.gpa, std.mem.sliceAsBytes(s), n, k / gs, 4, rows, .{ c0 / gs, c1 / gs });
-        p.s = @alignCast(std.mem.bytesAsSlice(f32, sb));
+        defer b.gpa.free(sb);
+        // select's bytes are u8-aligned: an f32 copy, so Piece.free frees what it allocated
+        const sf = try b.gpa.alloc(f32, sb.len / 4);
+        @memcpy(std.mem.sliceAsBytes(sf), sb);
+        p.s = sf;
         return p;
     }
 
