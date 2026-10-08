@@ -47,9 +47,14 @@ pub const NGram = struct {
         g.files = try gpa.alloc(std.Io.File, shards.len);
         g.offs = try gpa.alloc(u64, shards.len);
         for (shards, 0..) |s, i| {
-            const f = s.object.get("file").?.string;           // a container path under /cache/tf
-            const host = if (std.mem.startsWith(u8, f, "/cache/tf/")) try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, f["/cache/tf/".len..] }) else f;
-            g.files[i] = try std.Io.Dir.cwd().openFile(io, host, .{});
+            const f = s.object.get("file").?.string;           // as given (the checkpoint loader's), or a pack's container path
+            g.files[i] = std.Io.Dir.cwd().openFile(io, f, .{}) catch |err| blk: {
+                if (!std.mem.startsWith(u8, f, "/cache/tf/")) return err;
+                // a pack recorded inside the container, read on the host: its /cache/tf/ paths resolve under ``root``
+                const host = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, f["/cache/tf/".len..] });
+                defer gpa.free(host);
+                break :blk try std.Io.Dir.cwd().openFile(io, host, .{});
+            };
             g.offs[i] = @intCast(s.object.get("offset").?.integer);
         }
         for (o.get("initial_history").?.array.items, 0..) |x, i| g.history[i] = x.integer;
