@@ -51,7 +51,7 @@ const max_depth = max_rows - 1;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -123,6 +123,9 @@ const Owned = struct {
     next_id: u64 = 1,
     drawn: [64]u32 = undefined,
     next: u64 = 0,
+    costs: [max_rows]lanes.config.Cost = undefined, // a window's ms by width (rank 0, timed at open)
+    cost_count: usize = 0,
+    mtp_ms: f64 = 0, // one chained head step
 
     fn take(self: *Owned, t: u32) u64 {
         self.drawn[self.next % self.drawn.len] = t;
@@ -151,6 +154,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.nccl.close();
     const comm = try cuda.tp_link.communicator(&own.nccl, own.link);
     own.ctx = .{ .d = ctx.d, .ctx = ctx, .stream = try cuda.Stream.init(ctx.d, true), .nccl = &own.nccl, .comm = comm, .rank = o.rank };
+    { // NCCL connects (and registers its buffers) at its first collective: here, before weights and tables take the
+      // memory (a GB10 worker refuses the registration once they are resident)
+        var warm = try cuda.DeviceBuffer.alloc(ctx.d, 4096);
+        defer warm.free();
+        try own.nccl.check(own.nccl.api.ncclAllGather(warm.ptr, warm.ptr + 2048, 256, .i32, comm, own.ctx.stream.handle), "warm gather");
+        try own.ctx.stream.synchronize();
+    }
     own.kernels = try api.Kernels.load(gpa, io, ctx.d, ctx.device, kernels_dir);
     errdefer own.kernels.deinit();
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
@@ -158,20 +168,95 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = max_rows, .depth = if (o.drafts) max_depth else 0 });
     errdefer forward.deinit(own.e);
     try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
+    // both halves loaded before rank 0 serves: rank 1 says so once its engine is up (it loads more slowly)
+    if (o.rank == 1) try own.link.send(@intFromEnum(Op.ready), "") else {
+        const m = try own.link.recv(gpa);
+        gpa.free(m.bytes);
+        if (m.tag != @intFromEnum(Op.ready)) return error.RankOneNotReady;
+    }
     own.lanes_by = .init(gpa);
     own.by_id = .init(gpa);
     own.next_id = 1;
     own.next = 0;
+    own.cost_count = 0;
+    own.mtp_ms = 0;
+    if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
-                    .hidden_rows = false, .max_streams = 1, .batch_rows = max_rows },
+                    .hidden_rows = false, .max_streams = 1, .batch_rows = max_rows,
+                    .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms },
         .rows = if (o.drafts) max_rows else 1,
         .stream_bytes = forward.seqBytes(own.e),
         .ctx = own,
         .deinit = release,
         .follow = if (o.rank == 1) followLoop else null,
     };
+}
+
+fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
+}
+
+/// The lane core's costs on a throwaway sequence: a verify window of each width (best of three after a warm-up,
+/// which also captures its graph) and a chained head step. Sent to rank 1 like any request.
+fn calibrate(self: *Owned, drafts: bool) !void {
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    const id = self.next_id;
+    self.next_id += 1;
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 37) % 5000);
+    try w.int(id);
+    try w.tokens(&prompt);
+    try self.send(.prefill, &w);
+    const seq = try forward.newSeq(self.e);
+    defer {
+        w.int(id) catch {};
+        self.send(.release, &w) catch {};
+        forward.freeSeq(self.e, seq);
+    }
+    var tok = try forward.prefill(self.e, seq, &prompt);
+    var ids: [max_rows]u32 = undefined;
+    var out: [max_rows]u32 = undefined;
+    for (1..max_rows + 1) |width| {
+        var best: f64 = std.math.inf(f64);
+        for (0..4) |rep| {
+            @memset(ids[0..width], tok);
+            try w.int(id);
+            try w.tokens(ids[0..width]);
+            try self.send(.verify, &w);
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
+            try forward.verify(self.e, seq, ids[0..width], out[0..width]);
+            if (rep > 0) best = @min(best, msSince(self.io, t0));
+            try w.int(id);
+            try w.int(width);
+            try w.int(1);
+            try self.send(.keep, &w);
+            try forward.keep(self.e, seq, @intCast(width), 1);
+            tok = out[0];
+        }
+        self.costs[width - 1] = .{ .width = @intCast(width), .ms = best };
+    }
+    self.cost_count = max_rows;
+    if (!drafts) return;
+    var held: [max_depth]u32 = undefined;
+    var at: [2]f64 = .{ std.math.inf(f64), std.math.inf(f64) };
+    for ([_]u32{ 1, 8 }, 0..) |depth, k| {
+        for (0..3) |rep| {
+            const follow = [_]u32{tok};
+            try w.int(id);
+            try w.tokens(&follow);
+            try w.int(depth);
+            try self.send(.draft, &w);
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
+            try forward.draft(self.e, seq, &follow, depth, held[0..depth]);
+            if (rep > 0) at[k] = @min(at[k], msSince(self.io, t0));
+        }
+    }
+    self.mtp_ms = @max(0, (at[1] - at[0]) / 7);
+    std.log.info("flash next costs: window 1/4/8/16 rows {d:.1}/{d:.1}/{d:.1}/{d:.1} ms, head step {d:.2} ms", .{
+        self.costs[0].ms, self.costs[3].ms, self.costs[7].ms, self.costs[15].ms, self.mtp_ms });
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
@@ -357,6 +442,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 forward.freeSeq(self.e, kv.value);
             },
             .stop => return,
+            .ready => {},
         }
     }
 }
