@@ -319,6 +319,7 @@ pub const Engine = struct {
     rowbuf: []i64,
     valbuf: []u16,
     confidence: f64 = 0,
+    draft_p: [16]f64 = undefined, // the last draftUpTo's head probability for each draft it returned
     /// Verify windows and MTP head steps as CUDA graphs (each width, DeltaNet parity and attention geometry).
     use_graphs: bool = true,
     stage_ms: f64 = 0, // host time staging windows (ids, n-gram rows)
@@ -508,6 +509,21 @@ pub fn newSeq(e: *Engine) !*Seq {
     try e.ctx.d.check(e.ctx.d.api.cuMemcpyHtoD_v2(s.conv_ptrs, &ptrs, LIN * 8), "conv pointers");
     s.hist = e.ng.start();
     return s;
+}
+
+/// ``s`` as newSeq leaves a sequence, in its own memory (zeroed on the stream, no allocation): a server reuses one
+/// sequence's ~11 GiB at a 1M window instead of allocating and zeroing it per request, and its graphs stay valid.
+pub fn resetSeq(e: *Engine, s: *Seq) !void {
+    const mem = s.mem;
+    s.* = .{ .capacity = e.capacity };
+    s.mem = mem;
+    var c: Carve = .{ .base = mem.ptr };
+    s.lay(&c, e.buf.rows);
+    try e.ctx.d.check(e.ctx.d.api.cuMemsetD8Async(mem.ptr, 0, c.at, e.k.stream.handle), "zero state");
+    var ptrs: [LIN]u64 = undefined;
+    for (0..LIN) |i| ptrs[i] = s.conv + i * 3 * CONV_DIM * 2;
+    try e.k.upload(s.conv_ptrs, std.mem.sliceAsBytes(&ptrs));
+    s.hist = e.ng.start();
 }
 
 pub fn freeSeq(e: *Engine, s: *Seq) void {
@@ -932,6 +948,7 @@ pub fn draftUpTo(e: *Engine, s: *Seq, follow: []const u32, depth: u32, confidenc
         const low = confidence > 0 and pick[0].p < confidence;
         if (low and j > 0) break;
         out[got] = @intCast(pick[0].tok);
+        e.draft_p[got] = pick[0].p;
         got += 1;
         if (low) break;
         if (j + 1 < depth) {
