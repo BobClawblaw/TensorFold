@@ -62,16 +62,10 @@ pub const Cache = struct {
         self.memory.gpa.free(self.blocks);
     }
 
+    /// The step's rows are in the cache: the forward copied the committed DeltaNet state on the GPU
+    /// (Encoder.commitStates); this keeps the length and the window a later keep() may cut.
     pub fn commit(self: *Cache, scratch: *const Scratch, base: usize, rows: usize, record: bool) void {
-        const dn, const cn = .{ self.g.deltaBytes(), self.g.convBytes() };
-        for (self.blocks, scratch.snapshots) |*b, snapshot| {
-            if (b.* == .delta) {
-                const d = b.delta;
-                const saved = if (record) base + rows - 1 else 0;
-                @memcpy(d.recurrence.contents()[0..dn], (snapshot.?.recurrence.contents() + saved * dn)[0..dn]);
-                @memcpy(d.conv.contents()[0..cn], (snapshot.?.conv.contents() + (base + rows - 1) * cn)[0..cn]);
-            }
-        }
+        _ = scratch;
         if (record) self.last = .{ .start = self.len, .base = base, .rows = rows } else self.last = null;
         self.len += rows;
     }

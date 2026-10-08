@@ -34,6 +34,27 @@ const Encoder = struct {
         self.e.setBuffer(y, y_offset, 6);
         self.run(.{ p.threads * ((linear.outputs + p.columns - 1) / p.columns), (rows + 7) / 8, 1 }, .{ p.threads, 1, 1 });
     }
+    /// Each segment's committed DeltaNet state (its last row's recurrence and conv window) from the snapshots into
+    /// its cache, on the GPU at the end of the step: the rows Cache.commit used to copy on the host.
+    fn commitStates(self: Encoder, s: *st.Scratch, segments: []const Segment, record: bool) void {
+        const g = self.m.config.g;
+        const dn, const cn = .{ g.deltaBytes(), g.convBytes() };
+        self.pipe("qwen35_copy");
+        var base: usize = 0;
+        for (segments) |seg| {
+            for (seg.cache.blocks, s.snapshots) |*b, snapshot| {
+                if (b.* != .delta) continue;
+                const saved = if (record) base + seg.rows - 1 else 0;
+                self.e.setBuffer(snapshot.?.recurrence, saved * dn, 0);
+                self.e.setBuffer(b.delta.recurrence, 0, 1);
+                self.run(.{ dn / 16, 1, 1 }, .{ 256, 1, 1 });
+                self.e.setBuffer(snapshot.?.conv, (base + seg.rows - 1) * cn, 0);
+                self.e.setBuffer(b.delta.conv, 0, 1);
+                self.run(.{ cn / 16, 1, 1 }, .{ 256, 1, 1 });
+            }
+            base += seg.rows;
+        }
+    }
     fn norm(self: Encoder, h: Buffer, residual: ?Buffer, weight: wts.Tensor, x: Buffer, rows: usize) void {
         if (residual) |r| {
             self.pipe("norm");
@@ -106,6 +127,7 @@ pub fn run(m: *Model, s: *st.Scratch, segments: []const Segment, tokens: []const
     if (head == .all) enc.projection(m.weights.head(), s.x, 0, s.logits, 0, total) else {
         enc.projection(m.weights.head(), s.x, (total - 1) * g.hidden * 2, s.logits, 0, 1);
     }
+    enc.commitStates(s, segments, record);
     e.end();
     cb.commit();
     cb.wait();

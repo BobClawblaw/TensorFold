@@ -84,3 +84,10 @@ kernel void qwen35_attention_gate(const device bfloat* x [[buffer(0)]],
   const bfloat s = bfloat(1.0f / (1.0f + metal::exp(-gate)));
   out[size_t(r) * QIN + d] = bfloat(float(x[size_t(r) * QIN + d]) * float(s));
 }
+
+// A committed state row from the scratch snapshot into a stream's cache, 16 bytes a thread, inside the step's encoder.
+kernel void qwen35_copy(const device uint4* src [[buffer(0)]],
+                        device uint4* dst [[buffer(1)]],
+                        uint i [[thread_position_in_grid]]) {
+  dst[i] = src[i];
+}

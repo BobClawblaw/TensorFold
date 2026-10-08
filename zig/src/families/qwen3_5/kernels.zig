@@ -5,7 +5,7 @@ const cfg = @import("config.zig");
 const sources = @import("kernel_sources").qwen35;
 const layout = @import("kernel_sources").qwen35_layout;
 
-const layout_names = [_][:0]const u8{ "qwen35_embed", "qwen35_head_norm", "qwen35_queries", "qwen35_keys", "qwen35_attention_gate" };
+const layout_names = [_][:0]const u8{ "qwen35_embed", "qwen35_head_norm", "qwen35_queries", "qwen35_keys", "qwen35_attention_gate", "qwen35_copy" };
 pub const fixed_total = sources.all.len + layout_names.len;
 const max_projections = 16;
 

@@ -262,7 +262,7 @@ takes 64 KiB a token (16 attention layers, 4 heads of 256, keys and values), so 
 
 Measured on an M5 Ultra (256 GB, macOS 27.0.1), Zig 0.17.0, Metal Toolchain 27A266a, revision 22d8d538:
 
-- `zig-out/bin/tf-qwen35-check`: the checkpoint loads with 22 native pipelines and its separate head.
+- `zig-out/bin/tf-qwen35-check`: the checkpoint loads with 23 native pipelines and its separate head.
 - `zig-out/bin/tf-qwen35-exact`: 49 of 49 forward and cache checks (windows of 1 to 32 rows at six prefixes against
   one-row
   execution, committed logits, recurrent state and attention caches, partial keeps, unequal streams).
@@ -277,10 +277,14 @@ Measured on an M5 Ultra (256 GB, macOS 27.0.1), Zig 0.17.0, Metal Toolchain 27A2
 | public-contribution-guide-512 | 512 | 2.996 / 2.997 / 2.992 / 2.994 | 0.975 | 0.979 | 0.980 |
 | repo-docs-2048 | 2,048 | 1.905 / 1.906 / 1.907 / 1.907 | 0.985 | 0.983 | 0.985 |
 
-- Server, `tools/bench_concurrent.py --alone --serial` at 1, 2, 4 and 8 streams, sampled and greedy, 128 tokens: 120
-  of 120 concurrent replies equal their solo runs and 72 of 72 solo runs equal `"draft": false`; aggregate 36 tok/s at
-  one stream, 53-54 at two, 79-81 at four, 104-108 at eight.
-- Decode, `tools/bench_openai.py --tokens 64 --reps 5 --temperatures 1.0,0`: 36.0-36.2 tok/s medians on the code and
+- Server, `tools/bench_concurrent.py --alone --serial` at 1, 2, 4 and 8 streams, sampled and greedy, 128 tokens: 180
+  of 180 concurrent replies equal their solo runs and every solo run equals `"draft": false`; aggregate 38-39 tok/s at
+  one stream, 60-61 at two, 94-96 at four, 131-138 at eight (141-144 steady).
+- Decode, `tools/bench_openai.py --tokens 64 --reps 5 --temperatures 1.0,0`: 38.5-38.9 tok/s medians on the code and
   chat prompts, sampled and greedy, first token in 0.05-0.08 s. No drafter: this checkpoint carries no MTP weights and
   the native server has no DFlash2, so the lanes carry context copies only.
+- Where a one-row step goes, `zig-out/bin/tf-qwen35-bench`: 25.6 ms, of which 23.1 ms is the projection kernels (about
+  660 GB/s over the 4-bit weights) and 1.8 ms the other kernels. Each step ends with the committed DeltaNet state
+  copied on the GPU from the scratch snapshot into the stream's cache (3 MiB a layer, 151 MB a stream); the host
+  memcpy it replaces cost 2 ms a step at one stream and eight times that at eight.
 - The server came up in 2.6-3 s and held 15.9-16.1 GiB RSS at `--parallel 8 --context 32768`.
