@@ -19,20 +19,20 @@ fn readIn(gpu: Gpu, dir: []const u8, name: []const u8, limit: usize) ![]u8 {
 }
 
 /// The kernels: every extension cubin loaded once; a function found by two fragments of its mangled name.
-const Kernels = struct {
+pub const Kernels = struct {
     gpu: Gpu,
     symbols: std.json.Parsed(std.json.Value),
     modules: std.StringHashMap(cuda.Module),
     images: std.ArrayList([]align(16) u8),
 
-    fn init(gpu: Gpu) !Kernels {
+    pub fn init(gpu: Gpu) !Kernels {
         const text = try readPath(gpu, CUBINS ++ "/symbols.json", 1 << 22);
         defer gpu.gpa.free(text);
         return .{ .gpu = gpu, .symbols = try std.json.parseFromSlice(std.json.Value, gpu.gpa, text, .{}),
                   .modules = .init(gpu.gpa), .images = .empty };
     }
 
-    fn deinit(self: *Kernels) void {
+    pub fn deinit(self: *Kernels) void {
         var it = self.modules.valueIterator();
         while (it.next()) |m| m.unload();
         self.modules.deinit();
@@ -209,6 +209,149 @@ fn i32of(x: i64) i32 {
 
 fn cdiv(a: i64, b: i64) i64 {
     return @divFloor(a + b - 1, b);
+}
+
+/// One extension call launched as its C++ launcher would: ``c`` gives the arguments by position (ptr, int, float,
+/// dim, stride, numel, dtype); ``ret_ptr`` is the buffer a call that returns a tensor writes.
+pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u64, stream: cuda.Stream) !void {
+    const sms: i64 = try gpu.ctx.attribute(.multiprocessor_count);
+    var a: cuda.Args = .{};
+    var tmpl_buf: [256]u8 = undefined;
+
+    if (std.mem.endsWith(u8, name, "experts_v7.plan")) {
+        const P = c.int(1);
+        const E = i32of(c.int(2));
+        const T = i32of(c.int(3));
+        if (P <= 1024) {
+            a.add(c.ptr(0)); a.add(i32of(P)); a.add(E); a.add(T); a.add(c.ptr(4)); a.add(c.ptr(5)); a.add(c.ptr(6));
+            try go(try k.find("_10_experts_cu_", "11plan_kernelE"), d1(1), 1024, 0, stream, &a);
+        } else {
+            const nblk = cdiv(P, 1024);
+            a.add(c.ptr(0)); a.add(i32of(P)); a.add(E); a.add(c.ptr(7)); a.add(c.ptr(8));
+            try go(try k.find("_10_experts_cu_", "9plan_rankE"), d1(nblk), 1024, 0, stream, &a);
+            var b: cuda.Args = .{};
+            b.add(i32of(nblk)); b.add(E); b.add(T); b.add(c.ptr(8)); b.add(c.ptr(5)); b.add(c.ptr(6));
+            try go(try k.find("_10_experts_cu_", "12plan_offsetsE"), d1(1), 1024, 0, stream, &b);
+            var s: cuda.Args = .{};
+            s.add(c.ptr(0)); s.add(i32of(P)); s.add(E); s.add(c.ptr(7)); s.add(c.ptr(8)); s.add(c.ptr(4));
+            try go(try k.find("_10_experts_cu_", "12plan_scatterE"), d1(cdiv(P, 256)), 256, 0, stream, &s);
+        }
+    } else if (std.mem.endsWith(u8, name, "experts_v7.run") or std.mem.endsWith(u8, name, "experts_v7.prefill")) {
+        const prefill = std.mem.endsWith(u8, name, "prefill");
+        const gs = c.int(0);
+        const epi = c.int(1);
+        const m: i64 = if (epi == 2) 2 else 1;
+        const nb = c.int(6);
+        a.add(c.ptr(2)); a.add(i32of(c.stride(2, 0))); a.add(i32of(c.int(3))); a.add(c.ptr(4)); a.add(i32of(c.int(5)));
+        a.add(i32of(nb)); a.add(c.ptr(7)); a.add(c.ptr(8)); a.add(c.ptr(9)); a.add(c.ptr(10)); a.add(i32of(c.int(11)));
+        a.add(c.float(12));
+        if (prefill) {
+            const t = try std.fmt.bufPrint(&tmpl_buf, "14prefill_kernelILi{d}ELi{d}ELi{d}ELi2ELi2ELi4E", .{ gs, m, epi });
+            const f = try k.find("_18_experts_prefill_cu_", t);
+            // Pre<GS, M, 2, 2, 4>: X rows (64 x 8 uint4) and WN weight blocks of 64 / GS groups a stage, 48 KiB at most
+            const block: i64 = 32 * @divExact(4 * gs, 128) + 4 * 2;
+            const su: i64 = 64 * 8 + 4 * @divExact(64, gs) * m * block;
+            const sb = su * 16;
+            const stages: i64 = if (sb * 4 <= 49152) 4 else if (sb * 3 <= 49152) 3 else 2;
+            const smem: u32 = @intCast(stages * sb);
+            try f.allowDynamicShared(smem);
+            const grid = c.int(13) * cdiv(nb, 4);
+            if (grid >= 1) try go(f, d1(grid), 256, smem, stream, &a);
+        } else {
+            const t = try std.fmt.bufPrint(&tmpl_buf, "13expert_kernelILi{d}ELi{d}ELi{d}ELi2ELi4E", .{ gs, m, epi });
+            const f = try k.find("_10_experts_cu_", t);
+            const per_sm: i64 = @max(1, try f.occupancy(128, 0));
+            const grid = @min(cdiv(c.int(13), 4), per_sm * sms);
+            if (grid >= 1) try go(f, d1(grid), 128, 0, stream, &a);
+        }
+    } else if (std.mem.endsWith(u8, name, "gdn_v2.prefill")) {
+        const W = c.dim(0, 0);
+        const hk = c.dim(0, 1);
+        const hv = c.dim(2, 1);
+        const rows: i64 = if (hv >= sms) 128 else 64;
+        const qk = if (std.mem.eql(u8, c.dtype(0), "float32")) "f" else "13__nv_bfloat16";
+        const t = try std.fmt.bufPrint(&tmpl_buf, "12chain_kernelI{s}Li{d}ELi32E", .{ qk, rows });
+        const f = try k.find("_14_gdn_prefill_cu_", t);
+        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |i| a.add(c.ptr(i));
+        a.add(ret_ptr); a.add(i32of(W)); a.add(i32of(hk)); a.add(i32of(hv));
+        if (W > 0) try go(f, .{ .x = @intCast(hv), .y = @intCast(@divExact(128, rows)) }, @intCast(2 * rows), 0, stream, &a);
+    } else if (std.mem.endsWith(u8, name, "qwen4_exp_gdn.chain")) {
+        const nv = c.numel(4);
+        const rows = c.int(8);
+        const t = try std.fmt.bufPrint(&tmpl_buf, "12chain_kernelILi{d}ELi{d}ELb{d}E", .{ @divExact(nv, 3), nv, @intFromBool(rows > 1) });
+        const f = try k.find("_6_gdn_cu_", t);
+        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |i| a.add(c.ptr(i));
+        a.add(c.float(7)); a.add(i32of(rows));
+        for ([_]usize{ 9, 10, 11, 12, 13, 14, 15 }) |i| a.add(c.ptr(i));
+        try go(f, d1(nv), 1024, 0, stream, &a);
+    } else if (std.mem.endsWith(u8, name, "qwen4_exp_gdn.replay")) {
+        const nv = c.dim(3, 1);
+        const t = try std.fmt.bufPrint(&tmpl_buf, "13replay_kernelILi{d}ELi{d}E", .{ @divExact(nv, 3), nv });
+        const f = try k.find("_6_gdn_cu_", t);
+        for ([_]usize{ 0, 1, 2, 3, 4 }) |i| a.add(c.ptr(i));
+        a.add(i32of(c.int(5))); a.add(c.ptr(6));
+        try go(f, d1(nv), 1024, 0, stream, &a);
+    } else if (std.mem.endsWith(u8, name, "gdn_io.front")) {
+        const nv = c.numel(5);
+        const nk = @divExact(nv, 3);
+        const t = try std.fmt.bufPrint(&tmpl_buf, "12front_kernelILi{d}ELi{d}E", .{ nk, nv });
+        const f = try k.find("_9_gdn_io_cu_", t);
+        for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }) |i| a.add(c.ptr(i));
+        try go(f, .{ .x = @intCast(c.dim(3, 0)), .y = @intCast(nk + nv) }, 128, 0, stream, &a);
+    } else if (std.mem.endsWith(u8, name, "gdn_io.back")) {
+        const nv = c.dim(0, 1);
+        const t = try std.fmt.bufPrint(&tmpl_buf, "11back_kernelILi{d}ELi{d}E", .{ @divExact(nv, 3), nv });
+        const f = try k.find("_9_gdn_io_cu_", t);
+        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.float(3)); a.add(c.ptr(4)); a.add(c.ptr(5));
+        try go(f, .{ .x = @intCast(c.dim(0, 0)), .y = @intCast(nv) }, 128, 0, stream, &a);
+    } else if (std.mem.endsWith(u8, name, "qmm_v5.qmm")) {
+        const M = c.dim(0, 0);
+        const K = c.dim(0, 1);
+        const N = c.int(7);
+        const sk = c.int(8);
+        const gs = c.int(9);
+        const bm = c.int(10);
+        const fp32 = c.int(11) != 0;
+        const reduce = c.int(12) != 0;
+        const cluster = sk > 1 and sk <= 8 and reduce;
+        try check.expect(sk == 1, "qmm with K slices is not ported yet (sk {d})", .{sk});
+        const t = try std.fmt.bufPrint(&tmpl_buf, "10qmm_kernelILi{d}ELi{d}ELi64ELi1ELi4ELi4ELb{d}ELb{d}ELb0E", .{ gs, bm, @intFromBool(fp32), @intFromBool(cluster) });
+        const f = try k.find("_6_qmm_cu_", t);
+        const stage = bm * gs * 2 + 64 * @divExact(gs, 2) + 2 * 64 * 2 + bm * 4;
+        const partials = @divExact(bm, 16) * 2 * 4 * 128 * 4;
+        const smem: u32 = @intCast(@max(4 * stage, partials));
+        try f.allowDynamicShared(smem);
+        const rows_t = cdiv(M, bm);
+        const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K * 2)));
+        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.ptr(3)); a.add(c.ptr(4)); a.add(c.ptr(5));
+        a.add(@as(u64, 0)); a.add(i32of(M)); a.add(i32of(N)); a.add(i32of(K)); a.add(i32of(sk)); a.add(i32of(c.stride(3, 0)));
+        a.add(i32of(if (M == 1) K else c.stride(0, 0))); a.add(i32of(group));
+        try go(f, .{ .x = @intCast(rows_t * cdiv(N, 64)), .y = 1, .z = @intCast(sk) }, 128, smem, stream, &a);
+    } else if (std.mem.endsWith(u8, name, "qmm_v5.qmm_prefill")) {
+        const M = c.dim(0, 0);
+        const K = c.dim(0, 1);
+        const N = c.int(5);
+        const gs = c.int(6);
+        const fp32 = c.int(7) != 0;
+        const tiles = [_][5]i64{ .{ 128, 128, 2, 4, 3 }, .{ 64, 128, 1, 4, 4 }, .{ 128, 64, 2, 2, 4 }, .{ 64, 64, 1, 4, 4 },
+            .{ 128, 128, 2, 4, 4 }, .{ 128, 128, 2, 2, 3 }, .{ 128, 128, 2, 2, 4 }, .{ 128, 256, 2, 4, 3 },
+            .{ 64, 256, 1, 4, 4 }, .{ 128, 128, 2, 2, 2 }, .{ 64, 128, 1, 2, 2 }, .{ 128, 256, 2, 4, 2 } };
+        const tl = tiles[@intCast(c.int(8))];
+        const bm = tl[0];
+        const bn = tl[1];
+        const t = try std.fmt.bufPrint(&tmpl_buf, "14prefill_kernelILi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELi{d}ELb{d}E", .{ gs, bm, bn, tl[2], tl[3], tl[4], @intFromBool(fp32) });
+        const f = try k.find("_14_qmm_prefill_cu_", t);
+        const smem: u32 = @intCast(tl[4] * (bm * gs * 2 + bn * @divExact(gs, 2) + 2 * bn * 2));
+        try f.allowDynamicShared(smem);
+        const rows_t = cdiv(M, bm);
+        const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K * 2)));
+        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.ptr(3)); a.add(c.ptr(4));
+        a.add(i32of(M)); a.add(i32of(N)); a.add(i32of(K)); a.add(i32of(c.dim(2, 1)));
+        a.add(i32of(if (M == 1) K else c.stride(0, 0))); a.add(i32of(group));
+        try go(f, d1(rows_t * cdiv(N, bn)), @intCast(tl[2] * tl[3] * 32), smem, stream, &a);
+    } else {
+        return check.expect(false, "no launcher for {s}", .{name});
+    }
 }
 
 pub fn extCall(gpu: Gpu, dir: []const u8) !void {
