@@ -1,6 +1,7 @@
 //! Qwen3.5 kernel templates. The family prepends a checkpoint's geometry as constants when it compiles them.
 pub const Kernel = struct { key: []const u8, function: [:0]const u8, source: []const u8 };
 pub const qmm = Kernel{ .key = "qmm", .function = "qwen35_qmm", .source = @embedFile("qmm.metal") };
+pub const qmv = Kernel{ .key = "qmv", .function = "qwen35_qmv", .source = @embedFile("qmv.metal") };
 pub const all = [_]Kernel{
     .{ .key = "norm", .function = "custom_kernel_qwen35_norm_bfloat16_t_bfloat16_t_bfloat16_t_floatc_bfloat16_t_bfloat16_t", .source = @embedFile("norm.metal") },
     .{ .key = "norm_nores", .function = "custom_kernel_qwen35_norm_nores_bfloat16_t_bfloat16_t_floatc_bfloat16_t", .source = @embedFile("norm_nores.metal") },

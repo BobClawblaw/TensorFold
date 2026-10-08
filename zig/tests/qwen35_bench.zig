@@ -43,11 +43,40 @@ fn time(m: *q.Model, p: mtl.Pipeline, lin: q.weights.Linear, nt: usize, x: mtl.B
     return cb.gpuSeconds() * 1e6 / @as(f64, @floatFromInt(reps));
 }
 
+/// The FP32 path, dispatched as forward.zig does: 128 threads a threadgroup, 16 output rows each.
+fn timeQmv(m: *q.Model, p: mtl.Pipeline, lin: q.weights.Linear, x: mtl.Buffer, y: mtl.Buffer, rows: usize, reps: usize) f64 {
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const cb = m.queue.commandBuffer();
+    const e = cb.compute(.serial);
+    for (0..reps) |_| {
+        e.setPipeline(p);
+        e.setBuffer(x, 0, 0);
+        e.setValue([2]i32{ @intCast(rows), @intCast(lin.inputs) }, 1);
+        e.setBuffer(lin.weight.buffer, lin.weight.offset, 2);
+        e.setBuffer(lin.scales.buffer, lin.scales.offset, 3);
+        e.setBuffer(lin.biases.buffer, lin.biases.offset, 4);
+        e.setValue([1]f32{1}, 5);
+        e.setBuffer(y, 0, 6);
+        e.dispatchThreads(mtl.Size.of(128 * ((lin.outputs + q.kernels.qmv_rows - 1) / q.kernels.qmv_rows), 1, 1), mtl.Size.of(128, 1, 1));
+    }
+    e.end();
+    cb.commit();
+    cb.wait();
+    return cb.gpuSeconds() * 1e6 / @as(f64, @floatFromInt(reps));
+}
+
+fn bf(v: u16) f32 {
+    return @bitCast(@as(u32, v) << 16);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.ExpectedModelDir;
     const reps: usize = if (args.len > 2) try std.fmt.parseInt(usize, args[2], 10) else 30; // ms a cell
+    const grid = args.len > 3 and std.mem.eql(u8, args[3], "grid"); // the split and tile alternatives too
+    if (args.len > 5 and std.mem.eql(u8, args[3], "teacher")) return teacher(init, args[1], args[4], args[5]);
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const m = try q.Model.load(gpa, init.io, args[1]);
@@ -83,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
     const y_ref = try gpa.alloc(u8, max_rows * max_n * 2);
     defer gpa.free(y_ref);
     for (x.slice(u16, max_rows * max_k), 0..) |*v, i| v.* = @truncate(0x3c00 + (i * 7) % 96 + (i / 1000) % 16);
-    const rows_list = [_]usize{ 1, 8, 16, 32 };
+    const rows_list = [_]usize{ 1, 2, 4, 8, 16, 32 };
     const nts = [_]usize{ 1, 2, 4, 8 };
     const ss = [_]usize{ 8, 16, 32 };
     std.debug.print("geometry hidden {d} layers {d}; {d} ms bursts a cell; us a call; '=' same bytes as shipped, '!' differs\n", .{ g.hidden, g.layers, reps });
@@ -100,8 +129,44 @@ pub fn main(init: std.process.Init) !void {
             const base = time(m, shipped.pipeline, c.lin, nt0, x, y, rows, n_reps);
             @memcpy(y_ref[0 .. rows * n * 2], y.contents()[0 .. rows * n * 2]);
             std.debug.print("  rows {d:>2} ({d} reps): shipped {d:>7.1}", .{ rows, n_reps, base });
+            if (rows <= 8) if (if (rows == 1) shipped.qmv1 else if (rows == 2) shipped.qmv2 else if (rows <= 4) shipped.qmv4 else shipped.qmv8) |pq| {
+                @memset(y.contents()[0 .. rows * n * 2], 0);
+                _ = timeQmv(m, pq, c.lin, x, y, rows, n_reps / 2);
+                const t = timeQmv(m, pq, c.lin, x, y, rows, n_reps);
+                // numeric distance from the shipped bytes: the largest |difference| over the largest |value|, and how many differ
+                const a = std.mem.bytesAsSlice(u16, y_ref[0 .. rows * n * 2]);
+                const b = y.slice(u16, rows * n);
+                var worst: f32 = 0;
+                var scale: f32 = 0;
+                var differ: usize = 0;
+                for (a, b) |u, v| {
+                    const diff = @abs(bf(u) - bf(v));
+                    worst = @max(worst, diff);
+                    scale = @max(scale, @abs(bf(u)));
+                    if (u != v) differ += 1;
+                }
+                std.debug.print("  fp32 {d:.1} (max diff {e:.1} of {e:.1}, {d}/{d} differ)", .{ t, worst, scale, differ, rows * n });
+                // Row independence: the same lane width built for more rows must give these rows the same bytes.
+                if (rows <= 2) {
+                    const vpl: usize = if (rows == 1) 32 else 16;
+                    var hb: [128]u8 = undefined;
+                    const hdr = try std.fmt.bufPrint(&hb, "#define K {d}\n#define N {d}\n#define RM {d}\n#define VPL {d}\n", .{ k, n, 4, vpl });
+                    const txt = try std.mem.concat(gpa, u8, &.{ hdr, @import("kernel_sources").qwen35.qmv.source });
+                    defer gpa.free(txt);
+                    const lib = try mtl.Library.fromSource(m.device, txt, mtl.CompileOptions.mlx());
+                    defer lib.deinit();
+                    const p4 = try mtl.Pipeline.init(m.device, lib, "qwen35_qmv", false);
+                    defer p4.deinit();
+                    const mine = try gpa.alloc(u8, rows * n * 2);
+                    defer gpa.free(mine);
+                    @memcpy(mine, y.contents()[0 .. rows * n * 2]);
+                    @memset(y.contents()[0 .. rows * n * 2], 0);
+                    _ = timeQmv(m, p4, c.lin, x, y, rows, 3);
+                    std.debug.print("  [RM4@VPL{d} {s}]", .{ vpl, if (std.mem.eql(u8, mine, y.contents()[0 .. rows * n * 2])) "same bytes" else "DIFFERENT" });
+                }
+            };
             for (ss) |s| for (nts) |nt| {
-                if (s * nt * 64 * 4 > 32768 or (s == s0 and nt == nt0)) continue;
+                if (!grid or s * nt * 64 * 4 > 32768 or (s == s0 and nt == nt0)) continue;
                 if (n % (8 * nt) != 0) continue;
                 const p = try compile(gpa, m.device, n, k, s, nt);
                 defer p.deinit();
@@ -166,4 +231,31 @@ pub fn main(init: std.process.Init) !void {
     }
     const ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(init.io).toNanoseconds() - t0)) / 1e6 / steps;
     std.debug.print("one-row step on shipped kernels: {d:.2} ms ({d:.1} tok/s) over {d} steps\n", .{ ms, 1000 / ms, steps });
+}
+
+/// Teacher-forced one-row steps over a token fixture: each position's logits (bf16) to `out`, for comparing paths.
+fn teacher(init: std.process.Init, model: []const u8, tokens: []const u8, out_path: []const u8) !void {
+    const gpa = init.gpa;
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, tokens, gpa, .limited(4 << 20));
+    defer gpa.free(bytes);
+    const a = try tf.npy.parse(bytes);
+    const ids = try gpa.alloc(u32, a.count());
+    defer gpa.free(ids);
+    @memcpy(std.mem.sliceAsBytes(ids), a.data);
+    const m = try q.Model.load(gpa, init.io, model);
+    defer m.deinit();
+    var cache = try q.state.Cache.init(gpa, m.device, m.config.g, ids.len + 8);
+    defer cache.deinit();
+    var scratch = try q.state.Scratch.init(gpa, m.device, m.config.g, 32, cache.capacity);
+    defer scratch.deinit();
+    const out = try gpa.alloc(u8, ids.len * q.config.vocab * 2);
+    defer gpa.free(out);
+    for (ids, 0..) |id, i| {
+        try q.forward.run(m, &scratch, &.{.{ .cache = &cache, .rows = 1 }}, &.{id}, false, .last);
+        @memcpy(out[i * q.config.vocab * 2 ..][0 .. q.config.vocab * 2], scratch.logits.contents()[0 .. q.config.vocab * 2]);
+    }
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = out });
+    std.debug.print("teacher-forced {d} one-row steps, logits to {s}\n", .{ ids.len, out_path });
 }

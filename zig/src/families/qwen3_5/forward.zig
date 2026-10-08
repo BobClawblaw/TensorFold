@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const Model = @import("model.zig").Model;
 const st = @import("state.zig");
 const wts = @import("weights.zig");
+const kernels = @import("kernels.zig");
 const c = @import("config.zig");
 const Buffer = mtl.Buffer;
 pub const Segment = struct { cache: *st.Cache, rows: usize };
@@ -24,7 +25,9 @@ const Encoder = struct {
     }
     fn projection(self: Encoder, linear: wts.Linear, x: Buffer, offset: usize, y: Buffer, y_offset: usize, rows: usize) void {
         const p = self.m.kernels.projection(linear.outputs, linear.inputs).?;
-        self.e.setPipeline(p.pipeline);
+        // The FP32 path at one or two rows, where it beats the matrix kernel in the step on every shape.
+        const qmv: ?mtl.Pipeline = if (std.c.getenv("TF_QWEN_QMV") == null) null else if (rows == 1) p.qmv1 else if (rows == 2) p.qmv2 else null;
+        self.e.setPipeline(qmv orelse p.pipeline);
         self.e.setBuffer(x, offset, 0);
         self.e.setValue([2]i32{ @intCast(rows), @intCast(linear.inputs) }, 1);
         self.tensor(linear.weight, 2);
@@ -32,6 +35,10 @@ const Encoder = struct {
         self.tensor(linear.biases, 4);
         self.e.setValue([1]f32{1}, 5);
         self.e.setBuffer(y, y_offset, 6);
+        if (qmv != null) {
+            self.run(.{ 128 * ((linear.outputs + kernels.qmv_rows - 1) / kernels.qmv_rows), 1, 1 }, .{ 128, 1, 1 });
+            return;
+        }
         self.run(.{ p.threads * ((linear.outputs + p.columns - 1) / p.columns), (rows + 7) / 8, 1 }, .{ p.threads, 1, 1 });
     }
     /// Each segment's committed DeltaNet state (its last row's recurrence and conv window) from the snapshots into
