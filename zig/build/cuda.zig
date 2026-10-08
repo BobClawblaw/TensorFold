@@ -29,6 +29,7 @@ const kernels = [_]Kernel{
     .{ .name = "fn_qmm_prefill", .src = "flashnext/qmm_prefill", .flags = &.{"-O3"} },
     .{ .name = "fn_gdn", .src = "flashnext/fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py
     .{ .name = "fn_gdn_io", .src = "flashnext/gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py
+    .{ .name = "fn_sample", .src = "flashnext/sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: greedy candidates
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },

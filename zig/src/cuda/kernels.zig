@@ -31,6 +31,7 @@ pub const fn_qmm: []const u8 = if (available) &Blob("fatbin_fn_qmm").bytes else 
 pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefill").bytes else &.{};
 pub const fn_gdn: []const u8 = if (available) &Blob("fatbin_fn_gdn").bytes else &.{};
 pub const fn_gdn_io: []const u8 = if (available) &Blob("fatbin_fn_gdn_io").bytes else &.{};
+pub const fn_sample: []const u8 = if (available) &Blob("fatbin_fn_sample").bytes else &.{};
 pub const torch_argmax: []const u8 = if (available) &Blob("fatbin_torch_argmax").bytes else &.{};
 pub const torch_topk: []const u8 = if (available) &Blob("fatbin_torch_topk").bytes else &.{};
 pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_pointwise").bytes else &.{};

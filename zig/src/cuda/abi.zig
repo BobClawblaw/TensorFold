@@ -205,6 +205,9 @@ pub const Api = struct {
     cuGraphExecDestroy: *const fn (GraphExec) callconv(.c) R,
     cuGraphExecUpdate_v2: *const fn (GraphExec, Graph, *ExecUpdateResultInfo) callconv(.c) R,
     cuGraphExecKernelNodeSetParams_v2: *const fn (GraphExec, GraphNode, *const KernelNodeParams) callconv(.c) R,
+    cuModuleGetFunctionCount: *const fn (*c_uint, Module) callconv(.c) R,
+    cuModuleEnumerateFunctions: *const fn ([*]Function, c_uint, Module) callconv(.c) R,
+    cuFuncGetName: *const fn (*?[*:0]const u8, Function) callconv(.c) R,
     cuGetErrorName: *const fn (R, *?[*:0]const u8) callconv(.c) R,
     cuGetErrorString: *const fn (R, *?[*:0]const u8) callconv(.c) R,
 };
