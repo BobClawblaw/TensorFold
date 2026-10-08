@@ -75,6 +75,15 @@ pub fn keyOf(i: usize) []const u8 {
     return if (h < head_names.len) head_names[h] else sample_names[h - head_names.len];
 }
 
+/// Every source the pipelines compile from and the prebuilt library, hashed: a learned prompt state's identity.
+pub fn sourceHash() u64 {
+    var h = std.hash.Wyhash.init(0x6e);
+    inline for (sources.nemotron.all) |k| h.update(k.source);
+    for ([_][]const u8{ sources.nemotron_glue, sources.nemotron_experts, sources.nemotron_tree, sources.nemotron_round, sources.nemotron_head, sources.nemotron_sample, sources.nax, sources.core_row_projection, sources.packed_metallib }) |s| h.update(s);
+    for (sources.prefill) |f| h.update(f.text);
+    return h.final();
+}
+
 pub const Kernels = struct {
     pipelines: [total]mtl.Pipeline = undefined,
     rows: ?row.Pipelines = null, // the core's row projections, on chips without tensor units

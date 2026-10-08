@@ -19,5 +19,6 @@ pub const prefill = @import("prefill.zig");
 pub const prefill_launch = @import("prefill_launch.zig");
 pub const simd_attention = @import("simd_attention.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const learned = @import("learned.zig");
 
 pub const Model = model.Model;
