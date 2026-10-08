@@ -20,7 +20,7 @@ pub const head_names = [_][:0]const u8{ "tf_head_prep", "tf_head_norm" };
 pub const sample_names = [_][:0]const u8{ "tf_sample_full", "tf_sample_full_ids" };
 
 /// Routed experts taking an expert's member rows two or four at a time (nemotron_experts.metal).
-pub const rows_names = [_][:0]const u8{ "tf_xup_rows2", "tf_xdown_rows2", "tf_xup_rows4", "tf_xdown_rows4" };
+pub const rows_names = [_][:0]const u8{ "tf_xup_rows2", "tf_xdown_rows2", "tf_xup_rows4", "tf_xdown_rows4", "tf_xup_w3", "tf_xdown_w3" };
 
 /// Routed-expert kernels at other (rows a simdgroup, simdgroups a threadgroup): each row's arithmetic is unchanged.
 pub const geometries = [_][2]usize{ .{ 2, 2 }, .{ 8, 2 }, .{ 4, 4 }, .{ 8, 4 }, .{ 4, 1 }, .{ 2, 4 } };
