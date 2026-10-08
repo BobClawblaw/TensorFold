@@ -49,6 +49,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     run(gpu, cmd, rest) catch |e| {
         std.debug.print("FAIL {s}: {t}\n", .{ cmd, e });
+        if (@errorReturnTrace()) |t| std.debug.dumpStackTrace(t);
         return 1;
     };
     return 0;
@@ -83,6 +84,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fn-triton")) return fn_fixtures.tritonRegions(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-ext")) return fn_ext.extCall(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-aot")) return @import("fn_native.zig").aotLoad(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-native")) return @import("fn_forward.zig").native(gpu, rest);
     if (std.mem.eql(u8, cmd, "fn-tp")) return @import("fn_native.zig").tpLink(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "fn-weights")) return @import("fn_native.zig").weightsCheck(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "fn-fatbins")) return @import("fn_native.zig").fatbins(gpu);
