@@ -78,10 +78,11 @@ pub const flags = [_]Flag{
     .{ .name = "--ple-on-ssd", .kind = .store_true },
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda" }, .native = true, .native_values = backend_values },
-    .{ .name = "--tp", .choices = &.{ "1", "2" } },
-    .{ .name = "--rank", .choices = &.{ "0", "1" } },
-    .{ .name = "--master" },
-    .{ .name = "--master-port" },
+    // two GB10s (CUDA): rank 0 serves, rank 1 follows it (Flash Next)
+    .{ .name = "--tp", .choices = &.{ "1", "2" }, .native = cuda_build },
+    .{ .name = "--rank", .choices = &.{ "0", "1" }, .native = cuda_build },
+    .{ .name = "--master", .native = cuda_build },
+    .{ .name = "--master-port", .native = cuda_build },
     .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" } },
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
@@ -135,6 +136,10 @@ pub const Args = struct {
     backend: []const u8 = "auto",
     device: ?u32 = null,
     segments: ?u32 = null,
+    tp: u8 = 1,
+    rank: u8 = 0,
+    master: ?[]const u8 = null,
+    master_port: u16 = 29600,
 };
 
 /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
@@ -243,6 +248,14 @@ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage
     } else if (std.mem.eql(u8, name, "--segments")) {
         const n = try int(u, a, name, v);
         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
+    } else if (std.mem.eql(u8, name, "--tp")) {
+        out.tp = if (std.mem.eql(u8, v, "2")) 2 else 1;
+    } else if (std.mem.eql(u8, name, "--rank")) {
+        out.rank = if (std.mem.eql(u8, v, "1")) 1 else 0;
+    } else if (std.mem.eql(u8, name, "--master")) {
+        out.master = v;
+    } else if (std.mem.eql(u8, name, "--master-port")) {
+        out.master_port = std.math.cast(u16, try int(u, a, name, v)) orelse return fail(u, a, "argument --master-port: a TCP port: '{s}'", .{v});
     } else return false;
     return true;
 }

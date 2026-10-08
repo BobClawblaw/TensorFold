@@ -143,10 +143,21 @@ pub const Open = struct {
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
+    /// --tp 2 (CUDA): this rank and rank 0's address; rank 1 follows rank 0 and serves no requests itself.
+    tp: u8 = 1,
+    rank: u8 = 0,
+    master: ?[]const u8 = null,
+    master_port: u16 = 29600,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+pub const Opened = struct {
+    engine: Engine,
+    close: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+    /// Rank 1 of two: replay rank 0's engine calls until it stops (the server then serves no HTTP); null elsewhere.
+    follow: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+};
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };
 

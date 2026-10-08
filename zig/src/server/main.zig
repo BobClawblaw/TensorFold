@@ -60,6 +60,10 @@ pub fn main(init: std.process.Init) !u8 {
     const model_type = modelType(a, io, dir);
     const opened = try engines.open(a, gpa, io, dir, model_type, args, &problem) orelse return fail(problem);
     defer opened.close(opened.ctx);
+    if (opened.follow) |follow| {           // rank 1 of two: rank 0 serves, this rank replays its engine calls
+        follow(opened.ctx) catch |e| return fail(@errorName(e));
+        return 0;
+    }
     return serve.run(gpa, io, args, .{
         .engine = opened.engine,
         .text = text.text(),

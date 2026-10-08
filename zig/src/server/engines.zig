@@ -28,5 +28,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
         .learn_gib = args.learn_gib,
         .device = args.device,
         .segments = args.segments,
+        .tp = args.tp,
+        .rank = args.rank,
+        .master = args.master,
+        .master_port = args.master_port,
     }, problem);
 }
