@@ -8,11 +8,11 @@ const check = @import("check.zig");
 const fn_ext = @import("fn_ext.zig");
 const Gpu = check.Gpu;
 
-const CACHE = ".cache/tensorfold-qwen38-int4mixed/cb2ebf0540f42604e2759b2ddef497861e928248";
-const SIZE = std.StaticStringMap(usize).initComptime(.{ .{ "bfloat16", 2 }, .{ "float16", 2 }, .{ "float32", 4 },
+pub const CACHE = ".cache/tensorfold-qwen38-int4mixed/cb2ebf0540f42604e2759b2ddef497861e928248";
+pub const SIZE = std.StaticStringMap(usize).initComptime(.{ .{ "bfloat16", 2 }, .{ "float16", 2 }, .{ "float32", 4 },
     .{ "int32", 4 }, .{ "int64", 8 }, .{ "uint8", 1 }, .{ "int8", 1 }, .{ "bool", 1 }, .{ "int16", 2 }, .{ "float8_e4m3fn", 1 } });
 
-fn openRead(gpu: Gpu, path: []const u8) !std.Io.File {
+pub fn openRead(gpu: Gpu, path: []const u8) !std.Io.File {
     return std.Io.Dir.cwd().openFile(gpu.io, path, .{});
 }
 
@@ -27,7 +27,7 @@ pub fn writeUid(gpu: Gpu, path: []const u8) !void {
     check.pass("NCCL unique id written to {s}", .{path});
 }
 
-const Run = struct {
+pub const Run = struct {
     gpu: Gpu,
     store: std.ArrayList(cuda.DeviceBuffer) = .empty,
     temps: cuda.DeviceBuffer = undefined,
@@ -42,7 +42,7 @@ const Run = struct {
     checks_ok: usize = 0,
     checks_bad: usize = 0,
 
-    fn addr(self: *const Run, v: std.json.Value) u64 {
+    pub fn addr(self: *const Run, v: std.json.Value) u64 {
         const o = v.object;
         const off: u64 = @intCast(o.get("off").?.integer);
         if (o.get("s")) |s| return self.store.items[@intCast(s.integer)].ptr + off;
@@ -50,7 +50,7 @@ const Run = struct {
     }
 };
 
-fn extent(o: std.json.ObjectMap) usize {
+pub fn extent(o: std.json.ObjectMap) usize {
     const shape = o.get("shape").?.array.items;
     const stride = o.get("stride").?.array.items;
     var e: usize = 1;
@@ -99,7 +99,7 @@ const OpArgs = struct {
     }
 };
 
-fn kernelFor(run: *Run, hash: []const u8) !cuda.triton.Kernel {
+pub fn kernelFor(run: *Run, hash: []const u8) !cuda.triton.Kernel {
     if (run.kernels.get(hash)) |k| return k;
     const gpa = run.gpu.gpa;
     const info = run.prog.value.object.get("kernels").?.object.get(hash).?.object;
@@ -128,7 +128,7 @@ fn kernelFor(run: *Run, hash: []const u8) !cuda.triton.Kernel {
     return k;
 }
 
-fn loadStorages(run: *Run, pack_path: []const u8, reset_path: []const u8) !void {
+pub fn loadStorages(run: *Run, pack_path: []const u8, reset_path: []const u8) !void {
     const gpa = run.gpu.gpa;
     const io = run.gpu.io;
     const pack = try openRead(run.gpu, pack_path);
@@ -684,9 +684,9 @@ pub fn checkChunk(gpu: Gpu, args: []const [:0]const u8) !void {
 // packed arguments; a gather's addresses; a copy's extent), so a step does no JSON, hashing or symbol lookups. The
 // three launches whose geometry follows the context length keep their source so ``refresh`` can re-derive it.
 
-const Keyed = enum { none, scores, chunks, select };
+pub const Keyed = enum { none, scores, chunks, select };
 
-const Launch = struct {
+pub const Launch = struct {
     f: cuda.Function,
     cfg: cuda.Config,
     args: cuda.Args,
@@ -696,7 +696,7 @@ const Launch = struct {
     name: []const u8 = "",
 };
 
-const COp = union(enum) {
+pub const COp = union(enum) {
     launch: Launch,
     gather: struct { send: u64, recv: u64, count: usize, dt: cuda.nccl.DataType },
     upload: struct { dst: u64, seq: usize, n: usize },
@@ -705,9 +705,9 @@ const COp = union(enum) {
     zero: struct { dst: u64, n: usize },
 };
 
-const Select = struct { block: u64, kern: cuda.triton.Kernel };
+pub const Select = struct { block: u64, kern: cuda.triton.Kernel };
 
-const Compiled = struct {
+pub const Compiled = struct {
     ops: std.ArrayList(COp) = .empty,
     keyed: std.ArrayList(usize) = .empty,     // indices of the launches ``refresh`` re-derives
     lead: usize = 0,                          // the leading uploads (the step's inputs), run before a graph
@@ -715,7 +715,7 @@ const Compiled = struct {
 };
 
 /// 64-bit constants (int64 fills, pointer fills) staged once on the device; a fill becomes an 8-byte copy from here.
-const Consts = struct {
+pub const Consts = struct {
     host: std.ArrayList(u64) = .empty,
     dev: cuda.DeviceBuffer = undefined,
 
@@ -744,7 +744,7 @@ fn tritonLaunch(run: *Run, kern: cuda.triton.Kernel, dims: cuda.Dim3, args: cuda
     return .{ .f = kern.function, .cfg = kern.config(dims), .args = a, .key = key, .kern = kern, .dims = dims, .name = name };
 }
 
-fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, consts: *Consts) !Compiled {
+pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, consts: *Consts) !Compiled {
     const gpa = run.gpu.gpa;
     var c: Compiled = .{};
     var leading = true;
@@ -754,7 +754,7 @@ fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.St
         const o = ov.object;
         const kind = o.get("kind").?.string;
         const name = o.get("name").?.string;
-        if (!std.mem.eql(u8, kind, "upload")) leading = false;
+        if (!std.mem.eql(u8, kind, "upload") and !std.mem.eql(u8, name, "aten.copy_.default")) leading = false;
         if (std.mem.eql(u8, kind, "triton")) {
             const kern = try kernelFor(run, o.get("hash").?.string);
             var a: cuda.Args = .{};
@@ -797,6 +797,7 @@ fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.St
         } else if (std.mem.eql(u8, name, "aten.copy_.default")) {
             const items = o.get("args").?.array.items;
             try c.ops.append(gpa, .{ .copy = .{ .dst = run.addr(items[0]), .src = run.addr(items[1]), .n = extent(items[0].object) } });
+            if (leading) c.lead = c.ops.items.len;
         } else if (std.mem.eql(u8, name, "aten.fill_.Scalar")) {
             const items = o.get("args").?.array.items;
             const t = items[0].object;
@@ -831,7 +832,7 @@ fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.St
 }
 
 /// Uploads the constants and rewrites every compiled program's constant sources (marked by bit 63) to addresses.
-fn finishConsts(run: *Run, consts: *Consts, progs: []const *Compiled) !void {
+pub fn finishConsts(run: *Run, consts: *Consts, progs: []const *Compiled) !void {
     consts.dev = try cuda.DeviceBuffer.alloc(run.gpu.d, @max(8, consts.host.items.len * 8));
     if (consts.host.items.len > 0) try consts.dev.upload(0, std.mem.sliceAsBytes(consts.host.items));
     for (progs) |p| for (p.ops.items) |*op| switch (op.*) {
@@ -840,7 +841,7 @@ fn finishConsts(run: *Run, consts: *Consts, progs: []const *Compiled) !void {
     };
 }
 
-fn selectTable(run: *Run) ![]Select {
+pub fn selectTable(run: *Run) ![]Select {
     const gpa = run.gpu.gpa;
     var out: std.ArrayList(Select) = .empty;
     var it = run.prog.value.object.get("kernels").?.object.iterator();
@@ -857,13 +858,13 @@ fn selectTable(run: *Run) ![]Select {
 
 /// The geometry a decode step at ``keys`` attended keys needs: the indexer's score programs (4 keys a block, 64
 /// blocks a program), the attention's 512-key chunks over at most 2051 keys, and the selector's power-of-two width.
-fn keyedSig(keys: i64) [3]u64 {
+pub fn keyedSig(keys: i64) [3]u64 {
     const blocks: u64 = @intCast(@max(1, @divFloor(keys + 3, 4)));
     return .{ (blocks + 63) / 64, @intCast(@divFloor(@min(keys, 2051) + 511, 512)), std.math.ceilPowerOfTwo(u64, blocks) catch unreachable };
 }
 
 /// Re-derives the keyed launches for ``keys``; returns whether anything changed.
-fn refresh(run: *Run, c: *Compiled, selects: []const Select, keys: i64) !bool {
+pub fn refresh(run: *Run, c: *Compiled, selects: []const Select, keys: i64) !bool {
     const sig = keyedSig(keys);
     if (std.mem.eql(u64, &sig, &c.sig)) return false;
     c.sig = sig;
@@ -889,7 +890,7 @@ fn refresh(run: *Run, c: *Compiled, selects: []const Select, keys: i64) !bool {
     return true;
 }
 
-fn runCompiled(run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype, pos: i64) !void {
+pub fn runCompiled(run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype, pos: i64) !void {
     const d = run.gpu.d;
     for (ops) |*op| switch (op.*) {
         .launch => |*l| try cuda.launch.launch(l.f, l.cfg, stream, &l.args),
@@ -908,14 +909,20 @@ fn runCompiled(run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.Libr
 }
 
 /// A decode forward as a CUDA graph (everything after its input uploads), recaptured when the keyed geometry moves.
-const DecodeGraph = struct {
+pub const DecodeGraph = struct {
     exec: ?cuda.graph.Exec = null,
     sig: [3]u64 = .{ 0, 0, 0 },
     captures: usize = 0,
     capture_ms: f64 = 0,
 
-    fn launch(self: *DecodeGraph, run: *Run, c: *Compiled, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype) !void {
+    pub fn launch(self: *DecodeGraph, run: *Run, c: *Compiled, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype) !void {
         try runCompiled(run, c.ops.items[0..c.lead], stream, nccl, comm, inputs, -1);
+        try self.prepare(run, c, stream, nccl, comm, inputs);
+        try self.exec.?.launchOn(stream);
+    }
+
+    /// Captures (or updates) the graph for the program's current geometry without running it.
+    pub fn prepare(self: *DecodeGraph, run: *Run, c: *Compiled, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype) !void {
         if (self.exec == null or !std.mem.eql(u64, &self.sig, &c.sig)) {
             const t0 = std.Io.Timestamp.now(run.gpu.io, .awake);
             try cuda.graph.beginCapture(stream, .thread_local);
@@ -938,7 +945,6 @@ const DecodeGraph = struct {
             self.captures += 1;
             self.capture_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(run.gpu.io, .awake)).toNanoseconds())) / 1e6;
         }
-        try self.exec.?.launchOn(stream);
     }
 };
 

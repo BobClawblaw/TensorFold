@@ -20,6 +20,7 @@ pub const NGram = struct {
     lut: [256]u16,
     files: []std.Io.File,
     offs: []u64,
+    tables: [][]const u8 = &.{},        // each shard's rows, memory-mapped (``map``)
     history: [8]i64 = undefined,
     hlen: usize = 0,
     vocab_offset: i64 = 0,
@@ -53,6 +54,42 @@ pub const NGram = struct {
         for (o.get("initial_history").?.array.items, 0..) |x, i| g.history[i] = x.integer;
         g.hlen = o.get("initial_history").?.array.items.len;
         return g;
+    }
+
+    /// Maps every shard file once (read-only, shared with the page cache) and, with ``prefetch``, touches every page
+    /// of the rows from eight threads so no decode step faults on a table page.
+    pub fn map(self: *NGram, prefetch: bool) !void {
+        const shards = self.files.len;
+        self.tables = try self.gpa.alloc([]const u8, shards);
+        var bases = std.AutoHashMap(std.posix.fd_t, []align(std.heap.page_size_min) u8).init(self.gpa);
+        defer bases.deinit();
+        for (0..shards) |i| {
+            const fd = self.files[i].handle;
+            const whole = bases.get(fd) orelse blk: {
+                const len = try self.files[i].length(self.io);
+                const m = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+                try bases.put(fd, m);
+                break :blk m;
+            };
+            const rows: usize = @intCast(self.starts[i + 1] - self.starts[i]);
+            self.tables[i] = whole[self.offs[i]..][0 .. rows * self.width];
+        }
+        if (!prefetch) return;
+        const Touch = struct {
+            fn run(tables: []const []const u8, first: usize, step: usize, sum: *u64) void {
+                var acc: u64 = 0;
+                var i = first;
+                while (i < tables.len) : (i += step) {
+                    var at: usize = 0;
+                    while (at < tables[i].len) : (at += 4096) acc +%= tables[i][at];
+                }
+                sum.* = acc;
+            }
+        };
+        var threads: [8]std.Thread = undefined;
+        var sums: [8]u64 = @splat(0);
+        for (0..8) |t| threads[t] = try std.Thread.spawn(.{}, Touch.run, .{ self.tables, t, 8, &sums[t] });
+        for (threads) |t| t.join();
     }
 
     pub fn reset(self: *NGram) void {
@@ -104,9 +141,12 @@ pub const NGram = struct {
             var s: usize = 0;
             while (s + 1 < self.starts.len and self.starts[s + 1] <= id) s += 1;
             const local: u64 = @intCast(id - self.starts[s]);
-            const n = try self.files[s].readPositionalAll(self.io, raw[0..self.width], self.offs[s] + local * self.width);
-            if (n != self.width) return error.ShortRead;
-            for (0..self.width) |j| out[i * self.width + j] = self.lut[raw[j]];
+            const row: []const u8 = if (self.tables.len > 0) self.tables[s][local * self.width ..][0..self.width] else blk: {
+                const n = try self.files[s].readPositionalAll(self.io, raw[0..self.width], self.offs[s] + local * self.width);
+                if (n != self.width) return error.ShortRead;
+                break :blk raw[0..self.width];
+            };
+            for (0..self.width) |j| out[i * self.width + j] = self.lut[row[j]];
         }
     }
 
