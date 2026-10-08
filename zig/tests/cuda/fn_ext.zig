@@ -195,7 +195,12 @@ const Call = struct {
     }
 };
 
+/// One launch as an extension's launcher makes it, kept instead of run while ``record`` is set (the compiler's hook).
+pub const Rec = struct { f: cuda.Function, cfg: cuda.Config, args: cuda.Args };
+pub var record: ?struct { gpa: std.mem.Allocator, list: *std.ArrayList(Rec) } = null;
+
 fn go(f: cuda.Function, grid: cuda.Dim3, block: u32, shared: u32, stream: cuda.Stream, args: *cuda.Args) !void {
+    if (record) |r| return r.list.append(r.gpa, .{ .f = f, .cfg = .{ .grid = grid, .block = .{ .x = block }, .shared = shared }, .args = args.* });
     try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = block }, .shared = shared }, stream, args);
 }
 

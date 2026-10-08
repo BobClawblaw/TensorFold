@@ -84,7 +84,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fn-ext")) return fn_ext.extCall(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-uid")) return fn_run.writeUid(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-run")) return fn_run.decode(gpu, rest);
-    if (std.mem.eql(u8, cmd, "fn-gen")) return fn_run.generate(gpu, rest);
+    if (std.mem.eql(u8, cmd, "fn-gen")) return fn_run.generate(gpu, rest, .graph);
+    if (std.mem.eql(u8, cmd, "fn-gen-compiled")) return fn_run.generate(gpu, rest, .compiled);
+    if (std.mem.eql(u8, cmd, "fn-gen-profile")) return fn_run.generate(gpu, rest, .profile);
+    if (std.mem.eql(u8, cmd, "fn-gen-interp")) return fn_run.generate(gpu, rest, .interp);
     if (std.mem.eql(u8, cmd, "fn-check")) return fn_run.checkChunk(gpu, rest);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
