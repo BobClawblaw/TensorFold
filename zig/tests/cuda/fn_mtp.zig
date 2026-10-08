@@ -79,6 +79,8 @@ const Ctx = struct {
     graphs: bool,
     xbuf: cuda.DeviceBuffer,
     host: cuda.HostBuffer,                // logits rows read back here (pinned, reused)
+    device_sampling: bool = false,        // candidates from fn_rows_top inside each program, exchanged there too
+    gathered: u64 = 0,                    // [2 ranks][rows][4] words: id, max, log-sum-exp, 0
 
     fn launch(self: *Ctx, p: *Prog, keys: i64, in: *const Inputs) !void {
         _ = try R.refresh(self.run, &p.c, self.selects, keys);
@@ -94,9 +96,30 @@ fn markAddr(run: *R.Run, prog: std.json.ObjectMap, name: []const u8) ?struct { a
     return .{ .addr = run.addr(v), .rows = @intCast(shape[0].integer), .cols = @intCast(shape[1].integer) };
 }
 
+/// The exchanged candidates of the last program (both ranks, ``rows`` rows), read back once.
+fn readCands(cx: *Ctx, rows: usize) ![]const i32 {
+    const d = cx.run.gpu.d;
+    const n = 2 * rows * 4;
+    const w: []i32 = @alignCast(std.mem.bytesAsSlice(i32, cx.host.bytes[0 .. n * 4]));
+    try d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(w.ptr), cx.gathered, n * 4, cx.stream.handle), "candidates");
+    try cx.stream.synchronize();
+    return w;
+}
+
 /// Greedy over both ranks' vocabulary shards for ``rows`` rows: each rank's first maximum per row (global id, value),
 /// exchanged; the larger value wins, a tie the lower id.
 fn greedyRows(cx: *Ctx, logits: u64, rows: usize, cols: usize, vocab_offset: i64, out: []i64) !void {
+    if (cx.device_sampling) {
+        const g = try readCands(cx, rows);
+        for (0..rows) |r| {
+            const a = g[4 * r ..][0..4];
+            const b = g[4 * (rows + r) ..][0..4];
+            const v0: f32 = @bitCast(a[1]);
+            const v1: f32 = @bitCast(b[1]);
+            out[r] = if (v1 > v0 or (v1 == v0 and b[0] < a[0])) b[0] else a[0];
+        }
+        return;
+    }
     const d = cx.run.gpu.d;
     const buf: []u16 = @alignCast(std.mem.bytesAsSlice(u16, cx.host.bytes[0 .. rows * cols * 2]));
     try d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(buf.ptr), logits, rows * cols * 2, cx.stream.handle), "logits rows");
@@ -125,6 +148,18 @@ fn greedyRows(cx: *Ctx, logits: u64, rows: usize, cols: usize, vocab_offset: i64
 /// The MTP head's draft from its logits row over this rank's share of the draft vocabulary: the best (value, id)
 /// across ranks and its temperature-1 probability from both shards' log-sum-exps.
 fn draftPick(cx: *Ctx, logits: u64, cols: usize, ids: []const i32) !struct { tok: i64, p: f64 } {
+    if (cx.device_sampling) {
+        const g = try readCands(cx, 1);
+        const v0: f32 = @bitCast(g[1]);
+        const v1: f32 = @bitCast(g[5]);
+        const l0: f64 = @as(f32, @bitCast(g[2]));
+        const l1: f64 = @as(f32, @bitCast(g[6]));
+        const first = !(v1 > v0 or (v1 == v0 and g[4] < g[0]));
+        const top = @max(l0, l1);
+        const total = top + @log(@exp(l0 - top) + @exp(l1 - top));
+        const v: f64 = if (first) v0 else v1;
+        return .{ .tok = if (first) g[0] else g[4], .p = @exp(v - total) };
+    }
     const d = cx.run.gpu.d;
     const row: []u16 = @alignCast(std.mem.bytesAsSlice(u16, cx.host.bytes[0 .. cols * 2]));
     try d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(row.ptr), logits, cols * 2, cx.stream.handle), "draft row");
@@ -155,7 +190,7 @@ fn draftPick(cx: *Ctx, logits: u64, cols: usize, ids: []const i32) !struct { tok
     return .{ .tok = if (first) all[0] else all[4], .p = @exp(v - total) };
 }
 
-pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool) !void {
+pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_sampling: bool) !void {
     // fn-mtp <program.json> <weights.bin> <pre_prefill.bin> <ngram.json> <reference.json> <draft_ids.bin> <rank> <uid file>
     const gpa = gpu.gpa;
     const io = gpu.io;
@@ -232,6 +267,31 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool) !void {
     var cx: Ctx = .{ .run = &run, .stream = stream, .nccl = &nccl, .comm = comm, .selects = try R.selectTable(&run),
                      .graphs = graphs, .xbuf = try cuda.DeviceBuffer.alloc(gpu.d, 4096),
                      .host = try cuda.HostBuffer.alloc(gpu.d, 8 * 131072 * 2) };
+    if (device_sampling) {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, "flashnext-zig/cubins/fn_sample.cubin", gpa, .limited(1 << 24));
+        const img = try gpa.alignedAlloc(u8, .@"16", raw.len);
+        @memcpy(img, raw);
+        const mod = try cuda.Module.load(gpu.d, img);
+        const top = try mod.function("fn_rows_top");
+        const cand = try cuda.DeviceBuffer.alloc(gpu.d, 16 * 16);
+        const gath = try cuda.DeviceBuffer.alloc(gpu.d, 2 * 16 * 16);
+        const idmap = try cuda.DeviceBuffer.alloc(gpu.d, draw.len);
+        try idmap.upload(0, draw);
+        cx.device_sampling = true;
+        cx.gathered = gath.ptr;
+        var tit = table.iterator();
+        while (tit.next()) |e| {
+            const nm = e.key_ptr.*;
+            const p = e.value_ptr.*;
+            const head = std.mem.startsWith(u8, nm, "fwd_");
+            if (!head and !std.mem.startsWith(u8, nm, "mtp_")) continue;
+            var a: cuda.Args = .{};
+            a.add(p.logits); a.add(@as(i32, @intCast(p.cols))); a.add(@as(i32, @intCast(p.cols)));
+            a.add(@as(u64, if (head) 0 else idmap.ptr)); a.add(@as(i32, @intCast(if (head) ng.vocab_offset else 0))); a.add(cand.ptr);
+            try p.c.ops.append(gpa, .{ .launch = .{ .f = top, .cfg = .{ .grid = .{ .x = @intCast(p.rows) }, .block = .{ .x = 1024 } }, .args = a, .name = "fn_rows_top" } });
+            try p.c.ops.append(gpa, .{ .gather = .{ .send = cand.ptr, .recv = gath.ptr, .count = 4 * p.rows, .dt = .i32 } });
+        }
+    }
     std.debug.print("compiled {d} programs, {d:.0} ms\n", .{ table.count(),
         @as(f64, @floatFromInt(tc.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6 });
     var name_buf_init: [64]u8 = undefined;
@@ -288,7 +348,10 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool) !void {
     const ls = markAddr(&run, progs.get("prefill").?.object, "last_streams").?;
     try gpu.d.check(gpu.d.api.cuMemcpyDtoD_v2(lastbuf.ptr, ls.addr, ROW), "last streams");
     var first: [1]i64 = undefined;
+    const dev = cx.device_sampling;
+    cx.device_sampling = false;               // the prompt's program has no candidate step: its row is read here
     try greedyRows(&cx, pre.logits, 1, pre.cols, ng.vocab_offset, &first);
+    cx.device_sampling = dev;
     std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len,
         @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6, first[0], want[0] });
 
