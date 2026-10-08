@@ -82,6 +82,9 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "fn-triton")) return fn_fixtures.tritonRegions(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-ext")) return fn_ext.extCall(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-aot")) return @import("fn_native.zig").aotLoad(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-tp")) return @import("fn_native.zig").tpLink(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "fn-fatbins")) return @import("fn_native.zig").fatbins(gpu);
     if (std.mem.eql(u8, cmd, "fn-uid")) return fn_run.writeUid(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-run")) return fn_run.decode(gpu, rest);
     if (std.mem.eql(u8, cmd, "fn-gen")) return fn_run.generate(gpu, rest, .graph);
