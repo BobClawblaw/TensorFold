@@ -48,6 +48,9 @@ pub fn deviceWeightBytes(io: std.Io, dir: []const u8) u64 {
 
 const max_rows = 16;            // a verify window's rows at most (pending + 15 drafts)
 const max_depth = max_rows - 1;
+/// The head stops at a draft it gives less than this (the Python engine's --mtp-confidence, the recipe's 0.70);
+/// the slots past it are held with chance 0, so the lane core's allocator leaves them out of the window.
+const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
@@ -90,6 +93,7 @@ const Lane = struct {
     seq: *forward.Seq,
     id: u64,
     held: [max_depth]u32 = undefined,   // drafts held for the next window
+    probs: [max_depth]f64 = undefined,  // the head's chance for each (0 past the confidence cut)
     nheld: u32 = 0,
     rows: u32 = 0,                      // the last verify's rows, not yet committed (0: nothing pending)
 };
@@ -126,6 +130,20 @@ const Owned = struct {
     costs: [max_rows]lanes.config.Cost = undefined, // a window's ms by width (rank 0, timed at open)
     cost_count: usize = 0,
     mtp_ms: f64 = 0, // one chained head step
+    spare: ?*forward.Seq = null, // a released sequence, reset and reused by the next request (its memory, its graphs)
+
+    fn obtain(self: *Owned) !*forward.Seq {
+        if (self.spare) |s| {
+            self.spare = null;
+            try forward.resetSeq(self.e, s);
+            return s;
+        }
+        return forward.newSeq(self.e);
+    }
+
+    fn retire(self: *Owned, s: *forward.Seq) void {
+        if (self.spare == null) self.spare = s else forward.freeSeq(self.e, s);
+    }
 
     fn take(self: *Owned, t: u32) u64 {
         self.drawn[self.next % self.drawn.len] = t;
@@ -179,13 +197,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.next_id = 1;
     own.next = 0;
     own.cost_count = 0;
+    own.spare = null;
     own.mtp_ms = 0;
     if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
                     .hidden_rows = false, .max_streams = 1, .batch_rows = max_rows,
-                    .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms },
+                    .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms,
+                    .draft_probabilities = o.drafts },
         .rows = if (o.drafts) max_rows else 1,
         .stream_bytes = forward.seqBytes(own.e),
         .ctx = own,
@@ -210,11 +230,11 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     try w.int(id);
     try w.tokens(&prompt);
     try self.send(.prefill, &w);
-    const seq = try forward.newSeq(self.e);
+    const seq = try self.obtain();
     defer {
         w.int(id) catch {};
         self.send(.release, &w) catch {};
-        forward.freeSeq(self.e, seq);
+        self.retire(seq);
     }
     var tok = try forward.prefill(self.e, seq, &prompt);
     var ids: [max_rows]u32 = undefined;
@@ -248,6 +268,7 @@ fn calibrate(self: *Owned, drafts: bool) !void {
             try w.int(id);
             try w.tokens(&follow);
             try w.int(depth);
+            try w.int(0); // no confidence cut: every level timed
             try self.send(.draft, &w);
             const t0 = std.Io.Timestamp.now(self.io, .awake);
             try forward.draft(self.e, seq, &follow, depth, held[0..depth]);
@@ -271,6 +292,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
     if (own.rank == 0) own.link.send(@intFromEnum(Op.stop), "") catch {};
+    if (own.spare) |s| forward.freeSeq(own.e, s);
     forward.deinit(own.e);
     own.store.deinit();
     own.kernels.deinit();
@@ -294,6 +316,7 @@ const vtable: be.Backend.VTable = .{
     .keep = keepFn,
     .draft = draftFn,
     .release = releaseFn,
+    .probabilities = probabilitiesFn,
 };
 
 /// A new sequence for the stream and its prompt (the head absorbs it); the first token is drawn here.
@@ -303,7 +326,7 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     const ids = s.prompt();
     if (ids.len == 0 or ids.len + s.max_new + max_rows > forward.maxLen(self.e)) return error.PromptTooLong;
     const gop = try self.lanes_by.getOrPut(s);
-    if (gop.found_existing) forward.freeSeq(self.e, gop.value_ptr.seq);
+    if (gop.found_existing) self.retire(gop.value_ptr.seq);
     const id = self.next_id;
     self.next_id += 1;
     var w: Writer = .{ .gpa = self.gpa };
@@ -311,7 +334,7 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     try w.int(id);
     try w.tokens(ids);
     try self.send(.prefill, &w);
-    const seq = try forward.newSeq(self.e);
+    const seq = try self.obtain();
     gop.value_ptr.* = .{ .seq = seq, .id = id };
     _ = self.take(try forward.prefill(self.e, seq, ids));
 }
@@ -386,10 +409,24 @@ fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         try w.int(l.id);
         try w.tokens(follow[0..n]);
         try w.int(depth);
+        try w.int(1); // the confidence cut (rank 1 must stop where rank 0 does: the head's steps gather)
         try self.send(.draft, &w);
-        try forward.draft(self.e, l.seq, follow[0..n], depth, l.held[0..depth]);
+        const got = try forward.draftUpTo(self.e, l.seq, follow[0..n], depth, draft_confidence, l.held[0..depth]);
+        for (0..depth) |i| {
+            l.probs[i] = if (i < got) self.e.draft_p[i] else 0;
+            if (i >= got) l.held[i] = l.held[got - 1];
+        }
         l.nheld = depth;
     }
+}
+
+/// Each held draft's chance of landing: the head's probability, 0 past the confidence cut.
+fn probabilitiesFn(p: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
+    const self = of(p);
+    const l = self.lanes_by.getPtr(s) orelse return false;
+    if (out.len > l.nheld) return false;
+    @memcpy(out, l.probs[0..out.len]);
+    return true;
 }
 
 fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
@@ -399,7 +436,7 @@ fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     defer w.buf.deinit(self.gpa);
     w.int(kv.value.id) catch {};
     self.send(.release, &w) catch {};
-    forward.freeSeq(self.e, kv.value.seq);
+    self.retire(kv.value.seq);
 }
 
 /// Rank 1: rank 0's calls, replayed in order on this rank's half of the model, until rank 0 stops.
@@ -417,7 +454,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
         switch (@as(Op, @enumFromInt(m.tag))) {
             .prefill => {
                 const id = try r.int();
-                const seq = try forward.newSeq(self.e);
+                const seq = try self.obtain();
                 try self.by_id.put(id, seq);
                 _ = try forward.prefill(self.e, seq, try r.tokens());
             },
@@ -435,11 +472,12 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                 const follow = try r.tokens();
                 const depth: u32 = @intCast(try r.int());
-                try forward.draft(self.e, seq, follow, depth, held[0..depth]);
+                const cut: f64 = if (try r.int() != 0) draft_confidence else 0;
+                _ = try forward.draftUpTo(self.e, seq, follow, depth, cut, held[0..depth]);
             },
             .release => {
                 const kv = self.by_id.fetchRemove(try r.int()) orelse continue;
-                forward.freeSeq(self.e, kv.value);
+                self.retire(kv.value);
             },
             .stop => return,
             .ready => {},
