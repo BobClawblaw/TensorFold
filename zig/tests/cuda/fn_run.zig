@@ -707,8 +707,15 @@ pub const COp = union(enum) {
 
 pub const Select = struct { block: u64, kern: cuda.triton.Kernel };
 
+/// A byte range an op touches on the device (read or written: both are assumed), for the graph's dependencies.
+pub const Range = struct { a: u64, b: u64 };
+const WILD: Range = .{ .a = 0, .b = std.math.maxInt(u64) };     // an operand whose extent is unknown: everything
+const COMM: Range = .{ .a = 1, .b = 2 };                        // the communicator: its calls keep their order
+
 pub const Compiled = struct {
     ops: std.ArrayList(COp) = .empty,
+    ranges: std.ArrayList([]const Range) = .empty,   // per op
+    deps: [][]const u32 = &.{},                       // per op from ``lead``: earlier ops it must follow (``analyze``)
     keyed: std.ArrayList(usize) = .empty,     // indices of the launches ``refresh`` re-derives
     lead: usize = 0,                          // the leading uploads (the step's inputs), run before a graph
     sig: [3]u64 = .{ 0, 0, 0 },               // the geometry ``refresh`` last set
@@ -744,6 +751,60 @@ fn tritonLaunch(run: *Run, kern: cuda.triton.Kernel, dims: cuda.Dim3, args: cuda
     return .{ .f = kern.function, .cfg = kern.config(dims), .args = a, .key = key, .kern = kern, .dims = dims, .name = name };
 }
 
+fn tensorRange(run: *Run, v: std.json.Value, out: *std.ArrayList(Range), gpa: std.mem.Allocator) !void {
+    switch (v) {
+        .object => |o| {
+            if (o.get("shape") == null or (o.get("s") == null and o.get("tmp") == null)) return;
+            const n = extent(o);
+            if (n == 0) return;
+            const a = run.addr(v);
+            try out.append(gpa, .{ .a = a, .b = a + n });
+        },
+        .array => |arr| for (arr.items) |x| try tensorRange(run, x, out, gpa),
+        else => {},
+    }
+}
+
+/// Every device range a traced op touches: its tensor operands (a raw pointer: everything), Triton's shared
+/// scratch, the communicator for collectives.
+fn opRanges(run: *Run, o: std.json.ObjectMap, kern: ?cuda.triton.Kernel) ![]const Range {
+    const gpa = run.gpu.gpa;
+    var out: std.ArrayList(Range) = .empty;
+    const kind = o.get("kind").?.string;
+    if (std.mem.eql(u8, kind, "triton")) {
+        for (o.get("args").?.array.items) |av| {
+            const ty = av.object.get("type").?.string;
+            const v = av.object.get("v").?;
+            if (ty[0] != '*' or v == .null) continue;
+            if (v == .object and v.object.get("shape") != null) try tensorRange(run, v, &out, gpa) else try out.append(gpa, WILD);
+        }
+        if (kern) |kk| if (kk.meta.global_scratch_size > 0 or kk.meta.profile_scratch_size > 0)
+            try out.append(gpa, .{ .a = run.scratch.ptr, .b = run.scratch.ptr + run.scratch.len });
+    } else {
+        if (o.get("args")) |a| try tensorRange(run, a, &out, gpa);
+        if (o.get("ret")) |r| try tensorRange(run, r, &out, gpa);
+        if (std.mem.eql(u8, kind, "comm")) try out.append(gpa, COMM);
+    }
+    return out.items;
+}
+
+fn overlaps(x: []const Range, y: []const Range) bool {
+    for (x) |r| for (y) |q| if (r.a < q.b and q.a < r.b) return true;
+    return false;
+}
+
+/// The dependencies of every op after the leading uploads: each earlier op sharing a range with it.
+pub fn analyze(gpa: std.mem.Allocator, c: *Compiled) !void {
+    const n = c.ops.items.len;
+    std.debug.assert(c.ranges.items.len == n);
+    c.deps = try gpa.alloc([]const u32, n - c.lead);
+    for (c.lead..n) |i| {
+        var d: std.ArrayList(u32) = .empty;
+        for (c.lead..i) |j| if (overlaps(c.ranges.items[i], c.ranges.items[j])) try d.append(gpa, @intCast(j));
+        c.deps[i - c.lead] = d.items;
+    }
+}
+
 pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, consts: *Consts) !Compiled {
     const gpa = run.gpu.gpa;
     var c: Compiled = .{};
@@ -754,6 +815,13 @@ pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cud
         const o = ov.object;
         const kind = o.get("kind").?.string;
         const name = o.get("name").?.string;
+        defer {
+            const kern: ?cuda.triton.Kernel = if (std.mem.eql(u8, kind, "triton")) run.kernels.get(o.get("hash").?.string) else null;
+            if (c.ranges.items.len < c.ops.items.len) {
+                const r = opRanges(run, o, kern) catch &.{WILD};
+                while (c.ranges.items.len < c.ops.items.len) c.ranges.append(gpa, r) catch unreachable;
+            }
+        }
         if (!std.mem.eql(u8, kind, "upload") and !std.mem.eql(u8, name, "aten.copy_.default")) leading = false;
         if (std.mem.eql(u8, kind, "triton")) {
             const kern = try kernelFor(run, o.get("hash").?.string);
@@ -908,8 +976,63 @@ pub fn runCompiled(run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.
     };
 }
 
+/// Side streams and an event per op for capturing a program's independent branches concurrently.
+pub const Par = struct {
+    streams: [4]cuda.Stream,
+    events: []cuda.Event,
+    on: []u8,                 // the stream each op went to
+    start: cuda.Event,
+
+    pub fn init(run: *Run, main: cuda.Stream, max_ops: usize) !Par {
+        var p: Par = .{ .streams = undefined, .events = try run.gpu.gpa.alloc(cuda.Event, max_ops),
+                        .on = try run.gpu.gpa.alloc(u8, max_ops), .start = try cuda.Event.init(run.gpu.d, false) };
+        p.streams[0] = main;
+        for (1..4) |i| p.streams[i] = try cuda.Stream.init(run.gpu.d, true);
+        for (p.events) |*e| e.* = try cuda.Event.init(run.gpu.d, false);
+        return p;
+    }
+
+    /// Issues ops[lead..] across the streams (inside a capture on streams[0]): an op joins the stream ending in its
+    /// latest dependency, or the stream idle longest; it waits on its other streams' latest dependencies.
+    pub fn issue(self: *Par, run: *Run, c: *Compiled, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype) !void {
+        const d = run.gpu.d;
+        const S = self.streams.len;
+        var last: [4]i64 = @splat(-1);
+        var waited: [4][4]i64 = @splat(@splat(-1));
+        try self.start.record(self.streams[0]);
+        for (1..S) |t| try self.streams[t].wait(self.start);
+        for (c.lead..c.ops.items.len) |i| {
+            const deps = c.deps[i - c.lead];
+            var mx: [4]i64 = @splat(-1);
+            for (deps) |j| mx[self.on[j]] = @max(mx[self.on[j]], j);
+            var s: usize = S;
+            for (0..S) |t| if (last[t] >= 0 and mx[t] == last[t] and (s == S or last[t] > last[s])) {
+                s = t;
+            };
+            if (s == S) {
+                s = 0;
+                for (1..S) |t| if (last[t] < last[s]) {
+                    s = t;
+                };
+            }
+            for (0..S) |t| if (t != s and mx[t] > waited[s][t]) {
+                try d.check(d.api.cuStreamWaitEvent(self.streams[s].handle, self.events[@intCast(mx[t])].handle, 0), "wait");
+                waited[s][t] = mx[t];
+            };
+            try runCompiled(run, c.ops.items[i .. i + 1], self.streams[s], nccl, comm, inputs, -1);
+            try self.events[i].record(self.streams[s]);
+            self.on[i] = @intCast(s);
+            last[s] = @intCast(i);
+        }
+        for (1..S) |t| if (last[t] >= 0 and last[t] > waited[0][t]) {
+            try d.check(d.api.cuStreamWaitEvent(self.streams[0].handle, self.events[@intCast(last[t])].handle, 0), "join");
+        };
+    }
+};
+
 /// A decode forward as a CUDA graph (everything after its input uploads), recaptured when the keyed geometry moves.
 pub const DecodeGraph = struct {
+    par: ?*Par = null,
     exec: ?cuda.graph.Exec = null,
     sig: [3]u64 = .{ 0, 0, 0 },
     captures: usize = 0,
@@ -926,7 +1049,7 @@ pub const DecodeGraph = struct {
         if (self.exec == null or !std.mem.eql(u64, &self.sig, &c.sig)) {
             const t0 = std.Io.Timestamp.now(run.gpu.io, .awake);
             try cuda.graph.beginCapture(stream, .thread_local);
-            runCompiled(run, c.ops.items[c.lead..], stream, nccl, comm, inputs, -1) catch |e| {
+            (if (self.par) |p| p.issue(run, c, nccl, comm, inputs) else runCompiled(run, c.ops.items[c.lead..], stream, nccl, comm, inputs, -1)) catch |e| {
                 if (cuda.graph.endCapture(stream)) |g| { var gg = g; gg.deinit(); } else |_| {}
                 return e;
             };
@@ -950,12 +1073,12 @@ pub const DecodeGraph = struct {
 
 /// GPU time per op kind over a few decode steps: an event after every op, summed by label (a launch's kernel name,
 /// a gather, a copy).
-const Profile = struct {
+pub const Profile = struct {
     totals: std.StringHashMap(struct { ms: f64 = 0, n: usize = 0 }),
     steps: usize = 0,
     step_ms: f64 = 0,
 
-    fn step(self: *Profile, run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype) !void {
+    pub fn step(self: *Profile, run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype) !void {
         const gpa = run.gpu.gpa;
         const evs = try gpa.alloc(cuda.Event, ops.len + 1);
         defer gpa.free(evs);
@@ -978,8 +1101,9 @@ const Profile = struct {
             gop.value_ptr.ms += ms;
             gop.value_ptr.n += 1;
         }
-        if (self.steps == 7) {            // the last profiled step, op by op, for offline attribution
-            const f = try std.Io.Dir.cwd().createFile(run.gpu.io, "flashnext-zig/prof_ops.txt", .{});
+        if (self.steps == 3) {            // the last profiled step, op by op, for offline attribution
+            const fname = try std.fmt.allocPrint(gpa, "flashnext-zig/prof_ops_{d}.txt", .{ops.len});
+            const f = try std.Io.Dir.cwd().createFile(run.gpu.io, fname, .{});
             defer f.close(run.gpu.io);
             var at: u64 = 0;
             for (ops, 0..) |op, i| {
@@ -992,7 +1116,7 @@ const Profile = struct {
         self.steps += 1;
     }
 
-    fn report(self: *Profile, gpa: std.mem.Allocator) !void {
+    pub fn report(self: *Profile, gpa: std.mem.Allocator) !void {
         const E = struct { name: []const u8, ms: f64, n: usize };
         var list: std.ArrayList(E) = .empty;
         var it = self.totals.iterator();
@@ -1000,7 +1124,7 @@ const Profile = struct {
         std.mem.sort(E, list.items, {}, struct { fn lt(_: void, a: E, b: E) bool { return a.ms > b.ms; } }.lt);
         const st: f64 = @floatFromInt(self.steps);
         std.debug.print("profile: {d} steps, {d:.2} ms a step on the GPU (events after every op)\n", .{ self.steps, self.step_ms / st });
-        for (list.items[0..@min(30, list.items.len)]) |e|
+        for (list.items[0..@min(40, list.items.len)]) |e|
             std.debug.print("  {d:7.3} ms a step  {d:4} ops  {d:7.1} us each  {s}\n", .{ e.ms / st, e.n / self.steps, 1000 * e.ms / @as(f64, @floatFromInt(e.n)), e.name });
     }
 };

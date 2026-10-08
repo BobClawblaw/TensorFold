@@ -87,6 +87,11 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fn-gen")) return fn_run.generate(gpu, rest, .graph);
     if (std.mem.eql(u8, cmd, "fn-gen-compiled")) return fn_run.generate(gpu, rest, .compiled);
     if (std.mem.eql(u8, cmd, "fn-mtp")) return @import("fn_mtp.zig").generate(gpu, rest, true, true);
+    if (std.mem.eql(u8, cmd, "fn-mtp-profile")) return @import("fn_mtp.zig").generateP(gpu, rest, true, true, true);
+    if (std.mem.eql(u8, cmd, "fn-mtp-parallel")) {
+        @import("fn_mtp.zig").parallel = true;
+        return @import("fn_mtp.zig").generate(gpu, rest, true, true);
+    }
     if (std.mem.eql(u8, cmd, "fn-mtp-host")) return @import("fn_mtp.zig").generate(gpu, rest, true, false);
     if (std.mem.eql(u8, cmd, "fn-mtp-eager")) return @import("fn_mtp.zig").generate(gpu, rest, false, true);
     if (std.mem.eql(u8, cmd, "fn-gen-profile")) return fn_run.generate(gpu, rest, .profile);
