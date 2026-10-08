@@ -295,10 +295,10 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
             a.add(@as(u64, if (head) 0 else idmap.ptr)); a.add(@as(i32, @intCast(if (head) ng.vocab_offset else 0))); a.add(cand.ptr);
             try p.c.ops.append(gpa, .{ .launch = .{ .f = top, .cfg = .{ .grid = .{ .x = @intCast(p.rows) }, .block = .{ .x = 1024 } }, .args = a, .name = "fn_rows_top" } });
             try p.c.ops.append(gpa, .{ .gather = .{ .send = cand.ptr, .recv = gath.ptr, .count = 4 * p.rows, .dt = .i32 } });
-            const lr = try gpa.dupe(R.Range, &.{ .{ .a = p.logits, .b = p.logits + p.rows * p.cols * 2 }, .{ .a = cand.ptr, .b = cand.ptr + cand.len },
-                .{ .a = idmap.ptr, .b = idmap.ptr + idmap.len } });
+            const lr = try gpa.dupe(R.Range, &.{ .{ .a = p.logits, .b = p.logits + p.rows * p.cols * 2, .w = false }, .{ .a = cand.ptr, .b = cand.ptr + cand.len },
+                .{ .a = idmap.ptr, .b = idmap.ptr + idmap.len, .w = false } });
             try p.c.ranges.append(gpa, lr);
-            try p.c.ranges.append(gpa, try gpa.dupe(R.Range, &.{ .{ .a = cand.ptr, .b = cand.ptr + cand.len }, .{ .a = gath.ptr, .b = gath.ptr + gath.len }, .{ .a = 1, .b = 2 } }));
+            try p.c.ranges.append(gpa, try gpa.dupe(R.Range, &.{ .{ .a = cand.ptr, .b = cand.ptr + cand.len, .w = false }, .{ .a = gath.ptr, .b = gath.ptr + gath.len }, .{ .a = 1, .b = 2 } }));
         }
     }
     if (parallel) {             // verify windows and head steps: independent branches captured on side streams
@@ -313,7 +313,7 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
             if (!std.mem.startsWith(u8, nm, "fwd_") and !std.mem.startsWith(u8, nm, "mtp_")) continue;
             try R.analyze(gpa, &e.value_ptr.*.c);
             e.value_ptr.*.g.par = par;
-            if (std.mem.eql(u8, nm, "fwd_R3_p0")) {        // how parallel the program is: its longest dependency chain
+            if (std.mem.eql(u8, nm, "fwd_R3_p0") or std.mem.eql(u8, nm, "mtp_n1")) {        // how parallel the program is: its longest dependency chain
                 const c = &e.value_ptr.*.c;
                 const depth = try gpa.alloc(u32, c.ops.items.len);
                 @memset(depth, 0);
@@ -327,7 +327,7 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
                     ndeps += c.deps[i - c.lead].len;
                     if (c.deps[i - c.lead].len == 0 and i > c.lead + 1) std.debug.print("  op {d} has no dependencies\n", .{i});
                 }
-                std.debug.print("fwd_R3_p0: {d} ops, longest chain {d}, {d} dependency pairs\n", .{ c.ops.items.len - c.lead, longest, ndeps });
+                std.debug.print("{s}: {d} ops, longest chain {d}, {d} dependency pairs\n", .{ nm, c.ops.items.len - c.lead, longest, ndeps });
             }
         }
     }
