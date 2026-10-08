@@ -54,7 +54,7 @@ def test_skewed_rank_memory_produces_identical_admission_and_rounds(rooms, expec
                             empty=lambda shape, **kwargs: Tensor([0] * shape[0]))
     namespace = {'hashlib': hashlib, 'json': json, 'torch': torch, 'Callable': Callable,
                  'OutOfStep': OutOfStep, 'NoRoom': NoRoom,
-                 'shape': lambda dec: ['shared-state'], '_pack': lambda sampling: None,
+                 'shape': lambda dec: ['shared-state'], '_pack': lambda sampling: None, '_pack_grammar': lambda constraint: [],
                  'admission': lambda dec, stream: dict(plan), 'round_plan': lambda dec: dict(plan),
                  'ready': lambda dec, proposed: dec.room >= proposed['need'],
                  'apply': lambda dec, proposed: setattr(dec, 'applied', True)}

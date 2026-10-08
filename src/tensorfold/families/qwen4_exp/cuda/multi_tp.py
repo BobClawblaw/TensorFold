@@ -86,6 +86,14 @@ class Link:
         return json.loads(text)
 
 
+def _pack_grammar(constraint) -> list[int]:
+    """A request's grammar as ``grammar.pack`` writes it for the other rank ([] for none)."""
+
+    from tensorfold.engine.grammar import pack
+
+    return pack(constraint)
+
+
 def _pack(sampling) -> list | None:
     """A request's sampling rule as exact JSON (floats round-trip bit for bit)."""
 
@@ -174,11 +182,13 @@ class TwoRanks:
         images = None if vision is None else vision if isinstance(vision, dict) else {
             "rows": [int(r) for r in vision.rows], "delta": int(vision.rope_delta),
             "shape": [int(n) for n in vision.features.shape]}
+        grammar = _pack_grammar(getattr(s, "constraint", None))     # rank 1 compiles the same grammar, walks and masks the same rows
         if self.link is not None:
             self.link.send(["admit", self.next_id, list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
-                            bool(s.stop_eos), bool(s.background), plan, images])
+                            bool(s.stop_eos), bool(s.background), plan, images, grammar])
         valid, fits = self._agree("admission", [shape(self), plan, list(s.prompt), s.count, _pack(s.sampling),
-                                               bool(s.draft), bool(s.stop_eos), bool(s.background), images],
+                                               bool(s.draft), bool(s.stop_eos), bool(s.background), images,
+                                               grammar],
                                   (valid, ready(self, plan)))
         if not valid:
             raise OutOfStep("the agreed prefix is not available on both ranks")
@@ -237,6 +247,10 @@ class TwoRanks:
                 s.background = background
                 s.vision = op[9] if len(op) > 9 else None    # an image prompt's rows, delta and feature shape
                 try:
+                    if len(op) > 10 and op[10]:              # the reply's grammar, compiled here as on rank 0
+                        if self.grammar_follow is None:
+                            raise ValueError("this rank cannot compile the request's grammar")
+                        s.constraint = self.grammar_follow(op[10])
                     self.admit(s, told=plan)
                 except (ValueError, NoRoom, OutOfStep) as exc:
                     print(f"[tensorfold] rank 1: stream {sid} refused: {exc}", flush=True)

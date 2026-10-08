@@ -205,7 +205,7 @@ class PromptPasses:
                 logits = s.constraint.mask(logits, None, self.w.meta.get("vocab_offset", 0))
             if self.w.comm is None:
                 first = e.sample(logits, [len(s.prompt)], s.sampling)[0]
-            elif _gathered_fits(s.sampling):
+            elif _gathered_fits(s.sampling) and s.constraint is None:     # candidates come before a grammar's mask
                 gathered = candidates[:, head:head + 1].contiguous().view(-1)
                 first = choose_gathered(self.w, gathered, 1, [len(s.prompt)], s.sampling)[0]
             else:

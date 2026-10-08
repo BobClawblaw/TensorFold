@@ -25,7 +25,7 @@ def _methods():
     return ast.fix_missing_locations(ast.Module(body=[gather, body], type_ignores=[]))
 
 
-def _ranks(visions, expected):
+def _ranks(visions, expected, grammars=(None, None)):
     """Run rank 0 (with ``visions[0]``) and rank 1 (with ``visions[1]``) through one admission; the outcomes."""
 
     barrier = threading.Barrier(2)
@@ -54,7 +54,7 @@ def _ranks(visions, expected):
                             empty=lambda shape, **kwargs: Tensor([0] * shape[0]))
     namespace = {'hashlib': hashlib, 'json': json, 'torch': torch, 'Callable': Callable,
                  'OutOfStep': OutOfStep, 'NoRoom': NoRoom,
-                 'shape': lambda dec: ['shared-state'], '_pack': lambda sampling: None,
+                 'shape': lambda dec: ['shared-state'], '_pack': lambda sampling: None, '_pack_grammar': lambda constraint: list(constraint or []),
                  'admission': lambda dec, stream: dict(plan),
                  'ready': lambda dec, proposed: True,
                  'apply': lambda dec, proposed: setattr(dec, 'applied', True)}
@@ -75,7 +75,7 @@ def _ranks(visions, expected):
         decoder._share_vision = lambda s, images: shared.setdefault(rank, ('features', images))
         decoder.slots, decoder.kept, decoder.streams, decoder.filling = [object()], [], {}, []
         stream = SimpleNamespace(prompt=[1, 2, 3, 4], count=4, sampling=None, draft=True,
-                                 stop_eos=False, background=False, vision=visions[rank])
+                                 stop_eos=False, background=False, vision=visions[rank], constraint=grammars[rank])
         try:
             decoder._prepare_admission(stream, None if rank == 0 else dict(plan))
             results[rank] = ('admit', stream.vision)
@@ -94,7 +94,7 @@ def _ranks(visions, expected):
 
 def test_text_admissions_carry_no_image_metadata_and_share_nothing():
     results, sent, shared = _ranks([None, None], 'admit')
-    assert sent[0][0] == 'admit' and sent[0][-1] is None and len(sent[0]) == 10
+    assert sent[0][0] == 'admit' and sent[0][9] is None and sent[0][10] == [] and len(sent[0]) == 11   # images, grammar
     assert shared == {} and [r[1] for r in results] == [None, None]
 
 
@@ -102,7 +102,7 @@ def test_rank_0_sends_the_rows_it_encoded_and_both_ranks_share_the_same_tensors(
     encoded = SimpleNamespace(rows=(1, 2), rope_delta=-1, features=SimpleNamespace(shape=(2, 2560)))
     meta = {'rows': [1, 2], 'delta': -1, 'shape': [2, 2560]}
     results, sent, shared = _ranks([encoded, json.loads(json.dumps(meta))], 'admit')
-    assert sent[0][-1] == meta                                   # what the follower is told, JSON-exact
+    assert sent[0][9] == meta                                   # what the follower is told, JSON-exact
     assert shared == {0: ('features', meta), 1: ('features', meta)}
     assert [r[1] for r in results] == [('features', meta)] * 2  # the stream now carries the shared features
 
@@ -267,3 +267,13 @@ def test_serial_engine_decodes_an_image_state_eagerly_and_keeps_no_snapshot(monk
     fe.cache = [kept]
     fe._decode([1, 2, 3], 1, None, lambda new: True, kept)
     assert 'vision' not in seen and seen['resume'] == {'state': 'old'} and fe.cache[-1][0] == [1, 2]
+
+
+def test_a_grammar_rides_the_admission_and_both_ranks_agree_on_it():
+    packed = [0, 0, *b'{"type": "object"}']          # grammar.pack's form: kind, think end + 1, the spec's bytes
+    _, sent, _ = _ranks([None, None], 'admit', grammars=(packed, packed))
+    assert sent[0][0] == 'admit' and sent[0][10] == packed     # rank 1 compiles this one and masks the same rows
+
+
+def test_ranks_holding_different_grammars_fall_out_of_step():
+    _ranks([None, None], 'OutOfStep', grammars=([0, 0, *b'{}'], [0, 0, *b'[]']))

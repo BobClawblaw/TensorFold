@@ -53,6 +53,7 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
                  share: float = SHARE, points=None, graphs: bool = True, vision=None, workspace_bytes: int = 0,
                  copy: bool = True) -> None:
         self.link = self.follower = None
+        self.grammar_follow = None                   # rank 1: packed grammar -> constraint (set by the engine)
         self.copy = bool(copy)                       # copy drafts (copy_drafts.py) for streams that draft
         self.planning, self.pass_plan, self.mixed_plan = False, None, None
         self.pass_index, self.pass_width = 0, prefill_rows
@@ -253,8 +254,8 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
         s.count = max(1, min(s.count, room))
         if any(x.waiting for x in self.streams.values()):
             raise NoRoom("streams already wait for memory; a new request waits until one finishes")
-        if self.w.comm is not None and any(x is not None for x in (s.constraint, s.probabilities)):
-            raise ValueError("concurrent Flash Next on two ranks serves text without grammars or logprobs")
+        if self.w.comm is not None and s.probabilities is not None:
+            raise ValueError("concurrent Flash Next on two ranks serves no logprobs")
         t0 = time.perf_counter()
         if self.w.comm is not None:
             if s.vision is not None and self.link is not None and not hasattr(s.vision, "features"):
@@ -374,15 +375,19 @@ class MultiDecoder(TwoRanks, Alone, PromptPasses):
             self.buf.gdn_tables = self.buf.attn_step = None
         lasts = self._absorb(pieces, psegs, cuts) if pieces else None
         starts = [a0 for _, a0, _ in segs] + [segs[-1][2]]
+        offset = int(self.w.meta.get("vocab_offset", 0))     # two ranks: each masks its own vocabulary columns
         for s, (_, a0, a1) in zip(live, segs):
             if s.sid in grammars:
-                s.constraint.mask(logits[a0:a1], grammars[s.sid])
+                s.constraint.mask(logits[a0:a1], grammars[s.sid], offset)
         positions = [[st.pos + 1 + r for r in range(a1 - a0)] for st, a0, a1 in segs]
         samplings = [s.sampling for s in live]
         if self.w.comm is None:
             sampled = sample_streams(logits, starts, positions, samplings)
         elif all(_gathered_fits(smp) for smp in samplings):
             sampled = choose_gathered_streams(self.w, self.buf.cand_all, starts[-1], starts, positions, samplings)
+            for i, (s, (_, a0, a1), pos) in enumerate(zip(live, segs, positions)):
+                if s.sid in grammars:                    # the forward's candidates came before the mask: these rows
+                    sampled[i] = tp_sample_rows(self.w, logits[a0:a1], pos, s.sampling, offset=offset)
         else:
             sampled = [tp_sample_rows(self.w, logits[a0:a1], pos, smp, offset=int(self.w.meta["vocab_offset"]))
                        for (_, a0, a1), pos, smp in zip(segs, positions, samplings)]

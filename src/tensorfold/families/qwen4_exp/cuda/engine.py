@@ -185,10 +185,7 @@ class FlashNextEngine:
                   flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
-        self.refuses_structured_output = (
-            "structured output is not served by Flash Next on two ranks with --parallel yet: "
-            "send text without response_format or guided output, or start without --parallel"
-            if self.concurrent and tp == 2 else None)
+        self.refuses_structured_output = None         # two ranks with --parallel: rank 1 compiles each grammar too
         self.multi = self.scheduler = None
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
@@ -202,6 +199,10 @@ class FlashNextEngine:
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                       prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace, graphs=graphs)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
+            if tp == 2:
+                from tensorfold.engine import grammar as _grammar
+
+                self.multi.grammar_follow = lambda packed: _grammar.compiler(self, self.model_dir, self.eos).follow(packed)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
