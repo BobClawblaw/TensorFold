@@ -139,8 +139,10 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         const s2 = try fwd.newSeq(e);
         const p = try gpa.alloc(u32, n); // the reference prompt repeated to n tokens (first_tokens.py builds the same)
         for (p, 0..) |*x, j| x.* = prompt[j % prompt.len];
+        const tn = std.Io.Timestamp.now(io, .awake);
         const t = try fwd.prefill(e, s2, p);
-        std.debug.print("prefix of {d} tokens: first token {d}\n", .{ n, t });
+        const ms = @as(f64, @floatFromInt(tn.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
+        std.debug.print("prefix of {d} tokens: first token {d} in {d:.1} ms\n", .{ n, t, ms });
         fwd.freeSeq(e, s2);
     }
     try check.expect(same == count, "{d} of {d} tokens equal Python's", .{ same, count });

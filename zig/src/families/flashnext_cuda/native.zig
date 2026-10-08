@@ -91,8 +91,22 @@ const Lane = struct {
     id: u64,
     held: [max_depth]u32 = undefined,   // drafts held for the next window
     nheld: u32 = 0,
-    rows: u32 = 0,                      // the last verify's rows, committed by keep
+    rows: u32 = 0,                      // the last verify's rows, not yet committed (0: nothing pending)
 };
+
+/// Commits the lane's last window: ``kept`` of its rows (the lane core calls keep only to cut a window short, so a
+/// window it accepted whole is committed here, before the lane's next call). Rank 1 commits the same.
+fn settle(self: *Owned, l: *Lane, kept: u32) !void {
+    if (l.rows == 0) return;
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    try w.int(l.id);
+    try w.int(l.rows);
+    try w.int(kept);
+    try self.send(.keep, &w);
+    try forward.keep(self.e, l.seq, l.rows, kept);
+    l.rows = 0;
+}
 
 const Owned = struct {
     gpa: std.mem.Allocator,
@@ -141,17 +155,19 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.kernels.deinit();
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
     errdefer own.store.deinit();
-    own.e = try forward.Engine.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = max_rows, .depth = if (o.drafts) max_depth else 0 });
+    own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = max_rows, .depth = if (o.drafts) max_depth else 0 });
+    errdefer forward.deinit(own.e);
+    try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
     own.lanes_by = .init(gpa);
     own.by_id = .init(gpa);
     own.next_id = 1;
     own.next = 0;
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
-        .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = false, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
+        .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
                     .hidden_rows = false, .max_streams = 1, .batch_rows = max_rows },
         .rows = if (o.drafts) max_rows else 1,
-        .stream_bytes = own.e.seqBytes(),
+        .stream_bytes = forward.seqBytes(own.e),
         .ctx = own,
         .deinit = release,
         .follow = if (o.rank == 1) followLoop else null,
@@ -170,7 +186,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
     if (own.rank == 0) own.link.send(@intFromEnum(Op.stop), "") catch {};
-    own.e.deinit();
+    forward.deinit(own.e);
     own.store.deinit();
     own.kernels.deinit();
     own.link.close();
@@ -200,9 +216,9 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     const self = of(p);
     if (s.sampling != null) return error.Sampled;
     const ids = s.prompt();
-    if (ids.len == 0 or ids.len + s.max_new + max_rows > self.e.maxLen()) return error.PromptTooLong;
+    if (ids.len == 0 or ids.len + s.max_new + max_rows > forward.maxLen(self.e)) return error.PromptTooLong;
     const gop = try self.lanes_by.getOrPut(s);
-    if (gop.found_existing) self.e.freeSeq(gop.value_ptr.seq);
+    if (gop.found_existing) forward.freeSeq(self.e, gop.value_ptr.seq);
     const id = self.next_id;
     self.next_id += 1;
     var w: Writer = .{ .gpa = self.gpa };
@@ -210,9 +226,9 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     try w.int(id);
     try w.tokens(ids);
     try self.send(.prefill, &w);
-    const seq = try self.e.newSeq();
+    const seq = try forward.newSeq(self.e);
     gop.value_ptr.* = .{ .seq = seq, .id = id };
-    _ = self.take(try self.e.prefill(seq, ids));
+    _ = self.take(try forward.prefill(self.e, seq, ids));
 }
 
 fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -239,6 +255,7 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     const l = self.lanes_by.getPtr(win.stream) orelse return error.NoLane;
     const rows = win.rows();
     if (rows > max_rows) return error.WindowTooWide;
+    try settle(self, l, l.rows); // the previous window, accepted whole
     var ids: [max_rows]u32 = undefined;
     ids[0] = win.pending;
     if (win.held > 0) @memcpy(ids[1..][0..win.held], l.held[0..win.held]) else @memcpy(ids[1..][0..win.tokens.len], win.tokens);
@@ -247,7 +264,7 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     try w.int(l.id);
     try w.tokens(ids[0..rows]);
     try self.send(.verify, &w);
-    try self.e.verify(l.seq, ids[0..rows], out[0].sampled[0..rows]);
+    try forward.verify(self.e, l.seq, ids[0..rows], out[0].sampled[0..rows]);
     @memcpy(out[0].drafts[0 .. rows - 1], ids[1..rows]);
     l.rows = @intCast(rows);
     l.nheld = 0;
@@ -259,13 +276,7 @@ fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const u32)
         if (path.len == 0) return error.EmptyPath;
         for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
         const l = self.lanes_by.getPtr(win.stream) orelse return error.NoLane;
-        var w: Writer = .{ .gpa = self.gpa };
-        defer w.buf.deinit(self.gpa);
-        try w.int(l.id);
-        try w.int(l.rows);
-        try w.int(path.len);
-        try self.send(.keep, &w);
-        try self.e.keep(l.seq, l.rows, @intCast(path.len));
+        try settle(self, l, @intCast(path.len));
     }
 }
 
@@ -274,6 +285,7 @@ fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
     for (requests) |r| {
         const l = self.lanes_by.getPtr(r.stream) orelse return error.NoLane;
         if (r.lanes != null) return error.TreesNotBuilt;
+        try settle(self, l, l.rows); // a window the core did not cut is kept whole
         var follow: [max_rows]u32 = undefined;
         const n: usize = if (r.rows) |rows| rows.len else 1;
         if (r.rows) |rows| {
@@ -290,7 +302,7 @@ fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         try w.tokens(follow[0..n]);
         try w.int(depth);
         try self.send(.draft, &w);
-        try self.e.draft(l.seq, follow[0..n], depth, l.held[0..depth]);
+        try forward.draft(self.e, l.seq, follow[0..n], depth, l.held[0..depth]);
         l.nheld = depth;
     }
 }
@@ -302,7 +314,7 @@ fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     defer w.buf.deinit(self.gpa);
     w.int(kv.value.id) catch {};
     self.send(.release, &w) catch {};
-    self.e.freeSeq(kv.value.seq);
+    forward.freeSeq(self.e, kv.value.seq);
 }
 
 /// Rank 1: rank 0's calls, replayed in order on this rank's half of the model, until rank 0 stops.
@@ -320,29 +332,29 @@ fn followLoop(p: *anyopaque) anyerror!void {
         switch (@as(Op, @enumFromInt(m.tag))) {
             .prefill => {
                 const id = try r.int();
-                const seq = try self.e.newSeq();
+                const seq = try forward.newSeq(self.e);
                 try self.by_id.put(id, seq);
-                _ = try self.e.prefill(seq, try r.tokens());
+                _ = try forward.prefill(self.e, seq, try r.tokens());
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                 const ids = try r.tokens();
-                try self.e.verify(seq, ids, sampled[0..ids.len]);
+                try forward.verify(self.e, seq, ids, sampled[0..ids.len]);
             },
             .keep => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                 const rows: u32 = @intCast(try r.int());
-                try self.e.keep(seq, rows, @intCast(try r.int()));
+                try forward.keep(self.e, seq, rows, @intCast(try r.int()));
             },
             .draft => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                 const follow = try r.tokens();
                 const depth: u32 = @intCast(try r.int());
-                try self.e.draft(seq, follow, depth, held[0..depth]);
+                try forward.draft(self.e, seq, follow, depth, held[0..depth]);
             },
             .release => {
                 const kv = self.by_id.fetchRemove(try r.int()) orelse continue;
-                self.e.freeSeq(kv.value);
+                forward.freeSeq(self.e, kv.value);
             },
             .stop => return,
         }
