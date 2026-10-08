@@ -708,9 +708,24 @@ pub const COp = union(enum) {
 pub const Select = struct { block: u64, kern: cuda.triton.Kernel };
 
 /// A byte range an op touches on the device (read or written: both are assumed), for the graph's dependencies.
-pub const Range = struct { a: u64, b: u64 };
+pub const Range = struct {
+    a: u64,
+    b: u64,
+    w: bool = true,                       // written (else only read)
+    col0: u64 = 0,                        // a write of columns [col0, col1) of a row-major buffer (col1 > 0)
+    col1: u64 = 0,
+};
 const WILD: Range = .{ .a = 0, .b = std.math.maxInt(u64) };     // an operand whose extent is unknown: everything
 const COMM: Range = .{ .a = 1, .b = 2 };                        // the communicator: its calls keep their order
+
+/// Extension calls' written arguments (by position); a name not listed writes every argument.
+const EXT_WRITES = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "experts.plan", &[_]u8{ 4, 5, 6, 7, 8 } },
+    .{ "experts.prefill", &[_]u8{10} },
+    .{ "experts.run", &[_]u8{10} },
+    .{ "qwen4_exp_gdn.chain", &[_]u8{ 1, 9, 10, 11, 12, 13, 14, 15 } },
+    .{ "qwen4_exp_gdn.replay", &[_]u8{6} },
+});
 
 pub const Compiled = struct {
     ops: std.ArrayList(COp) = .empty,
@@ -751,18 +766,25 @@ fn tritonLaunch(run: *Run, kern: cuda.triton.Kernel, dims: cuda.Dim3, args: cuda
     return .{ .f = kern.function, .cfg = kern.config(dims), .args = a, .key = key, .kern = kern, .dims = dims, .name = name };
 }
 
-fn tensorRange(run: *Run, v: std.json.Value, out: *std.ArrayList(Range), gpa: std.mem.Allocator) !void {
+fn tensorRange(run: *Run, v: std.json.Value, out: *std.ArrayList(Range), gpa: std.mem.Allocator, w: bool) !void {
     switch (v) {
         .object => |o| {
             if (o.get("shape") == null or (o.get("s") == null and o.get("tmp") == null)) return;
             const n = extent(o);
             if (n == 0) return;
             const a = run.addr(v);
-            try out.append(gpa, .{ .a = a, .b = a + n });
+            try out.append(gpa, .{ .a = a, .b = a + n, .w = w });
         },
-        .array => |arr| for (arr.items) |x| try tensorRange(run, x, out, gpa),
+        .array => |arr| for (arr.items) |x| try tensorRange(run, x, out, gpa, w),
         else => {},
     }
+}
+
+fn written(list: ?std.json.Value, i: usize) bool {
+    const l = list orelse return true;
+    if (l != .array) return true;                    // "all"
+    for (l.array.items) |x| if (x.integer == @as(i64, @intCast(i))) return true;
+    return false;
 }
 
 /// Every device range a traced op touches: its tensor operands (a raw pointer: everything), Triton's shared
@@ -771,25 +793,55 @@ fn opRanges(run: *Run, o: std.json.ObjectMap, kern: ?cuda.triton.Kernel) ![]cons
     const gpa = run.gpu.gpa;
     var out: std.ArrayList(Range) = .empty;
     const kind = o.get("kind").?.string;
+    const name = o.get("name").?.string;
     if (std.mem.eql(u8, kind, "triton")) {
-        for (o.get("args").?.array.items) |av| {
+        const kinfo = run.prog.value.object.get("kernels").?.object.get(o.get("hash").?.string).?.object;
+        const writes = kinfo.get("writes");
+        const args = o.get("args").?.array.items;
+        for (args, 0..) |av, i| {
             const ty = av.object.get("type").?.string;
             const v = av.object.get("v").?;
             if (ty[0] != '*' or v == .null) continue;
-            if (v == .object and v.object.get("shape") != null) try tensorRange(run, v, &out, gpa) else try out.append(gpa, WILD);
+            const w = written(writes, i);
+            if (v == .object and v.object.get("shape") != null) try tensorRange(run, v, &out, gpa, w) else try out.append(gpa, WILD);
+        }
+        // _q8slices writes PART[s, m, col0 + n] for n < N only: calls into one buffer's other columns are apart
+        if (std.mem.eql(u8, name, "_q8slices") and writes != null and writes.? == .array) {
+            const col0: u64 = @intCast(args[6].object.get("v").?.integer);
+            const n: u64 = @intCast(kinfo.get("consts").?.object.get("N").?.integer);
+            for (out.items) |*r| if (r.w) { r.col0 = col0; r.col1 = col0 + n; };
         }
         if (kern) |kk| if (kk.meta.global_scratch_size > 0 or kk.meta.profile_scratch_size > 0)
             try out.append(gpa, .{ .a = run.scratch.ptr, .b = run.scratch.ptr + run.scratch.len });
+    } else if (std.mem.eql(u8, kind, "ext")) {
+        const ew = EXT_WRITES.get(name);
+        const items = o.get("args").?.array.items;
+        for (items, 0..) |v, i| {
+            const w = if (ew) |list| std.mem.indexOfScalar(u8, list, @intCast(i)) != null else true;
+            try tensorRange(run, v, &out, gpa, w);
+        }
+        if (o.get("ret")) |r| try tensorRange(run, r, &out, gpa, true);
+    } else if (std.mem.eql(u8, kind, "comm")) {
+        const items = o.get("args").?.array.items;
+        try tensorRange(run, items[0], &out, gpa, false);
+        try tensorRange(run, items[1], &out, gpa, true);
+        try out.append(gpa, COMM);
+    } else if (std.mem.eql(u8, name, "aten.copy_.default") or std.mem.eql(u8, kind, "upload")) {
+        const items = o.get("args").?.array.items;
+        try tensorRange(run, items[0], &out, gpa, true);
+        if (items.len > 1) try tensorRange(run, items[1], &out, gpa, false);
     } else {
-        if (o.get("args")) |a| try tensorRange(run, a, &out, gpa);
-        if (o.get("ret")) |r| try tensorRange(run, r, &out, gpa);
-        if (std.mem.eql(u8, kind, "comm")) try out.append(gpa, COMM);
+        if (o.get("args")) |a| try tensorRange(run, a, &out, gpa, true);
     }
     return out.items;
 }
 
 fn overlaps(x: []const Range, y: []const Range) bool {
-    for (x) |r| for (y) |q| if (r.a < q.b and q.a < r.b) return true;
+    for (x) |r| for (y) |q| {
+        if (!(r.a < q.b and q.a < r.b) or !(r.w or q.w)) continue;
+        if (r.w and q.w and r.col1 > 0 and q.col1 > 0 and (r.col1 <= q.col0 or q.col1 <= r.col0)) continue;
+        return true;
+    };
     return false;
 }
 
