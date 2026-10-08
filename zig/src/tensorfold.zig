@@ -26,5 +26,6 @@ test {
     _ = @import("families/flashnext/marks.zig"); // a call's marks
     _ = @import("families/glm/glm.zig");
     _ = @import("families/qwen3_5/config.zig");
+    _ = @import("families/qwen3_5/kernels.zig"); // the 2B's projection shapes, chunks and tiles
     _ = @import("families/qwen3_5/backend.zig");
 }

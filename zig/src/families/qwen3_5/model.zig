@@ -1,4 +1,4 @@
-//! A native Qwen3.5-2B model: validated config, shared affine checkpoint views and Metal pipelines.
+//! A native Qwen3.5-family model: validated config and geometry, affine checkpoint views and Metal pipelines.
 const std = @import("std");
 const mtl = @import("metal");
 const cfg = @import("config.zig");
@@ -31,13 +31,15 @@ pub const Model = struct {
         const files = try shards.shardFiles(gpa, io, dir);
         defer shards.freeShardFiles(gpa, files);
         for (files) |path| try m.checkpoint.addFileSelected(m.device, path, "", "language_model.");
-        m.weights = try weights.load(&m.checkpoint);
-        m.kernels = try kernels.load(m.device);
+        m.weights = try weights.load(gpa, m.device, &m.checkpoint, config.g);
+        errdefer m.weights.deinit();
+        m.kernels = try kernels.load(gpa, m.device, config.g);
         return m;
     }
 
     pub fn deinit(m: *Model) void {
         m.kernels.deinit();
+        m.weights.deinit();
         m.checkpoint.deinit();
         m.queue.deinit();
         m.device.deinit();

@@ -41,9 +41,10 @@ The platform column names the hardware tested for each model.
 | Qwen3.8 Flash Next | MLX affine 6-bit, group 32 | Metal on M5 Ultra |
 | GLM-5.3-Flash | MLX affine 4-bit, group 64 | Metal on two M5 Ultras |
 | Qwen3.5-2B | Pinned MLX affine 4-bit, group 64, tied embeddings | Metal on M5 Max |
+| Qwen3.8-27B | MLX affine 4-bit, group 64 | Metal on M5 Ultra |
 
 Nemotron's named checkpoint is `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit`.
-The 2B checkpoint is `mlx-community/Qwen3.5-2B-MLX-4bit`, revision `93760be4f1f69842a46bc13dbdc0f19e291392a3`.
+The 2B checkpoint is `mlx-community/Qwen3.5-2B-MLX-4bit`, revision `93760be4f1f69842a46bc13dbdc0f19e291392a3`; the 27B is `TensorFold/Qwen3.8-27B-MLX-4bit`, revision `22d8d538154e0e5b6f8dcb1fcc74a60a0798104c`, served by the same family.
 Flash Next loads its checkpoint directly and builds its weight packs locally, without a recorded kernel directory.
 GLM's two-Mac setup uses one settings file per rank and a separate MCDMA runtime.
 The [release notes](RELEASE-NOTES-1.0.0.md) give qualification limits and credit the contributors.

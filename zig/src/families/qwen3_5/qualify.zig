@@ -9,14 +9,15 @@ const c = @import("config.zig");
 pub fn equal(a: *const st.Cache, b: *const st.Cache) !void {
     if (a.len != b.len) return error.QwenCacheLengthMismatch;
     if (!std.mem.eql(u8, a.logits.contents()[0 .. c.vocab * 2], b.logits.contents()[0 .. c.vocab * 2])) return error.QwenCommittedLogitsMismatch;
+    const g = a.g;
     for (a.blocks, b.blocks) |x, y| switch (x) {
         .delta => |d| {
-            if (!std.mem.eql(u8, d.recurrence.contents()[0..st.delta_bytes], y.delta.recurrence.contents()[0..st.delta_bytes]) or
-                !std.mem.eql(u8, d.conv.contents()[0..st.conv_bytes], y.delta.conv.contents()[0..st.conv_bytes])) return error.QwenRecurrenceMismatch;
+            if (!std.mem.eql(u8, d.recurrence.contents()[0..g.deltaBytes()], y.delta.recurrence.contents()[0..g.deltaBytes()]) or
+                !std.mem.eql(u8, d.conv.contents()[0..g.convBytes()], y.delta.conv.contents()[0..g.convBytes()])) return error.QwenRecurrenceMismatch;
         },
         .attention => |kv| {
             for ([_]mtl.Buffer{ kv.keys, kv.values }, [_]mtl.Buffer{ y.attention.keys, y.attention.values }) |ab, bb| {
-                for (0..c.kv_heads) |h| {
+                for (0..g.kv_heads) |h| {
                     const ao = h * a.capacity * c.head_dim * 2;
                     const bo = h * b.capacity * c.head_dim * 2;
                     const bytes = a.len * c.head_dim * 2;
@@ -28,13 +29,14 @@ pub fn equal(a: *const st.Cache, b: *const st.Cache) !void {
 }
 
 pub fn check(m: *Model, wide: *st.Scratch) !void {
-    var solo = try st.Scratch.init(m.gpa, m.device, 1, 64);
+    const g = m.config.g;
+    var solo = try st.Scratch.init(m.gpa, m.device, g, 1, 64);
     defer solo.deinit();
     var caches: [4]st.Cache = undefined;
     var initialized: usize = 0;
     defer for (caches[0..initialized]) |*cache| cache.deinit();
     for (&caches) |*cache| {
-        cache.* = try st.Cache.init(m.gpa, m.device, 64 + initialized);
+        cache.* = try st.Cache.init(m.gpa, m.device, g, 64 + initialized);
         initialized += 1;
     }
     const ids = [_]u32{ 825, 264, 15352, 4829, 9944, 13, 271, 279, 854, 22373, 825, 264, 15352, 4829, 9944, 13, 42, 264, 271, 279, 15352, 854, 13, 4829, 825, 22373, 9944, 264, 271, 42, 13, 279 };
@@ -54,7 +56,7 @@ pub fn check(m: *Model, wide: *st.Scratch) !void {
     try caches[0].keep(wide, &.{ 0, 1, 2 });
     try caches[1].keep(wide, &.{0});
     for (0..2) |stream| {
-        var fresh = try st.Cache.init(m.gpa, m.device, 64);
+        var fresh = try st.Cache.init(m.gpa, m.device, g, 64);
         defer fresh.deinit();
         const prefix: usize = if (stream == 0) 1 else 3;
         const kept: usize = if (stream == 0) 3 else 1;

@@ -7,16 +7,17 @@ const fwd = q.forward;
 const c = q.config;
 
 fn equal(a: *const st.Cache, b: *const st.Cache) !void {
+    const g = a.g;
     try std.testing.expectEqual(a.len, b.len);
     try std.testing.expectEqualSlices(u8, a.logits.contents()[0 .. c.vocab * 2], b.logits.contents()[0 .. c.vocab * 2]);
     for (a.blocks, b.blocks) |x, y| switch (x) {
         .delta => |d| {
-            try std.testing.expectEqualSlices(u8, d.recurrence.contents()[0..st.delta_bytes], y.delta.recurrence.contents()[0..st.delta_bytes]);
-            try std.testing.expectEqualSlices(u8, d.conv.contents()[0..st.conv_bytes], y.delta.conv.contents()[0..st.conv_bytes]);
+            try std.testing.expectEqualSlices(u8, d.recurrence.contents()[0..g.deltaBytes()], y.delta.recurrence.contents()[0..g.deltaBytes()]);
+            try std.testing.expectEqualSlices(u8, d.conv.contents()[0..g.convBytes()], y.delta.conv.contents()[0..g.convBytes()]);
         },
         .attention => |k| {
             for ([_]mtl.Buffer{ k.keys, k.values }, [_]mtl.Buffer{ y.attention.keys, y.attention.values }) |a_buf, b_buf| {
-                for (0..c.kv_heads) |h| {
+                for (0..g.kv_heads) |h| {
                     const ao = h * a.capacity * c.head_dim * 2;
                     const bo = h * b.capacity * c.head_dim * 2;
                     const bytes = a.len * c.head_dim * 2;
@@ -37,9 +38,9 @@ fn prompt(m: *q.Model, scratch: *st.Scratch, cache: *st.Cache, ids: []const u32)
 }
 
 fn window(m: *q.Model, wide: *st.Scratch, solo: *st.Scratch, ids: []const u32, prefix: usize, rows: usize, keep: usize) !void {
-    var a = try st.Cache.init(m.gpa, m.device, 512);
+    var a = try st.Cache.init(m.gpa, m.device, m.config.g, 512);
     defer a.deinit();
-    var b = try st.Cache.init(m.gpa, m.device, 529);
+    var b = try st.Cache.init(m.gpa, m.device, m.config.g, 529);
     defer b.deinit();
     try prompt(m, wide, &a, ids[0..prefix]);
     try prompt(m, solo, &b, ids[0..prefix]);
@@ -55,7 +56,7 @@ fn window(m: *q.Model, wide: *st.Scratch, solo: *st.Scratch, ids: []const u32, p
     var path: [32]u32 = undefined;
     for (&path, 0..) |*r, i| r.* = @intCast(i);
     try a.keep(wide, path[0..keep]);
-    var accepted = try st.Cache.init(m.gpa, m.device, 512);
+    var accepted = try st.Cache.init(m.gpa, m.device, m.config.g, 512);
     defer accepted.deinit();
     try prompt(m, solo, &accepted, ids[0..prefix]);
     for (0..keep) |r| try fwd.run(m, solo, &.{.{ .cache = &accepted, .rows = 1 }}, ids[prefix + r ..][0..1], false, .all);
@@ -71,7 +72,7 @@ fn shared(m: *q.Model, wide: *st.Scratch, solo: *st.Scratch, ids: []const u32) !
     var n: usize = 0;
     defer for (caches[0..n]) |*cache| cache.deinit();
     for (&caches) |*cache| {
-        cache.* = try st.Cache.init(m.gpa, m.device, 512);
+        cache.* = try st.Cache.init(m.gpa, m.device, m.config.g, 512);
         n += 1;
     }
     for (&caches, 0..) |*cache, i| try prompt(m, solo, cache, ids[0..if (i % 2 == 0) @as(usize, 127) else 256]);
@@ -91,7 +92,7 @@ fn shared(m: *q.Model, wide: *st.Scratch, solo: *st.Scratch, ids: []const u32) !
     try caches[0].keep(wide, &.{ 0, 1, 2 });
     try caches[1].keep(wide, &.{0});
     for ([_]usize{ 130, 257 }, 0..) |length, stream| {
-        var fresh = try st.Cache.init(m.gpa, m.device, 512);
+        var fresh = try st.Cache.init(m.gpa, m.device, m.config.g, 512);
         defer fresh.deinit();
         try prompt(m, solo, &fresh, ids[0..length]);
         try equal(&caches[stream], &fresh);
@@ -105,9 +106,9 @@ pub fn main(init: std.process.Init) !void {
     defer pool.pop();
     const m = try q.Model.load(init.gpa, init.io, args[1]);
     defer m.deinit();
-    var wide = try st.Scratch.init(init.gpa, m.device, 32, 529);
+    var wide = try st.Scratch.init(init.gpa, m.device, m.config.g, 32, 529);
     defer wide.deinit();
-    var solo = try st.Scratch.init(init.gpa, m.device, 32, 529);
+    var solo = try st.Scratch.init(init.gpa, m.device, m.config.g, 32, 529);
     defer solo.deinit();
     var ids: [300]u32 = undefined;
     const public = [_]u32{ 825, 264, 15352, 4829, 9944, 13, 271, 279, 854, 22373 };

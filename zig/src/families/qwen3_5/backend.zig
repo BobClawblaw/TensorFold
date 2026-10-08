@@ -21,7 +21,7 @@ pub const Metal = struct {
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
         errdefer gpa.destroy(out);
-        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = try st.Scratch.init(gpa, model.device, @max(options.chunk, st.batch_rows), options.capacity) };
+        out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = try st.Scratch.init(gpa, model.device, model.config.g, @max(options.chunk, st.batch_rows), options.capacity) };
         errdefer out.scratch.deinit();
         @import("qualify.zig").check(model, &out.scratch) catch |err| switch (err) {
             error.QwenCacheLengthMismatch, error.QwenRecurrenceMismatch, error.QwenAttentionCacheMismatch, error.QwenWindowLogitsMismatch, error.QwenCommittedLogitsMismatch => {
@@ -68,7 +68,7 @@ pub const Metal = struct {
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
         const capacity = @min(self.options.capacity, ids.len + stream.max_new + st.window_rows);
-        cache.* = try st.Cache.init(self.gpa, self.model.device, capacity);
+        cache.* = try st.Cache.init(self.gpa, self.model.device, self.model.config.g, capacity);
         errdefer cache.deinit();
         var at: usize = 0;
         while (at < ids.len) {

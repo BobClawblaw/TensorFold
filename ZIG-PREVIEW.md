@@ -12,6 +12,7 @@ The rule the whole engine is built around: drafted output is byte-for-byte ident
 | Qwen 3.8 Flash Next, mlx-q6g32 | Metal | Served through the same server, one reply at a time, with prompt reuse between requests. Kernels and packs come from TF_FLASHNEXT_DUMP, a folder made by tools/zig/flashnext_dump.py and its helpers. Also served from two Macs at once in [speed-up mode](docs/speed-up-mode.md). |
 | Nemotron 3.5 Lightning 30B-A3B | CUDA, NVIDIA GB10 (DGX Spark) | `tensorfold run` from the command line. Token-identical to the Python engine on 16 of 16 runs. Speed about level with the Python engine. Not wired into the server yet. |
 | Qwen3.5-2B, pinned MLX affine 4-bit/group-64 checkpoint | Metal, Apple M5 Max | Text generation through the native server and lane core, with shared tied embeddings. [Recipe, scope and verification](docs/recipes/qwen3.5-2b-native.md). M1–M4 untested for this model. |
+| Qwen3.8-27B, MLX affine 4-bit/group-64 checkpoint | Metal, Apple M5 Ultra | The same family with its geometry read from the checkpoint: 64 layers, 48 DeltaNet value heads over 16 key heads, a separate output head. [Recipe](docs/recipes/qwen3.8-27b.md#native-metal). |
 | Kimi K3 | Metal, several Macs over Thunderbolt | Research code for multi-Mac tensor parallelism (`zig/src/families/kimi_k3`, `zig/src/cluster`). Not ready for testing. |
 
 ## Speed so far
@@ -67,7 +68,7 @@ To serve Flash Next from two Macs at once, each holding the whole model, see [sp
 - Prompt reuse between turns covers Flash Next only. Nemotron reads the whole conversation again each turn.
 - On M1 to M4, chips without tensor units, prompt kernels use the simdgroup-matrix layout and Nemotron's window attention is rewritten to it. Both are checked at load. Dense projections and routed experts are already proven row-exact there. The Mamba tree conv/scan and the norms are still open.
 - A forward holds at most 32 rows.
-- The native server serves Nemotron 3.5 Lightning, Qwen 3.8 Flash Next, GLM-5.3-Flash and the Qwen3.5-2B checkpoint in its recipe. Flash Next takes one reply at a time.
+- The native server serves Nemotron 3.5 Lightning, Qwen 3.8 Flash Next, GLM-5.3-Flash, and the Qwen3.5-2B and Qwen3.8-27B checkpoints in their recipes. Flash Next takes one reply at a time.
 
 ## Where the work goes next, and where you can help
 

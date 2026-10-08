@@ -18,9 +18,9 @@ pub fn main(init: std.process.Init) !void {
     @memcpy(std.mem.sliceAsBytes(ids), a.data);
     const m = try q.Model.load(init.gpa, init.io, args[1]);
     defer m.deinit();
-    var cache = try q.state.Cache.init(init.gpa, m.device, ids.len + 64);
+    var cache = try q.state.Cache.init(init.gpa, m.device, m.config.g, ids.len + 64);
     defer cache.deinit();
-    var scratch = try q.state.Scratch.init(init.gpa, m.device, 32, cache.capacity);
+    var scratch = try q.state.Scratch.init(init.gpa, m.device, m.config.g, 32, cache.capacity);
     defer scratch.deinit();
     const out = try init.gpa.alloc(u8, ids.len * q.config.vocab * 2);
     defer init.gpa.free(out);

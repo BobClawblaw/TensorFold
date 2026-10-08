@@ -67,9 +67,12 @@ def main():
         cases.append((fixture["name"], np.array(ids, np.uint32)))
     text = (ROOT / "CONTRIBUTING.md").read_text()
     cases.append(("public-contribution-guide-512", np.array(tok.encode(text)[:512], np.uint32)))
-    import prefill_cold
-    text = prefill_cold.corpus()
-    cases.append(("python-stdlib-2048", np.array(tok.encode(text[:32768])[:2048], np.uint32)))
+    try:
+        import prefill_cold  # the Python engine's standard-library corpus, when that tree is installed
+        cases.append(("python-stdlib-2048", np.array(tok.encode(prefill_cold.corpus()[:32768])[:2048], np.uint32)))
+    except ImportError:
+        text = "".join((ROOT / name).read_text() for name in ("ZIG-PREVIEW.md", "README.md", "RUNBOOK.md"))
+        cases.append(("repo-docs-2048", np.array(tok.encode(text[:32768])[:2048], np.uint32)))
     report = dict(mlx=importlib.metadata.version("mlx"), mlx_lm=importlib.metadata.version("mlx-lm"), fixtures=[])
     for name, ids in cases:
         tokens = args.output / (name + ".npy")

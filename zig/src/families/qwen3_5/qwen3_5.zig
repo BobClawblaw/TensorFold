@@ -1,4 +1,4 @@
-//! Native Metal Qwen3.5-2B, with its tied affine head and hybrid recurrent/attention state.
+//! Native Metal Qwen3.5 family (the 2B and the 27B): affine 4-bit weights, hybrid recurrent/attention state.
 pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
 pub const kernels = @import("kernels.zig");

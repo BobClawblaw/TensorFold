@@ -238,3 +238,47 @@ provenance object with `--source` to `tools/fit_draft_calibration.py`; retain mo
 Kernel tests check rows alone and in windows, tree paths and committed state. Release checks must also
 compare drafted/serial, resumed/fresh and concurrent/solo requests with thinking on and off and tools.
 Decode rate, prefill, concurrency and peak-memory results are TBD [release-0.3.5].
+
+## Native Metal
+
+The Zig engine serves this checkpoint through the [Qwen3.5 family](qwen3.5-2b-native.md): the same kernels, compiled
+with the 27B's dimensions (hidden 5,120, 64 layers, 48 DeltaNet value heads over 16 key heads, 24 query heads over 4,
+a separate output head). Build as in [the native preview](../../ZIG-PREVIEW.md#build), then:
+
+```bash
+hf download TensorFold/Qwen3.8-27B-MLX-4bit --revision 22d8d538154e0e5b6f8dcb1fcc74a60a0798104c --local-dir "$HOME/models/qwen38-27b"
+zig-out/native/bin/tensorfold-native serve "$HOME/models/qwen38-27b" --name bench --port 8090 --parallel 8 --no-thinking
+```
+
+The 2B recipe's scope applies: text only, no DFlash2 or MTP drafts (context copies through the lane engine), greedy
+and
+sampled, up to 16 rows a stream and 32 a shared forward, no prompt reuse between requests yet. The exactness contract
+is
+the native engine's own, drafted against plain and concurrent against solo, and a load-time check with real weights
+compares two 16-row streams against one-row execution before wider lanes are admitted. Each stream's attention cache
+takes 64 KiB a token (16 attention layers, 4 heads of 256, keys and values), so `--context` sizes memory.
+
+Measured on an M5 Ultra (256 GB, macOS 27.0.1), Zig 0.17.0, Metal Toolchain 27A266a, revision 22d8d538:
+
+- `zig-out/bin/tf-qwen35-check`: the checkpoint loads with 22 native pipelines and its separate head.
+- `zig-out/bin/tf-qwen35-exact`: 49 of 49 forward and cache checks (windows of 1 to 32 rows at six prefixes against
+  one-row
+  execution, committed logits, recurrent state and attention caches, partial keeps, unequal streams).
+- `tools/zig/qwen35_fidelity.py` against stock mlx-lm 0.32.0 on mlx 0.32.3. The native engine's agreement with
+  mlx-lm's
+  one-row forward matches mlx-lm's own agreement between its one-row and 32-row-chunk forwards at every length:
+
+| Fixture | Tokens | NLL: native / mlx-lm one row / 32-row chunks / full | Top-1 agreement: native vs one row | native vs chunks | mlx-lm chunks vs one row |
+|---|---|---|---|---|---|
+| fibonacci-raw | 14 | 2.731 / 2.715 / 2.734 / 2.734 | 1.000 | 0.929 | 0.929 |
+| gpu-chat-no-think | 31 | 5.746 / 5.749 / 5.702 / 5.702 | 1.000 | 1.000 | 1.000 |
+| public-contribution-guide-512 | 512 | 2.996 / 2.997 / 2.992 / 2.994 | 0.975 | 0.979 | 0.980 |
+| repo-docs-2048 | 2,048 | 1.905 / 1.906 / 1.907 / 1.907 | 0.985 | 0.983 | 0.985 |
+
+- Server, `tools/bench_concurrent.py --alone --serial` at 1, 2, 4 and 8 streams, sampled and greedy, 128 tokens: 120
+  of 120 concurrent replies equal their solo runs and 72 of 72 solo runs equal `"draft": false`; aggregate 36 tok/s at
+  one stream, 53-54 at two, 79-81 at four, 104-108 at eight.
+- Decode, `tools/bench_openai.py --tokens 64 --reps 5 --temperatures 1.0,0`: 36.0-36.2 tok/s medians on the code and
+  chat prompts, sampled and greedy, first token in 0.05-0.08 s. No drafter: this checkpoint carries no MTP weights and
+  the native server has no DFlash2, so the lanes carry context copies only.
+- The server came up in 2.6-3 s and held 15.9-16.1 GiB RSS at `--parallel 8 --context 32768`.

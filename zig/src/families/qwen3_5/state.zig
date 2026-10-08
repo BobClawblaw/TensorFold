@@ -3,8 +3,6 @@ const std = @import("std");
 const mtl = @import("metal");
 const c = @import("config.zig");
 const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
-pub const delta_bytes = c.linear_heads * c.linear_dim * c.linear_dim * 4;
-pub const conv_bytes = (c.conv_taps - 1) * c.conv_dim * 2;
 pub const window_rows = 16;
 pub const batch_rows = 32;
 
@@ -32,25 +30,27 @@ pub const Mixer = union(enum) { delta: Delta, attention: Attention };
 
 pub const Cache = struct {
     memory: Storage,
+    g: c.Geometry,
     capacity: usize,
     len: usize = 0,
     last: ?struct { start: usize, base: usize, rows: usize } = null,
-    blocks: [c.layers]Mixer,
+    blocks: []Mixer,
     logits: mtl.Buffer,
 
-    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, capacity: usize) !Cache {
-        var out: Cache = .{ .memory = .{ .gpa = gpa, .device = device }, .capacity = capacity, .blocks = undefined, .logits = undefined };
+    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, g: c.Geometry, capacity: usize) !Cache {
+        var out: Cache = .{ .memory = .{ .gpa = gpa, .device = device }, .g = g, .capacity = capacity, .blocks = try gpa.alloc(Mixer, g.layers), .logits = undefined };
+        errdefer gpa.free(out.blocks);
         errdefer out.memory.deinit();
         out.logits = try out.memory.alloc(c.vocab * 2);
-        for (&out.blocks, 0..) |*b, i| {
+        for (out.blocks, 0..) |*b, i| {
             if (c.linear(i)) {
-                const r = try out.memory.alloc(delta_bytes);
-                const conv = try out.memory.alloc(conv_bytes);
-                @memset(r.contents()[0..delta_bytes], 0);
-                @memset(conv.contents()[0..conv_bytes], 0);
+                const r = try out.memory.alloc(g.deltaBytes());
+                const conv = try out.memory.alloc(g.convBytes());
+                @memset(r.contents()[0..g.deltaBytes()], 0);
+                @memset(conv.contents()[0..g.convBytes()], 0);
                 b.* = .{ .delta = .{ .recurrence = r, .conv = conv } };
             } else {
-                const bytes = capacity * c.kv_heads * c.head_dim * 2;
+                const bytes = capacity * g.kvInner() * 2;
                 b.* = .{ .attention = .{ .keys = try out.memory.alloc(bytes), .values = try out.memory.alloc(bytes) } };
             }
         }
@@ -59,15 +59,17 @@ pub const Cache = struct {
 
     pub fn deinit(self: *Cache) void {
         self.memory.deinit();
+        self.memory.gpa.free(self.blocks);
     }
 
     pub fn commit(self: *Cache, scratch: *const Scratch, base: usize, rows: usize, record: bool) void {
-        for (&self.blocks, scratch.snapshots) |*b, snapshot| {
+        const dn, const cn = .{ self.g.deltaBytes(), self.g.convBytes() };
+        for (self.blocks, scratch.snapshots) |*b, snapshot| {
             if (b.* == .delta) {
                 const d = b.delta;
                 const saved = if (record) base + rows - 1 else 0;
-                @memcpy(d.recurrence.contents()[0..delta_bytes], (snapshot.?.recurrence.contents() + saved * delta_bytes)[0..delta_bytes]);
-                @memcpy(d.conv.contents()[0..conv_bytes], (snapshot.?.conv.contents() + (base + rows - 1) * conv_bytes)[0..conv_bytes]);
+                @memcpy(d.recurrence.contents()[0..dn], (snapshot.?.recurrence.contents() + saved * dn)[0..dn]);
+                @memcpy(d.conv.contents()[0..cn], (snapshot.?.conv.contents() + (base + rows - 1) * cn)[0..cn]);
             }
         }
         if (record) self.last = .{ .start = self.len, .base = base, .rows = rows } else self.last = null;
@@ -78,11 +80,12 @@ pub const Cache = struct {
         const last = self.last orelse return error.NothingToKeep;
         if (path.len == 0 or path.len > last.rows) return error.NothingToKeep;
         for (path, 0..) |row, i| if (row != i) return error.UnsupportedQwenTree;
-        for (&self.blocks, scratch.snapshots) |*b, snapshot| {
+        const dn, const cn = .{ self.g.deltaBytes(), self.g.convBytes() };
+        for (self.blocks, scratch.snapshots) |*b, snapshot| {
             if (b.* == .delta) {
                 const src = last.base + path.len - 1;
-                @memcpy(b.delta.recurrence.contents()[0..delta_bytes], (snapshot.?.recurrence.contents() + src * delta_bytes)[0..delta_bytes]);
-                @memcpy(b.delta.conv.contents()[0..conv_bytes], (snapshot.?.conv.contents() + src * conv_bytes)[0..conv_bytes]);
+                @memcpy(b.delta.recurrence.contents()[0..dn], (snapshot.?.recurrence.contents() + src * dn)[0..dn]);
+                @memcpy(b.delta.conv.contents()[0..cn], (snapshot.?.conv.contents() + src * cn)[0..cn]);
             }
         }
         self.len = last.start + path.len;
@@ -94,27 +97,28 @@ pub const Cache = struct {
 
 pub const Scratch = struct {
     memory: Storage,
+    g: c.Geometry,
     rows: usize,
     ids: mtl.Buffer,
     windows: mtl.Buffer,
     dims: mtl.Buffer,
-    h: mtl.Buffer,
-    x: mtl.Buffer,
-    r: mtl.Buffer,
-    qkv: mtl.Buffer,
-    z: mtl.Buffer,
+    h: mtl.Buffer, // residual [rows, hidden]
+    x: mtl.Buffer, // normed [rows, hidden]
+    r: mtl.Buffer, // a mixer's or MLP's output [rows, hidden]
+    qkv: mtl.Buffer, // [rows, convDim]
+    z: mtl.Buffer, // [rows, vInner]
     a: mtl.Buffer,
     b: mtl.Buffer,
-    q: mtl.Buffer,
-    k: mtl.Buffer,
-    v: mtl.Buffer,
-    g: mtl.Buffer,
+    q: mtl.Buffer, // DeltaNet queries, or normed attention queries [rows, max(kInner, qInner)]
+    k: mtl.Buffer, // DeltaNet keys, or attention keys before their norm [rows, max(kInner, kvInner)]
+    v: mtl.Buffer, // DeltaNet or attention values [rows, max(vInner, kvInner)]
+    g_: mtl.Buffer, // decay gates f32 [rows, value heads]
     beta: mtl.Buffer,
-    y: mtl.Buffer,
-    mix: mtl.Buffer,
-    qraw: mtl.Buffer,
-    knorm: mtl.Buffer,
-    queries: mtl.Buffer,
+    y: mtl.Buffer, // a mixer's heads [rows, inner]
+    mix: mtl.Buffer, // gated heads, the output projection's input [rows, inner]
+    qraw: mtl.Buffer, // attention queries and their gates [rows, 2 * qInner]
+    knorm: mtl.Buffer, // [rows, kvInner]
+    queries: mtl.Buffer, // rotated queries by head [query heads, rows, head_dim]
     gate: mtl.Buffer,
     up: mtl.Buffer,
     act: mtl.Buffer,
@@ -122,36 +126,47 @@ pub const Scratch = struct {
     pl: mtl.Buffer,
     po: mtl.Buffer,
     logits: mtl.Buffer,
-    snapshots: [c.layers]?Delta = @splat(null),
+    snapshots: []?Delta,
 
-    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, rows: usize, capacity: usize) !Scratch {
+    pub fn init(gpa: std.mem.Allocator, device: mtl.Device, g: c.Geometry, rows: usize, capacity: usize) !Scratch {
         var out: Scratch = undefined;
         out.memory = .{ .gpa = gpa, .device = device };
         errdefer out.memory.deinit();
+        out.g = g;
         out.rows = rows;
-        out.snapshots = @splat(null);
+        out.snapshots = try gpa.alloc(?Delta, g.layers);
+        errdefer gpa.free(out.snapshots);
+        @memset(out.snapshots, null);
         const mem = &out.memory;
         out.ids = try mem.alloc(rows * 4);
         out.windows = try mem.alloc(rows * c.conv_taps * 4);
         out.dims = try mem.alloc(8 * 4);
-        inline for (.{ "h", "x", "r", "z", "q", "k", "v", "y", "mix", "queries" }) |name| @field(out, name) = try mem.alloc(rows * c.hidden * 2);
-        inline for (.{ "qkv", "gate", "up", "act" }) |name| @field(out, name) = try mem.alloc(rows * c.intermediate * 2);
-        out.qraw = try mem.alloc(rows * 2 * c.hidden * 2);
-        out.knorm = try mem.alloc(rows * c.kv_heads * c.head_dim * 2);
-        inline for (.{ "a", "b", "beta" }) |name| @field(out, name) = try mem.alloc(rows * c.linear_heads * 2);
-        out.g = try mem.alloc(rows * c.linear_heads * 4);
+        inline for (.{ "h", "x", "r" }) |name| @field(out, name) = try mem.alloc(rows * g.hidden * 2);
+        out.qkv = try mem.alloc(rows * g.convDim() * 2);
+        out.z = try mem.alloc(rows * g.vInner() * 2);
+        out.q = try mem.alloc(rows * @max(g.kInner(), g.qInner()) * 2);
+        out.k = try mem.alloc(rows * @max(g.kInner(), g.kvInner()) * 2);
+        out.v = try mem.alloc(rows * @max(g.vInner(), g.kvInner()) * 2);
+        inline for (.{ "y", "mix" }) |name| @field(out, name) = try mem.alloc(rows * g.inner() * 2);
+        out.qraw = try mem.alloc(rows * 2 * g.qInner() * 2);
+        out.knorm = try mem.alloc(rows * g.kvInner() * 2);
+        out.queries = try mem.alloc(rows * g.qInner() * 2);
+        inline for (.{ "gate", "up", "act" }) |name| @field(out, name) = try mem.alloc(rows * g.intermediate * 2);
+        inline for (.{ "a", "b", "beta" }) |name| @field(out, name) = try mem.alloc(rows * g.linear_v_heads * 2);
+        out.g_ = try mem.alloc(rows * g.linear_v_heads * 4);
         const chunks = (capacity + 127) / 128;
-        out.pm = try mem.alloc(rows * c.query_heads * chunks * 4);
-        out.pl = try mem.alloc(rows * c.query_heads * chunks * 4);
-        out.po = try mem.alloc(rows * c.query_heads * chunks * c.head_dim * 4);
+        out.pm = try mem.alloc(rows * g.query_heads * chunks * 4);
+        out.pl = try mem.alloc(rows * g.query_heads * chunks * 4);
+        out.po = try mem.alloc(rows * g.query_heads * chunks * c.head_dim * 4);
         out.logits = try mem.alloc(batch_rows * c.vocab * 2);
-        for (&out.snapshots, 0..) |*s, i| if (c.linear(i)) {
-            s.* = .{ .recurrence = try mem.alloc(batch_rows * delta_bytes), .conv = try mem.alloc(rows * conv_bytes) };
+        for (out.snapshots, 0..) |*s, i| if (c.linear(i)) {
+            s.* = .{ .recurrence = try mem.alloc(batch_rows * g.deltaBytes()), .conv = try mem.alloc(rows * g.convBytes()) };
         };
         return out;
     }
 
     pub fn deinit(self: *Scratch) void {
         self.memory.deinit();
+        self.memory.gpa.free(self.snapshots);
     }
 };
