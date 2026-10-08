@@ -109,8 +109,8 @@ The binary's `capabilities --json` response lists its supported flags and platfo
 | `--no-drafts` | Produce the plain reference through the same engine. |
 | `--keep-warm SECONDS` | Keep the Metal GPU active while idle for this long after a request, default 900; zero disables it. |
 | `--parallel N` | Admit up to N requests where the engine shares lanes; `auto` is the default. |
-| `--prompt-cache-gib GIB` | Flash Next and GLM retained-prefix budget; zero disables retention. |
-| `--prompt-cache-over-cap` | Permit an explicit Flash Next prefix budget above its default allowance. |
+| `--prompt-cache-gib GIB` | Nemotron, Flash Next and GLM retained-prefix budget; zero disables retention. |
+| `--prompt-cache-over-cap` | Permit an explicit Nemotron or Flash Next prefix budget above its default allowance. |
 | `--learn` | Keep shared prompt prefixes, such as a system prompt and its tools, on disk so new conversations resume them after a restart or an upgrade that computes the same bits. GLM only for now. |
 | `--learn-dir DIR` | Where `--learn` keeps them, `~/.cache/tensorfold/learned` by default; implies `--learn`. |
 | `--learn-gib GIB` | Disk for learned prefixes on each Mac, 32 by default; the least recently used go first. Implies `--learn`. |

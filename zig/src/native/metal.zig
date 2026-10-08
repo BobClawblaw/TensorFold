@@ -8,6 +8,7 @@ const nemotron = tf.nemotron;
 const Allocator = std.mem.Allocator;
 const flashnext = @import("flashnext_host.zig");
 const glm = @import("glm_host.zig");
+const cache_fit = @import("cache_fit.zig");
 
 pub const backends: []const []const u8 = &.{"metal"};
 pub const families: []const api.Family = &.{
@@ -62,6 +63,7 @@ const Host = struct {
     clock: nemotron.timing.RoundClock,
     core: lanes.Engine,
     host: api.LaneHost,
+    cache: ?api.prompt_cache.Store = null, // kept prompt states (engine thread only); null: a zero budget
     round: nemotron.gpu_round.Options = .{ .depth = 8 }, // a lone greedy stream's GPU-side rounds, as the CLI runs them
 
     /// A lone greedy stream's rounds on the GPU until it finishes, or a hand-over to the lane core (true).
@@ -76,6 +78,7 @@ const Host = struct {
     fn close(ctx: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(ctx));
         h.host.stop();
+        if (h.cache) |*store| store.deinit();
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         h.metal.deinit();
@@ -129,6 +132,17 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(@max(window, 0)), .prefill_step = step });
     h.round = .{ .depth = 8 };
+    const budget = (cache_fit.fit(cache_fit.ram() orelse 0, cache_fit.footprint() orelse 0, o.prompt_cache_gib, o.prompt_cache_over_cap) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "--prompt-cache-gib {d} would take this server past 70% of this Mac's memory; pass a smaller one or add --prompt-cache-over-cap", .{o.prompt_cache_gib.?});
+        return e;
+    }).budget;
+    if (budget > 0) {
+        const S = nemotron.snapshot.Cached;
+        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = h.metal, .vtable = &.{ .bytes = S.snapBytes, .save = S.snapSave, .restore = S.snapRestore, .drop = S.snapDrop } }, .{ .lookahead = 1, .planned = true }, budget);
+        h.host.cache = &h.cache.?;
+        std.log.info("prompt cache: {d:.1} GiB for kept prompt states", .{cache_fit.gibs(budget)});
+    }
+    errdefer if (h.cache) |*store| store.deinit();
     if (h.metal.head != null) h.host.lone = .{ .ctx = h, .run = Host.lone };
     h.warm = .{ .queue = h.m.queue };
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
