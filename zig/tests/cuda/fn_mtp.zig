@@ -13,6 +13,7 @@ const R = @import("fn_run.zig");
 const Gpu = check.Gpu;
 
 const DEPTH = 6;
+pub var parallel = false;           // capture independent branches on side streams (fn-mtp-parallel); measured slower so far
 const CONFIDENCE = 0.7;
 const ROW = 10240 * 2;          // one residual-stream row (bf16), the MTP head's input
 
@@ -191,6 +192,10 @@ fn draftPick(cx: *Ctx, logits: u64, cols: usize, ids: []const i32) !struct { tok
 }
 
 pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_sampling: bool) !void {
+    return generateP(gpu, args, graphs, device_sampling, false);
+}
+
+pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_sampling: bool, profile: bool) !void {
     // fn-mtp <program.json> <weights.bin> <pre_prefill.bin> <ngram.json> <reference.json> <draft_ids.bin> <rank> <uid file>
     const gpa = gpu.gpa;
     const io = gpu.io;
@@ -290,6 +295,40 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_sampl
             a.add(@as(u64, if (head) 0 else idmap.ptr)); a.add(@as(i32, @intCast(if (head) ng.vocab_offset else 0))); a.add(cand.ptr);
             try p.c.ops.append(gpa, .{ .launch = .{ .f = top, .cfg = .{ .grid = .{ .x = @intCast(p.rows) }, .block = .{ .x = 1024 } }, .args = a, .name = "fn_rows_top" } });
             try p.c.ops.append(gpa, .{ .gather = .{ .send = cand.ptr, .recv = gath.ptr, .count = 4 * p.rows, .dt = .i32 } });
+            const lr = try gpa.dupe(R.Range, &.{ .{ .a = p.logits, .b = p.logits + p.rows * p.cols * 2 }, .{ .a = cand.ptr, .b = cand.ptr + cand.len },
+                .{ .a = idmap.ptr, .b = idmap.ptr + idmap.len } });
+            try p.c.ranges.append(gpa, lr);
+            try p.c.ranges.append(gpa, try gpa.dupe(R.Range, &.{ .{ .a = cand.ptr, .b = cand.ptr + cand.len }, .{ .a = gath.ptr, .b = gath.ptr + gath.len }, .{ .a = 1, .b = 2 } }));
+        }
+    }
+    if (parallel) {             // verify windows and head steps: independent branches captured on side streams
+        var most: usize = 0;
+        var tit = table.iterator();
+        while (tit.next()) |e| most = @max(most, e.value_ptr.*.c.ops.items.len);
+        const par = try gpa.create(R.Par);
+        par.* = try R.Par.init(&run, stream, most);
+        tit = table.iterator();
+        while (tit.next()) |e| {
+            const nm = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, nm, "fwd_") and !std.mem.startsWith(u8, nm, "mtp_")) continue;
+            try R.analyze(gpa, &e.value_ptr.*.c);
+            e.value_ptr.*.g.par = par;
+            if (std.mem.eql(u8, nm, "fwd_R3_p0")) {        // how parallel the program is: its longest dependency chain
+                const c = &e.value_ptr.*.c;
+                const depth = try gpa.alloc(u32, c.ops.items.len);
+                @memset(depth, 0);
+                var longest: u32 = 0;
+                var ndeps: usize = 0;
+                for (c.lead..c.ops.items.len) |i| {
+                    var dd: u32 = 0;
+                    for (c.deps[i - c.lead]) |j| dd = @max(dd, depth[j]);
+                    depth[i] = dd + 1;
+                    longest = @max(longest, depth[i]);
+                    ndeps += c.deps[i - c.lead].len;
+                    if (c.deps[i - c.lead].len == 0 and i > c.lead + 1) std.debug.print("  op {d} has no dependencies\n", .{i});
+                }
+                std.debug.print("fwd_R3_p0: {d} ops, longest chain {d}, {d} dependency pairs\n", .{ c.ops.items.len - c.lead, longest, ndeps });
+            }
         }
     }
     std.debug.print("compiled {d} programs, {d:.0} ms\n", .{ table.count(),
@@ -507,6 +546,32 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_sampl
     std.debug.print("time: verify {d:.1} ms ({d:.2} a round), commit {d:.1} ms, MTP head {d:.1} ms over {d} steps ({d:.2} a step, sampling included)\n", .{
         tm.verify, tm.verify / @as(f64, @floatFromInt(rounds)), tm.commit, tm.mtp, tm.mtp_steps, tm.mtp / @as(f64, @floatFromInt(tm.mtp_steps)) });
     std.debug.print("verify split: staging {d:.1} ms, GPU {d:.1} ms, greedy {d:.1} ms; draft sampling {d:.1} ms\n", .{ tm.stage, tm.gpu, tm.greedy, tm.pick });
+    if (profile) {          // after the reply: each verify width's ops timed one by one (the state is not used again)
+        for ([_]usize{ 1, 3, 7 }) |rows| {
+            var prof: R.Profile = .{ .totals = .init(gpa) };
+            const fp = table.get(try std.fmt.bufPrint(&name_buf, "fwd_R{d}_p{d}", .{ rows, cur })).?;
+            _ = try R.refresh(&run, &fp.c, cx.selects, pos + @as(i64, @intCast(rows)));
+            var zi: [8]i32 = @splat(0);
+            const zv = try gpa.alloc(u16, rows * ng.heads * ng.width);
+            @memset(zv, 0);
+            var in: Inputs = .{};
+            in.a[0] = std.mem.sliceAsBytes(zi[0..rows]);
+            in.a[1] = std.mem.sliceAsBytes(zv);
+            for (0..4) |_| try prof.step(&run, fp.c.ops.items, stream, &nccl, comm, &in);
+            std.debug.print("== verify window of {d} rows\n", .{rows});
+            try prof.report(gpa);
+        }
+        const mp = table.get("mtp_n1").?;
+        var prof: R.Profile = .{ .totals = .init(gpa) };
+        var zi = [1]i32{0};
+        var zl = [1]i32{0};
+        var in: Inputs = .{};
+        in.a[0] = std.mem.asBytes(&zi);
+        in.a[1] = std.mem.asBytes(&zl);
+        for (0..4) |_| try prof.step(&run, mp.c.ops.items, stream, &nccl, comm, &in);
+        std.debug.print("== MTP head step of 1 row\n", .{});
+        try prof.report(gpa);
+    }
     try check.expect(same == count, "{d} of {d} tokens equal Python's", .{ same, count });
     check.pass("EXACT rank {d}: prefill + {d} tokens with MTP drafts equal the Python engine's", .{ rank, count });
 }
