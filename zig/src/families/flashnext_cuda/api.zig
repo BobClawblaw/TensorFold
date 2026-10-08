@@ -54,9 +54,13 @@ pub const Store = struct {
     owned: std.ArrayList(cuda.DeviceBuffer) = .empty,
     /// Host-side facts the loaders record (vocabulary offset, draft ids, n-gram table geometry), by name.
     ints: std.StringHashMap(i64),
+    /// Host data by name (owned): "ngram.json" (the n-gram table's geometry, shard files and offsets, lookup
+    /// table; the format tests/cuda/fn_ngram.zig opens), "draft_ids" (this rank's draft vocabulary, i32 LE),
+    /// "ngram_root" (optional: the folder shard paths under /cache/tf/ resolve in).
+    host: std.StringHashMap([]u8),
 
     pub fn init(gpa: std.mem.Allocator) Store {
-        return .{ .gpa = gpa, .map = .init(gpa), .ints = .init(gpa) };
+        return .{ .gpa = gpa, .map = .init(gpa), .ints = .init(gpa), .host = .init(gpa) };
     }
 
     pub fn deinit(self: *Store) void {
@@ -68,6 +72,12 @@ pub const Store = struct {
         var it2 = self.ints.keyIterator();
         while (it2.next()) |k| self.gpa.free(k.*);
         self.ints.deinit();
+        var it3 = self.host.iterator();
+        while (it3.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.*);
+        }
+        self.host.deinit();
     }
 
     pub fn put(self: *Store, name: []const u8, t: Tensor) !void {
