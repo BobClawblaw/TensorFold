@@ -72,7 +72,7 @@ fn median(v: []f64) f64 {
 /// GPU-timed medians after a warm-up: windows of 1 to 16 rows and wider to 33, shared rounds of 2-row windows, a head step.
 pub fn measure(b: *backend.Metal) !void {
     const c = b.m.config;
-    var caches: [16]st.Cache = undefined;
+    var caches: [64]st.Cache = undefined;
     const n = @min(b.o.batch_rows / 2, caches.len);
     for (caches[0..n]) |*x| x.* = try st.Cache.init(b.m.device, c, timed_len + st.max_rows, b.head != null);
     defer for (caches[0..n]) |*x| x.deinit(&b.pool);
