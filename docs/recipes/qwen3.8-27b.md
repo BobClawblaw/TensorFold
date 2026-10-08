@@ -246,7 +246,9 @@ with the 27B's dimensions (hidden 5,120, 64 layers, 48 DeltaNet value heads over
 a separate output head). Build as in [the native preview](../../ZIG-PREVIEW.md#build), then:
 
 ```bash
-hf download TensorFold/Qwen3.8-27B-MLX-4bit --revision 22d8d538154e0e5b6f8dcb1fcc74a60a0798104c --local-dir "$HOME/models/qwen38-27b"
+hf download TensorFold/Qwen3.8-27B-MLX-4bit \
+  --revision 22d8d538154e0e5b6f8dcb1fcc74a60a0798104c \
+  --local-dir "$HOME/models/qwen38-27b"
 zig-out/native/bin/tensorfold-native serve "$HOME/models/qwen38-27b" --name bench --port 8090 --parallel 8 --no-thinking
 ```
 
