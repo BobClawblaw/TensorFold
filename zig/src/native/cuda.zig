@@ -292,6 +292,12 @@ const Host = struct {
                     x.inner.vtable.release(x.inner.ptr, s);
                 }
             }.f,
+            .refused = if (v.refused != null) struct {
+                fn f(p: *anyopaque, out: []*lanes.Stream) usize {
+                    const x = bind(p);
+                    return x.inner.vtable.refused.?(x.inner.ptr, out);
+                }
+            }.f else null,
         };
         return .{ .ptr = h, .vtable = &h.vtable };
     }

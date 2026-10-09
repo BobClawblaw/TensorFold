@@ -505,7 +505,9 @@ pub const LaneHost = struct {
             }
             h.unlock();
             h.core.step() catch |e| {
-                h.failAll(@errorName(e));
+                var refused: [lanes.Engine.max_together]*lanes.Stream = undefined;
+                const n = h.core.refused(&refused);
+                if (n > 0) h.failSome(refused[0..n], h.words(e)) else h.failAll(h.words(e));
                 continue;
             };
             var i: usize = 0;
@@ -517,6 +519,32 @@ pub const LaneHost = struct {
                     h.unlock();
                 } else i += 1;
             }
+        }
+    }
+
+    /// A round the backend refused for some streams alone (their caches could not grow): those end with its error,
+    /// the others take the next round.
+    fn failSome(h: *LaneHost, streams: []const *lanes.Stream, message: []const u8) void {
+        var i: usize = 0;
+        while (true) {
+            h.lock();
+            if (i >= h.admitted.items.len) {
+                h.unlock();
+                break;
+            }
+            const job = h.admitted.items[i];
+            const hit = for (streams) |s| {
+                if (s == &job.stream) break true;
+            } else false;
+            if (!hit) {
+                i += 1;
+                h.unlock();
+                continue;
+            }
+            _ = h.admitted.orderedRemove(i);
+            h.unlock();
+            if (!job.stream.finished) h.core.discard(&job.stream);
+            h.finish(job, .failed, message);
         }
     }
 

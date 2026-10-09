@@ -74,6 +74,9 @@ pub const Backend = struct {
         alternatives: ?*const fn (ptr: *anyopaque, s: *Stream, out: []Alternative) anyerror!usize = null,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
+        /// After a failed round: the streams it failed for alone (their caches could not grow), which the caller
+        /// ends while the round's other streams go on; 0 when the failure is the round's.
+        refused: ?*const fn (ptr: *anyopaque, out: []*Stream) usize = null,
     };
 
     pub fn prefill(b: Backend, s: *Stream) !void {
