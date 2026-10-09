@@ -184,3 +184,87 @@ extern "C" __global__ void fn_vis_to_f32(const __nv_bfloat16* __restrict__ x, fl
     for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
         y[i] = f(x[i]);
 }
+
+// -- the fp32 tower (Tower.mode = .fp32): every activation in fp32, no rounding until the features --------------------
+extern "C" __global__ void fn_vis32_bias_act(const float* __restrict__ acc, const __nv_bfloat16* __restrict__ bias,
+                                             float* __restrict__ out, int64_t n, int cols, int act) {
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        float t = acc[i] + f(bias[i % cols]);
+        if (act == 1) t = gelu_tanh(t);
+        else if (act == 2) t = gelu_erf(t);
+        out[i] = t;
+    }
+}
+extern "C" __global__ void fn_vis32_add(float* __restrict__ x, const float* __restrict__ y, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) x[i] += y[i];
+}
+extern "C" __global__ void fn_vis32_ln(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                       const __nv_bfloat16* __restrict__ bias, float* __restrict__ y, int cols, float eps) {
+    __shared__ float red[32];
+    const float* xr = x + (int64_t)blockIdx.x * cols;
+    float* yr = y + (int64_t)blockIdx.x * cols;
+    float s = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) s += xr[c];
+    const float mean = block_sum(s, red) / cols;
+    float v = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float d = xr[c] - mean;
+        v += d * d;
+    }
+    const float rstd = rsqrtf(block_sum(v, red) / cols + eps);
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) yr[c] = (xr[c] - mean) * rstd * f(w[c]) + f(bias[c]);
+}
+extern "C" __global__ void fn_vis32_pos(float* __restrict__ x, const __nv_bfloat16* __restrict__ table,
+                                        const int* __restrict__ idx, const float* __restrict__ wts, int rows, int cols) {
+    const int64_t n = (int64_t)rows * cols;
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        const int r = (int)(i / cols), c = (int)(i % cols);
+        float p = 0.0f;
+        for (int j = 0; j < 4; ++j) p += f(table[(int64_t)idx[r * 4 + j] * cols + c]) * wts[r * 4 + j];
+        x[i] += p;
+    }
+}
+extern "C" __global__ void fn_vis32_rope_split(const float* __restrict__ qkv, const int* __restrict__ pos,
+                                               const float* __restrict__ inv_freq, float* __restrict__ q,
+                                               float* __restrict__ k, float* __restrict__ vt, int N, int H, int D) {
+    const int half = D / 2, quarter = D / 4;
+    const int64_t n = (int64_t)N * H * D;
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        const int d = (int)(i % D), h = (int)((i / D) % H), r = (int)(i / ((int64_t)D * H));
+        const int j = d % half;
+        const float angle = (float)pos[r * 2 + (j < quarter ? 0 : 1)] * inv_freq[j % quarter];
+        const float c = cosf(angle), s = sinf(angle);
+        const float* row = qkv + (int64_t)r * 3 * H * D;
+        const int pair = d < half ? d + half : d - half;
+        const float sign = d < half ? -1.0f : 1.0f;
+        const int64_t o = ((int64_t)h * N + r) * D + d;
+        q[o] = row[h * D + d] * c + sign * row[h * D + pair] * s;
+        k[o] = row[(H + h) * D + d] * c + sign * row[(H + h) * D + pair] * s;
+        vt[((int64_t)h * D + d) * N + r] = row[(2 * H + h) * D + d];
+    }
+}
+extern "C" __global__ void fn_vis32_softmax(const float* __restrict__ s, float* __restrict__ p, float* __restrict__ sums,
+                                            int cols, float scale) {
+    __shared__ float red[32];
+    const float* sr = s + (int64_t)blockIdx.x * cols;
+    float* pr = p + (int64_t)blockIdx.x * cols;
+    float m = -INFINITY;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, sr[c] * scale);
+    m = block_max(m, red);
+    float t = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float e = expf(sr[c] * scale - m);
+        t += e;
+        pr[c] = e;
+    }
+    t = block_sum(t, red);
+    if (threadIdx.x == 0) sums[blockIdx.x] = t;
+}
+extern "C" __global__ void fn_vis32_head_out(const float* __restrict__ o, const float* __restrict__ sums,
+                                             float* __restrict__ out, int rows, int H, int D, int h) {
+    const int64_t n = (int64_t)rows * D;
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+        const int r = (int)(i / D), d = (int)(i % D);
+        out[(int64_t)r * H * D + h * D + d] = o[i] / sums[r];
+    }
+}
