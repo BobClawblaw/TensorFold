@@ -132,9 +132,31 @@ pub const Prepared = struct {
     preparing: bool,
 };
 
+/// --tool-system: the server's instruction as the first message of a chat request that offers tools and sends no
+/// system message (the client's own instruction wins); other requests pass unchanged.
+fn withToolSystem(srv: *Server, a: Allocator, input: Input) Allocator.Error!Input {
+    const text = srv.config.tool_system orelse return input;
+    if (input.tools.len == 0 or input.prompt != null or input.messages != .array) return input;
+    for (input.messages.array) |m| {
+        if (m != .object) continue;
+        const role = m.object.get("role") orelse continue;
+        if (role == .string and std.mem.eql(u8, role.string, "system")) return input;
+    }
+    const sys = try json.newObject(a);
+    try sys.put(a, "role", .{ .string = "system" });
+    try sys.put(a, "content", .{ .string = text });
+    const list = try a.alloc(Value, input.messages.array.len + 1);
+    list[0] = .{ .object = sys };
+    @memcpy(list[1..], input.messages.array);
+    var out = input;
+    out.messages = .{ .array = list };
+    return out;
+}
+
 /// Render ``input`` and run every check that can refuse it, before anything reaches the client or the engine.
-pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepared {
+pub fn prepare(srv: *Server, cx: *Cx, input_in: Input, gone: anytype) Failure!Prepared {
     const a = cx.a;
+    const input = try withToolSystem(srv, a, input_in);
     const io = srv.io;
     const received = nowNs(io);
     const f = input.fields;
