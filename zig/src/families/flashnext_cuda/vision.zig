@@ -22,7 +22,16 @@ const EPS: f32 = 1e-6;
 
 const Block = struct { n1w: u64, n1b: u64, qkv_w: u64, qkv_b: u64, proj_w: u64, proj_b: u64, n2w: u64, n2b: u64, fc1_w: u64, fc1_b: u64, fc2_w: u64, fc2_b: u64 };
 
-const LinKey = struct { m: u64, n: u64, k: u64, f32_out: bool };
+const LinKey = struct { m: u64, n: u64, k: u64, f32_out: bool, f32_in: bool = false };
+
+/// The tower's arithmetic: ``bf16`` (the default) rounds as torch's bf16 tower in the Python engine does, its
+/// activations between blocks in fp32; ``fp32`` (TENSORFOLD_VISION_FP32=1) keeps every activation in fp32 (fp32
+/// products on fp32 copies of the weights, about 2.5x the time) and lands within 0.02% of torch's fp32 tower. The
+/// bf16 tower is noise-limited -- torch's own CPU and CUDA runs differ by up to 8.5% -- and the model reads some
+/// degenerate images (a blank one) differently under any perturbation, near-exact features included.
+pub const Mode = enum { fp32, bf16 };
+
+const W32 = struct { patch: u64, qkv: [DEPTH]u64, proj: [DEPTH]u64, fc1: [DEPTH]u64, fc2: [DEPTH]u64, m1: u64, m2: u64 };
 
 pub const Tower = struct {
     gpa: std.mem.Allocator,
@@ -38,9 +47,11 @@ pub const Tower = struct {
     linears: std.AutoHashMap(LinKey, cuda.cublaslt.Linear),
     ws: cuda.DeviceBuffer,
     ws_len: usize = 64 << 20,
-    /// The residual stream in fp32 between blocks (the blocks still compute in bf16): fewer roundings than torch's
-    /// bf16 tower, the features nearer its exact arithmetic.
+    /// The residual stream in fp32 between blocks (the bf16 mode's blocks still compute in bf16).
     precise: bool = true,
+    mode: Mode = .bf16,
+    w32: ?cuda.DeviceBuffer = null, // fp32 copies of the linears' weights (the fp32 mode; made on first use)
+    w32p: W32 = undefined,
 
     /// The tower's tensors from ``dir``/model-visual.safetensors (bf16), onto the device in one allocation.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8) !Tower {
@@ -66,6 +77,9 @@ pub const Tower = struct {
         }
         var t: Tower = .{ .gpa = gpa, .d = d, .lt = try cuda.cublaslt.Library.open(), .mem = try cuda.DeviceBuffer.alloc(d, total),
             .inv_freq = try cuda.DeviceBuffer.alloc(d, 18 * 4), .linears = .init(gpa), .ws = undefined };
+        if (std.c.getenv("TENSORFOLD_VISION_FP32")) |v| if (v[0] == '1') {
+            t.mode = .fp32;
+        };
         errdefer t.deinit();
         t.ws = try cuda.DeviceBuffer.alloc(d, t.ws_len);
         var at: u64 = 0;
@@ -124,6 +138,7 @@ pub const Tower = struct {
         while (it.next()) |l| l.deinit();
         t.linears.deinit();
         t.mem.free();
+        if (t.w32) |*w| w.free();
         t.inv_freq.free();
         t.ws.free();
         t.lt.close();
@@ -131,10 +146,14 @@ pub const Tower = struct {
 
     /// D[m, n] = X[m, k] . W[n, k]^T (fp32 or bf16 out), a plan per shape kept for the next image.
     fn linear(t: *Tower, k: *kern.K, x: u64, w: u64, d: u64, m: i64, n: i64, kk: i64, f32_out: bool) !void {
-        const key: LinKey = .{ .m = @intCast(m), .n = @intCast(n), .k = @intCast(kk), .f32_out = f32_out };
+        return t.linearT(k, x, w, d, m, n, kk, f32_out, false);
+    }
+
+    fn linearT(t: *Tower, k: *kern.K, x: u64, w: u64, d: u64, m: i64, n: i64, kk: i64, f32_out: bool, f32_in: bool) !void {
+        const key: LinKey = .{ .m = @intCast(m), .n = @intCast(n), .k = @intCast(kk), .f32_out = f32_out, .f32_in = f32_in };
         const gop = try t.linears.getOrPut(key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = cuda.cublaslt.Linear.init(&t.lt, key.m, key.n, key.k, if (f32_out) .f32 else .bf16, t.ws_len) catch |e| {
+            gop.value_ptr.* = cuda.cublaslt.Linear.initTyped(&t.lt, key.m, key.n, key.k, if (f32_in) .f32 else .bf16, if (f32_out) .f32 else .bf16, t.ws_len) catch |e| {
                 _ = t.linears.remove(key);
                 return e;
             };
@@ -172,6 +191,7 @@ pub const Tower = struct {
     /// Features for images of ``grids`` ([t, h, w] in patches; t = 1) from their patches (fp32, [patches, 1536] in the
     /// processor's merge-block order) into ``out`` ([patches / 4, 2560] bf16). Scratch is allocated per call.
     pub fn encode(t: *Tower, k: *kern.K, patches: []const f32, grids: []const [3]i64, out: u64) !void {
+        if (t.mode == .fp32) return t.encode32(k, patches, grids, out);
         const d = t.d;
         var N: i64 = 0;
         for (grids) |g| {
@@ -329,6 +349,164 @@ pub const Tower = struct {
         try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
     }
 
+    fn run(k: *kern.K, name: []const u8, grid: i64, block: u32, args: anytype) !void {
+        const f = try k.ext(.vision, name);
+        var a: cuda.Args = .{};
+        inline for (args) |x| a.add(x);
+        try k.go(f, grid1(grid), block, 0, &a);
+    }
+
+    /// The fp32 copies of the linears' weights (made once, on the stream).
+    fn ensure32(t: *Tower, k: *kern.K) !void {
+        if (t.w32 != null) return;
+        const sizes = [_]i64{ H * PATCH, 3 * H * H, H * H, MLP * H, H * MLP };
+        var total: i64 = sizes[0] + DEPTH * (sizes[1] + sizes[2] + sizes[3] + sizes[4]) + 4 * H * 4 * H + OUT * 4 * H;
+        total += 64; // alignment slack
+        var buf = try cuda.DeviceBuffer.alloc(t.d, @intCast(total * 4 + 64 * 256));
+        errdefer buf.free();
+        var at: u64 = buf.ptr;
+        const conv = struct {
+            fn f(kk: *kern.K, src: u64, n: i64, p: *u64) !u64 {
+                const dst = p.*;
+                p.* += std.mem.alignForward(u64, @intCast(n * 4), 256);
+                try run(kk, "fn_vis_to_f32", n, 256, .{ src, dst, n });
+                return dst;
+            }
+        }.f;
+        t.w32p.patch = try conv(k, t.patch_w, H * PATCH, &at);
+        for (t.blocks, 0..) |bl, i| {
+            t.w32p.qkv[i] = try conv(k, bl.qkv_w, 3 * H * H, &at);
+            t.w32p.proj[i] = try conv(k, bl.proj_w, H * H, &at);
+            t.w32p.fc1[i] = try conv(k, bl.fc1_w, MLP * H, &at);
+            t.w32p.fc2[i] = try conv(k, bl.fc2_w, H * MLP, &at);
+        }
+        t.w32p.m1 = try conv(k, t.m1_w, 4 * H * 4 * H, &at);
+        t.w32p.m2 = try conv(k, t.m2_w, OUT * 4 * H, &at);
+        t.w32 = buf;
+    }
+
+    /// An fp32 Linear with its bias (and GELU): the fp32 product into ``acc``, then the bias kernel into ``out`` (fp32).
+    fn dense32(t: *Tower, k: *kern.K, x: u64, w: u64, bias: u64, out: u64, acc: u64, m: i64, n: i64, kk: i64, act: i32) !void {
+        try t.linearT(k, x, w, acc, m, n, kk, true, true);
+        try run(k, "fn_vis32_bias_act", m * n, 256, .{ acc, bias, out, @as(i64, m * n), @as(i32, @intCast(n)), act });
+    }
+
+    fn ln32f(k: *kern.K, x: u64, w: u64, bias: u64, y: u64, rows: i64) !void {
+        const f = try k.ext(.vision, "fn_vis32_ln");
+        var a: cuda.Args = .{};
+        a.add(x); a.add(w); a.add(bias); a.add(y); a.add(@as(i32, @intCast(H))); a.add(EPS);
+        try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
+    }
+
+    /// encode in fp32 throughout (Mode.fp32): the features rounded to bf16 once, at the end.
+    fn encode32(t: *Tower, k: *kern.K, patches: []const f32, grids: []const [3]i64, out: u64) !void {
+        try t.ensure32(k);
+        const d = t.d;
+        var N: i64 = 0;
+        for (grids) |g| {
+            if (g[0] != 1 or @mod(g[1], MERGE) != 0 or @mod(g[2], MERGE) != 0) return error.BadImageGrid;
+            N += g[1] * g[2];
+        }
+        if (@as(i64, @intCast(patches.len)) != N * PATCH) return error.BadImagePatches;
+        const pos = try t.gpa.alloc(i32, @intCast(N * 2));
+        defer t.gpa.free(pos);
+        const idx = try t.gpa.alloc(i32, @intCast(N * 4));
+        defer t.gpa.free(idx);
+        const wts = try t.gpa.alloc(f32, @intCast(N * 4));
+        defer t.gpa.free(wts);
+        tables(grids, pos, idx, wts);
+        const M = @divExact(N, MERGE * MERGE);
+        const big = @max(@max(N * 3 * H, N * MLP), N * PATCH);
+        const sizes = [_]i64{ N * H, N * H, N * H, big, big, N * H, N * H, N * H, CHUNK * N, CHUNK * N, CHUNK * HD, CHUNK, M * OUT, N * 2, N * 4, N * 4 };
+        var bytes: u64 = 0;
+        for (sizes) |n| bytes += std.mem.alignForward(u64, @intCast(n * 4), 256);
+        var scratch = try cuda.DeviceBuffer.alloc(d, bytes);
+        defer scratch.free();
+        var at: u64 = scratch.ptr;
+        var ptrs: [sizes.len]u64 = undefined;
+        for (sizes, 0..) |n, i| {
+            ptrs[i] = at;
+            at += std.mem.alignForward(u64, @intCast(n * 4), 256);
+        }
+        const x = ptrs[0];
+        const xn = ptrs[1];
+        const y = ptrs[2];
+        const big32 = ptrs[3];
+        const acc = ptrs[4];
+        const qh = ptrs[5];
+        const kh = ptrs[6];
+        const vt = ptrs[7];
+        const sc = ptrs[8];
+        const pr = ptrs[9];
+        const oh = ptrs[10];
+        const sums = ptrs[11];
+        const out32 = ptrs[12];
+        const dpos = ptrs[13];
+        const didx = ptrs[14];
+        const dwts = ptrs[15];
+        const att = y; // the attention's merged heads (y is free until the projection)
+        try d.check(d.api.cuMemcpyHtoDAsync_v2(dpos, pos.ptr, pos.len * 4, k.stream.handle), "vision positions");
+        try d.check(d.api.cuMemcpyHtoDAsync_v2(didx, idx.ptr, idx.len * 4, k.stream.handle), "vision taps");
+        try d.check(d.api.cuMemcpyHtoDAsync_v2(dwts, wts.ptr, wts.len * 4, k.stream.handle), "vision tap weights");
+        try d.check(d.api.cuMemcpyHtoDAsync_v2(big32, patches.ptr, patches.len * 4, k.stream.handle), "vision patches");
+        try t.dense32(k, big32, t.w32p.patch, t.patch_b, x, acc, N, H, PATCH, 0);
+        try run(k, "fn_vis32_pos", N * H, 256, .{ x, t.pos_table, didx, dwts, @as(i32, @intCast(N)), @as(i32, @intCast(H)) });
+        const scale: f32 = 1.0 / @sqrt(@as(f32, HD));
+        for (t.blocks, 0..) |bl, li| {
+            try ln32f(k, x, bl.n1w, bl.n1b, xn, N);
+            try t.dense32(k, xn, t.w32p.qkv[li], bl.qkv_b, big32, acc, N, 3 * H, H, 0);
+            try run(k, "fn_vis32_rope_split", N * H, 256, .{ big32, dpos, t.inv_freq.ptr, qh, kh, vt, @as(i32, @intCast(N)), @as(i32, @intCast(HEADS)), @as(i32, @intCast(HD)) });
+            var s0: i64 = 0;
+            for (grids) |g| {
+                const n = g[1] * g[2];
+                var h: i64 = 0;
+                while (h < HEADS) : (h += 1) {
+                    const q0 = qh + @as(u64, @intCast((h * N + s0) * HD * 4));
+                    const k0 = kh + @as(u64, @intCast((h * N + s0) * HD * 4));
+                    var c: i64 = 0;
+                    while (c < n) : (c += CHUNK) {
+                        const rows = @min(CHUNK, n - c);
+                        try t.linearT(k, q0 + @as(u64, @intCast(c * HD * 4)), k0, sc, rows, n, HD, true, true);
+                        {
+                            const f = try k.ext(.vision, "fn_vis32_softmax");
+                            var a: cuda.Args = .{};
+                            a.add(sc); a.add(pr); a.add(sums); a.add(@as(i32, @intCast(n))); a.add(scale);
+                            try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
+                        }
+                        try t.valuesProduct32(k, pr, vt, h, s0, n, N, rows, oh);
+                        try run(k, "fn_vis32_head_out", rows * HD, 256, .{ oh, sums, att + @as(u64, @intCast((s0 + c) * H * 4)), @as(i32, @intCast(rows)), @as(i32, @intCast(HEADS)), @as(i32, @intCast(HD)), @as(i32, @intCast(h)) });
+                    }
+                }
+                s0 += n;
+            }
+            try t.dense32(k, att, t.w32p.proj[li], bl.proj_b, xn, acc, N, H, H, 0);
+            try run(k, "fn_vis32_add", N * H, 256, .{ x, xn, @as(i64, N * H) });
+            try ln32f(k, x, bl.n2w, bl.n2b, xn, N);
+            try t.dense32(k, xn, t.w32p.fc1[li], bl.fc1_b, big32, acc, N, MLP, H, 1);
+            try t.dense32(k, big32, t.w32p.fc2[li], bl.fc2_b, y, acc, N, H, MLP, 0);
+            try run(k, "fn_vis32_add", N * H, 256, .{ x, y, @as(i64, N * H) });
+        }
+        try ln32f(k, x, t.mn_w, t.mn_b, xn, N);
+        try t.dense32(k, xn, t.w32p.m1, t.m1_b, big32, acc, M, 4 * H, 4 * H, 2);
+        try t.dense32(k, big32, t.w32p.m2, t.m2_b, out32, acc, M, OUT, 4 * H, 0);
+        try run(k, "fn_vis_to_bf16", M * OUT, 256, .{ out32, out, @as(i64, M * OUT) });
+        try k.stream.synchronize(); // the scratch is freed on return
+    }
+
+    /// valuesProduct for fp32 probabilities and values.
+    fn valuesProduct32(t: *Tower, k: *kern.K, p: u64, vt: u64, h: i64, s0: i64, n: i64, N: i64, rows: i64, out: u64) !void {
+        if (n == N) return t.linearT(k, p, vt + @as(u64, @intCast(h * HD * N * 4)), out, rows, HD, n, true, true);
+        var tmp = try cuda.DeviceBuffer.alloc(t.d, @intCast(HD * n * 4));
+        defer tmp.free();
+        var r: i64 = 0;
+        while (r < HD) : (r += 1) {
+            const src = vt + @as(u64, @intCast(((h * HD + r) * N + s0) * 4));
+            try t.d.check(t.d.api.cuMemcpyDtoDAsync_v2(tmp.ptr + @as(u64, @intCast(r * n * 4)), src, @intCast(n * 4), k.stream.handle), "vision values");
+        }
+        try t.linearT(k, p, tmp.ptr, out, rows, HD, n, true, true);
+        try k.stream.synchronize();
+    }
+
     /// O[rows, 72] (fp32) = P[rows, n] . V^T where V^T is head h's columns s0 .. s0 + n of vt [H, 72, N]: a product with the
     /// weight's rows N apart (a plan for that leading dimension).
     fn valuesProduct(t: *Tower, k: *kern.K, p: u64, vt: u64, h: i64, s0: i64, n: i64, N: i64, rows: i64, out: u64) !void {
@@ -345,6 +523,34 @@ pub const Tower = struct {
         try k.stream.synchronize(); // tmp is freed on return
     }
 };
+
+/// Each patch's (row, col) in merge-block order and its four position-table taps, for ``grids`` in order.
+fn tables(grids: []const [3]i64, pos: []i32, idx: []i32, wts: []f32) void {
+    var r0: usize = 0;
+    for (grids) |g| {
+        const h = g[1];
+        const w = g[2];
+        var i: i64 = 0;
+        while (i < h * w) : (i += 1) {
+            const in_col = @mod(i, MERGE);
+            const in_row = @mod(@divTrunc(i, MERGE), MERGE);
+            const block_col = @mod(@divTrunc(i, MERGE * MERGE), @divTrunc(w, MERGE));
+            const block_row = @divTrunc(i, MERGE * MERGE * @divTrunc(w, MERGE));
+            const row = block_row * MERGE + in_row;
+            const col = block_col * MERGE + in_col;
+            const p = r0 + @as(usize, @intCast(i));
+            pos[p * 2] = @intCast(row);
+            pos[p * 2 + 1] = @intCast(col);
+            const hr = taps(row, h);
+            const wc = taps(col, w);
+            for (0..2) |a| for (0..2) |b| {
+                idx[p * 4 + a * 2 + b] = @intCast(hr.i[a] * SIDE + wc.i[b]);
+                wts[p * 4 + a * 2 + b] = hr.w[a] * wc.w[b];
+            };
+        }
+        r0 += @intCast(h * w);
+    }
+}
 
 /// The position table's bilinear taps for coordinate ``i`` of an axis of ``size`` patches (align_corners: the ends map
 /// to 0 and 47), as transformers computes them in fp32.
