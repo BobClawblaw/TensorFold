@@ -28,6 +28,7 @@ pub const Options = struct {
     master: ?[]const u8 = null,
     master_port: u16 = 29600,
     vision: bool = false, // load the vision tower (rank 0) and take image prompts
+    kv_bits: u8 = 8, // the attention caches' codes: 8 (int8) or 4 (int4, two a byte), as Python's --kv-dtype
 };
 
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
@@ -207,7 +208,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.kernels.deinit();
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
     errdefer own.store.deinit();
-    own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = batch_rows, .depth = if (o.drafts) max_depth else 0 });
+    own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = batch_rows, .depth = if (o.drafts) max_depth else 0, .kv_bits = o.kv_bits });
     errdefer forward.deinit(own.e);
     try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
     { // the sequences' caches grow within what is free now, less the server's reserve and a margin (a GB10 shares

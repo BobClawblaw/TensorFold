@@ -157,6 +157,8 @@ pub const Open = struct {
     master_port: u16 = 29600,
     /// --vision: load the family's vision tower and accept image inputs.
     vision: bool = false,
+    /// --kv-dtype: bits of the attention cache's codes (8 or 4) for families that keep a quantized cache.
+    kv_bits: u8 = 8,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.

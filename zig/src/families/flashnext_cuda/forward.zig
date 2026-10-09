@@ -301,8 +301,9 @@ pub const Seq = struct {
         const cap: u64 = @intCast(s.capacity);
         var offs: [ATT + 1][6]u64 = undefined;
         for (&offs) |*o| {
-            o[0] = try s.grow.add(cap * 256, 256, 1);
-            o[1] = try s.grow.add(cap * 256, 256, 1);
+            const code: u64 = if (e.opts.kv_bits == 4) 128 else 256; // a position's 256 key (value) codes, int4 two a byte
+            o[0] = try s.grow.add(cap * code, code, 1);
+            o[1] = try s.grow.add(cap * code, code, 1);
             o[2] = try s.grow.add(cap * 16, 16, 1);
             o[3] = try s.grow.add(cap * 16, 16, 1);
             o[4] = try s.grow.add(cap * 256, 256, 1);
@@ -329,7 +330,7 @@ pub const Seq = struct {
     }
 };
 
-pub const Options = struct { context: usize, max_rows: u32, depth: u32 };
+pub const Options = struct { context: usize, max_rows: u32, depth: u32, kv_bits: u8 = 8 };
 
 /// An image prompt on a sequence: the rotary positions of its rows ([length, 3] int32, then the decode delta) and,
 /// while the prompt is prefilled, the features that replace its image placeholder rows (``rows``: their indexes).
@@ -601,7 +602,8 @@ pub fn seqBytes(e: *const Engine) usize {
     var c: Carve = .{};
     s.lay(&c, e.buf.rows);
     // and the caches' first growth step (the rest is mapped as the sequence grows, within the engine's budget)
-    const per_pos: u64 = (ATT + 1) * (256 + 256 + 16 + 16 + 256 + 64);
+    const code: u64 = if (e.opts.kv_bits == 4) 128 else 256;
+    const per_pos: u64 = (ATT + 1) * (code + code + 16 + 16 + 256 + 64);
     return c.at + per_pos * @as(u64, @intCast(grow_mod.step_positions));
 }
 
@@ -756,7 +758,7 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
         const s = sg.s;
         const pos = if (mtp) s.mtp_pos else s.pos_dev;
         try kern.attnPrep(k, rowAt(b.pa, sg.row0, 7296 * 2), pos, a.q_scale, a.k_scale, a.iq_scale, e.inv_freq, rowAt(b.q, sg.row0, 12 * 256 * 2),
-            s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows, if (s.img) |*im| im.rope() else null);
+            s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows, if (s.img) |*im| im.rope() else null, e.opts.kv_bits);
         try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, sg.rows, if (s.img) |*im| im.rope() else null);
     }
     if (b.prefill) {
@@ -770,7 +772,7 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
             const ro: u64 = @intCast(r0);
             try kern.qsaRows(k, b.iq + ro * 4 * 128 * 2, s.pooled[ai], b.pos_blk, b.a_scores, b.a_ids, b.a_nk, b.a_sparse, b.nb, n, ends);
             try kern.attention(k, b.q + ro * 12 * 256 * 2, s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], b.pos_blk, b.a_po, b.a_pm, b.a_pl,
-                b.a_ids, b.a_nk, b.a_sparse, b.attn_o + ro * 12 * 256 * 2, n, ends);
+                b.a_ids, b.a_nk, b.a_sparse, b.attn_o + ro * 12 * 256 * 2, n, ends, e.opts.kv_bits);
         }
         try kern.attnGate(k, b.attn_o, b.pa, b.gated, b.xs_gated, R);
     } else {
@@ -786,7 +788,7 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
                 sp, b.nb, sg.rows, keys);
             try kern.attention(k, rowAt(b.q, r0, 12 * 256 * 2), s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], pos, rowAt(b.a_po, r0, kern.NCH * 12 * 256 * 4),
                 rowAt(b.a_pm, r0, kern.NCH * 12 * 4), rowAt(b.a_pl, r0, kern.NCH * 12 * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk, sp,
-                rowAt(b.a_out, r0, 12 * 256 * 2), sg.rows, keys);
+                rowAt(b.a_out, r0, 12 * 256 * 2), sg.rows, keys, e.opts.kv_bits);
         }
         try kern.attnGate(k, b.a_out, b.pa, b.gated, b.xs_gated, R);
     }
