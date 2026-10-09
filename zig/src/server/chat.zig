@@ -175,9 +175,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input_in: Input, gone: anytype) Failure!Pr
     if (input.prompt != null) thinking = false;
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
     var rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
-    if (input.images.len > 0) { // image prompts: pads expanded, no prefix kept for a later turn (as the Python server)
-        rendered = .{ .ids = try @import("vision_inputs.zig").expand(srv, cx, rendered.ids, input.images), .history_len = 0 };
-    }
+    if (input.images.len > 0) rendered.history_len = 0; // image prompts keep no prefix for a later turn (as Python)
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;

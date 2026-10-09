@@ -377,11 +377,12 @@ pub const Positions = struct {
 };
 
 /// The image token ids (config.json: image_token_id, vision_start_token_id, vision_end_token_id).
-pub const Ids = struct { image: u32 = 248056, start: u32 = 248053, end: u32 = 248054 };
+pub const Ids = struct { image: u32 = 248056, video: u32 = 248057, start: u32 = 248053, end: u32 = 248054 };
 
 /// Qwen3.5's rope index for images (the Python engine's media_positions): text counts up on all three axes; each
 /// image's merged grid sits at the next position, rows on the h axis and columns on the w axis, and the text after it
-/// resumes past its larger side. ``grids``: each image's [t, h, w] in patches (t = 1), in prompt order.
+/// resumes past its larger side. A video's frame groups are blocks of their own (``<|video_pad|>`` rows, each after its
+/// timestamp text). ``grids``: each image's and each frame group's [1, h, w] in patches, in prompt order.
 pub fn mediaPositions(gpa: std.mem.Allocator, tokens: []const u32, grids: []const [3]i64, ids: Ids) !Positions {
     const L = tokens.len;
     const pos = try gpa.alloc(i32, 3 * L);
@@ -393,8 +394,9 @@ pub fn mediaPositions(gpa: std.mem.Allocator, tokens: []const u32, grids: []cons
     var used: usize = 0;
     while (true) {
         const begin = for (cursor..L) |i| {
-            if (tokens[i] == ids.image) break i;
+            if (tokens[i] == ids.image or tokens[i] == ids.video) break i;
         } else break;
+        const kind = tokens[begin];
         if (used >= grids.len) return error.ImageWithoutGrid;
         const g = grids[used];
         used += 1;
@@ -403,7 +405,7 @@ pub fn mediaPositions(gpa: std.mem.Allocator, tokens: []const u32, grids: []cons
         const w: usize = @intCast(@divExact(g[2], MERGE));
         const end = begin + h * w;
         if (begin == 0 or tokens[begin - 1] != ids.start or end >= L or tokens[end] != ids.end) return error.ImagePlaceholdersMismatch;
-        for (tokens[begin..end]) |t| if (t != ids.image) return error.ImagePlaceholdersMismatch;
+        for (tokens[begin..end]) |t| if (t != kind) return error.ImagePlaceholdersMismatch;
         for (cursor..begin) |i| {
             const v: i32 = @intCast(next_pos + @as(i64, @intCast(i - cursor)));
             for (0..3) |a| pos[a * L + i] = v;
