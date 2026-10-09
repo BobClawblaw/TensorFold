@@ -263,6 +263,7 @@ pub const Seq = struct {
     grow: grow_mod.Range = undefined, // the caches that grow with the position (kc_*, ikc, pooled)
     img: ?Image = null, // an image prompt's rotary table and (until its prefill ends) its features
     sampling: ?lanes.Sampling = null, // the stream's draw (null: greedy); its rows step eagerly
+    mask: ?Mask = null, // the next forward's grammar rows (set before each call, cleared by it)
     // host
     pos: i64 = 0,
     mtp_len: i64 = 0,
@@ -420,6 +421,9 @@ pub const Engine = struct {
     cand_host: []i32 = &.{}, // gathered candidates, read back
     full: cuda.DeviceBuffer = undefined, // a full row of both ranks' logits (a rule past the candidates)
     full_host: []u16 = &.{},
+    gbits: cuda.DeviceBuffer = undefined, // a window's grammar rows: their allowed bits over this rank's columns
+    grows: cuda.DeviceBuffer = undefined,
+    gbits_host: []u32 = &.{},
     budget: grow_mod.Budget = .{ .cap = std.math.maxInt(u64) }, // what every sequence's caches may map together
     /// Verify windows and MTP head steps as CUDA graphs (each width, DeltaNet parity and attention geometry).
     use_graphs: bool = true,
@@ -518,6 +522,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.cand_host = try gpa.alloc(i32, @intCast(2 * @max(rows_for(opts), 1) * draw_mod.W));
     e.full = try cuda.DeviceBuffer.alloc(ctx.d, 2 * HEAD_N * 2);
     e.full_host = try gpa.alloc(u16, 2 * HEAD_N);
+    e.gbits = try cuda.DeviceBuffer.alloc(ctx.d, @intCast(64 * MASK_WORDS * 4));
+    e.grows = try cuda.DeviceBuffer.alloc(ctx.d, 64 * 4);
+    e.gbits_host = try gpa.alloc(u32, @intCast(64 * MASK_WORDS));
     e.budget = .{ .cap = std.math.maxInt(u64) };
     e.k = try K.init(gpa, ctx.d, ctx.ctx, ctx.stream, &kernels.triton, &kernels.ext);
     var ai: usize = 0;
@@ -588,6 +595,9 @@ pub fn deinit(e: *Engine) void {
     e.gpa.free(e.cand_host);
     e.gpa.free(e.full_host);
     e.full.free();
+    e.gbits.free();
+    e.grows.free();
+    e.gpa.free(e.gbits_host);
     e.gpa.free(e.valbuf);
     e.gpa.destroy(e);
 }
@@ -1049,6 +1059,7 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
         if (final) { // the head on the last row, its candidates before the MTP head reuses the logits buffer
             _ = try finish(e, b, e.mixer, R, pending);
             try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, 1, b.kpart);
+            _ = try applyMasks(e, b.logits, &.{.{ .s = s, .row0 = 0, .rows = 1 }});
             try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, 1);
             var picks: [1]Pick = undefined;
             try readPicks(e, b, 1, &picks);
@@ -1090,6 +1101,36 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
 }
 
 /// One window over ``ids`` (the pending token, then drafts): out[r] is the greedy token after row r.
+/// A stream's grammar rows for its next forward: each row of its window the grammar constrains (in window order)
+/// and that row's allowed bits over this rank's columns, MASK_WORDS words a row.
+pub const Mask = struct { rows: []const u32, bits: []const u32 };
+pub const MASK_WORDS: usize = @intCast(@divExact(HEAD_N, 32));
+
+/// Every segment's grammar rows to -inf in ``logits`` (both ranks, before the picks); whether any was masked.
+fn applyMasks(e: *Engine, logits: u64, segs: []const Seg) !bool {
+    var n: usize = 0;
+    var rows: [64]i32 = undefined;
+    for (segs) |sg| if (sg.s.mask) |m| {
+        for (m.rows, 0..) |r, i| {
+            if (n == rows.len) return error.WindowTooWide;
+            rows[n] = @intCast(sg.row0 + @as(i64, r));
+            @memcpy(e.gbits_host[n * MASK_WORDS ..][0..MASK_WORDS], m.bits[i * MASK_WORDS ..][0..MASK_WORDS]);
+            n += 1;
+        }
+        sg.s.mask = null;
+    };
+    if (n == 0) return false;
+    const k = &e.k;
+    try k.upload(e.gbits.ptr, std.mem.sliceAsBytes(e.gbits_host[0 .. n * MASK_WORDS]));
+    try k.upload(e.grows.ptr, std.mem.sliceAsBytes(rows[0..n]));
+    const f = try k.ext(.sample, "fn_grammar_rows");
+    var a: cuda.Args = .{};
+    a.add(logits); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(HEAD_N)));
+    a.add(e.gbits.ptr); a.add(@as(i32, @intCast(MASK_WORDS))); a.add(e.grows.ptr);
+    try k.go(f, .{ .x = @intCast(n) }, 256, 0, &a);
+    return true;
+}
+
 fn rows_for(opts: Options) i64 {
     return @max(@as(i64, opts.max_rows), 16);
 }
@@ -1159,6 +1200,7 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
         ev[0].deinit();
         ev[1].deinit();
     };
+    if (try applyMasks(e, b.logits, &.{.{ .s = s, .row0 = 0, .rows = R }})) try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
     var picks: [16]Pick = undefined;
     try readPicks(e, b, R, picks[0..ids.len]);
     for (out[0..ids.len], picks[0..ids.len]) |*o, p| o.* = @intCast(p.tok);
@@ -1195,6 +1237,7 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
     const pending = try mainForward(e, b, segs[0..parts.len], R);
     _ = try finish(e, b, e.mixer, R, pending);
     try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, R, b.kpart);
+    _ = try applyMasks(e, b.logits, segs[0..parts.len]);
     try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
     var picks: [max_parts * 16]Pick = undefined;
     try readPicks(e, b, R, picks[0..@intCast(R)]);

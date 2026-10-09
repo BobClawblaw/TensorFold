@@ -1,5 +1,6 @@
 //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
 const std = @import("std");
+const grammar = @import("grammar.zig");
 const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const Allocator = std.mem.Allocator;
@@ -117,6 +118,7 @@ pub const Spec = struct {
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
     images: []const Image = &.{}, // an image prompt's inputs, in prompt order (the backend encodes them at prefill)
+    structure: ?grammar.Structure = null, // the reply's grammar (Info.structures backends mask its rows)
 };
 
 pub const Stream = struct {
@@ -134,6 +136,7 @@ pub const Stream = struct {
     think_end: i64,
     think_open: bool,
     images: []const Image = &.{},
+    structure: ?grammar.Structure = null,
     loop_guard: bool,
     loop_period: ?u32 = null,
     chunks: []const u32,
@@ -185,6 +188,7 @@ pub const Stream = struct {
             .cancel_check = spec.cancel_check,
             .think_budget = spec.think_budget,
             .images = spec.images,
+            .structure = spec.structure,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
