@@ -622,6 +622,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.use_graphs = true;
     e.multi_attn = kern.hasMulti(&e.k);
     e.multi_gdn = true;
+    e.multi_layers = .{ 0, 0 };
     e.confidence = 0;
     e.stage_ms = 0;
     e.split = .{ 0, 0, 0 };
@@ -704,7 +705,7 @@ pub fn resetSeq(e: *Engine, s: *Seq) !void {
     detach(e, s);
     const mem = s.mem;
     var g = s.grow;
-    g.shrink(); // the caches' memory back to the budget (mapped again, zeroed, as the next request grows)
+    try g.trim(e.k.stream.handle); // the caches' memory back to the budget but their first step, zeroed
     const snap_buf = s.snap.buf;
     s.* = .{ .capacity = e.capacity };
     s.snap.buf = snap_buf;

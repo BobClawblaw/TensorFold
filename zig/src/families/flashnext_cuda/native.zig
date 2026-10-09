@@ -748,7 +748,9 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
     };
     try self.send(.prefills, &w);
     var firsts: [max_streams]u32 = undefined;
+    const t0 = std.Io.Timestamp.now(self.io, .awake);
     try forward.prefillMany(self.e, prompts[0..ss.len], firsts[0..ss.len]);
+    std.log.debug("flash next: {d} prompts in one pass ({d} rows) in {d:.1} ms", .{ ss.len, rows, msSince(self.io, t0) });
     for (ss, 0..) |s, k| self.lanes_by.getPtr(s).?.first = self.take(firsts[k]);
     return true;
 }
