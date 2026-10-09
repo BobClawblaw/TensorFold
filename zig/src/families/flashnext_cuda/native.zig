@@ -319,6 +319,35 @@ const Owned = struct {
         w.buf.clearRetainingCapacity();
     }
 
+    /// ``seq``'s caches backed through ``target``; past the budget, memory no live stream holds goes first (spare
+    /// sequences, then rank 0's oldest kept prompt states, dropped on both ranks) before the growth is refused.
+    fn grow(self: *Owned, seq: *forward.Seq, target: i64) !void {
+        while (true) {
+            forward.reserve(self.e, seq, target) catch |err| {
+                if (err == error.OutOfDeviceMemory and self.relieve()) continue;
+                return err;
+            };
+            return;
+        }
+    }
+
+    fn relieve(self: *Owned) bool {
+        if (self.spares.pop()) |s| {
+            forward.freeSeq(self.e, s);
+            return true;
+        }
+        if (self.rank != 0 or self.kept.items.len == 0) return false;
+        const k = self.kept.orderedRemove(0);
+        var w: Writer = .{ .gpa = self.gpa };
+        defer w.buf.deinit(self.gpa);
+        w.int(k.id) catch {};
+        w.int(0) catch {};
+        self.send(.release, &w) catch {};
+        self.gpa.free(k.ids);
+        forward.freeSeq(self.e, k.seq);
+        return true;
+    }
+
     fn refuse(self: *Owned, s: *lanes.Stream) !void {
         for (self.refused.items) |x| if (x == s) return;
         try self.refused.append(self.gpa, s);
@@ -354,7 +383,7 @@ fn reserveRound(self: *Owned, ls: []const *Lane, ss: []const *lanes.Stream, targ
     var refused = false;
     for (ls, targets, 0..) |l, t, k| {
         if (!forward.short(l.seq, t)) continue;
-        forward.reserve(self.e, l.seq, t) catch |err| switch (err) {
+        self.grow(l.seq, t) catch |err| switch (err) {
             error.OutOfDeviceMemory => {
                 try self.refuse(ss[k]);
                 refused = true;
@@ -723,7 +752,7 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     const pr = try setupPrefill(self, s, &w, 0, &resumed);
     const target: i64 = @intCast(pr.ids.len + grow_margin);
     const asked = forward.short(pr.s, target);
-    if (asked) forward.reserve(self.e, pr.s, target) catch |err| {
+    if (asked) self.grow(pr.s, target) catch |err| {
         // refused before rank 1 hears of the prompt: a kept state it resumed is dropped there (the lane is released
         // as any failed one, its id unknown to rank 1)
         if (resumed != 0) {
@@ -849,7 +878,7 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const target: i64 = @intCast(pr.ids.len + grow_margin);
         if (!forward.short(pr.s, target)) continue;
         asked = true;
-        forward.reserve(self.e, pr.s, target) catch |err| switch (err) {
+        self.grow(pr.s, target) catch |err| switch (err) {
             error.OutOfDeviceMemory => { // each alone then: the refused one ends on its own
                 undoSetups(self, ss, resumed[0..ss.len]);
                 return false;
@@ -1185,7 +1214,7 @@ fn followPrefill(self: *Owned, r: *Reader, at: usize, grown: *?bool) !forward.Pr
     try self.by_id.put(id, seq);
     if (grow > 0) { // rank 0 grew for this prompt and waits for rank 1's answer
         var ok = true;
-        forward.reserve(self.e, seq, grow) catch |err| switch (err) {
+        self.grow(seq, grow) catch |err| switch (err) {
             error.OutOfDeviceMemory => ok = false,
             else => return err,
         };
@@ -1286,7 +1315,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
                     const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                     const target: i64 = @intCast(try r.int());
                     ok.* = 1;
-                    forward.reserve(self.e, seq, target) catch |err| switch (err) {
+                    self.grow(seq, target) catch |err| switch (err) {
                         error.OutOfDeviceMemory => ok.* = 0,
                         else => return err,
                     };
