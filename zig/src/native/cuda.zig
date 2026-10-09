@@ -359,6 +359,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     }
     var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
+    if (@hasField(F.Options, "vision")) fo.vision = o.vision;
     if (@hasField(F.Options, "rank")) {
         fo.tp = o.tp;
         fo.rank = o.rank;
@@ -388,7 +389,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .vision = o.vision and @hasField(F.Options, "vision") }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     const follow: ?*const fn (*anyopaque) anyerror!void = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
     if (follow) |f| {

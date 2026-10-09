@@ -1,6 +1,7 @@
 //! The engine a server drives (``Engine``), and ``LaneHost``: the lane core served on one thread, rounds left to it.
 const std = @import("std");
 /// Image inputs (decode, resize, patches) for families with a vision tower; the server reaches them here.
+pub const Image = lanes.Image;
 pub const qwen_image = @import("qwen_image");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
@@ -69,6 +70,8 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// An image prompt's inputs in prompt order (Info.vision engines only; the prompt holds their placeholder rows).
+    images: []const lanes.Image = &.{},
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -121,6 +124,8 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
+    /// The engine encodes image inputs (Request.images): it was opened with ``vision`` and its family has a tower.
+    vision: bool = false,
 };
 
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
@@ -150,6 +155,8 @@ pub const Open = struct {
     rank: u8 = 0,
     master: ?[]const u8 = null,
     master_port: u16 = 29600,
+    /// --vision: load the family's vision tower and accept image inputs.
+    vision: bool = false,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.

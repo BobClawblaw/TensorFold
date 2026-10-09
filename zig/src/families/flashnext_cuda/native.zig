@@ -9,6 +9,7 @@ const lanes = @import("lanes");
 const api = @import("api.zig");
 const weights = @import("weights.zig");
 const forward = @import("forward.zig");
+const vision = @import("vision.zig");
 const be = lanes.backend;
 
 pub const model_type = "qwen4_exp";
@@ -26,6 +27,7 @@ pub const Options = struct {
     rank: u8 = 0,
     master: ?[]const u8 = null,
     master_port: u16 = 29600,
+    vision: bool = false, // load the vision tower (rank 0) and take image prompts
 };
 
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
@@ -56,7 +58,7 @@ const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -126,6 +128,8 @@ const Owned = struct {
     e: *forward.Engine,
     lanes_by: std.AutoHashMap(*lanes.Stream, Lane),
     by_id: std.AutoHashMap(u64, *forward.Seq),    // rank 1's sequences, by rank 0's stream id
+    tower: ?vision.Tower = null,                  // rank 0, with vision: the image encoder
+    images: std.AutoHashMap(u64, []u8),           // rank 1: an image frame waiting for its prefill, by stream id
     next_id: u64 = 1,
     drawn: [64]u32 = undefined,
     next: u64 = 0,
@@ -206,6 +210,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     }
     own.lanes_by = .init(gpa);
     own.by_id = .init(gpa);
+    own.images = .init(gpa);
+    own.tower = null;
+    if (o.vision and o.rank == 0) own.tower = try vision.Tower.load(gpa, io, ctx.d, dir);
     own.next_id = 1;
     own.next = 0;
     own.cost_count = 0;
@@ -366,6 +373,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
         error.Sampled => "the native Flash Next engine draws greedily for now: send temperature 0",
+        error.NoVision => "image inputs need the server started with --vision",
         else => null,
     };
 }
@@ -381,6 +389,10 @@ fn release(p: *anyopaque) void {
     own.nccl.close();
     own.lanes_by.deinit();
     own.by_id.deinit();
+    if (own.tower) |*t| t.deinit();
+    var it = own.images.valueIterator();
+    while (it.next()) |v| own.gpa.free(v.*);
+    own.images.deinit();
     own.gpa.destroy(own);
 }
 
@@ -406,17 +418,61 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     if (s.sampling != null) return error.Sampled;
     const ids = s.prompt();
     if (ids.len == 0 or ids.len + s.max_new + max_rows > forward.maxLen(self.e)) return error.PromptTooLong;
+    // images: encoded and their positions computed before rank 1 hears of the request (a refusal stays on rank 0)
+    var frame: ?[]u8 = null;
+    defer if (frame) |f| self.gpa.free(f);
+    var pos: ?vision.Positions = null;
+    defer if (pos) |*q| q.deinit(self.gpa);
+    var feats: ?cuda.DeviceBuffer = null;
+    defer if (feats) |*f| f.free();
+    if (s.images.len > 0) {
+        const tower = &(self.tower orelse return error.NoVision);
+        var grids = try self.gpa.alloc([3]i64, s.images.len);
+        defer self.gpa.free(grids);
+        var npatch: usize = 0;
+        for (s.images, 0..) |im, k| {
+            grids[k] = im.grid;
+            npatch += im.patches.len;
+        }
+        const patches = try self.gpa.alloc(f32, npatch);
+        defer self.gpa.free(patches);
+        var at: usize = 0;
+        for (s.images) |im| {
+            @memcpy(patches[at..][0..im.patches.len], im.patches);
+            at += im.patches.len;
+        }
+        pos = try vision.mediaPositions(self.gpa, ids, grids, .{});
+        const rows = pos.?.rows.len;
+        feats = try cuda.DeviceBuffer.alloc(self.ctx.d, rows * 2560 * 2);
+        try tower.encode(&self.e.k, patches, grids, feats.?.ptr);
+        // rank 1's frame: rows, delta, the positions [3, L] and the features (bf16), after the stream id
+        const L = ids.len;
+        var w0: Writer = .{ .gpa = self.gpa };
+        try w0.int(self.next_id);
+        try w0.int(rows);
+        try w0.int(@as(u64, @bitCast(pos.?.delta)));
+        try w0.int(L);
+        try w0.buf.appendSlice(self.gpa, std.mem.sliceAsBytes(pos.?.pos));
+        try w0.buf.appendSlice(self.gpa, std.mem.sliceAsBytes(pos.?.rows));
+        const fat = w0.buf.items.len;
+        try w0.buf.resize(self.gpa, fat + rows * 2560 * 2);
+        try self.e.k.stream.synchronize();
+        try self.ctx.d.check(self.ctx.d.api.cuMemcpyDtoH_v2(w0.buf.items[fat..].ptr, feats.?.ptr, rows * 2560 * 2), "image features");
+        frame = try w0.buf.toOwnedSlice(self.gpa);
+    }
     const gop = try self.lanes_by.getOrPut(s);
     if (gop.found_existing) self.retire(gop.value_ptr.seq);
     const id = self.next_id;
     self.next_id += 1;
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
+    if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
     try w.int(id);
     try w.tokens(ids);
     try self.send(.prefill, &w);
     const seq = try self.obtain();
     gop.value_ptr.* = .{ .seq = seq, .id = id };
+    if (pos) |q| try forward.attach(self.e, seq, q.rows, feats.?.ptr, q.pos, q.delta);
     _ = self.take(try forward.prefill(self.e, seq, ids));
 }
 
@@ -621,6 +677,28 @@ fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     self.retire(kv.value.seq);
 }
 
+/// Rank 1: an image frame (see prefillFn) attached to its sequence.
+fn attachFrame(self: *Owned, seq: *forward.Seq, f: []const u8) !void {
+    var r: Reader = .{ .bytes = f };
+    _ = try r.int(); // the stream id
+    const rows: usize = @intCast(try r.int());
+    const delta: i64 = @bitCast(try r.int());
+    const L: usize = @intCast(try r.int());
+    if (r.at + L * 12 + rows * 4 + rows * 5120 > f.len) return error.ShortFrame;
+    const pos = try self.gpa.alloc(i32, 3 * L);
+    defer self.gpa.free(pos);
+    @memcpy(std.mem.sliceAsBytes(pos), f[r.at..][0 .. L * 12]);
+    r.at += L * 12;
+    const idx = try self.gpa.alloc(u32, rows);
+    defer self.gpa.free(idx);
+    @memcpy(std.mem.sliceAsBytes(idx), f[r.at..][0 .. rows * 4]);
+    r.at += rows * 4;
+    var fd = try cuda.DeviceBuffer.alloc(self.ctx.d, rows * 5120);
+    defer fd.free();
+    try self.ctx.d.check(self.ctx.d.api.cuMemcpyHtoD_v2(fd.ptr, f[r.at..].ptr, rows * 5120), "image features");
+    try forward.attach(self.e, seq, idx, fd.ptr, pos, delta);
+}
+
 /// Rank 1: rank 0's calls, replayed in order on this rank's half of the model, until rank 0 stops.
 fn followLoop(p: *anyopaque) anyerror!void {
     const self = of(p);
@@ -634,10 +712,18 @@ fn followLoop(p: *anyopaque) anyerror!void {
         defer self.gpa.free(m.bytes);
         var r: Reader = .{ .bytes = m.bytes };
         switch (@as(Op, @enumFromInt(m.tag))) {
+            .image => {
+                const id = try r.int();
+                try self.images.put(id, try self.gpa.dupe(u8, m.bytes));
+            },
             .prefill => {
                 const id = try r.int();
                 const seq = try self.obtain();
                 try self.by_id.put(id, seq);
+                if (self.images.fetchRemove(id)) |kv| {
+                    defer self.gpa.free(kv.value);
+                    try attachFrame(self, seq, kv.value);
+                }
                 _ = try forward.prefill(self.e, seq, try r.tokens());
             },
             .verify => {

@@ -116,8 +116,10 @@ extern "C" __global__ void fn_vis_rope_split(const __nv_bfloat16* __restrict__ q
     }
 }
 
-// a row of scores to probabilities: p = bf16(softmax(s * scale)) in fp32, one block a row
-extern "C" __global__ void fn_vis_softmax(const float* __restrict__ s, __nv_bfloat16* __restrict__ p, int cols, float scale) {
+// a row of scores as flash attention keeps them: p = bf16(exp(s * scale - max)) (unnormalized, the values product's
+// input) and the row's fp32 sum of the unrounded exponentials (the output is divided by it after the product)
+extern "C" __global__ void fn_vis_softmax(const float* __restrict__ s, __nv_bfloat16* __restrict__ p, float* __restrict__ sums,
+                                          int cols, float scale) {
     __shared__ float red[32];
     const float* sr = s + (int64_t)blockIdx.x * cols;
     __nv_bfloat16* pr = p + (int64_t)blockIdx.x * cols;
@@ -125,18 +127,23 @@ extern "C" __global__ void fn_vis_softmax(const float* __restrict__ s, __nv_bflo
     for (int c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, sr[c] * scale);
     m = block_max(m, red);
     float t = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) t += expf(sr[c] * scale - m);
-    const float inv = 1.0f / block_sum(t, red);
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) pr[c] = b(expf(sr[c] * scale - m) * inv);
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float e = expf(sr[c] * scale - m);
+        t += e;
+        pr[c] = b(e);
+    }
+    t = block_sum(t, red);
+    if (threadIdx.x == 0) sums[blockIdx.x] = t;
 }
 
-// a head's output [rows, D] into the merged [rows, H * D] at head h
-extern "C" __global__ void fn_vis_head_out(const __nv_bfloat16* __restrict__ o, __nv_bfloat16* __restrict__ out, int rows,
-                                           int H, int D, int h) {
+// a head's output [rows, D] (the fp32 values product of unnormalized probabilities) divided by each row's sum and
+// rounded into the merged [rows, H * D] at head h
+extern "C" __global__ void fn_vis_head_out(const float* __restrict__ o, const float* __restrict__ sums,
+                                           __nv_bfloat16* __restrict__ out, int rows, int H, int D, int h) {
     const int64_t n = (int64_t)rows * D;
     for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
         const int r = (int)(i / D), d = (int)(i % D);
-        out[(int64_t)r * H * D + h * D + d] = o[i];
+        out[(int64_t)r * H * D + h * D + d] = b(o[i] / sums[r]);
     }
 }
 
@@ -148,4 +155,32 @@ extern "C" __global__ void fn_vis_splice(__nv_bfloat16* __restrict__ h, const __
     const __nv_bfloat16* f = feats + (int64_t)src * width;
     __nv_bfloat16* dst = h + (int64_t)row * width * copies;
     for (int i = threadIdx.x; i < width * copies; i += blockDim.x) dst[i] = f[i % width];
+}
+
+// the fp32 residual stream (the tower's precise variant): x += y (bf16 branch output), LayerNorm reading fp32 rows,
+// and the casts in and out
+extern "C" __global__ void fn_vis_add32(float* __restrict__ x, const __nv_bfloat16* __restrict__ y, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
+        x[i] += f(y[i]);
+}
+extern "C" __global__ void fn_vis_layernorm32(const float* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                              const __nv_bfloat16* __restrict__ bias, __nv_bfloat16* __restrict__ y,
+                                              int cols, float eps) {
+    __shared__ float red[32];
+    const float* xr = x + (int64_t)blockIdx.x * cols;
+    __nv_bfloat16* yr = y + (int64_t)blockIdx.x * cols;
+    float s = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) s += xr[c];
+    const float mean = block_sum(s, red) / cols;
+    float v = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float d = xr[c] - mean;
+        v += d * d;
+    }
+    const float rstd = rsqrtf(block_sum(v, red) / cols + eps);
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) yr[c] = b((xr[c] - mean) * rstd * f(w[c]) + f(bias[c]));
+}
+extern "C" __global__ void fn_vis_to_f32(const __nv_bfloat16* __restrict__ x, float* __restrict__ y, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
+        y[i] = f(x[i]);
 }

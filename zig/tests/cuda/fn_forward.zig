@@ -149,6 +149,60 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     check.pass("EXACT rank {d}: native forward, prefill + {d} tokens with MTP drafts equal the Python engine's", .{ rank, count });
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "shared")) try sharedCheck(e, prompt, rank);
     for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "vision=")) try visionCheck(e, gpu, rank, a["vision=".len..]);
+    for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "probes=")) try probesDecode(e, gpu, rank, a["probes=".len..]);
+}
+
+/// Each probe prompt of <dir> (vision_ref.py's tokens and grid) decoded greedily (40 tokens, one row a step) with
+/// each feature set present: <name>.features.bf16 (torch on CUDA), <name>.got.bf16 (this tower), and <dir>_cpu's
+/// (torch on the CPU); the ids written to <dir>/decoded.rank<r>.json for a tokenizer to read.
+fn probesDecode(e: *fwd.Engine, gpu: Gpu, rank: u8, dir: []const u8) !void {
+    const gpa = gpu.gpa;
+    const io = gpu.io;
+    const vision = @import("flashnext_weights").vision;
+    var nb: [512]u8 = undefined;
+    const index_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/index.json", .{dir}), gpa, .limited(1 << 20));
+    const index = try std.json.parseFromSlice(std.json.Value, gpa, index_text, .{});
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    try out.writer.writeAll("{");
+    for (index.value.array.items, 0..) |case, ci| {
+        const name = case.object.get("name").?.string;
+        const meta_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/{s}.json", .{ dir, name }), gpa, .limited(1 << 22));
+        const meta = try std.json.parseFromSlice(std.json.Value, gpa, meta_text, .{});
+        const g = meta.value.object.get("grid").?.array.items[0].array.items;
+        const grid = [3]i64{ g[0].integer, g[1].integer, g[2].integer };
+        const p64 = try ints(gpa, meta.value.object.get("tokens").?);
+        const prompt = try gpa.alloc(u32, p64.len);
+        for (prompt, p64) |*d, x| d.* = @intCast(x);
+        var pos = try vision.mediaPositions(gpa, prompt, &.{grid}, .{});
+        defer pos.deinit(gpa);
+        try out.writer.print("{s}\"{s}\": {{", .{ if (ci > 0) ", " else "", name });
+        const sources = [_][]const u8{ "gpu", "ours", "cpu" };
+        for (sources, 0..) |src, si| {
+            const path = if (si == 0) try std.fmt.bufPrint(&nb, "{s}/{s}.features.bf16", .{ dir, name }) else if (si == 1)
+                try std.fmt.bufPrint(&nb, "{s}/{s}.got.bf16", .{ dir, name }) else try std.fmt.bufPrint(&nb, "{s}_cpu/{s}.features.bf16", .{ dir[0 .. dir.len - "_cuda".len], name });
+            const fbytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 28)) catch continue;
+            var fdev = try cuda.DeviceBuffer.alloc(gpu.d, fbytes.len);
+            defer fdev.free();
+            try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(fdev.ptr, fbytes.ptr, fbytes.len), "features");
+            const s = try fwd.newSeq(e);
+            defer fwd.freeSeq(e, s);
+            try fwd.attach(e, s, pos.rows, fdev.ptr, pos.pos, pos.delta);
+            var tok = try fwd.prefill(e, s, prompt);
+            try out.writer.print("{s}\"{s}\": [{d}", .{ if (si > 0) ", " else "", src, tok });
+            for (0..39) |_| {
+                var o: [1]u32 = undefined;
+                try fwd.verify(e, s, &.{tok}, &o);
+                try fwd.keep(e, s, 1, 1);
+                tok = o[0];
+                try out.writer.print(", {d}", .{tok});
+            }
+            try out.writer.writeAll("]");
+        }
+        try out.writer.writeAll("}");
+    }
+    try out.writer.writeAll("}");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&nb, "{s}/decoded.rank{d}.json", .{ dir, rank }), .data = out.written() });
+    std.debug.print("rank {d}: probes decoded into {s}/decoded.rank{d}.json\n", .{ rank, dir, rank });
 }
 
 /// Image prompts against the Python engine (flashnext-zig/tools/capture_vision.py): the rotary positions computed
