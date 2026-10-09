@@ -147,4 +147,53 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     }
     try check.expect(same == count, "{d} of {d} tokens equal Python's", .{ same, count });
     check.pass("EXACT rank {d}: native forward, prefill + {d} tokens with MTP drafts equal the Python engine's", .{ rank, count });
+    for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "shared")) try sharedCheck(e, prompt, rank);
+}
+
+/// Shared rounds against lone ones: three prompts of different lengths decode 16 greedy tokens each alone, then
+/// together (every round one forward over the three windows): one-row windows, then four-row windows whose drafts
+/// are the lone run's own later tokens (all kept). Every stream's tokens must equal its lone run's.
+fn sharedCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
+    const lens = [_]usize{ 2695, 1500, 333 };
+    const steps = 16;
+    var alone: [lens.len][steps + 1]u32 = undefined;
+    for (lens, 0..) |n, k| {
+        const s = try fwd.newSeq(e);
+        defer fwd.freeSeq(e, s);
+        alone[k][0] = try fwd.prefill(e, s, prompt[0..n]);
+        for (0..steps) |t| {
+            var o: [1]u32 = undefined;
+            try fwd.verify(e, s, alone[k][t .. t + 1], &o);
+            try fwd.keep(e, s, 1, 1);
+            alone[k][t + 1] = o[0];
+        }
+    }
+    for ([_]u32{ 1, 4 }) |w| {
+        var seqs: [lens.len]*fwd.Seq = undefined;
+        var got: [lens.len][steps + 1]u32 = undefined;
+        for (lens, 0..) |n, k| {
+            seqs[k] = try fwd.newSeq(e);
+            got[k][0] = try fwd.prefill(e, seqs[k], prompt[0..n]);
+        }
+        defer for (seqs) |s| fwd.freeSeq(e, s);
+        var t: usize = 0;
+        while (t < steps) : (t += w) {
+            const rows = @min(w, steps - t);
+            var parts: [lens.len]fwd.Part = undefined;
+            for (&parts, 0..) |*p, k| p.* = .{ .s = seqs[k], .ids = alone[k][t .. t + rows] }; // pending + the lone run's next tokens
+            var out: [lens.len * 4]u32 = undefined;
+            try fwd.verifyShared(e, &parts, out[0 .. lens.len * rows]);
+            for (0..lens.len) |k| {
+                for (0..rows) |r| got[k][t + 1 + r] = out[k * rows + r];
+                try fwd.keep(e, seqs[k], rows, rows);
+            }
+        }
+        var same: usize = 0;
+        for (0..lens.len) |k| for (0..steps + 1) |j| {
+            if (got[k][j] == alone[k][j]) same += 1;
+        };
+        std.debug.print("rank {d}: shared rounds of {d}-row windows over {d} streams: {d} of {d} tokens equal the lone runs\n", .{ rank, w, lens.len, same, lens.len * (steps + 1) });
+        try check.expect(same == lens.len * (steps + 1), "shared {d}-row rounds: {d} of {d} tokens equal", .{ w, same, lens.len * (steps + 1) });
+    }
+    check.pass("EXACT rank {d}: shared rounds over {d} streams equal each stream alone", .{ rank, lens.len });
 }

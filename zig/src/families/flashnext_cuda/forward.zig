@@ -11,6 +11,7 @@ const cuda = @import("cuda");
 const api = @import("api.zig");
 const kern = @import("kern.zig");
 const ngram_mod = @import("ngram.zig");
+const grow_mod = @import("grow.zig");
 pub const devstore = @import("devstore.zig");
 pub const api_ = api;
 
@@ -139,6 +140,7 @@ pub const Buffers = struct {
     ple_v: u64 = 0, ple_emb: u64 = 0, xs_ple: u64 = 0, ple_keys: u64 = 0, ple_vals: u64 = 0, ple_gated: u64 = 0, ple_pss: u64 = 0, ple_nrow: u64 = 0,
     mtp_e: u64 = 0, mtp_eo: u64 = 0, mtp_hn: u64 = 0, mtp_xh: u64 = 0, mtp_hs: u64 = 0, mtp_in: u64 = 0,
     kpart: u64 = 0, hcpart: u64 = 0, dnf: u64 = 0, sgu: u64 = 0,
+    seg_nk: u64 = 0, seg_sparse: u64 = 0, // a shared round's per-stream key counts, 64 bytes a stream (16-aligned)
 
     fn lay(b: *Buffers, c: *Carve) void {
         const R = b.rows;
@@ -193,8 +195,8 @@ pub const Buffers = struct {
         b.part_moe = c.take(R * D * 4);
         b.g_branch = c.take(2 * R * D * 4);
         b.g_moe = c.take(2 * R * D * 4);
-        b.cand = c.take(16 * 4 * 4);
-        b.gath = c.take(2 * 16 * 4 * 4);
+        b.cand = c.take(@max(R, 16) * 4 * 4);
+        b.gath = c.take(2 * @max(R, 16) * 4 * 4);
         b.ple_v = c.take(R * 16 * 160 * 2);
         b.ple_emb = c.take(R * D * 2);
         b.xs_ple = c.take(R * (D / 32) * 4);
@@ -214,6 +216,8 @@ pub const Buffers = struct {
         b.hcpart = c.take(8 * @min(R, 128) * 324 * 4);
         b.dnf = c.take(R * 324 * 4);
         b.sgu = c.take(R * 640 * 2);
+        b.seg_nk = c.take(max_parts * 64);
+        b.seg_sparse = c.take(max_parts * 64);
     }
 
     fn init(d: *const cuda.Driver, rows: i64, is_prefill: bool, moe_prefill: bool, nb: i64) !Buffers {
@@ -249,6 +253,7 @@ pub const Seq = struct {
     ikc: [ATT + 1]u64 = undefined, pooled: [ATT + 1]u64 = undefined,
     ple_tail: u64 = 0,
     last_streams: u64 = 0,
+    grow: grow_mod.Range = undefined, // the caches that grow with the position (kc_*, ikc, pooled)
     // host
     pos: i64 = 0,
     mtp_len: i64 = 0,
@@ -257,6 +262,7 @@ pub const Seq = struct {
     hist: ngram_mod.History = .{},
     fresh: bool = true, // the next draft absorbs the prompt's last streams
     last_rows: i64 = 0, // the last verify's rows
+    last_row0: i64 = 0, // where they sat in the window's buffers (a shared round packs several streams)
     last_tokens: [16]i64 = undefined,
 
     const REC_LAYER: i64 = 24 * 128 * 128 * 4;
@@ -274,16 +280,39 @@ pub const Seq = struct {
             s.sc_g[i] = c.take(max_rows * 24 * 4);
             s.sc_b[i] = c.take(max_rows * 24 * 4);
         }
-        for (0..ATT + 1) |i| {
-            s.kc_k[i] = c.take(cap * 256);
-            s.kc_v[i] = c.take(cap * 256);
-            s.kc_ks[i] = c.take(cap * 8 * 2);
-            s.kc_vs[i] = c.take(cap * 8 * 2);
-            s.ikc[i] = c.take(cap * 128 * 2);
-            s.pooled[i] = c.take(cdiv(cap, 4) * 128 * 2);
-        }
+        _ = cap; // the position-sized caches live in ``grow`` (layGrow)
         s.ple_tail = c.take(9 * WIDE * 2);
         s.last_streams = c.take(WIDE * 2);
+    }
+
+    /// Each attention layer's caches as regions of one reserved range (mapped as positions reach them).
+    fn layGrow(s: *Seq, e: *Engine) !void {
+        s.grow = .{ .d = e.ctx.d, .gpa = e.gpa, .gran = e.gran, .budget = &e.budget };
+        errdefer s.grow.deinit();
+        const cap: u64 = @intCast(s.capacity);
+        var offs: [ATT + 1][6]u64 = undefined;
+        for (&offs) |*o| {
+            o[0] = try s.grow.add(cap * 256, 256, 1);
+            o[1] = try s.grow.add(cap * 256, 256, 1);
+            o[2] = try s.grow.add(cap * 16, 16, 1);
+            o[3] = try s.grow.add(cap * 16, 16, 1);
+            o[4] = try s.grow.add(cap * 256, 256, 1);
+            o[5] = try s.grow.add(@as(u64, @intCast(cdiv(s.capacity, 4))) * 256, 256, 4);
+        }
+        try s.grow.reserve();
+        s.pointGrow();
+    }
+
+    fn pointGrow(s: *Seq) void {
+        const r = s.grow.regions.items;
+        for (0..ATT + 1) |i| {
+            s.kc_k[i] = s.grow.base + r[6 * i].off;
+            s.kc_v[i] = s.grow.base + r[6 * i + 1].off;
+            s.kc_ks[i] = s.grow.base + r[6 * i + 2].off;
+            s.kc_vs[i] = s.grow.base + r[6 * i + 3].off;
+            s.ikc[i] = s.grow.base + r[6 * i + 4].off;
+            s.pooled[i] = s.grow.base + r[6 * i + 5].off;
+        }
     }
 
     fn recAt(s: *const Seq, half: u1, li: usize) u64 {
@@ -292,6 +321,14 @@ pub const Seq = struct {
 };
 
 pub const Options = struct { context: usize, max_rows: u32, depth: u32 };
+
+/// One sequence's rows of a forward: rows ``row0 .. row0 + rows`` of the buffers belong to ``s`` (a shared round
+/// packs several streams' windows; a lone window or a prompt chunk is one segment from row 0).
+pub const Seg = struct { s: *Seq, row0: i64 = 0, rows: i64 };
+
+fn rowAt(base: u64, row0: i64, row_bytes: i64) u64 {
+    return base + @as(u64, @intCast(row0 * row_bytes));
+}
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -320,6 +357,8 @@ pub const Engine = struct {
     valbuf: []u16,
     confidence: f64 = 0,
     draft_p: [16]f64 = undefined, // the last draftUpTo's head probability for each draft it returned
+    gran: u64 = 0, // device memory's mapping granularity
+    budget: grow_mod.Budget = .{ .cap = std.math.maxInt(u64) }, // what every sequence's caches may map together
     /// Verify windows and MTP head steps as CUDA graphs (each width, DeltaNet parity and attention geometry).
     use_graphs: bool = true,
     stage_ms: f64 = 0, // host time staging windows (ids, n-gram rows)
@@ -341,7 +380,7 @@ fn geometry(keys: i64, nb: i64) [3]i64 {
 fn body(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
     if (kind == 0) {
         const b = &e.buf;
-        const pending = try mainForward(e, b, s, R);
+        const pending = try mainForward(e, b, &.{.{ .s = s, .rows = R }}, R);
         _ = try finish(e, b, e.mixer, R, pending);
         try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, R, b.kpart);
         try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
@@ -413,6 +452,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.ctx = ctx;
     e.opts = opts;
     e.capacity = @intCast(opts.context + opts.depth + 1);
+    e.gran = try grow_mod.Range.granularity(ctx.d);
+    e.budget = .{ .cap = std.math.maxInt(u64) };
     e.k = try K.init(gpa, ctx.d, ctx.ctx, ctx.stream, &kernels.triton, &kernels.ext);
     var ai: usize = 0;
     var li: usize = 0;
@@ -454,7 +495,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.buf = try Buffers.init(ctx.d, rows, false, true, nb);
     e.mbuf = try Buffers.init(ctx.d, rows, false, false, nb);
     e.pbuf = try Buffers.init(ctx.d, PREFILL_ROWS, true, true, nb);
-    e.host = try cuda.HostBuffer.alloc(ctx.d, 2 * 16 * 16);
+    e.host = try cuda.HostBuffer.alloc(ctx.d, @intCast(2 * @max(rows, 16) * 4 * 4));
     e.idbuf = try gpa.alloc(i32, @intCast(PREFILL_ROWS));
     e.rowbuf = try gpa.alloc(i64, @intCast(PREFILL_ROWS * 16));
     e.valbuf = try gpa.alloc(u16, @intCast(PREFILL_ROWS * 16 * 160));
@@ -491,7 +532,19 @@ pub fn seqBytes(e: *const Engine) usize {
     var s: Seq = .{ .capacity = e.capacity };
     var c: Carve = .{};
     s.lay(&c, e.buf.rows);
-    return c.at;
+    // and the caches' first growth step (the rest is mapped as the sequence grows, within the engine's budget)
+    const per_pos: u64 = (ATT + 1) * (256 + 256 + 16 + 16 + 256 + 64);
+    return c.at + per_pos * @as(u64, @intCast(grow_mod.step_positions));
+}
+
+/// The bytes every sequence's growing caches may map together (the server's room for streams).
+pub fn setGrowthBudget(e: *Engine, cap: u64) void {
+    e.budget.cap = cap;
+}
+
+/// ``s``'s caches backed through ``positions`` (its main and MTP positions), before a forward writes them.
+fn room(e: *Engine, s: *Seq, extra: i64) !void {
+    try s.grow.ensure(@max(s.pos, s.mtp_len) + extra, e.k.stream.handle);
 }
 
 pub fn newSeq(e: *Engine) !*Seq {
@@ -508,6 +561,7 @@ pub fn newSeq(e: *Engine) !*Seq {
     for (0..LIN) |i| ptrs[i] = s.conv + i * 3 * CONV_DIM * 2;
     try e.ctx.d.check(e.ctx.d.api.cuMemcpyHtoD_v2(s.conv_ptrs, &ptrs, LIN * 8), "conv pointers");
     s.hist = e.ng.start();
+    try s.layGrow(e);
     return s;
 }
 
@@ -515,8 +569,12 @@ pub fn newSeq(e: *Engine) !*Seq {
 /// sequence's ~11 GiB at a 1M window instead of allocating and zeroing it per request, and its graphs stay valid.
 pub fn resetSeq(e: *Engine, s: *Seq) !void {
     const mem = s.mem;
+    var g = s.grow;
+    g.shrink(); // the caches' memory back to the budget (mapped again, zeroed, as the next request grows)
     s.* = .{ .capacity = e.capacity };
     s.mem = mem;
+    s.grow = g;
+    s.pointGrow();
     var c: Carve = .{ .base = mem.ptr };
     s.lay(&c, e.buf.rows);
     try e.ctx.d.check(e.ctx.d.api.cuMemsetD8Async(mem.ptr, 0, c.at, e.k.stream.handle), "zero state");
@@ -535,6 +593,7 @@ pub fn freeSeq(e: *Engine, s: *Seq) void {
         var ex = e.graphs.fetchRemove(key).?.value;
         ex.deinit();
     }
+    s.grow.deinit();
     s.mem.free();
     e.gpa.destroy(s);
 }
@@ -585,11 +644,12 @@ fn outProj(e: *Engine, b: *Buffers, x: u64, x_stride: i64, f: kern.Face, R: i64)
     return b.g_branch;
 }
 
-fn gdnBlock(e: *Engine, b: *Buffers, s: *Seq, l: LayerW, R: i64) !u64 {
+fn gdnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64) !u64 {
     const k = &e.k;
     const g = l.gdn;
     const li = l.li;
     if (b.prefill) {
+        const s = segs[0].s; // a prompt chunk: one sequence
         try kern.matmul(k, b.mixed, D, g.proj, b.proj, PROJ_W, false, R, b.kpart);
         const cur = s.cur[li];
         // q, k (fp32), v (bf16), g, beta of the piece: carved from the MTP/ple scratch of the prompt buffers
@@ -608,22 +668,30 @@ fn gdnBlock(e: *Engine, b: *Buffers, s: *Seq, l: LayerW, R: i64) !u64 {
     }
     const proj = b.proj + @as(u64, @intCast(@as(i64, @intCast(li)) * b.rows * PROJ_W * 2));
     try kern.matmul(k, b.mixed, D, g.proj, proj, PROJ_W, false, R, b.kpart);
-    const cur = s.cur[li];
-    try kern.gdnChain(k, proj, s.conv + li * 3 * CONV_DIM * 2, g.conv, s.recAt(cur, li), g.a_log, g.dt_bias, g.norm, R, b.gout, b.gxs, s.recAt(1 - cur, li),
-        s.sc_k[li], s.sc_v[li], s.sc_g[li], s.sc_b[li]);
+    for (segs) |sg| { // each stream's chain on its own state, over its rows
+        const s = sg.s;
+        const cur = s.cur[li];
+        try kern.gdnChain(k, rowAt(proj, sg.row0, PROJ_W * 2), s.conv + li * 3 * CONV_DIM * 2, g.conv, s.recAt(cur, li), g.a_log, g.dt_bias, g.norm, sg.rows,
+            rowAt(b.gout, sg.row0, 3072 * 2), rowAt(b.gxs, sg.row0, 96 * 4), s.recAt(1 - cur, li), s.sc_k[li], s.sc_v[li], s.sc_g[li], s.sc_b[li]);
+    }
     return outProj(e, b, b.gout, 3072, g.out, R);
 }
 
-fn attnBlock(e: *Engine, b: *Buffers, s: *Seq, l: LayerW, R: i64, mtp: bool) !u64 {
+fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp: bool) !u64 {
     const k = &e.k;
     const a = l.attn;
     const ai = if (mtp) ATT else l.li;
-    const pos = if (mtp) s.mtp_pos else s.pos_dev;
-    const host_pos = if (mtp) s.mtp_len else s.pos;
     try kern.matmul(k, b.mixed, D, a.proj, b.pa, 7296, false, R, b.kpart);
-    try kern.attnPrep(k, b.pa, pos, a.q_scale, a.k_scale, a.iq_scale, e.inv_freq, b.q, s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], b.iq, s.ikc[ai], R);
-    try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, R);
+    for (segs) |sg| { // each stream's rows into its own caches, at its own positions
+        const s = sg.s;
+        const pos = if (mtp) s.mtp_pos else s.pos_dev;
+        try kern.attnPrep(k, rowAt(b.pa, sg.row0, 7296 * 2), pos, a.q_scale, a.k_scale, a.iq_scale, e.inv_freq, rowAt(b.q, sg.row0, 12 * 256 * 2),
+            s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows);
+        try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, sg.rows);
+    }
     if (b.prefill) {
+        const s = segs[0].s; // a prompt chunk: one sequence
+        const host_pos = if (mtp) s.mtp_len else s.pos;
         var r0: i64 = 0;
         while (r0 < R) : (r0 += ATT_ROWS) {
             const n = @min(ATT_ROWS, R - r0);
@@ -636,21 +704,34 @@ fn attnBlock(e: *Engine, b: *Buffers, s: *Seq, l: LayerW, R: i64, mtp: bool) !u6
         }
         try kern.attnGate(k, b.attn_o, b.pa, b.gated, b.xs_gated, R);
     } else {
-        const keys = host_pos + R;
-        try kern.qsaRows(k, b.iq, s.pooled[ai], pos, b.a_scores, b.a_ids, b.a_nk, b.a_sparse, b.nb, R, keys);
-        try kern.attention(k, b.q, s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], pos, b.a_po, b.a_pm, b.a_pl, b.a_ids, b.a_nk, b.a_sparse, b.a_out, R, keys);
+        for (segs, 0..) |sg, j| {
+            const s = sg.s;
+            const pos = if (mtp) s.mtp_pos else s.pos_dev;
+            const keys = (if (mtp) s.mtp_len else s.pos) + sg.rows;
+            const r0 = sg.row0;
+            // per-row counts at row0 * 4 bytes would break the captured variants' 16-byte alignment: a slot per stream
+            const nk = if (segs.len == 1) b.a_nk else b.seg_nk + j * 64;
+            const sp = if (segs.len == 1) b.a_sparse else b.seg_sparse + j * 64;
+            try kern.qsaRows(k, rowAt(b.iq, r0, 4 * 128 * 2), s.pooled[ai], pos, rowAt(b.a_scores, r0, b.nb * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk,
+                sp, b.nb, sg.rows, keys);
+            try kern.attention(k, rowAt(b.q, r0, 12 * 256 * 2), s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], pos, rowAt(b.a_po, r0, kern.NCH * 12 * 256 * 4),
+                rowAt(b.a_pm, r0, kern.NCH * 12 * 4), rowAt(b.a_pl, r0, kern.NCH * 12 * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk, sp,
+                rowAt(b.a_out, r0, 12 * 256 * 2), sg.rows, keys);
+        }
         try kern.attnGate(k, b.a_out, b.pa, b.gated, b.xs_gated, R);
     }
     return outProj(e, b, b.gated, 3072, a.o, R);
 }
 
-fn pleBlock(e: *Engine, b: *Buffers, s: *Seq, p: PleW, R: i64) !void {
+fn pleBlock(e: *Engine, b: *Buffers, segs: []const Seg, p: PleW, R: i64) !void {
     const k = &e.k;
     try kern.pleEmbedBf16(k, b.ple_v, b.ple_emb, b.xs_ple, R);
     try kern.matmul(k, b.ple_emb, D, p.key, b.ple_keys, WIDE, false, R, b.kpart);
     try kern.matmul(k, b.ple_emb, D, p.value, b.ple_vals, D, false, R, b.kpart);
     try kern.pleGate(k, b.ple_keys, b.ple_vals, b.h, p.norm_key, p.norm_query, b.ple_gated, b.ple_pss, R);
-    try kern.pleConv(k, b.ple_gated, b.ple_pss, p.norm_conv, s.ple_tail, p.conv, b.h, b.ple_nrow, R);
+    for (segs) |sg| // the causal conv over each stream's own tail
+        try kern.pleConv(k, rowAt(b.ple_gated, sg.row0, WIDE * 2), rowAt(b.ple_pss, sg.row0, 4 * 4), p.norm_conv, sg.s.ple_tail, p.conv, rowAt(b.h, sg.row0, WIDE * 2),
+            rowAt(b.ple_nrow, sg.row0, WIDE * 2), sg.rows);
 }
 
 fn moeBlock(e: *Engine, b: *Buffers, m: MoEW, R: i64) !u64 {
@@ -673,17 +754,17 @@ fn moeBlock(e: *Engine, b: *Buffers, m: MoEW, R: i64) !u64 {
     return b.g_moe;
 }
 
-fn layerForward(e: *Engine, b: *Buffers, s: *Seq, l: LayerW, R: i64, pending_in: ?Pending, mtp: bool) !Pending {
+fn layerForward(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, pending_in: ?Pending, mtp: bool) !Pending {
     var pending = pending_in;
     if (l.ple) |p| {
         if (pending) |pd| {
             try kern.hcWriteback(&e.k, b.h, b.pss, pd.g, pd.inj, R, 3);
             pending = null;
         }
-        try pleBlock(e, b, s, p, R);
+        try pleBlock(e, b, segs, p, R);
     }
     try hcBlock(e, b, l.attn_hc, R, pending, b.inj_a);
-    const g = if (l.linear) try gdnBlock(e, b, s, l, R) else try attnBlock(e, b, s, l, R, mtp);
+    const g = if (l.linear) try gdnBlock(e, b, segs, l, R) else try attnBlock(e, b, segs, l, R, mtp);
     try hcBlock(e, b, l.mlp_hc, R, .{ .g = g, .inj = b.inj_a }, b.inj_m);
     return .{ .g = try moeBlock(e, b, l.moe, R), .inj = b.inj_m };
 }
@@ -754,10 +835,29 @@ fn stage(e: *Engine, b: *Buffers, s: *const Seq, tokens: []const i64) !void {
     try e.k.upload(b.ple_v, std.mem.sliceAsBytes(e.valbuf[0 .. n * heads * e.ng.width]));
 }
 
-fn mainForward(e: *Engine, b: *Buffers, s: *Seq, R: i64) !Pending {
+/// stage for a shared round: every part's ids, each part's n-gram rows from its own history, then one upload each.
+fn stageParts(e: *Engine, b: *Buffers, parts: []const Part, segs: []const Seg) !void {
+    const heads = e.ng.heads;
+    var n: usize = 0;
+    for (parts, segs) |p, sg| {
+        var toks: [16]i64 = undefined;
+        for (p.ids, 0..) |t, i| {
+            toks[i] = t;
+            e.idbuf[n + i] = @intCast(t);
+        }
+        const r0: usize = @intCast(sg.row0);
+        try e.ng.ids(&p.s.hist, toks[0..p.ids.len], e.rowbuf[r0 * heads .. (r0 + p.ids.len) * heads]);
+        n += p.ids.len;
+    }
+    try e.k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..n]));
+    try e.ng.gather(e.rowbuf[0 .. n * heads], e.valbuf[0 .. n * heads * e.ng.width]);
+    try e.k.upload(b.ple_v, std.mem.sliceAsBytes(e.valbuf[0 .. n * heads * e.ng.width]));
+}
+
+fn mainForward(e: *Engine, b: *Buffers, segs: []const Seg, R: i64) !Pending {
     try kern.embed(&e.k, b.ids, e.embed, b.h, R, 4);
     var pending: ?Pending = null;
-    for (e.layers) |l| pending = try layerForward(e, b, s, l, R, pending, false);
+    for (e.layers) |l| pending = try layerForward(e, b, segs, l, R, pending, false);
     return pending.?;
 }
 
@@ -792,7 +892,7 @@ fn mtpCompute(e: *Engine, b: *Buffers, s: *Seq, n: i64) !void {
     try kern.rmsnorm(k, b.mtp_in, m.norm_h, b.mtp_hn, b.mtp_xh, WIDE, n, WIDE);
     try kern.matmul(k, b.mtp_hn, D, m.fc_h, b.mtp_hs, D, false, n * 4, b.kpart);
     try kern.addStreams(k, b.mtp_eo, b.mtp_hs, b.h, n);
-    const pending = try layerForward(e, b, s, m.layer, n, null, true);
+    const pending = try layerForward(e, b, &.{.{ .s = s, .rows = n }}, m.layer, n, null, true);
     _ = try finish(e, b, m.mixer, n, pending);
     if (b.prefill) {
         try kern.qmmPrefill(k, b.mixed, e.dh, b.logits);
@@ -835,8 +935,9 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
         const end = @min(at + @as(usize, @intCast(PREFILL_ROWS)), prompt.len);
         const R: i64 = @intCast(end - at);
         const final = end == prompt.len;
+        try room(e, s, R + 1);
         try stage(e, b, s, prompt[at..end]);
-        const pending = try mainForward(e, b, s, R);
+        const pending = try mainForward(e, b, &.{.{ .s = s, .rows = R }}, R);
         if (final) { // the head on the last row, its candidates before the MTP head reuses the logits buffer
             _ = try finish(e, b, e.mixer, R, pending);
             try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, 1, b.kpart);
@@ -879,6 +980,7 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     const b = &e.buf;
     var toks: [16]i64 = undefined;
     for (ids, 0..) |t, i| toks[i] = t;
+    try room(e, s, R + 1);
     try stage(e, b, s, toks[0..ids.len]);
     var ev: [2]cuda.Event = undefined;
     if (e.timing) {
@@ -897,8 +999,46 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     try readPicks(e, b, R, picks[0..ids.len]);
     for (out[0..ids.len], picks[0..ids.len]) |*o, p| o.* = @intCast(p.tok);
     s.last_rows = R;
+    s.last_row0 = 0;
     @memcpy(s.last_tokens[0..ids.len], toks[0..ids.len]);
 }
+
+/// A stream's window in a shared round: its sequence and its rows' tokens (the pending one, then its drafts).
+pub const Part = struct { s: *Seq, ids: []const u32 };
+
+/// One forward over several streams' windows (eager): shared layers over every row, each stream's attention,
+/// DeltaNet, conv and n-gram rows on its own state; ``out`` gets every row's greedy token, the parts in order.
+pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
+    if (parts.len == 0 or parts.len > max_parts) return error.TooManyParts;
+    var segs: [max_parts]Seg = undefined;
+    var R: i64 = 0;
+    for (parts, 0..) |p, i| {
+        const n: i64 = @intCast(p.ids.len);
+        if (n == 0 or n > 16) return error.WindowTooWide;
+        if (p.s.pos + n > e.capacity) return error.PromptTooLong;
+        segs[i] = .{ .s = p.s, .row0 = R, .rows = n };
+        R += n;
+    }
+    const b = &e.buf;
+    if (R > b.rows) return error.WindowTooWide;
+    for (segs[0..parts.len]) |sg| try room(e, sg.s, sg.rows + 1);
+    try stageParts(e, b, parts, segs[0..parts.len]);
+    const pending = try mainForward(e, b, segs[0..parts.len], R);
+    _ = try finish(e, b, e.mixer, R, pending);
+    try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, R, b.kpart);
+    try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
+    var picks: [max_parts * 16]Pick = undefined;
+    try readPicks(e, b, R, picks[0..@intCast(R)]);
+    for (out[0..@intCast(R)], picks[0..@intCast(R)]) |*o, p| o.* = @intCast(p.tok);
+    for (parts, segs[0..parts.len]) |p, sg| {
+        p.s.last_rows = sg.rows;
+        p.s.last_row0 = sg.row0;
+        for (p.ids, 0..) |t, i| p.s.last_tokens[i] = t;
+    }
+}
+
+/// Streams a shared round packs at most.
+pub const max_parts = 16;
 
 /// forward.commit: keep the first ``kept`` of the last window's ``rows`` (DeltaNet replays, conv and n-gram windows).
 pub fn keep(e: *Engine, s: *Seq, rows: u32, kept: u32) !void {
@@ -912,8 +1052,9 @@ pub fn keep(e: *Engine, s: *Seq, rows: u32, kept: u32) !void {
         s.cur[li] = 1 - cur;
     }
     const b = &e.buf;
-    try kern.shiftWindows(k, s.conv, b.proj, kp, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, LIN, CONV_DIM, 3);
-    try kern.shiftWindows(k, s.ple_tail, b.ple_nrow, kp, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
+    // the stream's own rows of the window (row0: where a shared round put them)
+    try kern.shiftWindows(k, s.conv, rowAt(b.proj, s.last_row0, PROJ_W * 2), kp, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, LIN, CONV_DIM, 3);
+    try kern.shiftWindows(k, s.ple_tail, rowAt(b.ple_nrow, s.last_row0, WIDE * 2), kp, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
     s.hist.advance(s.last_tokens[0..@intCast(kp)]);
     try setPos(e, s, s.pos + kp);
 }
@@ -932,12 +1073,13 @@ pub fn draftUpTo(e: *Engine, s: *Seq, follow: []const u32, depth: u32, confidenc
         try setMtpLen(e, s, s.mtp_len - s.mtp_drafted);
         s.mtp_drafted = 0;
     }
+    try room(e, s, n + depth + 1);
     for (follow, 0..) |t, i| e.idbuf[i] = @intCast(t);
     try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..follow.len]));
     if (s.fresh) {
         try k.copy(b.mtp_in, s.last_streams, WIDE * 2);
         s.fresh = false;
-    } else try k.copy(b.mtp_in, e.buf.streams, @intCast(n * WIDE * 2));
+    } else try k.copy(b.mtp_in, rowAt(e.buf.streams, s.last_row0, WIDE * 2), @intCast(n * WIDE * 2));
     try step(e, 1, s, n);
     try setMtpLen(e, s, s.mtp_len + n);
     var got: usize = 0;
