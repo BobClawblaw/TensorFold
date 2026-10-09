@@ -317,3 +317,110 @@ pub fn prepare(gpa: std.mem.Allocator, im: Image, max_tokens: u64) Error!Prepare
     }
     return .{ .patches = out, .grid = .{ 1, @intCast(gh), @intCast(gw) } };
 }
+
+// -- videos ---------------------------------------------------------------------------------------------------------
+
+/// A video's frame size for the tower (the Python frontend's video_size): Qwen3-VL's smart_resize with its per-frame
+/// cap (at most 768 tokens a frame group, at least ~134), the whole video within ``budget`` tokens.
+pub fn videoSize(frames: u32, height0: u32, width0: u32, budget: u64) Error![2]u32 {
+    const factor: f64 = FACTOR;
+    const shortest: f64 = 128 * FACTOR * FACTOR;
+    const longest: f64 = @as(f64, @floatFromInt(budget)) * TEMPORAL * FACTOR * FACTOR;
+    const per_frame = @max(@min(768 * FACTOR * FACTOR, @floor(longest / @as(f64, @floatFromInt(@max(1, frames))))), @floor(shortest * 1.05));
+    const max_pixels = per_frame * @as(f64, @floatFromInt(frames));
+    if (frames < TEMPORAL) return error.UnsupportedImage;
+    var height: f64 = @floatFromInt(height0);
+    var width: f64 = @floatFromInt(width0);
+    if (height < factor or width < factor) {
+        const scale = @max(factor / height, factor / width);
+        height = @trunc(height * scale);
+        width = @trunc(width * scale);
+    }
+    if (@max(height, width) / @min(height, width) > 200) return error.BadAspectRatio;
+    var hb = pyRound(height / factor) * factor;
+    var wb = pyRound(width / factor) * factor;
+    const tb = pyRound(@as(f64, @floatFromInt(frames)) / TEMPORAL) * TEMPORAL;
+    const n: f64 = @floatFromInt(frames);
+    if (tb * hb * wb > max_pixels) {
+        const beta = @sqrt(n * height * width / max_pixels);
+        hb = @max(factor, @floor(height / beta / factor) * factor);
+        wb = @max(factor, @floor(width / beta / factor) * factor);
+    } else if (tb * hb * wb < shortest) {
+        const beta = @sqrt(shortest / (n * height * width));
+        hb = @ceil(height * beta / factor) * factor;
+        wb = @ceil(width * beta / factor) * factor;
+    }
+    return .{ @intFromFloat(hb), @intFromFloat(wb) };
+}
+
+/// A decoded video's frame groups for the tower: each group's patches (fp32 [gh * gw, 1536], two consecutive frames
+/// as the temporal pair; an odd last frame repeats), normalized as numpy does ((x * f32(1/255) - 0.5) / 0.5), and
+/// each group's time (the mean of its two frames' seconds).
+pub const Video = struct {
+    patches: []f32, // groups x gh x gw x 1536
+    groups: usize,
+    gh: usize,
+    gw: usize,
+    times: []f64,
+
+    pub fn groupPatches(v: Video, g: usize) []f32 {
+        const per = v.gh * v.gw * 3 * TEMPORAL * PATCH * PATCH;
+        return v.patches[g * per ..][0..per];
+    }
+
+    pub fn tokens(v: Video) usize {
+        return v.gh * v.gw / (MERGE * MERGE);
+    }
+
+    pub fn deinit(v: *Video, gpa: std.mem.Allocator) void {
+        gpa.free(v.patches);
+        gpa.free(v.times);
+    }
+};
+
+/// ``rgb``: ``frames`` RGB frames of ``h`` x ``w`` (already at the tower's size), their source ``indices`` and ``fps``.
+pub fn prepareVideo(gpa: std.mem.Allocator, rgb: []const u8, frames: usize, h: usize, w: usize, indices: []const i32, fps: f64) Error!Video {
+    if (h % FACTOR != 0 or w % FACTOR != 0 or frames < 2) return error.UnsupportedImage;
+    const groups = (frames + TEMPORAL - 1) / TEMPORAL;
+    const gh = h / PATCH;
+    const gw = w / PATCH;
+    const per = 3 * TEMPORAL * PATCH * PATCH;
+    const out = try gpa.alloc(f32, groups * gh * gw * per);
+    errdefer gpa.free(out);
+    const scale: f32 = @floatCast(@as(f64, 1.0) / 255.0);
+    var n: usize = 0;
+    for (0..groups) |g| {
+        for (0..gh / MERGE) |bh| for (0..gw / MERGE) |bw| for (0..MERGE) |mh| for (0..MERGE) |mw| {
+            const py = (bh * MERGE + mh) * PATCH;
+            const px = (bw * MERGE + mw) * PATCH;
+            const dst = out[n * per ..][0..per];
+            for (0..3) |c| for (0..TEMPORAL) |t| {
+                const f = @min(g * TEMPORAL + t, frames - 1);
+                const frame = rgb[f * h * w * 3 ..];
+                for (0..PATCH) |y| for (0..PATCH) |x| {
+                    const v: f32 = @as(f32, @floatFromInt(frame[((py + y) * w + px + x) * 3 + c])) * scale;
+                    dst[((c * TEMPORAL + t) * PATCH + y) * PATCH + x] = (v - 0.5) / 0.5;
+                };
+            };
+            n += 1;
+        };
+    }
+    const times = try gpa.alloc(f64, groups);
+    for (0..groups) |g| {
+        const a: f64 = @as(f64, @floatFromInt(indices[g * TEMPORAL])) / fps;
+        const b: f64 = @as(f64, @floatFromInt(indices[@min(g * TEMPORAL + TEMPORAL - 1, frames - 1)])) / fps;
+        times[g] = (a + b) / 2;
+    }
+    return .{ .patches = out, .groups = groups, .gh = gh, .gw = gw, .times = times };
+}
+
+/// Python's f"{t:.1f}": one decimal, an exact tie rounded to even.
+pub fn formatSeconds(buf: []u8, t: f64) ![]const u8 {
+    const x: f128 = @as(f128, t) * 10; // exact: a double's 53 bits times ten fit f128's 113
+    const fl = @floor(x);
+    const frac = x - fl;
+    var r = if (frac > 0.5) fl + 1 else fl;
+    if (frac == 0.5 and @rem(fl, 2) != 0) r = fl + 1;
+    const v: i64 = @intFromFloat(r);
+    return std.fmt.bufPrint(buf, "{d}.{d}", .{ @divTrunc(v, 10), @as(u64, @intCast(@mod(v, 10))) });
+}

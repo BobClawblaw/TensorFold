@@ -129,3 +129,76 @@ pub fn prep(gpu: Gpu, refdir: []const u8) !void {
     try check.expect(grids_equal and worst_bytes <= 1, "grids equal and patches within one pixel level", .{});
     check.pass("image preparation: grids equal Python's, patches within {d} pixel level(s)", .{worst_bytes});
 }
+
+/// The video path (libtfvideo + qwen_image) against the Python frontend's (flashnext-zig/tools/video_ref.py): the
+/// sampled frames' indices and size, the decoded RGB, the patches and the expanded prompt text. video-prep <ref dir>
+pub fn videoPrep(gpu: Gpu, refdir: []const u8) !void {
+    const gpa = gpu.gpa;
+    const io = gpu.io;
+    const qi = @import("qwen_image");
+    var nb: [512]u8 = undefined;
+    const meta_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/video.json", .{refdir}), gpa, .limited(1 << 22));
+    const meta = (try std.json.parseFromSlice(std.json.Value, gpa, meta_text, .{})).value.object;
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/test.mp4", .{refdir}), gpa, .limited(1 << 26));
+    const TfVideo = extern struct { rgb: ?[*]u8, frames: c_int, height: c_int, width: c_int, indices: ?[*]c_int, fps: f64 };
+    const SizeFn = *const fn (?*anyopaque, c_int, c_int, c_int, *c_int, *c_int) callconv(.c) c_int;
+    const DecodeFn = *const fn ([*]const u8, usize, f64, c_int, c_int, f64, c_int, SizeFn, ?*anyopaque, *TfVideo) callconv(.c) c_int;
+    var dl = try std.DynLib.open("libtfvideo.so");
+    const decode = dl.lookup(DecodeFn, "tf_video_decode") orelse return error.NoSymbol;
+    const size = struct {
+        fn f(_: ?*anyopaque, frames: c_int, h: c_int, w: c_int, oh: *c_int, ow: *c_int) callconv(.c) c_int {
+            const s = qi.videoSize(@intCast(frames), @intCast(h), @intCast(w), 16384) catch return -1;
+            oh.* = @intCast(s[0]);
+            ow.* = @intCast(s[1]);
+            return 0;
+        }
+    }.f;
+    var v: TfVideo = undefined;
+    const rc = decode(data.ptr, data.len, 2.0, 4, 256, 3600.0, 8192, size, null, &v);
+    try check.expect(rc == 0, "libtfvideo decodes the test video ({d})", .{rc});
+    const frames: usize = @intCast(v.frames);
+    const h: usize = @intCast(v.height);
+    const w: usize = @intCast(v.width);
+    const want_idx = meta.get("indices").?.array.items;
+    var same_idx = want_idx.len == frames;
+    if (same_idx) for (want_idx, 0..) |x, i| {
+        if (x.integer != v.indices.?[i]) same_idx = false;
+    };
+    const fshape = meta.get("frames").?.array.items;
+    std.debug.print("frames {d} of {d}x{d} at {d:.3} fps, indices {any} (Python {d} of {d}x{d}, same indices: {})\n",
+        .{ frames, h, w, v.fps, v.indices.?[0..frames], fshape[0].integer, fshape[1].integer, fshape[2].integer, same_idx });
+    try check.expect(same_idx and h == fshape[1].integer and w == fshape[2].integer, "sampled frames and size equal Python's", .{});
+    const want_rgb = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/video.frames.u8", .{refdir}), gpa, .limited(1 << 30));
+    var px_diff: usize = 0;
+    var px_max: u8 = 0;
+    for (v.rgb.?[0 .. frames * h * w * 3], want_rgb[0 .. frames * h * w * 3]) |a, b| {
+        if (a != b) px_diff += 1;
+        px_max = @max(px_max, if (a > b) a - b else b - a);
+    }
+    const idx = try gpa.alloc(i32, frames);
+    for (idx, 0..) |*x, i| x.* = v.indices.?[i];
+    var vid = try qi.prepareVideo(gpa, v.rgb.?[0 .. frames * h * w * 3], frames, h, w, idx, v.fps);
+    defer vid.deinit(gpa);
+    const pbytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/video.patches.f32", .{refdir}), gpa, .limited(1 << 30));
+    var p_diff: usize = 0;
+    if (pbytes.len == vid.patches.len * 4) {
+        for (vid.patches, 0..) |x, i| {
+            if (x != @as(f32, @bitCast(std.mem.readInt(u32, pbytes[i * 4 ..][0..4], .little)))) p_diff += 1;
+        }
+    } else p_diff = std.math.maxInt(usize);
+    // the expanded prompt text, as the server writes it
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(gpa, "<|im_start|>user\n");
+    for (0..vid.groups) |g| {
+        var tb: [32]u8 = undefined;
+        try text.print(gpa, "<{s} seconds><|vision_start|>", .{try qi.formatSeconds(&tb, vid.times[g])});
+        for (0..vid.tokens()) |_| try text.appendSlice(gpa, "<|video_pad|>");
+        try text.appendSlice(gpa, "<|vision_end|>");
+    }
+    try text.appendSlice(gpa, "What moves in this video?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    const same_text = std.mem.eql(u8, text.items, meta.get("expanded").?.string);
+    std.debug.print("decoded RGB: {d} of {d} bytes differ (at most {d}); patches: {d} of {d} values differ; groups {d} of {d}x{d}; expanded text equal: {}\n",
+        .{ px_diff, frames * h * w * 3, px_max, p_diff, vid.patches.len, vid.groups, vid.gh, vid.gw, same_text });
+    try check.expect(same_text, "the expanded prompt text equals Python's", .{});
+    check.pass("video preparation: sampling, size and prompt text equal Python's; RGB differs in {d} bytes (at most {d} levels)", .{ px_diff, px_max });
+}
