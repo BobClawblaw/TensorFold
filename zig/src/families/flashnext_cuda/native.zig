@@ -47,8 +47,8 @@ pub fn deviceWeightBytes(io: std.Io, dir: []const u8) u64 {
 }
 
 const max_rows = 16;            // a verify window's rows at most (pending + 15 drafts)
-const batch_rows = 32;          // a shared round's rows at most, every stream's window together
-const max_streams = 8;          // streams a shared round packs at most
+const batch_rows = 64;          // a shared round's rows at most, every stream's window together
+const max_streams = 16;         // streams a shared round packs at most
 const max_depth = max_rows - 1;
 /// The head stops at a draft it gives less than this (the Python engine's --mtp-confidence, the recipe's 0.70);
 /// the slots past it are held with chance 0, so the lane core's allocator leaves them out of the window.
@@ -56,7 +56,7 @@ const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -220,7 +220,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
                     .hidden_rows = o.drafts, .max_streams = if (o.drafts) max_streams else 1, .batch_rows = batch_rows,
                     .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms,
-                    .draft_probabilities = o.drafts },
+                    .draft_probabilities = o.drafts, .draft_streams = o.drafts },
         .rows = if (o.drafts) max_rows else 1,
         .stream_bytes = forward.seqBytes(own.e),
         .ctx = own,
@@ -450,6 +450,7 @@ fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const u32)
 
 fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
     const self = of(p);
+    if (requests.len > 1) return draftMany(self, requests);
     for (requests) |r| {
         const l = self.lanes_by.getPtr(r.stream) orelse return error.NoLane;
         if (r.lanes != null) return error.TreesNotBuilt;
@@ -478,6 +479,60 @@ fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
             if (i >= got) l.held[i] = l.held[got - 1];
         }
         l.nheld = depth;
+    }
+}
+
+/// Several streams' drafts in one batch (each level one forward over every stream still chaining), sent to rank 1
+/// as one op after every request is checked and every stream's kept rows committed.
+fn draftMany(self: *Owned, requests: []const be.DraftRequest) anyerror!void {
+    if (requests.len > max_streams) return error.TooManyStreams;
+    var lanes_of: [max_streams]*Lane = undefined;
+    var follow: [max_streams][max_rows]u32 = undefined;
+    var nf: [max_streams]usize = undefined;
+    var depth: [max_streams]u32 = undefined;
+    for (requests, 0..) |r, k| {
+        lanes_of[k] = self.lanes_by.getPtr(r.stream) orelse return error.NoLane;
+        if (r.lanes != null) return error.TreesNotBuilt;
+        if (r.rows) |rows| {
+            if (rows.len == 0 or rows.len > max_rows) return error.WindowTooWide;
+            for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+        } else if (r.first == null) return error.NoFirstToken;
+        depth[k] = @min(r.depth, max_depth);
+    }
+    for (requests, 0..) |r, k| {
+        const l = lanes_of[k];
+        try settle(self, l, if (r.rows) |rows| @intCast(rows.len) else l.rows);
+        if (r.rows) |rows| {
+            nf[k] = rows.len;
+            @memcpy(follow[k][0..rows.len], r.follow[0..rows.len]);
+        } else {
+            nf[k] = 1;
+            follow[k][0] = switch (r.first.?) {
+                .handle => |h| try readFn(self, h),
+                .value => |v| v,
+            };
+        }
+    }
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    try w.int(requests.len);
+    var reqs: [max_streams]forward.DraftReq = undefined;
+    for (0..requests.len) |k| {
+        const l = lanes_of[k];
+        try w.int(l.id);
+        try w.tokens(follow[k][0..nf[k]]);
+        try w.int(depth[k]);
+        reqs[k] = .{ .s = l.seq, .follow = follow[k][0..nf[k]], .depth = depth[k], .out = l.held[0..depth[k]], .probs = l.probs[0..depth[k]] };
+    }
+    try self.send(.drafts, &w);
+    try forward.draftBatch(self.e, reqs[0..requests.len], draft_confidence);
+    for (reqs[0..requests.len], 0..) |r, k| {
+        const l = lanes_of[k];
+        for (r.got..depth[k]) |i| { // past the confidence cut: held with chance 0 (the allocator leaves them out)
+            l.held[i] = l.held[r.got - 1];
+            l.probs[i] = 0;
+        }
+        l.nheld = depth[k];
     }
 }
 
@@ -546,6 +601,20 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .stop => return,
             .ready => {},
+            .drafts => {
+                const n: usize = @intCast(try r.int());
+                if (n == 0 or n > max_streams) return error.TooManyStreams;
+                var reqs: [max_streams]forward.DraftReq = undefined;
+                var outs: [max_streams][max_depth]u32 = undefined;
+                var probs: [max_streams][max_depth]f64 = undefined;
+                for (reqs[0..n], 0..) |*q, k| {
+                    const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
+                    const follow = try r.tokens();
+                    const depth: u32 = @intCast(try r.int());
+                    q.* = .{ .s = seq, .follow = follow, .depth = depth, .out = outs[k][0..depth], .probs = probs[k][0..depth] };
+                }
+                try forward.draftBatch(self.e, reqs[0..n], draft_confidence);
+            },
             .shared => {
                 const n: usize = @intCast(try r.int());
                 if (n == 0 or n > max_streams) return error.TooManyStreams;

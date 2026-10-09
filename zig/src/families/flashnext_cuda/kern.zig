@@ -573,8 +573,13 @@ pub fn qmmPrefill(k: *K, x: u64, h: DraftHead, out: u64) !void {
 
 /// fn_rows_top (our sample.cu): each bf16 row's first maximum as a global id, its value and log-sum-exp.
 pub fn rowsTop(k: *K, logits: u64, cols: i64, id_map: u64, offset: i64, out: u64, rows: i64) !void {
+    return rowsTopStrided(k, logits, cols, cols, id_map, offset, out, rows);
+}
+
+/// rowsTop over rows ``stride`` elements apart (rows padded to an alignment).
+pub fn rowsTopStrided(k: *K, logits: u64, cols: i64, stride: i64, id_map: u64, offset: i64, out: u64, rows: i64) !void {
     const f = try k.ext(.sample, "fn_rows_top");
     var a: cuda.Args = .{};
-    a.add(logits); a.add(@as(i32, @intCast(cols))); a.add(@as(i32, @intCast(cols))); a.add(id_map); a.add(@as(i32, @intCast(offset))); a.add(out);
+    a.add(logits); a.add(@as(i32, @intCast(cols))); a.add(@as(i32, @intCast(stride))); a.add(id_map); a.add(@as(i32, @intCast(offset))); a.add(out);
     try k.go(f, .{ .x = @intCast(rows) }, 1024, 0, &a);
 }
