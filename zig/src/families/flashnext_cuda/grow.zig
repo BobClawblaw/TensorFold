@@ -64,29 +64,38 @@ pub const Range = struct {
         return bytes;
     }
 
-    /// Every region backed through ``positions`` (in steps of step_positions), new memory zeroed on ``stream``.
-    pub fn ensure(self: *Range, positions: i64, stream: abi.Stream) !void {
+    /// Every region backed through ``positions`` (in steps of step_positions), new memory zeroed on ``stream``. A
+    /// region's first step is a chunk of its own (``trim`` keeps exactly it, so a reused sequence maps what a new one
+    /// does once its prompt is backed: both ranks then see the same growths). ``strict``: past the budget the growth
+    /// is refused; else only a GPU out of memory refuses it (a forward's own growth, which both ranks agreed on).
+    pub fn ensure(self: *Range, positions: i64, stream: abi.Stream, strict: bool) !void {
         const want_pos = std.mem.alignForward(u64, @intCast(@max(positions, 1)), @intCast(step_positions));
         for (self.regions.items) |*r| {
             const units = std.math.divCeil(u64, want_pos, @intCast(r.per)) catch unreachable;
             const need = @min(r.cap, std.mem.alignForward(u64, units * r.bytes_per, self.gran));
-            if (need <= r.mapped) continue;
-            const grow = std.mem.alignForward(u64, need - r.mapped, self.gran);
-            if (self.budget.used + grow > self.budget.cap) return error.OutOfDeviceMemory;
-            const at = self.base + r.off + r.mapped;
-            var h: abi.MemHandle = 0;
-            const prop: abi.MemAllocationProp = .{};
-            if (self.d.api.cuMemCreate(&h, grow, &prop, 0) != abi.success) return error.OutOfDeviceMemory;
-            errdefer _ = self.d.api.cuMemRelease(h);
-            try self.d.check(self.d.api.cuMemMap(at, grow, 0, h, 0), "cuMemMap");
-            errdefer _ = self.d.api.cuMemUnmap(at, grow);
-            const access: abi.MemAccessDesc = .{};
-            try self.d.check(self.d.api.cuMemSetAccess(at, grow, &access, 1), "cuMemSetAccess");
-            try self.d.check(self.d.api.cuMemsetD8Async(at, 0, grow, stream), "zero grown cache");
-            try self.chunks.append(self.gpa, .{ .at = at, .size = grow, .handle = h });
-            self.budget.used += grow;
-            r.mapped += grow;
+            while (need > r.mapped) try self.map(r, need, stream, strict);
         }
+    }
+
+    fn map(self: *Range, r: *Region, need: u64, stream: abi.Stream, strict: bool) !void {
+        const first_units = std.math.divCeil(u64, @intCast(step_positions), @intCast(r.per)) catch unreachable;
+        const first = @min(r.cap, std.mem.alignForward(u64, first_units * r.bytes_per, self.gran));
+        const upto = if (r.mapped == 0) @min(need, first) else need;
+        const grow = std.mem.alignForward(u64, upto - r.mapped, self.gran);
+        if (strict and self.budget.used + grow > self.budget.cap) return error.OutOfDeviceMemory;
+        const at = self.base + r.off + r.mapped;
+        var h: abi.MemHandle = 0;
+        const prop: abi.MemAllocationProp = .{};
+        if (self.d.api.cuMemCreate(&h, grow, &prop, 0) != abi.success) return error.OutOfDeviceMemory;
+        errdefer _ = self.d.api.cuMemRelease(h);
+        try self.d.check(self.d.api.cuMemMap(at, grow, 0, h, 0), "cuMemMap");
+        errdefer _ = self.d.api.cuMemUnmap(at, grow);
+        const access: abi.MemAccessDesc = .{};
+        try self.d.check(self.d.api.cuMemSetAccess(at, grow, &access, 1), "cuMemSetAccess");
+        try self.d.check(self.d.api.cuMemsetD8Async(at, 0, grow, stream), "zero grown cache");
+        try self.chunks.append(self.gpa, .{ .at = at, .size = grow, .handle = h });
+        self.budget.used += grow;
+        r.mapped += grow;
     }
 
     /// Every chunk unmapped and released (the range stays reserved, for the next request).
