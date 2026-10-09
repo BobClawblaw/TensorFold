@@ -85,6 +85,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fn-ext")) return fn_ext.extCall(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-aot")) return @import("fn_native.zig").aotLoad(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-native")) return @import("fn_forward.zig").native(gpu, rest);
+    if (std.mem.eql(u8, cmd, "vision-prep")) return @import("fn_vision.zig").prep(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "fn-vision")) return @import("fn_vision.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "fn-tp")) return @import("fn_native.zig").tpLink(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "fn-weights")) return @import("fn_native.zig").weightsCheck(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
