@@ -343,6 +343,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.cost_count = 0;
     own.shared_count = 0;
     own.spare = null;
+    own.kept = .empty;
+    own.streams = max_streams;
+    own.gfull = &.{};
+    own.gbits = .{ &.{}, &.{} };
     own.mtp_ms = 0;
     if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
     // the calibration's sequence is not kept: the server budgets streams from the memory left after open
