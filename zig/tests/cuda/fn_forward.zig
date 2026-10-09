@@ -66,7 +66,7 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     const s = try fwd.newSeq(e);
     std.debug.print("rank {d}: sequence allocated, prefilling\n", .{rank});
     const tp = std.Io.Timestamp.now(io, .awake);
-    const first = try fwd.prefill(e, s, prompt);
+    const first = try fwd.prefill(e, s, prompt, 0);
     const prefill_ms = @as(f64, @floatFromInt(tp.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
     std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len, prefill_ms, first, want[0] });
 
@@ -140,7 +140,7 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         const p = try gpa.alloc(u32, n); // the reference prompt repeated to n tokens (first_tokens.py builds the same)
         for (p, 0..) |*x, j| x.* = prompt[j % prompt.len];
         const tn = std.Io.Timestamp.now(io, .awake);
-        const t = try fwd.prefill(e, s2, p);
+        const t = try fwd.prefill(e, s2, p, 0);
         const ms = @as(f64, @floatFromInt(tn.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6;
         std.debug.print("prefix of {d} tokens: first token {d} in {d:.1} ms\n", .{ n, t, ms });
         fwd.freeSeq(e, s2);
@@ -148,8 +148,46 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     try check.expect(same == count, "{d} of {d} tokens equal Python's", .{ same, count });
     check.pass("EXACT rank {d}: native forward, prefill + {d} tokens with MTP drafts equal the Python engine's", .{ rank, count });
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "shared")) try sharedCheck(e, prompt, rank);
+    for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "resume")) try resumeCheck(e, prompt, rank);
     for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "vision=")) try visionCheck(e, gpu, rank, a["vision=".len..]);
     for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "probes=")) try probesDecode(e, gpu, rank, a["probes=".len..]);
+}
+
+/// A next turn resumed from the kept point of the last (one token before its prompt's end) decodes as the same turn
+/// prefilled fresh: the prompt, then a longer one sharing all but its last token, 32 greedy tokens each way.
+fn resumeCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
+    const gpa = e.gpa;
+    const k = prompt.len - 1;
+    const next = try gpa.alloc(u32, k + 300);
+    defer gpa.free(next);
+    @memcpy(next[0..k], prompt[0..k]);
+    for (next[k..], 0..) |*x, j| x.* = prompt[(j * 7 + 3) % prompt.len];
+    var runs: [2][32]u32 = undefined;
+    for (0..2) |way| {
+        const s = try fwd.newSeq(e);
+        defer fwd.freeSeq(e, s);
+        var tok: u32 = undefined;
+        if (way == 0) {
+            s.cut_at = @intCast(next.len - 1);
+            tok = try fwd.prefill(e, s, next, 0);
+        } else {
+            s.cut_at = @intCast(k);
+            _ = try fwd.prefill(e, s, prompt, 0);
+            try check.expect(s.snap.at == @as(i64, @intCast(k)), "the kept point is at {d} (want {d})", .{ s.snap.at, k });
+            s.cut_at = @intCast(next.len - 1);
+            tok = try fwd.prefill(e, s, next, k);
+        }
+        for (&runs[way]) |*o| {
+            o.* = tok;
+            var out: [1]u32 = undefined;
+            try fwd.verify(e, s, &.{tok}, &out);
+            try fwd.keep(e, s, 1, 1);
+            tok = out[0];
+        }
+    }
+    std.debug.print("fresh:   {any}\nresumed: {any}\n", .{ runs[0][0..16], runs[1][0..16] });
+    try check.expect(std.mem.eql(u32, &runs[0], &runs[1]), "the resumed turn's 32 tokens equal the fresh turn's", .{});
+    check.pass("EXACT rank {d}: a turn resumed from its kept point ({d} of {d} prompt tokens kept) decodes as prefilled fresh", .{ rank, k, next.len });
 }
 
 /// Each probe prompt of <dir> (vision_ref.py's tokens and grid) decoded greedily (40 tokens, one row a step) with
@@ -187,7 +225,7 @@ fn probesDecode(e: *fwd.Engine, gpu: Gpu, rank: u8, dir: []const u8) !void {
             const s = try fwd.newSeq(e);
             defer fwd.freeSeq(e, s);
             try fwd.attach(e, s, pos.rows, fdev.ptr, pos.pos, pos.delta);
-            var tok = try fwd.prefill(e, s, prompt);
+            var tok = try fwd.prefill(e, s, prompt, 0);
             try out.writer.print("{s}\"{s}\": [{d}", .{ if (si > 0) ", " else "", src, tok });
             for (0..39) |_| {
                 var o: [1]u32 = undefined;
@@ -245,7 +283,7 @@ fn visionCheck(e: *fwd.Engine, gpu: Gpu, rank: u8, dir: []const u8) !void {
         const want = try ints(gpa, o.get("tokens").?);
         const count = want.len;
         var out: std.ArrayList(u32) = .empty;
-        const first = try fwd.prefill(e, s, prompt);
+        const first = try fwd.prefill(e, s, prompt, 0);
         try out.append(gpa, first);
         var drafts: [16]u32 = undefined;
         const depth: usize = 15;
@@ -296,7 +334,7 @@ fn sharedCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
     for (lens, 0..) |n, k| {
         const s = try fwd.newSeq(e);
         defer fwd.freeSeq(e, s);
-        alone[k][0] = try fwd.prefill(e, s, prompt[0..n]);
+        alone[k][0] = try fwd.prefill(e, s, prompt[0..n], 0);
         for (0..steps) |t| {
             var o: [1]u32 = undefined;
             try fwd.verify(e, s, alone[k][t .. t + 1], &o);
@@ -309,7 +347,7 @@ fn sharedCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
         var got: [lens.len][steps + 1]u32 = undefined;
         for (lens, 0..) |n, k| {
             seqs[k] = try fwd.newSeq(e);
-            got[k][0] = try fwd.prefill(e, seqs[k], prompt[0..n]);
+            got[k][0] = try fwd.prefill(e, seqs[k], prompt[0..n], 0);
         }
         defer for (seqs) |s| fwd.freeSeq(e, s);
         var t: usize = 0;
@@ -345,7 +383,7 @@ fn draftsCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
     for (lens, 0..) |n, k| {
         const s = try fwd.newSeq(e);
         defer fwd.freeSeq(e, s);
-        const first = try fwd.prefill(e, s, prompt[0..n]);
+        const first = try fwd.prefill(e, s, prompt[0..n], 0);
         alone_n[k][0] = try fwd.draftUpTo(e, s, &.{first}, depth, 0.7, &alone[k][0]);
         var win: [depth + 1]u32 = undefined;
         win[0] = first;
@@ -362,7 +400,7 @@ fn draftsCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
     var firsts: [lens.len]u32 = undefined;
     for (lens, 0..) |n, k| {
         seqs[k] = try fwd.newSeq(e);
-        firsts[k] = try fwd.prefill(e, seqs[k], prompt[0..n]);
+        firsts[k] = try fwd.prefill(e, seqs[k], prompt[0..n], 0);
     }
     defer for (seqs) |s| fwd.freeSeq(e, s);
     var got: [lens.len][2][depth]u32 = undefined;

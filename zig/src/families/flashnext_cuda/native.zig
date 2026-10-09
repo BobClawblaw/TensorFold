@@ -130,6 +130,24 @@ const Gram = struct {
     fed: usize = 0,       // reply tokens the matcher has followed
 };
 
+/// A released sequence kept to resume from (multi.py's kept): its prompt to the kept point, rank 1's id for it.
+const Kept = struct { ids: []u32, seq: *forward.Seq, id: u64 };
+
+/// Kept prompt states (engine.py KEEP).
+const keep_max = 8;
+
+/// Rank 0: drop kept state ``i`` on both ranks.
+fn dropKept(self: *Owned, i: usize) void {
+    const k = self.kept.orderedRemove(i);
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    w.int(k.id) catch {};
+    w.int(0) catch {};
+    self.send(.release, &w) catch {};
+    self.gpa.free(k.ids);
+    self.retire(k.seq);
+}
+
 /// A window's grammar rows: which rows and their bits, both ranks' halves.
 const Rows = struct {
     n: usize = 0,
@@ -234,6 +252,8 @@ const Owned = struct {
     shared_count: usize = 0,
     mtp_ms: f64 = 0, // one chained head step
     spare: ?*forward.Seq = null, // a released sequence, reset and reused by the next request (its memory, its graphs)
+    kept: std.ArrayList(Kept) = .empty, // released sequences kept at their prompts' kept points (oldest first)
+    streams: usize = max_streams, // the streams admission budgeted: active, kept and spare sequences stay within it
     gfull: []u32 = &.{}, // a grammar row's bits over the whole vocabulary
     gbits: [2][]u32 = .{ &.{}, &.{} }, // a round's grammar rows, each rank's half (rank 1: what the frames carry)
     growsbuf: [batch_rows]u32 = undefined,
@@ -362,14 +382,18 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     try w.tokens(&prompt);
     try writeSampling(&w, null);
     try w.int(0); // no grammar rows
+    try w.int(0); // nor a kept state, nor a kept point
+    try w.int(0);
+    try w.int(0);
     try self.send(.prefill, &w);
     const seq = try self.obtain();
     defer {
         w.int(id) catch {};
+        w.int(0) catch {};
         self.send(.release, &w) catch {};
         self.retire(seq);
     }
-    var tok = try forward.prefill(self.e, seq, &prompt);
+    var tok = try forward.prefill(self.e, seq, &prompt, 0);
     var ids: [max_rows]u32 = undefined;
     var out: [max_rows]u32 = undefined;
     for (1..max_rows + 1) |width| {
@@ -425,6 +449,7 @@ fn calibrateShared(self: *Owned) !void {
     var made: usize = 0;
     defer for (ids[0..made], seqs[0..made]) |id, sq| {
         w.int(id) catch {};
+        w.int(0) catch {};
         self.send(.release, &w) catch {};
         forward.freeSeq(self.e, sq);
     };
@@ -437,11 +462,11 @@ fn calibrateShared(self: *Owned) !void {
         try w.int(ids[k]);
         try w.tokens(&prompt);
         try writeSampling(&w, null);
-        try w.int(0);
+        for (0..4) |_| try w.int(0);
         try self.send(.prefill, &w);
         seqs[k] = try forward.newSeq(self.e);
         made += 1;
-        first[k] = try forward.prefill(self.e, seqs[k], &prompt);
+        first[k] = try forward.prefill(self.e, seqs[k], &prompt, 0);
     }
     const shapes = [_][2]usize{ .{ 2, 2 }, .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 16, 4 } };
     for (shapes) |sh| {
@@ -477,6 +502,11 @@ fn calibrateShared(self: *Owned) !void {
     }
     std.log.info("flash next shared rounds: 4/8/16/32/64 rows {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} ms", .{
         self.shared[0].ms, self.shared[1].ms, self.shared[2].ms, self.shared[3].ms, self.shared[4].ms });
+}
+
+/// The streams admission budgeted (native/cuda.zig after open): kept prompt states stay within them.
+pub fn setStreams(p: *anyopaque, n: usize) void {
+    of(p).streams = n;
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
@@ -571,8 +601,24 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         try self.ctx.d.check(self.ctx.d.api.cuMemcpyDtoH_v2(w0.buf.items[fat..].ptr, feats.?.ptr, rows * 2560 * 2), "image features");
         frame = try w0.buf.toOwnedSlice(self.gpa);
     }
+    // a kept prompt state this prompt extends (the longest), and the point this prompt keeps (drafting, no images)
+    const cutting = s.drafts and s.images.len == 0;
+    var reuse: ?Kept = null;
+    if (cutting) {
+        var best: ?usize = null;
+        for (self.kept.items, 0..) |k, i| {
+            if (k.ids.len < ids.len and std.mem.eql(u32, k.ids, ids[0..k.ids.len]) and (best == null or k.ids.len > self.kept.items[best.?].ids.len)) best = i;
+        }
+        if (best) |i| reuse = self.kept.orderedRemove(i);
+    }
+    errdefer if (reuse) |k| { // refused before rank 1 heard of the prompt: the state is dropped on both ranks
+        self.kept.insert(self.gpa, 0, k) catch {};
+        if (self.kept.items.len > 0 and self.kept.items[0].seq == k.seq) dropKept(self, 0);
+    };
     const gop = try self.lanes_by.getOrPut(s);
     if (gop.found_existing) self.retire(gop.value_ptr.seq);
+    // every sequence within the budgeted streams: the oldest kept states go first
+    while (self.kept.items.len > 0 and self.lanes_by.count() + self.kept.items.len + @intFromBool(self.spare != null) > self.streams) dropKept(self, 0);
     const id = self.next_id;
     self.next_id += 1;
     var w: Writer = .{ .gpa = self.gpa };
@@ -596,15 +642,24 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     try w.tokens(ids);
     try writeSampling(&w, s.sampling);
     try writeRows(&w, &grows);
+    const start: usize = if (reuse) |k| k.ids.len else 0;
+    const cut: ?i64 = if (cutting) @max(1, @as(i64, @intCast(ids.len)) - 1) else null;
+    try w.int(if (reuse) |k| k.id else 0);
+    try w.int(start);
+    try w.int(if (cut) |c| @as(u64, @intCast(c)) else 0);
     try self.send(.prefill, &w);
-    const seq = try self.obtain();
+    const seq = if (reuse) |k| k.seq else try self.obtain();
+    if (reuse) |k| self.gpa.free(k.ids);
+    reuse = null;
     seq.sampling = s.sampling;
+    seq.cut_at = cut;
+    s.cached = @intCast(start);
     if (grows.n > 0) seq.mask = .{ .rows = grows.rows[0..grows.n], .bits = grows.bits[0][0 .. grows.n * MW] };
     if (gop.found_existing) if (gop.value_ptr.g) |g| g.m.free();
     gop.value_ptr.* = .{ .seq = seq, .id = id, .g = gram };
     gram = null;
     if (pos) |q| try forward.attach(self.e, seq, q.rows, feats.?.ptr, q.pos, q.delta);
-    _ = self.take(try forward.prefill(self.e, seq, ids));
+    _ = self.take(try forward.prefill(self.e, seq, ids, start));
 }
 
 fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -823,9 +878,20 @@ fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     if (kv.value.g) |g| g.m.free();
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
+    const seq = kv.value.seq;
+    const at: usize = @intCast(seq.snap.at);
+    const kept_ids: ?[]u32 = if (at > 0 and at <= s.prompt_len) self.gpa.dupe(u32, s.context.items[0..at]) catch null else null;
     w.int(kv.value.id) catch {};
+    w.int(@intFromBool(kept_ids != null)) catch {}; // 1: rank 1 keeps it by id
     self.send(.release, &w) catch {};
-    self.retire(kv.value.seq);
+    if (kept_ids) |k| {
+        self.kept.append(self.gpa, .{ .ids = k, .seq = seq, .id = kv.value.id }) catch {
+            self.gpa.free(k);
+            self.retire(seq);
+            return;
+        };
+        while (self.kept.items.len > keep_max) dropKept(self, 0);
+    } else self.retire(seq);
 }
 
 /// Rank 1: an image frame (see prefillFn) attached to its sequence.
@@ -869,17 +935,23 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .prefill => {
                 const id = try r.int();
-                const seq = try self.obtain();
+                const toks = try r.tokens();
+                const sampling = try readSampling(&r);
+                try self.gramScratch();
+                const mask = try readRows(&r, self.growsbuf[0..], self.gbits[1]);
+                const reuse = try r.int();
+                const start: usize = @intCast(try r.int());
+                const cut = try r.int();
+                const seq = if (reuse != 0) (self.by_id.fetchRemove(reuse) orelse return error.NoSequence).value else try self.obtain();
                 try self.by_id.put(id, seq);
                 if (self.images.fetchRemove(id)) |kv| {
                     defer self.gpa.free(kv.value);
                     try attachFrame(self, seq, kv.value);
                 }
-                const toks = try r.tokens();
-                seq.sampling = try readSampling(&r);
-                try self.gramScratch();
-                seq.mask = try readRows(&r, self.growsbuf[0..], self.gbits[1]);
-                _ = try forward.prefill(self.e, seq, toks);
+                seq.sampling = sampling;
+                seq.mask = mask;
+                seq.cut_at = if (cut != 0) @intCast(cut) else null;
+                _ = try forward.prefill(self.e, seq, toks, start);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
@@ -901,7 +973,9 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 _ = try forward.draftUpTo(self.e, seq, follow, depth, cut, held[0..depth]);
             },
             .release => {
-                const kv = self.by_id.fetchRemove(try r.int()) orelse continue;
+                const rid = try r.int();
+                if (try r.int() == 1) continue; // kept: it stays under its id until a prefill resumes it or it is dropped
+                const kv = self.by_id.fetchRemove(rid) orelse continue;
                 if (kv.key == 1) { // the calibration's sequence (rank 0 frees its own at open, see there)
                     forward.freeSeq(self.e, kv.value);
                     continue;
