@@ -254,6 +254,7 @@ pub const Seq = struct {
     ple_tail: u64 = 0,
     last_streams: u64 = 0,
     grow: grow_mod.Range = undefined, // the caches that grow with the position (kc_*, ikc, pooled)
+    img: ?Image = null, // an image prompt's rotary table and (until its prefill ends) its features
     // host
     pos: i64 = 0,
     mtp_len: i64 = 0,
@@ -321,6 +322,56 @@ pub const Seq = struct {
 };
 
 pub const Options = struct { context: usize, max_rows: u32, depth: u32 };
+
+/// An image prompt on a sequence: the rotary positions of its rows ([length, 3] int32, then the decode delta) and,
+/// while the prompt is prefilled, the features that replace its image placeholder rows (``rows``: their indexes).
+pub const Image = struct {
+    table: cuda.DeviceBuffer,
+    length: i64,
+    rows: []u32,
+    feats: ?cuda.DeviceBuffer,
+
+    fn rope(im: *const Image) kern.Rope {
+        return .{ .table = im.table.ptr, .delta = im.table.ptr + deltaAt(im.length), .length = im.length };
+    }
+
+    fn deltaAt(length: i64) u64 {
+        return std.mem.alignForward(u64, @intCast(length * 12), 16);
+    }
+};
+
+/// ``s`` gets an image prompt: its rows' rotary positions (``positions`` [3, length] as the Python engine computes
+/// them), the decode ``delta``, and the features (``feats``: device bf16 [rows.len, 2560], copied) for its
+/// placeholder ``rows``. Before prefill; an image sequence runs its steps eagerly (its table is its own).
+pub fn attach(e: *Engine, s: *Seq, rows: []const u32, feats: u64, positions: []const i32, delta: i64) !void {
+    detach(e, s);
+    const length: i64 = @intCast(positions.len / 3);
+    var table = try cuda.DeviceBuffer.alloc(e.ctx.d, @intCast(Image.deltaAt(length) + 16));
+    errdefer table.free();
+    const host = try e.gpa.alloc(i32, @intCast(length * 3 + 4));
+    defer e.gpa.free(host);
+    @memset(host, 0);
+    for (0..@intCast(length)) |i| for (0..3) |a| {
+        host[i * 3 + a] = positions[a * @as(usize, @intCast(length)) + i];
+    };
+    try e.ctx.d.check(e.ctx.d.api.cuMemcpyHtoD_v2(table.ptr, host.ptr, @intCast(length * 12)), "image positions");
+    const d32: i32 = @intCast(delta);
+    try e.ctx.d.check(e.ctx.d.api.cuMemcpyHtoD_v2(table.ptr + Image.deltaAt(length), &d32, 4), "image delta");
+    var fb = try cuda.DeviceBuffer.alloc(e.ctx.d, rows.len * 2560 * 2);
+    errdefer fb.free();
+    try e.ctx.d.check(e.ctx.d.api.cuMemcpyDtoD_v2(fb.ptr, feats, rows.len * 2560 * 2), "image features");
+    s.img = .{ .table = table, .length = length, .rows = try e.gpa.dupe(u32, rows), .feats = fb };
+}
+
+pub fn detach(e: *Engine, s: *Seq) void {
+    if (s.img) |*im| {
+        im.table.free();
+        if (im.feats) |*f| f.free();
+        e.gpa.free(im.rows);
+    }
+    s.img = null;
+}
+
 
 /// One sequence's rows of a forward: rows ``row0 .. row0 + rows`` of the buffers belong to ``s`` (a shared round
 /// packs several streams' windows; a lone window or a prompt chunk is one segment from row 0).
@@ -438,7 +489,7 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
 
 /// ``body`` from its graph (captured the first time this width, parity and geometry run).
 fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
-    if (!e.use_graphs or e.k.sync_each) return body(e, kind, s, R);
+    if (!e.use_graphs or e.k.sync_each or s.img != null) return body(e, kind, s, R); // image sequences: eager, as Python
     try capture(e, kind, s, R);
     return e.graphs.get(keyOf(e, kind, s, R)).?.launchOn(e.k.stream);
 }
@@ -568,6 +619,7 @@ pub fn newSeq(e: *Engine) !*Seq {
 /// ``s`` as newSeq leaves a sequence, in its own memory (zeroed on the stream, no allocation): a server reuses one
 /// sequence's ~11 GiB at a 1M window instead of allocating and zeroing it per request, and its graphs stay valid.
 pub fn resetSeq(e: *Engine, s: *Seq) !void {
+    detach(e, s);
     const mem = s.mem;
     var g = s.grow;
     g.shrink(); // the caches' memory back to the budget (mapped again, zeroed, as the next request grows)
@@ -593,6 +645,7 @@ pub fn freeSeq(e: *Engine, s: *Seq) void {
         var ex = e.graphs.fetchRemove(key).?.value;
         ex.deinit();
     }
+    detach(e, s);
     s.grow.deinit();
     s.mem.free();
     e.gpa.destroy(s);
@@ -686,8 +739,8 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
         const s = sg.s;
         const pos = if (mtp) s.mtp_pos else s.pos_dev;
         try kern.attnPrep(k, rowAt(b.pa, sg.row0, 7296 * 2), pos, a.q_scale, a.k_scale, a.iq_scale, e.inv_freq, rowAt(b.q, sg.row0, 12 * 256 * 2),
-            s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows);
-        try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, sg.rows);
+            s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows, if (s.img) |*im| im.rope() else null);
+        try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, sg.rows, if (s.img) |*im| im.rope() else null);
     }
     if (b.prefill) {
         const s = segs[0].s; // a prompt chunk: one sequence
@@ -835,6 +888,27 @@ fn stage(e: *Engine, b: *Buffers, s: *const Seq, tokens: []const i64) !void {
     try e.k.upload(b.ple_v, std.mem.sliceAsBytes(e.valbuf[0 .. n * heads * e.ng.width]));
 }
 
+/// An image prompt's features over its placeholder rows in this piece (rows s.pos .. s.pos + rows of the prompt).
+fn splice(e: *Engine, b: *Buffers, sg: Seg) !void {
+    const im = &(sg.s.img orelse return);
+    const fb = im.feats orelse return;
+    var pairs: std.ArrayList(i32) = .empty;
+    defer pairs.deinit(e.gpa);
+    for (im.rows, 0..) |p, i| {
+        const at: i64 = p;
+        if (at >= sg.s.pos and at < sg.s.pos + sg.rows) try pairs.appendSlice(e.gpa, &.{ @intCast(sg.row0 + at - sg.s.pos), @intCast(i) });
+    }
+    if (pairs.items.len == 0) return;
+    var dp = try cuda.DeviceBuffer.alloc(e.ctx.d, pairs.items.len * 4);
+    defer dp.free();
+    try e.k.upload(dp.ptr, std.mem.sliceAsBytes(pairs.items));
+    const f = try e.k.ext(.vision, "fn_vis_splice");
+    var a: cuda.Args = .{};
+    a.add(b.h); a.add(fb.ptr); a.add(dp.ptr); a.add(@as(i32, @intCast(D))); a.add(@as(i32, 4));
+    try e.k.go(f, .{ .x = @intCast(pairs.items.len / 2) }, 256, 0, &a);
+    try e.k.stream.synchronize(); // the pairs' buffer is freed on return
+}
+
 /// stage for a shared round: every part's ids, each part's n-gram rows from its own history, then one upload each.
 fn stageParts(e: *Engine, b: *Buffers, parts: []const Part, segs: []const Seg) !void {
     const heads = e.ng.heads;
@@ -856,6 +930,7 @@ fn stageParts(e: *Engine, b: *Buffers, parts: []const Part, segs: []const Seg) !
 
 fn mainForward(e: *Engine, b: *Buffers, segs: []const Seg, R: i64) !Pending {
     try kern.embed(&e.k, b.ids, e.embed, b.h, R, 4);
+    for (segs) |sg| try splice(e, b, sg);
     var pending: ?Pending = null;
     for (e.layers) |l| pending = try layerForward(e, b, segs, l, R, pending, false);
     return pending.?;
@@ -942,6 +1017,7 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
     defer e.gpa.free(prompt);
     for (prompt_u, prompt) |t, *x| x.* = t;
     if (prompt.len == 0) return error.EmptyPrompt;
+    if (s.img) |im| if (im.length != @as(i64, @intCast(prompt.len))) return error.ImageLengthMismatch;
     if (@as(i64, @intCast(prompt.len)) + @as(i64, e.opts.depth) + 1 > e.capacity) return error.PromptTooLong;
     const b = &e.pbuf;
     var at: usize = 0;
@@ -984,6 +1060,10 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
     s.fresh = true;
     s.mtp_drafted = 0;
     try e.k.stream.synchronize();
+    if (s.img) |*im| if (im.feats) |*f| { // the features end with the prompt; the rotary table stays for decode
+        f.free();
+        im.feats = null;
+    };
     return @intCast(first.tok);
 }
 
