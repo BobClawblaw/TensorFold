@@ -271,6 +271,7 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 37) % 5000);
     try w.int(id);
     try w.tokens(&prompt);
+    try writeSampling(&w, null);
     try self.send(.prefill, &w);
     const seq = try self.obtain();
     defer {
@@ -344,6 +345,7 @@ fn calibrateShared(self: *Owned) !void {
         self.next_id += 1;
         try w.int(ids[k]);
         try w.tokens(&prompt);
+        try writeSampling(&w, null);
         try self.send(.prefill, &w);
         seqs[k] = try forward.newSeq(self.e);
         made += 1;
