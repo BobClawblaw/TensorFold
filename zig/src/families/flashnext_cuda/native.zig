@@ -335,6 +335,15 @@ const Owned = struct {
     }
 };
 
+/// TENSORFOLD_GROWTH_LIMIT_MIB: this rank's sequences' caches grow by this much at most past what is mapped when the
+/// calibration ends (a test's budget: growths refused with short prompts, on either rank alone).
+fn growthLimit(e: *forward.Engine) void {
+    const v = std.c.getenv("TENSORFOLD_GROWTH_LIMIT_MIB") orelse return;
+    const mib = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return;
+    forward.setGrowthBudget(e, @min(e.budget.cap, e.budget.used + (mib << 20)));
+    std.log.info("flash next: cache growth within {d} MiB ({d} MiB mapped)", .{ e.budget.cap >> 20, e.budget.used >> 20 });
+}
+
 /// Every lane's caches backed through its target before rank 1 hears of the round: rank 0 grows first, then rank 1
 /// (a .grow frame it answers), so a growth refused on either rank refuses the round on both before any forward (one
 /// refused on one rank alone left the other in a forward whose collectives never met). The streams refused wait in
@@ -446,7 +455,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.gfull = &.{};
     own.gbits = .{ &.{}, &.{} };
     own.mtp_ms = 0;
-    if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
+    if (o.rank == 0) { // rank 1 replays it in its follow loop, then hears it ended
+        try calibrate(own, o.drafts);
+        try own.link.send(@intFromEnum(Op.ready), "");
+        growthLimit(own.e);
+    }
     // the calibration's sequence is not kept: the server budgets streams from the memory left after open
     while (own.spares.pop()) |sp| forward.freeSeq(own.e, sp);
     return .{
@@ -1264,7 +1277,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 self.retire(kv.value);
             },
             .stop => return,
-            .ready => {},
+            .ready => growthLimit(self.e), // the calibration ended
             .grow => { // rank 0 grew these sequences' caches for its next frame: rank 1 grows them too, and answers
                 const n: usize = @intCast(try r.int());
                 if (n == 0 or n > max_streams) return error.TooManyStreams;
