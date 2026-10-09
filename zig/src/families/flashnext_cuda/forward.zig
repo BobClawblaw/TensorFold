@@ -873,6 +873,17 @@ fn peek(e: *Engine, what: []const u8, at: u64, f32_: bool) void {
 }
 
 fn mtpCompute(e: *Engine, b: *Buffers, s: *Seq, n: i64) !void {
+    return mtpComputeSegs(e, b, &.{.{ .s = s, .rows = n }}, n);
+}
+
+/// The draft head's logits rows (a stream's row k of a batched level at ``k * head_stride`` elements, 16-aligned).
+fn headStride(e: *const Engine) i64 {
+    return std.mem.alignForward(i64, e.dh.n, 8);
+}
+
+/// mtpCompute over several streams' rows (a batched draft level): the MTP layer over every row, each stream's
+/// attention on its own MTP cache, and the draft head on each stream's last row into logits row k.
+fn mtpComputeSegs(e: *Engine, b: *Buffers, segs: []const Seg, n: i64) !void {
     const k = &e.k;
     const m = e.mtp;
     defer if (k.sync_each and b.prefill) {
@@ -892,13 +903,13 @@ fn mtpCompute(e: *Engine, b: *Buffers, s: *Seq, n: i64) !void {
     try kern.rmsnorm(k, b.mtp_in, m.norm_h, b.mtp_hn, b.mtp_xh, WIDE, n, WIDE);
     try kern.matmul(k, b.mtp_hn, D, m.fc_h, b.mtp_hs, D, false, n * 4, b.kpart);
     try kern.addStreams(k, b.mtp_eo, b.mtp_hs, b.h, n);
-    const pending = try layerForward(e, b, &.{.{ .s = s, .rows = n }}, m.layer, n, null, true);
+    const pending = try layerForward(e, b, segs, m.layer, n, null, true);
     _ = try finish(e, b, m.mixer, n, pending);
     if (b.prefill) {
         try kern.qmmPrefill(k, b.mixed, e.dh, b.logits);
-    } else {
-        const last: u64 = @intCast(n - 1);
-        try kern.qmmDecode(k, b.mixed + last * D * 2, b.xs_mixed + last * (D / 32) * 4, e.dh, b.logits, 0);
+    } else for (segs, 0..) |sg, j| {
+        const last: u64 = @intCast(sg.row0 + sg.rows - 1);
+        try kern.qmmDecode(k, b.mixed + last * D * 2, b.xs_mixed + last * (D / 32) * 4, e.dh, b.logits + j * @as(u64, @intCast(headStride(e))) * 2, 0);
     }
     if (k.sync_each and !b.prefill) {
         peek(e, "w.mtp_hs", b.mtp_hs, false);
@@ -908,7 +919,11 @@ fn mtpCompute(e: *Engine, b: *Buffers, s: *Seq, n: i64) !void {
         peek(e, "w.g_moe", b.g_moe, true);
         peek(e, "w.logits", b.logits, false);
     }
-    try candidates(e, b, b.logits, e.dh.n, e.draft_ids.ptr, 0, 1);
+    if (segs.len == 1) try candidates(e, b, b.logits, e.dh.n, e.draft_ids.ptr, 0, 1) else {
+        const rows: i64 = @intCast(segs.len);
+        try kern.rowsTopStrided(k, b.logits, e.dh.n, headStride(e), e.draft_ids.ptr, 0, b.cand, rows);
+        try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(b.cand, b.gath, @intCast(4 * rows), .i32, e.ctx.comm, k.stream.handle), "candidates");
+    }
 }
 
 fn setPos(e: *Engine, s: *Seq, pos: i64) !void {
@@ -1062,6 +1077,84 @@ pub fn keep(e: *Engine, s: *Seq, rows: u32, kept: u32) !void {
 /// decode.draft: the MTP head absorbs the kept rows (``follow``: the token after each), then chains ``depth`` drafts.
 pub fn draft(e: *Engine, s: *Seq, follow: []const u32, depth: u32, out: []u32) !void {
     _ = try draftUpTo(e, s, follow, depth, 0, out);
+}
+
+/// One stream's request in a batched draft: the token after each kept row, how deep to draft, where the drafts and
+/// the head's chance for each go; ``got`` is how many it drafted.
+pub const DraftReq = struct { s: *Seq, follow: []const u32, depth: u32, out: []u32, probs: []f64, got: usize = 0 };
+
+/// draftUpTo for several streams at once: each level one MTP forward over every stream still chaining (the absorb
+/// over each stream's kept rows first), one read-back a level; the same drafts each would get alone.
+pub fn draftBatch(e: *Engine, reqs: []DraftReq, confidence: f64) !void {
+    if (reqs.len == 0) return;
+    if (reqs.len > max_parts) return error.TooManyParts;
+    const k = &e.k;
+    const b = &e.mbuf;
+    var segs: [max_parts]Seg = undefined;
+    var R: i64 = 0;
+    for (reqs, 0..) |*r, i| {
+        const s = r.s;
+        const n: i64 = @intCast(r.follow.len);
+        if (s.mtp_drafted > 0) {
+            try setMtpLen(e, s, s.mtp_len - s.mtp_drafted);
+            s.mtp_drafted = 0;
+        }
+        try room(e, s, n + r.depth + 1);
+        for (r.follow, 0..) |t, j| e.idbuf[@as(usize, @intCast(R)) + j] = @intCast(t);
+        if (s.fresh) {
+            try k.copy(rowAt(b.mtp_in, R, WIDE * 2), s.last_streams, WIDE * 2);
+            s.fresh = false;
+        } else try k.copy(rowAt(b.mtp_in, R, WIDE * 2), rowAt(e.buf.streams, s.last_row0, WIDE * 2), @intCast(n * WIDE * 2));
+        segs[i] = .{ .s = s, .row0 = R, .rows = n };
+        r.got = 0;
+        R += n;
+    }
+    if (R > b.rows) return error.WindowTooWide;
+    try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..@intCast(R)]));
+    try mtpComputeSegs(e, b, segs[0..reqs.len], R);
+    for (reqs, segs[0..reqs.len]) |r, sg| try setMtpLen(e, r.s, r.s.mtp_len + sg.rows);
+    // levels: who chains on, and the row of b.streams its next input comes from
+    var live: [max_parts]usize = undefined;
+    var from: [max_parts]i64 = undefined;
+    var nlive: usize = reqs.len;
+    for (0..reqs.len) |i| {
+        live[i] = i;
+        from[i] = segs[i].row0 + segs[i].rows - 1;
+    }
+    var j: u32 = 0;
+    var picks: [max_parts]Pick = undefined;
+    while (nlive > 0) : (j += 1) {
+        try readPicks(e, b, @intCast(nlive), picks[0..nlive]);
+        var next: usize = 0;
+        var row: i64 = 0;
+        for (live[0..nlive], 0..) |i, m| {
+            const r = &reqs[i];
+            if (j >= r.depth) continue;
+            const p = picks[m];
+            const low = confidence > 0 and p.p < confidence;
+            if (low and j > 0) continue;
+            r.out[r.got] = @intCast(p.tok);
+            r.probs[r.got] = p.p;
+            r.got += 1;
+            if (low or j + 1 >= r.depth) continue;
+            // chains on: its pick as the next row's id, its last row's streams as the next row's input
+            e.idbuf[@intCast(row)] = @intCast(p.tok);
+            try k.copy(rowAt(b.mtp_in, row, WIDE * 2), rowAt(b.streams, from[m], WIDE * 2), WIDE * 2);
+            segs[next] = .{ .s = r.s, .row0 = row, .rows = 1 };
+            live[next] = i;
+            from[next] = row;
+            next += 1;
+            row += 1;
+        }
+        nlive = next;
+        if (nlive == 0) break;
+        try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..nlive]));
+        try mtpComputeSegs(e, b, segs[0..nlive], @intCast(nlive));
+        for (segs[0..nlive]) |sg| {
+            try setMtpLen(e, sg.s, sg.s.mtp_len + 1);
+            sg.s.mtp_drafted += 1;
+        }
+    }
 }
 
 /// ``draft`` that stops before a later draft the head gives under ``confidence`` (0: never; the first draft stays).

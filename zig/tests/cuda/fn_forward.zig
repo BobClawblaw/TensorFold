@@ -196,4 +196,78 @@ fn sharedCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
         try check.expect(same == lens.len * (steps + 1), "shared {d}-row rounds: {d} of {d} tokens equal", .{ w, same, lens.len * (steps + 1) });
     }
     check.pass("EXACT rank {d}: shared rounds over {d} streams equal each stream alone", .{ rank, lens.len });
+    try draftsCheck(e, prompt, rank);
+}
+
+/// Batched drafts against lone ones: each stream drafts after its prompt, verifies the drafts, keeps the agreeing
+/// prefix and drafts again; alone (draftUpTo, verify) and together (draftBatch, verifyShared): same drafts.
+fn draftsCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
+    const lens = [_]usize{ 2695, 1500, 333 };
+    const depth = 6;
+    var alone: [lens.len][2][depth]u32 = undefined;
+    var alone_n: [lens.len][2]usize = undefined;
+    for (lens, 0..) |n, k| {
+        const s = try fwd.newSeq(e);
+        defer fwd.freeSeq(e, s);
+        const first = try fwd.prefill(e, s, prompt[0..n]);
+        alone_n[k][0] = try fwd.draftUpTo(e, s, &.{first}, depth, 0.7, &alone[k][0]);
+        var win: [depth + 1]u32 = undefined;
+        win[0] = first;
+        @memcpy(win[1..][0..alone_n[k][0]], alone[k][0][0..alone_n[k][0]]);
+        const R = 1 + alone_n[k][0];
+        var o: [depth + 1]u32 = undefined;
+        try fwd.verify(e, s, win[0..R], o[0..R]);
+        var kept: usize = 1;
+        while (kept < R and o[kept - 1] == win[kept]) kept += 1;
+        try fwd.keep(e, s, @intCast(R), @intCast(kept));
+        alone_n[k][1] = try fwd.draftUpTo(e, s, o[0..kept], depth, 0.7, &alone[k][1]);
+    }
+    var seqs: [lens.len]*fwd.Seq = undefined;
+    var firsts: [lens.len]u32 = undefined;
+    for (lens, 0..) |n, k| {
+        seqs[k] = try fwd.newSeq(e);
+        firsts[k] = try fwd.prefill(e, seqs[k], prompt[0..n]);
+    }
+    defer for (seqs) |s| fwd.freeSeq(e, s);
+    var got: [lens.len][2][depth]u32 = undefined;
+    var probs: [lens.len][depth]f64 = undefined;
+    var reqs: [lens.len]fwd.DraftReq = undefined;
+    for (&reqs, 0..) |*r, k| r.* = .{ .s = seqs[k], .follow = firsts[k .. k + 1], .depth = depth, .out = &got[k][0], .probs = &probs[k] };
+    try fwd.draftBatch(e, &reqs, 0.7);
+    var same: usize = 0;
+    var total: usize = 0;
+    var wins: [lens.len][depth + 1]u32 = undefined;
+    var parts: [lens.len]fwd.Part = undefined;
+    for (0..lens.len) |k| {
+        total += 1;
+        if (reqs[k].got == alone_n[k][0] and std.mem.eql(u32, got[k][0][0..reqs[k].got], alone[k][0][0..alone_n[k][0]])) same += 1;
+        wins[k][0] = firsts[k];
+        @memcpy(wins[k][1..][0..reqs[k].got], got[k][0][0..reqs[k].got]);
+        parts[k] = .{ .s = seqs[k], .ids = wins[k][0 .. 1 + reqs[k].got] };
+    }
+    var out: [lens.len * (depth + 1)]u32 = undefined;
+    var nrows: usize = 0;
+    for (parts) |p| nrows += p.ids.len;
+    try fwd.verifyShared(e, &parts, out[0..nrows]);
+    var follows: [lens.len][depth + 1]u32 = undefined;
+    var r0: usize = 0;
+    for (parts, 0..) |p, k| {
+        const R = p.ids.len;
+        const o = out[r0..][0..R];
+        var kept: usize = 1;
+        while (kept < R and o[kept - 1] == p.ids[kept]) kept += 1;
+        @memcpy(follows[k][0..kept], o[0..kept]);
+        reqs[k] = .{ .s = seqs[k], .follow = follows[k][0..kept], .depth = depth, .out = &got[k][1], .probs = &probs[k] };
+        r0 += R;
+    }
+    // a shared round drafts before it keeps: the drafts read the verify's rows, then each keeps its prefix
+    for (parts, 0..) |p, k| try fwd.keep(e, seqs[k], @intCast(p.ids.len), @intCast(reqs[k].follow.len));
+    try fwd.draftBatch(e, &reqs, 0.7);
+    for (0..lens.len) |k| {
+        total += 1;
+        if (reqs[k].got == alone_n[k][1] and std.mem.eql(u32, got[k][1][0..reqs[k].got], alone[k][1][0..alone_n[k][1]])) same += 1;
+    }
+    std.debug.print("rank {d}: batched drafts over {d} streams: {d} of {d} draft runs equal the lone runs\n", .{ rank, lens.len, same, total });
+    try check.expect(same == total, "batched drafts: {d} of {d} equal", .{ same, total });
+    check.pass("EXACT rank {d}: batched drafts over {d} streams equal each stream's own", .{ rank, lens.len });
 }
