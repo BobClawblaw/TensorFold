@@ -33,6 +33,7 @@ pub const Config = struct {
     default_max_tokens: i64 = 4096,
     tool_system: ?[]const u8 = null, // --tool-system (trimmed; null when empty)
     vision_max_images: usize = 4, // --vision-max-images
+    vision_urls: bool = false, // --vision-urls: public HTTPS media URLs are fetched (media_fetch.zig)
     vision_image_tokens: u64 = 4096, // --vision-image-tokens: the visual tokens a request's images share
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,

@@ -6,6 +6,7 @@
 //! for each frame group of a video. The template copies the text, and one tokenization gives Python's ids.
 
 const std = @import("std");
+const media_fetch = @import("media_fetch.zig");
 const api = @import("engine_api");
 const json = @import("json.zig");
 const errors = @import("errors.zig");
@@ -85,17 +86,29 @@ fn hasImages(messages: Value) bool {
     return false;
 }
 
-/// The bytes of a ``data:<type>;base64,<data>`` URL.
-fn dataBytes(cx: *Cx, url: []const u8, limit: usize) errors.Refused![]u8 {
-    if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://"))
-        return cx.refuse("image URLs are not fetched by this server; send the image as a data: URL (base64)");
-    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("an image must be a data: URL with base64 bytes");
+const image_media = [_][]const u8{ "image/jpeg", "image/png", "image/webp" };
+const video_media = [_][]const u8{ "video/mp4", "video/webm", "video/quicktime", "video/x-matroska" };
+
+/// The bytes of a ``data:<type>;base64,<data>`` URL, or (--vision-urls) of a public HTTPS URL, fetched before
+/// ``deadline`` (images.py _check_source and load_images).
+fn dataBytes(srv: *Server, cx: *Cx, url: []const u8, limit: usize, kind: Kind, deadline: std.Io.Timestamp) errors.Refused![]u8 {
+    if (!std.mem.startsWith(u8, url, "data:")) {
+        if (!std.mem.startsWith(u8, url, "https://")) return cx.refuse(if (kind == .image) "images require data URLs or public HTTPS URLs" else "videos require data URLs or public HTTPS URLs");
+        if (!srv.config.vision_urls) return cx.refuse("image URLs are off on this server; send the image as a data URL, or start the server with --vision-urls");
+        if (url.len > media_fetch.max_url_chars) return cx.refuse("image URL is too long");
+        var f: media_fetch.Failure = .{};
+        const got = media_fetch.fetch(cx.a, srv.io, url, limit, deadline, if (kind == .image) &image_media else &video_media, &f) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Media => return cx.fail(.request, "{s}", .{f.text}),
+        };
+        return got.data;
+    }
     const comma = std.mem.indexOfScalar(u8, url, ',') orelse return cx.refuse("an image data: URL needs a comma before its bytes");
     if (!std.mem.endsWith(u8, url[0..comma], ";base64")) return cx.refuse("an image data: URL must be base64-encoded");
     const b64 = url[comma + 1 ..];
     const dec = std.base64.standard.Decoder;
     const n = dec.calcSizeForSlice(b64) catch return cx.refuse("an image's base64 bytes are invalid");
-    if (n > limit) return cx.refuse(if (limit == max_bytes_one) "an image exceeds the 10 MiB limit" else "a video exceeds the 16 MiB limit");
+    if (n > limit) return cx.refuse(if (kind == .image) "an image exceeds the 10 MiB limit (20 MiB for a request's media together)" else "a video exceeds the 16 MiB limit (20 MiB for a request's media together)");
     const out = try cx.a.alloc(u8, n);
     dec.decode(out, b64) catch return cx.refuse("an image's base64 bytes are invalid");
     return out;
@@ -137,9 +150,10 @@ pub fn extract(srv: *Server, cx: *Cx, messages: ?Value) errors.Refused!?Extracte
     const texts = try cx.a.alloc([]const u8, slots.items.len);
     var total_bytes: usize = 0;
     var total_pixels: u64 = 0;
+    const deadline = std.Io.Clock.awake.now(srv.io).addDuration(.fromSeconds(media_fetch.total_s)); // every URL's download
     for (slots.items, 0..) |sl, k| {
         const url = sl.url orelse return cx.refuse(if (sl.kind == .image) "an image part needs an image_url with a url" else "a video part needs a video_url with a url");
-        const bytes = try dataBytes(cx, url, if (sl.kind == .image) max_bytes_one else max_video_bytes);
+        const bytes = try dataBytes(srv, cx, url, @min(if (sl.kind == .image) max_bytes_one else max_video_bytes, max_bytes_all - total_bytes), sl.kind, deadline);
         total_bytes += bytes.len;
         if (total_bytes > max_bytes_all) return cx.refuse("a request's images and videos exceed the 20 MiB limit");
         var text: std.ArrayList(u8) = .empty;
