@@ -68,7 +68,7 @@ __device__ __forceinline__ void lse_merge(float& m, float& s, float m2, float s2
     m = mm;
 }
 
-extern "C" __global__ void __launch_bounds__(256) fn_rows_topk(const __nv_bfloat16* __restrict__ logits, int cols,
+extern "C" __global__ void __launch_bounds__(256) fn_cand_topk(const __nv_bfloat16* __restrict__ logits, int cols,
         int stride, int offset, const float* __restrict__ inv_t, int* __restrict__ out) {
     const int row = blockIdx.x;
     const __nv_bfloat16* x = logits + (size_t)row * stride;

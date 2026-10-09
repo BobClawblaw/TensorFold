@@ -1098,7 +1098,7 @@ fn rows_for(opts: Options) i64 {
 const Want = struct { row: usize, s: lanes.Sampling, position: u64 };
 
 /// The sampled rows' tokens into ``out`` (by row): each rank's 64 candidates of every row and its log-sum-exps
-/// (fn_rows_topk at each row's temperature), gathered, drawn on the host (draw.zig); a rule past the candidates draws
+/// (fn_cand_topk at each row's temperature), gathered, drawn on the host (draw.zig); a rule past the candidates draws
 /// over the row's gathered logits. Both ranks run it with the same rows and rules, so their gathers pair up.
 fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want, out: []u32) !void {
     if (want.len == 0) return;
@@ -1107,7 +1107,7 @@ fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want,
     for (want) |w| inv[w.row] = @floatCast(1.0 / @max(w.s.temperature, 1e-6));
     try k.upload(b.invt, std.mem.sliceAsBytes(inv[0..@intCast(rows)]));
     {
-        const f = try k.ext(.sample, "fn_rows_topk");
+        const f = try k.ext(.sample, "fn_cand_topk");
         var a: cuda.Args = .{};
         a.add(logits); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(e.vocab_offset)));
         a.add(b.invt); a.add(b.tk);
