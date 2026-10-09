@@ -38,6 +38,9 @@ pub const Tower = struct {
     linears: std.AutoHashMap(LinKey, cuda.cublaslt.Linear),
     ws: cuda.DeviceBuffer,
     ws_len: usize = 64 << 20,
+    /// The residual stream in fp32 between blocks (the blocks still compute in bf16): fewer roundings than torch's
+    /// bf16 tower, the features nearer its exact arithmetic.
+    precise: bool = true,
 
     /// The tower's tensors from ``dir``/model-visual.safetensors (bf16), onto the device in one allocation.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8) !Tower {
@@ -209,7 +212,7 @@ pub const Tower = struct {
         }
         // scratch: x, normed, qkv, q/k/vt, attention out, mlp, the fp32 products
         const big = @max(@max(N * 3 * H, N * MLP), N * PATCH);
-        var scratch = try cuda.DeviceBuffer.alloc(d, @intCast(N * H * 2 * 3 + big * 2 + big * 4 + N * 3 * H * 2 + CHUNK * N * 6 + CHUNK * HD * 2 + N * 16 + N * 32 + N * H * 2));
+        var scratch = try cuda.DeviceBuffer.alloc(d, @intCast(N * H * 2 * 3 + big * 2 + big * 4 + N * 3 * H * 2 + CHUNK * N * 6 + CHUNK * HD * 4 + CHUNK * 4 + 1024 + N * H * 4 + N * 16 + N * 32 + N * H * 2));
         defer scratch.free();
         var at: u64 = scratch.ptr;
         const take = struct {
@@ -220,6 +223,7 @@ pub const Tower = struct {
             }
         }.f;
         const x = take(&at, N * H * 2);
+        const x32 = take(&at, N * H * 4);
         const xn = take(&at, N * H * 2);
         const att = take(&at, N * H * 2);
         const big16 = take(&at, big * 2);
@@ -229,7 +233,8 @@ pub const Tower = struct {
         const vt = take(&at, N * H * 2);
         const sc = take(&at, CHUNK * N * 4);
         const pr = take(&at, CHUNK * N * 2);
-        const oh = take(&at, CHUNK * HD * 2);
+        const oh = take(&at, CHUNK * HD * 4);
+        const sums = take(&at, CHUNK * 4);
         const dpos = take(&at, N * 8);
         const didx = take(&at, N * 16);
         const dwts = take(&at, N * 16);
@@ -252,8 +257,9 @@ pub const Tower = struct {
             try k.go(f, grid1(N * H), 256, 0, &a);
         }
         const scale: f32 = 1.0 / @sqrt(@as(f32, HD));
+        if (t.precise) try t.call1(k, "fn_vis_to_f32", x, x32, N * H);
         for (t.blocks) |bl| {
-            try layernorm(k, x, bl.n1w, bl.n1b, xn, N, H);
+            if (t.precise) try t.ln32(k, x32, bl.n1w, bl.n1b, xn, N) else try layernorm(k, x, bl.n1w, bl.n1b, xn, N, H);
             try t.dense(k, xn, bl.qkv_w, bl.qkv_b, big16, acc, N, 3 * H, H, 0);
             {
                 const f = try k.ext(.vision, "fn_vis_rope_split");
@@ -278,14 +284,14 @@ pub const Tower = struct {
                         {
                             const f = try k.ext(.vision, "fn_vis_softmax");
                             var a: cuda.Args = .{};
-                            a.add(sc); a.add(pr); a.add(@as(i32, @intCast(n))); a.add(scale);
+                            a.add(sc); a.add(pr); a.add(sums); a.add(@as(i32, @intCast(n))); a.add(scale);
                             try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
                         }
                         try t.valuesProduct(k, pr, vt, h, s0, n, N, rows, oh);
                         {
                             const f = try k.ext(.vision, "fn_vis_head_out");
                             var a: cuda.Args = .{};
-                            a.add(oh); a.add(att + @as(u64, @intCast((s0 + c) * H * 2))); a.add(@as(i32, @intCast(rows)));
+                            a.add(oh); a.add(sums); a.add(att + @as(u64, @intCast((s0 + c) * H * 2))); a.add(@as(i32, @intCast(rows)));
                             a.add(@as(i32, @intCast(HEADS))); a.add(@as(i32, @intCast(HD))); a.add(@as(i32, @intCast(h)));
                             try k.go(f, grid1(rows * HD), 256, 0, &a);
                         }
@@ -294,23 +300,39 @@ pub const Tower = struct {
                 s0 += n;
             }
             try t.dense(k, att, bl.proj_w, bl.proj_b, xn, acc, N, H, H, 0);
-            try add(k, x, xn, N * H);
-            try layernorm(k, x, bl.n2w, bl.n2b, xn, N, H);
+            if (t.precise) try t.call1(k, "fn_vis_add32", x32, xn, N * H) else try add(k, x, xn, N * H);
+            if (t.precise) try t.ln32(k, x32, bl.n2w, bl.n2b, xn, N) else try layernorm(k, x, bl.n2w, bl.n2b, xn, N, H);
             try t.dense(k, xn, bl.fc1_w, bl.fc1_b, big16, acc, N, MLP, H, 1);
             try t.dense(k, big16, bl.fc2_w, bl.fc2_b, xn, acc, N, H, MLP, 0);
-            try add(k, x, xn, N * H);
+            if (t.precise) try t.call1(k, "fn_vis_add32", x32, xn, N * H) else try add(k, x, xn, N * H);
         }
         // merger: LayerNorm per patch, four patches a row (they are adjacent), fc1 + exact GELU, fc2 to the model's width
-        try layernorm(k, x, t.mn_w, t.mn_b, xn, N, H);
+        if (t.precise) try t.ln32(k, x32, t.mn_w, t.mn_b, xn, N) else try layernorm(k, x, t.mn_w, t.mn_b, xn, N, H);
         const M = @divExact(N, MERGE * MERGE);
         try t.dense(k, xn, t.m1_w, t.m1_b, big16, acc, M, 4 * H, 4 * H, 2);
         try t.dense(k, big16, t.m2_w, t.m2_b, out, acc, M, OUT, 4 * H, 0);
     }
 
-    /// O[rows, 72] = P[rows, n] . V^T where V^T is head h's columns s0 .. s0 + n of vt [H, 72, N]: a product with the
+    fn call1(t: *Tower, k: *kern.K, name: []const u8, a0: u64, a1: u64, n: i64) !void {
+        _ = t;
+        const f = try k.ext(.vision, name);
+        var a: cuda.Args = .{};
+        a.add(a0); a.add(a1); a.add(n);
+        try k.go(f, grid1(n), 256, 0, &a);
+    }
+
+    fn ln32(t: *Tower, k: *kern.K, x: u64, w: u64, bias: u64, y: u64, rows: i64) !void {
+        _ = t;
+        const f = try k.ext(.vision, "fn_vis_layernorm32");
+        var a: cuda.Args = .{};
+        a.add(x); a.add(w); a.add(bias); a.add(y); a.add(@as(i32, @intCast(H))); a.add(EPS);
+        try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
+    }
+
+    /// O[rows, 72] (fp32) = P[rows, n] . V^T where V^T is head h's columns s0 .. s0 + n of vt [H, 72, N]: a product with the
     /// weight's rows N apart (a plan for that leading dimension).
     fn valuesProduct(t: *Tower, k: *kern.K, p: u64, vt: u64, h: i64, s0: i64, n: i64, N: i64, rows: i64, out: u64) !void {
-        if (n == N) return t.linear(k, p, vt + @as(u64, @intCast(h * HD * N * 2)), out, rows, HD, n, false);
+        if (n == N) return t.linear(k, p, vt + @as(u64, @intCast(h * HD * N * 2)), out, rows, HD, n, true);
         // several images: copy this image's columns into a contiguous [72, n] block first
         var tmp = try cuda.DeviceBuffer.alloc(t.d, @intCast(HD * n * 2));
         defer tmp.free();
@@ -319,7 +341,7 @@ pub const Tower = struct {
             const src = vt + @as(u64, @intCast(((h * HD + r) * N + s0) * 2));
             try t.d.check(t.d.api.cuMemcpyDtoDAsync_v2(tmp.ptr + @as(u64, @intCast(r * n * 2)), src, @intCast(n * 2), k.stream.handle), "vision values");
         }
-        try t.linear(k, p, tmp.ptr, out, rows, HD, n, false);
+        try t.linear(k, p, tmp.ptr, out, rows, HD, n, true);
         try k.stream.synchronize(); // tmp is freed on return
     }
 };

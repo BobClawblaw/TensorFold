@@ -317,6 +317,7 @@ pub const LaneHost = struct {
             .loop_guard = r.loop_guard,
             .chunks = r.chunks,
             .reuse = reuse,
+            .images = r.images,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");

@@ -105,6 +105,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .served_name = s.served,
         .model_ids = ids.items,
         .default_max_tokens = args.max_tokens,
+        .vision_max_images = @intCast(@max(args.vision_max_images, 1)),
+        .vision_image_tokens = @intCast(std.math.clamp(args.vision_image_tokens, 1, 65536)),
         .tool_system = if (args.tool_system) |t| (if (std.mem.trim(u8, t, " \t\r\n").len > 0) std.mem.trim(u8, t, " \t\r\n") else null) else null,
         .enable_thinking = args.thinking,
         .reasoning_effort = args.reasoning_effort,
