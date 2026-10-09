@@ -200,6 +200,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.spare = null;
     own.mtp_ms = 0;
     if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
+    // the calibration's sequence is not kept: the server budgets streams from the memory left after open
+    if (own.spare) |sp| {
+        forward.freeSeq(own.e, sp);
+        own.spare = null;
+    }
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
@@ -477,6 +482,10 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .release => {
                 const kv = self.by_id.fetchRemove(try r.int()) orelse continue;
+                if (kv.key == 1) { // the calibration's sequence (rank 0 frees its own at open, see there)
+                    forward.freeSeq(self.e, kv.value);
+                    continue;
+                }
                 self.retire(kv.value);
             },
             .stop => return,
