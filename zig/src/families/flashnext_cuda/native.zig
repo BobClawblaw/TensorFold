@@ -73,6 +73,22 @@ const Writer = struct {
     }
 };
 
+/// A stream's draw rule in a frame: present, then seed, temperature, top_k, top_p, min_p (floats as their bits).
+fn writeSampling(w: *Writer, s: ?lanes.Sampling) !void {
+    const r = s orelse return w.int(0);
+    try w.int(1);
+    try w.int(r.seed);
+    try w.int(@as(u64, @bitCast(r.temperature)));
+    try w.int(r.top_k);
+    try w.int(@as(u64, @bitCast(r.top_p)));
+    try w.int(@as(u64, @bitCast(r.min_p)));
+}
+
+fn readSampling(r: *Reader) !?lanes.Sampling {
+    if (try r.int() == 0) return null;
+    return .{ .seed = try r.int(), .temperature = @bitCast(try r.int()), .top_k = @intCast(try r.int()), .top_p = @bitCast(try r.int()), .min_p = @bitCast(try r.int()) };
+}
+
 const Reader = struct {
     bytes: []const u8,
     at: usize = 0,
@@ -372,7 +388,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
-        error.Sampled => "the native Flash Next engine draws greedily for now: send temperature 0",
         error.NoVision => "image inputs need the server started with --vision",
         else => null,
     };
@@ -415,7 +430,6 @@ const vtable: be.Backend.VTable = .{
 /// A new sequence for the stream and its prompt (the head absorbs it); the first token is drawn here.
 fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     const self = of(p);
-    if (s.sampling != null) return error.Sampled;
     const ids = s.prompt();
     if (ids.len == 0 or ids.len + s.max_new + max_rows > forward.maxLen(self.e)) return error.PromptTooLong;
     // images: encoded and their positions computed before rank 1 hears of the request (a refusal stays on rank 0)
@@ -469,8 +483,10 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
     try w.int(id);
     try w.tokens(ids);
+    try writeSampling(&w, s.sampling);
     try self.send(.prefill, &w);
     const seq = try self.obtain();
+    seq.sampling = s.sampling;
     gop.value_ptr.* = .{ .seq = seq, .id = id };
     if (pos) |q| try forward.attach(self.e, seq, q.rows, feats.?.ptr, q.pos, q.delta);
     _ = self.take(try forward.prefill(self.e, seq, ids));
@@ -501,6 +517,8 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     const rows = win.rows();
     if (rows > max_rows) return error.WindowTooWide;
     try settle(self, l, l.rows); // the previous window, accepted whole
+    // the core keys row r's draw at position pos + 1 + r, as the forward draws it
+    if (win.positions.len > 0 and win.positions[0] != @as(u64, @intCast(l.seq.pos + 1))) return error.PositionMismatch;
     var ids: [max_rows]u32 = undefined;
     ids[0] = win.pending;
     if (win.held > 0) @memcpy(ids[1..][0..win.held], l.held[0..win.held]) else @memcpy(ids[1..][0..win.tokens.len], win.tokens);
@@ -724,7 +742,9 @@ fn followLoop(p: *anyopaque) anyerror!void {
                     defer self.gpa.free(kv.value);
                     try attachFrame(self, seq, kv.value);
                 }
-                _ = try forward.prefill(self.e, seq, try r.tokens());
+                const toks = try r.tokens();
+                seq.sampling = try readSampling(&r);
+                _ = try forward.prefill(self.e, seq, toks);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
