@@ -41,13 +41,24 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         try @import("flashnext_weights").load(gpa, io, &ctx, &kernels, args[4][5..], rank)
     else
         try fwd.devstore.load(gpa, io, gpu.d, args[4], args[5], args[6], args[7]);
-    const e = try fwd.init(gpa, io, &ctx, &kernels, &store, .{ .context = 16384, .max_rows = 16, .depth = 15 });
+    const e = try fwd.init(gpa, io, &ctx, &kernels, &store, .{ .context = 16384, .max_rows = rows: {
+        // "rows=<n>": the shared rounds' rows at most (the server's batch_rows)
+        for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "rows=")) break :rows try std.fmt.parseInt(u32, a[5..], 10);
+        break :rows 16;
+    }, .depth = 15 });
     try fwd.prefetchTables(e);
     e.k.sync_each = std.mem.indexOf(u8, args[1], "sync") != null or (args.len > 9 and std.mem.eql(u8, args[args.len - 1], "sync"));
     // "nographs" among the trailing words: verify and draft steps eager (the graphs' A/B)
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "nographs")) {
         e.use_graphs = false;
     };
+    // "nomultigdn", "nomultiattn": shared rounds launch DeltaNet chains or attention stream by stream (the A/B)
+    for (args[@min(9, args.len)..]) |a| {
+        if (std.mem.eql(u8, a, "nomultigdn")) e.multi_gdn = false;
+        if (std.mem.eql(u8, a, "nomultiattn")) e.multi_attn = false;
+    }
+    // "multi=on|off" between benches below: both on or both off from there
+    std.debug.print("rank {d}: shared rounds: DeltaNet {s}, attention {s}\n", .{ rank, if (e.multi_gdn) "one launch" else "per stream", if (e.multi_attn) "one launch" else "per stream" });
     std.debug.print("rank {d}: n-gram tables locked {d} of {d} GiB\n", .{ rank, e.ng.locked >> 30, blk: {
         var t: usize = 0;
         for (e.ng.tables) |x| t += x.len;
@@ -149,6 +160,32 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     check.pass("EXACT rank {d}: native forward, prefill + {d} tokens with MTP drafts equal the Python engine's", .{ rank, count });
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "shared")) try sharedCheck(e, prompt, rank);
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "resume")) try resumeCheck(e, prompt, rank);
+    const has_multi = e.multi_attn;
+    for (args[@min(9, args.len)..]) |a| {
+        if (std.mem.eql(u8, a, "multi=off")) {
+            e.multi_gdn = false;
+            e.multi_attn = false;
+        }
+        if (std.mem.eql(u8, a, "multi=gdn")) {
+            e.multi_gdn = true;
+            e.multi_attn = false;
+        }
+        if (std.mem.eql(u8, a, "multi=on")) {
+            e.multi_gdn = true;
+            e.multi_attn = has_multi;
+        }
+        if (std.mem.startsWith(u8, a, "bench=")) {
+            std.debug.print("rank {d}: bench with DeltaNet {s}, attention {s}\n", .{ rank, if (e.multi_gdn) "one launch" else "per stream", if (e.multi_attn) "one launch" else "per stream" });
+            try benchShared(e, prompt, rank, a["bench=".len..]);
+        }
+        if (std.mem.eql(u8, a, "admit")) try benchAdmit(e, prompt, rank);
+        if (std.mem.eql(u8, a, "prefills")) try prefillsCheck(e, prompt, rank);
+        // "exit": leave through libc's exit, whose handlers flush a profiler's trace buffers (nsys)
+        if (std.mem.eql(u8, a, "exit")) {
+            try e.k.stream.synchronize();
+            std.c.exit(0);
+        }
+    }
     for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "vision=")) try visionCheck(e, gpu, rank, a["vision=".len..]);
     for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "probes=")) try probesDecode(e, gpu, rank, a["probes=".len..]);
 }
@@ -371,6 +408,107 @@ fn sharedCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
     }
     check.pass("EXACT rank {d}: shared rounds over {d} streams equal each stream alone", .{ rank, lens.len });
     try draftsCheck(e, prompt, rank);
+    try decodeCheck(e, prompt, rank);
+}
+
+/// MTP decoding together against alone: each stream drafts (depth 6, confidence 0.7), verifies, keeps the agreeing
+/// prefix (the DeltaNet replays) and drafts again; alone (verify, keep, draftUpTo) and together (verifyShared,
+/// keepMany, draftBatch) every stream's tokens are the same.
+fn decodeCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
+    const lens = [_]usize{ 2695, 1500, 333, 97, 1200 };
+    const N = lens.len;
+    const want = 48;
+    const depth = 6;
+    var alone: [N][want + 16]u32 = undefined;
+    for (lens, 0..) |n, k| {
+        const s = try fwd.newSeq(e);
+        defer fwd.freeSeq(e, s);
+        var got: usize = 1;
+        alone[k][0] = try fwd.prefill(e, s, prompt[0..n], 0);
+        var drafts: [depth]u32 = undefined;
+        var nd = try fwd.draftUpTo(e, s, alone[k][0..1], depth, 0.7, &drafts);
+        while (got < want) {
+            var win: [depth + 1]u32 = undefined;
+            win[0] = alone[k][got - 1];
+            @memcpy(win[1..][0..nd], drafts[0..nd]);
+            var o: [depth + 1]u32 = undefined;
+            try fwd.verify(e, s, win[0 .. nd + 1], o[0 .. nd + 1]);
+            var kp: usize = 1;
+            while (kp < nd + 1 and o[kp - 1] == win[kp]) kp += 1;
+            try fwd.keep(e, s, @intCast(nd + 1), @intCast(kp));
+            @memcpy(alone[k][got..][0..kp], o[0..kp]);
+            got += kp;
+            nd = try fwd.draftUpTo(e, s, o[0..kp], depth, 0.7, &drafts);
+        }
+    }
+    var seqs: [N]*fwd.Seq = undefined;
+    var together: [N][want + 16]u32 = undefined;
+    var got: [N]usize = @splat(1);
+    var drafts: [N][depth]u32 = undefined;
+    var probs: [N][depth]f64 = undefined;
+    var follows: [N][depth + 1]u32 = undefined;
+    var reqs: [N]fwd.DraftReq = undefined;
+    for (lens, 0..) |n, k| {
+        seqs[k] = try fwd.newSeq(e);
+        together[k][0] = try fwd.prefill(e, seqs[k], prompt[0..n], 0);
+        follows[k][0] = together[k][0];
+        reqs[k] = .{ .s = seqs[k], .follow = follows[k][0..1], .depth = depth, .out = &drafts[k], .probs = &probs[k] };
+    }
+    defer for (seqs) |s| fwd.freeSeq(e, s);
+    try fwd.draftBatch(e, &reqs, 0.7);
+    var rounds: usize = 0;
+    var partial: usize = 0;
+    while (true) {
+        var parts: [N]fwd.Part = undefined;
+        var wins: [N][depth + 1]u32 = undefined;
+        var live: [N]usize = undefined;
+        var nl: usize = 0;
+        var R: usize = 0;
+        for (0..N) |k| if (got[k] < want) {
+            wins[k][0] = together[k][got[k] - 1];
+            @memcpy(wins[k][1..][0..reqs[k].got], drafts[k][0..reqs[k].got]);
+            parts[nl] = .{ .s = seqs[k], .ids = wins[k][0 .. 1 + reqs[k].got] };
+            live[nl] = k;
+            nl += 1;
+            R += 1 + reqs[k].got;
+        };
+        if (nl == 0) break;
+        var out: [N * (depth + 1)]u32 = undefined;
+        if (nl == 1) try fwd.verify(e, parts[0].s, parts[0].ids, out[0..R]) else try fwd.verifyShared(e, parts[0..nl], out[0..R]);
+        var keeps: [N]fwd.Keep = undefined;
+        var dreqs: [N]fwd.DraftReq = undefined;
+        var r0: usize = 0;
+        for (parts[0..nl], live[0..nl], 0..) |p, k, j| {
+            const w = p.ids.len;
+            const o = out[r0..][0..w];
+            var kp: usize = 1;
+            while (kp < w and o[kp - 1] == p.ids[kp]) kp += 1;
+            if (kp < w) partial += 1;
+            @memcpy(together[k][got[k]..][0..kp], o[0..kp]);
+            @memcpy(follows[k][0..kp], o[0..kp]);
+            got[k] += kp;
+            keeps[j] = .{ .s = seqs[k], .rows = @intCast(w), .kept = @intCast(kp) };
+            reqs[k] = .{ .s = seqs[k], .follow = follows[k][0..kp], .depth = depth, .out = &drafts[k], .probs = &probs[k] };
+            dreqs[j] = reqs[k];
+            r0 += w;
+        }
+        try fwd.keepMany(e, keeps[0..nl]);
+        if (nl == 1) {
+            const k = live[0];
+            reqs[k].got = try fwd.draftUpTo(e, seqs[k], reqs[k].follow, depth, 0.7, &drafts[k]);
+        } else {
+            try fwd.draftBatch(e, dreqs[0..nl], 0.7);
+            for (live[0..nl], 0..) |k, j| reqs[k].got = dreqs[j].got;
+        }
+        rounds += 1;
+    }
+    var same: usize = 0;
+    for (0..N) |k| {
+        if (std.mem.eql(u32, alone[k][0..want], together[k][0..want])) same += 1;
+    }
+    std.debug.print("rank {d}: MTP decoding over {d} streams together: {d} of {d} streams equal alone ({d} rounds, {d} windows cut short)\n", .{ rank, N, same, N, rounds, partial });
+    try check.expect(same == N, "decoding together: {d} of {d} streams equal", .{ same, N });
+    check.pass("EXACT rank {d}: MTP decoding over {d} streams together equals each stream alone", .{ rank, N });
 }
 
 /// Batched drafts against lone ones: each stream drafts after its prompt, verifies the drafts, keeps the agreeing
@@ -444,4 +582,202 @@ fn draftsCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
     std.debug.print("rank {d}: batched drafts over {d} streams: {d} of {d} draft runs equal the lone runs\n", .{ rank, lens.len, same, total });
     try check.expect(same == total, "batched drafts: {d} of {d} equal", .{ same, total });
     check.pass("EXACT rank {d}: batched drafts over {d} streams equal each stream's own", .{ rank, lens.len });
+}
+
+/// Shared rounds at load: ``streams`` streams (prompts of different lengths from the reference prompt) decoding
+/// together as the Python engine's rounds do (every stream's chain to ``depth`` drafts, confidence 0.7, one verify
+/// over every window, keeps, one batched draft), timed by phase. bench=<streams>x<depth>[x<rounds>]
+fn benchShared(e: *fwd.Engine, prompt: []const u32, rank: u8, spec: []const u8) !void {
+    const io = e.io;
+    var it = std.mem.splitScalar(u8, spec, 'x');
+    const n = try std.fmt.parseInt(usize, it.next().?, 10);
+    const depth = try std.fmt.parseInt(u32, it.next().?, 10);
+    const rounds = if (it.next()) |r| try std.fmt.parseInt(usize, r, 10) else 40;
+    const M = 16;
+    if (n > M or depth > 15) return error.BadBench;
+    var seqs: [M]*fwd.Seq = undefined;
+    var pend: [M]u32 = undefined;
+    var t = std.Io.Timestamp.now(io, .awake);
+    for (0..n) |k| {
+        seqs[k] = try fwd.newSeq(e);
+        const len = @min(prompt.len, 200 + 131 * k);
+        pend[k] = try fwd.prefill(e, seqs[k], prompt[0..len], 0);
+    }
+    defer for (seqs[0..n]) |s| fwd.freeSeq(e, s);
+    const ms = struct {
+        fn since(io_: std.Io, t0: std.Io.Timestamp) f64 {
+            return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io_, .awake)).toNanoseconds())) / 1e6;
+        }
+    }.since;
+    std.debug.print("rank {d}: bench {d} prompts prefilled in {d:.0} ms\n", .{ rank, n, ms(io, t) });
+    var drafts: [M][16]u32 = undefined;
+    var probs: [M][16]f64 = undefined;
+    var follows: [M][16]u32 = undefined;
+    var reqs: [M]fwd.DraftReq = undefined;
+    for (0..n) |k| {
+        follows[k][0] = pend[k];
+        reqs[k] = .{ .s = seqs[k], .follow = follows[k][0..1], .depth = depth, .out = drafts[k][0..depth], .probs = probs[k][0..depth] };
+    }
+    if (depth > 0) try fwd.draftBatch(e, reqs[0..n], 0.7);
+    var t_verify: f64 = 0;
+    var t_keep: f64 = 0;
+    var t_draft: f64 = 0;
+    var rows_total: usize = 0;
+    var tokens: usize = 0;
+    const tw = std.Io.Timestamp.now(io, .awake);
+    for (0..rounds) |_| {
+        var wins: [M][16]u32 = undefined;
+        var parts: [M]fwd.Part = undefined;
+        var R: usize = 0;
+        for (0..n) |k| {
+            const got = if (depth > 0) reqs[k].got else 0;
+            wins[k][0] = pend[k];
+            @memcpy(wins[k][1..][0..got], drafts[k][0..got]);
+            parts[k] = .{ .s = seqs[k], .ids = wins[k][0 .. 1 + got] };
+            R += 1 + got;
+        }
+        var out: [M * 16]u32 = undefined;
+        t = std.Io.Timestamp.now(io, .awake);
+        if (n == 1) try fwd.verify(e, seqs[0], parts[0].ids, out[0..R]) else try fwd.verifyShared(e, parts[0..n], out[0..R]);
+        t_verify += ms(io, t);
+        rows_total += R;
+        var r0: usize = 0;
+        var kept: [M]usize = undefined;
+        for (parts[0..n], 0..) |p, k| {
+            const w = p.ids.len;
+            const o = out[r0..][0..w];
+            var kp: usize = 1;
+            while (kp < w and o[kp - 1] == p.ids[kp]) kp += 1;
+            kept[k] = kp;
+            @memcpy(follows[k][0..kp], o[0..kp]);
+            pend[k] = o[kp - 1];
+            tokens += kp;
+            r0 += w;
+        }
+        t = std.Io.Timestamp.now(io, .awake);
+        var keeps: [M]fwd.Keep = undefined;
+        for (parts[0..n], 0..) |p, k| keeps[k] = .{ .s = seqs[k], .rows = @intCast(p.ids.len), .kept = @intCast(kept[k]) };
+        try fwd.keepMany(e, keeps[0..n]);
+        try e.k.stream.synchronize();
+        t_keep += ms(io, t);
+        if (depth > 0) {
+            for (0..n) |k| reqs[k] = .{ .s = seqs[k], .follow = follows[k][0..kept[k]], .depth = depth, .out = drafts[k][0..depth], .probs = probs[k][0..depth] };
+            t = std.Io.Timestamp.now(io, .awake);
+            if (n == 1) {
+                reqs[0].got = try fwd.draftUpTo(e, seqs[0], reqs[0].follow, depth, 0.7, reqs[0].out);
+            } else try fwd.draftBatch(e, reqs[0..n], 0.7);
+            t_draft += ms(io, t);
+        }
+    }
+    const wall = ms(io, tw);
+    const fr: f64 = @floatFromInt(rounds);
+    std.debug.print("rank {d}: bench {d} streams depth {d}: {d} rounds, {d:.1} rows and {d:.1} tokens a round; {d:.1} ms a round " ++
+        "(verify {d:.1}, keep {d:.1}, draft {d:.1}); {d:.0} tok/s\n", .{ rank, n, depth, rounds, @as(f64, @floatFromInt(rows_total)) / fr,
+        @as(f64, @floatFromInt(tokens)) / fr, wall / fr, t_verify / fr, t_keep / fr, t_draft / fr, @as(f64, @floatFromInt(tokens)) / (wall / 1000) });
+    std.debug.print("rank {d}: shared attention layers so far: {d} in one launch a kernel, {d} stream by stream (no variant)\n", .{ rank, e.multi_layers[0], e.multi_layers[1] });
+}
+
+/// What a request's admission costs: a short prompt's prefill and its first drafts, on a new sequence and on a
+/// reused one (reset, its graphs kept), and the prefill alone at several short lengths.
+fn benchAdmit(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
+    const io = e.io;
+    const ms = struct {
+        fn since(io_: std.Io, t0: std.Io.Timestamp) f64 {
+            return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io_, .awake)).toNanoseconds())) / 1e6;
+        }
+    }.since;
+    var drafts: [6]u32 = undefined;
+    for ([_]usize{ 40, 120, 400 }) |n| {
+        var t = std.Io.Timestamp.now(io, .awake);
+        const s = try fwd.newSeq(e);
+        try e.k.stream.synchronize();
+        const t_new = ms(io, t);
+        t = std.Io.Timestamp.now(io, .awake);
+        const first = try fwd.prefill(e, s, prompt[0..n], 0);
+        const t_pre = ms(io, t);
+        t = std.Io.Timestamp.now(io, .awake);
+        _ = try fwd.draftUpTo(e, s, &.{first}, 6, 0.7, &drafts);
+        const t_draft = ms(io, t);
+        t = std.Io.Timestamp.now(io, .awake);
+        try fwd.resetSeq(e, s);
+        try e.k.stream.synchronize();
+        const t_reset = ms(io, t);
+        t = std.Io.Timestamp.now(io, .awake);
+        const first2 = try fwd.prefill(e, s, prompt[0..n], 0);
+        const t_pre2 = ms(io, t);
+        t = std.Io.Timestamp.now(io, .awake);
+        _ = try fwd.draftUpTo(e, s, &.{first2}, 6, 0.7, &drafts);
+        const t_draft2 = ms(io, t);
+        fwd.freeSeq(e, s);
+        std.debug.print("rank {d}: admit {d} tokens: new sequence {d:.1} ms, prefill {d:.1} ms, first drafts {d:.1} ms; reset {d:.1} ms, prefill {d:.1} ms, first drafts {d:.1} ms\n", .{ rank, n, t_new, t_pre, t_draft, t_reset, t_pre2, t_draft2 });
+    }
+}
+
+/// Several short prompts in one pass (prefillMany) against each prompt alone: first tokens and 24 greedy tokens after
+/// them, each prompt's kept point taken (one token before its end) and a next turn resumed from it; and the pass's
+/// time against the prompts one by one.
+fn prefillsCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
+    const io = e.io;
+    const lens = [_]usize{ 40, 97, 333, 7, 200, 61, 120, 2 };
+    const N = lens.len;
+    const steps = 24;
+    const ms = struct {
+        fn since(io_: std.Io, t0: std.Io.Timestamp) f64 {
+            return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io_, .awake)).toNanoseconds())) / 1e6;
+        }
+    }.since;
+    var alone: [N][steps + 1]u32 = undefined;
+    var t = std.Io.Timestamp.now(io, .awake);
+    var seqs: [N]*fwd.Seq = undefined;
+    for (lens, 0..) |n, k| {
+        seqs[k] = try fwd.newSeq(e);
+        seqs[k].cut_at = @intCast(@max(1, n - 1));
+        alone[k][0] = try fwd.prefill(e, seqs[k], prompt[k * 50 ..][0..n], 0);
+    }
+    const t_alone = ms(io, t);
+    for (lens, 0..) |_, k| {
+        for (0..steps) |j| {
+            var o: [1]u32 = undefined;
+            try fwd.verify(e, seqs[k], alone[k][j .. j + 1], &o);
+            try fwd.keep(e, seqs[k], 1, 1);
+            alone[k][j + 1] = o[0];
+        }
+        try fwd.resetSeq(e, seqs[k]);
+    }
+    var ps: [N]fwd.Prompt = undefined;
+    for (lens, 0..) |n, k| {
+        seqs[k].cut_at = @intCast(@max(1, n - 1));
+        ps[k] = .{ .s = seqs[k], .ids = prompt[k * 50 ..][0..n] };
+    }
+    var firsts: [N]u32 = undefined;
+    t = std.Io.Timestamp.now(io, .awake);
+    try fwd.prefillMany(e, &ps, &firsts);
+    const t_many = ms(io, t);
+    var same: usize = 0;
+    var resumed: usize = 0;
+    for (lens, 0..) |n, k| {
+        var got: [steps + 1]u32 = undefined;
+        got[0] = firsts[k];
+        for (0..steps) |j| {
+            var o: [1]u32 = undefined;
+            try fwd.verify(e, seqs[k], got[j .. j + 1], &o);
+            try fwd.keep(e, seqs[k], 1, 1);
+            got[j + 1] = o[0];
+        }
+        if (std.mem.eql(u32, &got, &alone[k])) same += 1 else std.debug.print("rank {d}: prompt {d} ({d} tokens): together {any} alone {any}\n", .{ rank, k, n, got[0..8], alone[k][0..8] });
+        // the kept point: a next turn (this prompt and 30 more tokens) resumed there equals it prefilled fresh
+        if (seqs[k].snap.at > 0) {
+            const at: usize = @intCast(seqs[k].snap.at);
+            const longer = prompt[k * 50 ..][0 .. n + 30];
+            const r1 = try fwd.prefill(e, seqs[k], longer, at);
+            const f = try fwd.newSeq(e);
+            defer fwd.freeSeq(e, f);
+            const r2 = try fwd.prefill(e, f, longer, 0);
+            if (r1 == r2) resumed += 1;
+        }
+    }
+    for (seqs) |s| fwd.freeSeq(e, s);
+    std.debug.print("rank {d}: {d} prompts in one pass: {d:.1} ms, one by one {d:.1} ms; {d} of {d} decode as alone; {d} kept points resume as fresh\n", .{ rank, N, t_many, t_alone, same, N, resumed });
+    try check.expect(same == N, "prompts together: {d} of {d} as alone", .{ same, N });
+    check.pass("rank {d}: {d} prompts in one pass decode as each alone", .{ rank, N });
 }
