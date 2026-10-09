@@ -30,6 +30,7 @@ pub const Config = struct {
     /// The served name first, then aliases, without repeats.
     model_ids: []const []const u8,
     default_max_tokens: i64 = 4096,
+    tool_system: ?[]const u8 = null, // --tool-system (trimmed; null when empty)
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
