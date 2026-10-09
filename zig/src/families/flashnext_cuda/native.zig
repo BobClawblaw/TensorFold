@@ -47,6 +47,8 @@ pub fn deviceWeightBytes(io: std.Io, dir: []const u8) u64 {
 }
 
 const max_rows = 16;            // a verify window's rows at most (pending + 15 drafts)
+const batch_rows = 32;          // a shared round's rows at most, every stream's window together
+const max_streams = 8;          // streams a shared round packs at most
 const max_depth = max_rows - 1;
 /// The head stops at a draft it gives less than this (the Python engine's --mtp-confidence, the recipe's 0.70);
 /// the slots past it are held with chance 0, so the lane core's allocator leaves them out of the window.
@@ -54,7 +56,7 @@ const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -183,9 +185,17 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.kernels.deinit();
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
     errdefer own.store.deinit();
-    own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = max_rows, .depth = if (o.drafts) max_depth else 0 });
+    own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = batch_rows, .depth = if (o.drafts) max_depth else 0 });
     errdefer forward.deinit(own.e);
     try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
+    { // the sequences' caches grow within what is free now, less the server's reserve and a margin (a GB10 shares
+      // its memory with the host: past this a growth is refused instead of starving the system)
+        var free: usize = 0;
+        var total: usize = 0;
+        try ctx.d.check(ctx.d.api.cuMemGetInfo_v2(&free, &total), "cuMemGetInfo");
+        const keep_free: u64 = 14 << 30;
+        forward.setGrowthBudget(own.e, if (free > keep_free) free - keep_free else 0);
+    }
     // both halves loaded before rank 0 serves: rank 1 says so once its engine is up (it loads more slowly)
     if (o.rank == 1) try own.link.send(@intFromEnum(Op.ready), "") else {
         const m = try own.link.recv(gpa);
@@ -208,7 +218,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
-                    .hidden_rows = false, .max_streams = 1, .batch_rows = max_rows,
+                    .hidden_rows = o.drafts, .max_streams = if (o.drafts) max_streams else 1, .batch_rows = batch_rows,
                     .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms,
                     .draft_probabilities = o.drafts },
         .rows = if (o.drafts) max_rows else 1,
@@ -362,7 +372,7 @@ fn readFn(p: *anyopaque, handle: u64) anyerror!u32 {
 
 fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
     const self = of(p);
-    if (windows.len != 1) return error.SharedRoundsNotBuilt;
+    if (windows.len > 1) return verifyShared(self, windows, out);
     const win = windows[0];
     if (win.parents != null) return error.TreesNotBuilt;
     const l = self.lanes_by.getPtr(win.stream) orelse return error.NoLane;
@@ -383,6 +393,51 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     l.nheld = 0;
 }
 
+/// A shared round: every window checked and every stream's last window committed before rank 1 hears of it, then
+/// one forward over all of them on both ranks (rank 1 replays the same parts in the same order).
+fn verifyShared(self: *Owned, windows: []const be.Window, out: []be.Verified) anyerror!void {
+    if (windows.len > max_streams) return error.TooManyStreams;
+    var lanes_of: [max_streams]*Lane = undefined;
+    var ids: [max_streams][max_rows]u32 = undefined;
+    var total: usize = 0;
+    for (windows, 0..) |win, k| {
+        if (win.parents != null) return error.TreesNotBuilt;
+        lanes_of[k] = self.lanes_by.getPtr(win.stream) orelse return error.NoLane;
+        const rows = win.rows();
+        if (rows > max_rows) return error.WindowTooWide;
+        total += rows;
+    }
+    if (total > batch_rows) return error.WindowTooWide;
+    for (windows, 0..) |win, k| {
+        const l = lanes_of[k];
+        try settle(self, l, l.rows);
+        ids[k][0] = win.pending;
+        if (win.held > 0) @memcpy(ids[k][1..][0..win.held], l.held[0..win.held]) else @memcpy(ids[k][1..][0..win.tokens.len], win.tokens);
+    }
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    var parts: [max_streams]forward.Part = undefined;
+    try w.int(windows.len);
+    for (windows, 0..) |win, k| {
+        const rows = win.rows();
+        try w.int(lanes_of[k].id);
+        try w.tokens(ids[k][0..rows]);
+        parts[k] = .{ .s = lanes_of[k].seq, .ids = ids[k][0..rows] };
+    }
+    try self.send(.shared, &w);
+    var flat: [batch_rows]u32 = undefined;
+    try forward.verifyShared(self.e, parts[0..windows.len], flat[0..total]);
+    var r0: usize = 0;
+    for (windows, 0..) |win, k| {
+        const rows = win.rows();
+        @memcpy(out[k].sampled[0..rows], flat[r0..][0..rows]);
+        @memcpy(out[k].drafts[0 .. rows - 1], ids[k][1..rows]);
+        lanes_of[k].rows = @intCast(rows);
+        lanes_of[k].nheld = 0;
+        r0 += rows;
+    }
+}
+
 fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
     const self = of(p);
     for (windows, paths) |win, path| {
@@ -398,7 +453,8 @@ fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
     for (requests) |r| {
         const l = self.lanes_by.getPtr(r.stream) orelse return error.NoLane;
         if (r.lanes != null) return error.TreesNotBuilt;
-        try settle(self, l, l.rows); // a window the core did not cut is kept whole
+        // the kept rows (a shared round drafts before it keeps; a lone one has kept already and settles nothing)
+        try settle(self, l, if (r.rows) |rows| @intCast(rows.len) else l.rows);
         var follow: [max_rows]u32 = undefined;
         const n: usize = if (r.rows) |rows| rows.len else 1;
         if (r.rows) |rows| {
@@ -490,6 +546,20 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .stop => return,
             .ready => {},
+            .shared => {
+                const n: usize = @intCast(try r.int());
+                if (n == 0 or n > max_streams) return error.TooManyStreams;
+                var parts: [max_streams]forward.Part = undefined;
+                var total: usize = 0;
+                for (parts[0..n]) |*pt| {
+                    const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
+                    pt.* = .{ .s = seq, .ids = try r.tokens() };
+                    total += pt.ids.len;
+                }
+                var flat: [batch_rows]u32 = undefined;
+                if (total > flat.len) return error.WindowTooWide;
+                try forward.verifyShared(self.e, parts[0..n], flat[0..total]);
+            },
         }
     }
 }
