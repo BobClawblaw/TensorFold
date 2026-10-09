@@ -362,19 +362,32 @@ const Owned = struct {
     }
 
     /// Rank 1: a prompt frame's growth answered (``grown``: null when rank 0 asked for none) and rank 0's verdict
-    /// awaited; whether the pass runs.
-    fn settleGrowth(self: *Owned, grown: ?bool) !bool {
-        const ok = grown orelse return true;
-        try self.link.send(@intFromEnum(Op.grow), &.{@intFromBool(ok)});
-        const v = try self.link.recv(self.gpa);
-        defer self.gpa.free(v.bytes);
-        if (v.tag != @intFromEnum(Op.grow) or v.bytes.len != 1) return error.RankZeroOutOfStep;
-        return v.bytes[0] == 1;
+    /// awaited (a kept state to drop and try again, while rank 1 is short); whether the pass runs.
+    fn settleGrowth(self: *Owned, grown: ?bool, prompts: []const forward.Prompt) !bool {
+        var ok = grown orelse return true;
+        while (true) {
+            try self.link.send(@intFromEnum(Op.grow), &.{@intFromBool(ok)});
+            const v = try self.link.recv(self.gpa);
+            defer self.gpa.free(v.bytes);
+            if (v.tag != @intFromEnum(Op.grow) or v.bytes.len == 0) return error.RankZeroOutOfStep;
+            if (v.bytes[0] != 2) return v.bytes[0] == 1;
+            if (v.bytes.len != 9) return error.RankZeroOutOfStep;
+            if (self.by_id.fetchRemove(std.mem.readInt(u64, v.bytes[1..9], .little))) |kv| self.retire(kv.value);
+            ok = true;
+            for (prompts) |pr| self.grow(pr.s, @intCast(pr.ids.len + grow_margin)) catch |err| switch (err) {
+                error.OutOfDeviceMemory => ok = false,
+                else => return err,
+            };
+        }
     }
 
-    /// Rank 0's word on a prompt frame's growth (rank 1 waits for it before the pass): 1 when both ranks grew.
-    fn verdict(self: *Owned, go: bool) !void {
-        try self.link.send(@intFromEnum(Op.grow), &.{@intFromBool(go)});
+    /// Rank 0's word on a prompt frame's growth (rank 1 waits for it before the pass): 1 go, 0 refused, 2 the kept
+    /// state ``drop`` dropped on both ranks and rank 1 to try again.
+    fn verdict(self: *Owned, code: u8, drop: ?u64) !void {
+        var b: [9]u8 = undefined;
+        b[0] = code;
+        if (drop) |id| std.mem.writeInt(u64, b[1..9], id, .little);
+        try self.link.send(@intFromEnum(Op.grow), b[0..if (drop != null) 9 else 1]);
     }
 
     /// Rank 1's answer to a growth it was asked for (a .grow frame, or a prompt frame's): 1 a byte where it grew.
@@ -432,9 +445,36 @@ fn reserveRound(self: *Owned, ls: []const *Lane, ss: []const *lanes.Stream, targ
             error.OutOfDeviceMemory => mine[i] = false,
             else => return err,
         };
-        const oks = try self.answer(n);
-        defer self.gpa.free(oks);
-        for (ask[0..n], oks, 0..) |k, ok, i| if (ok == 0 or !mine[i]) {
+        var theirs: [max_streams]bool = undefined;
+        {
+            const oks = try self.answer(n);
+            defer self.gpa.free(oks);
+            for (oks, 0..) |ok, i| theirs[i] = ok == 1;
+        }
+        // rank 1 short where rank 0 is not (kept prompt states hold its memory too): the oldest go on both ranks and
+        // rank 1 tries those again, while there are some
+        while (self.kept.items.len > 0) {
+            var again: [max_streams]usize = undefined;
+            var m: usize = 0;
+            for (0..n) |i| if (mine[i] and !theirs[i]) {
+                again[m] = i;
+                m += 1;
+            };
+            if (m == 0) break;
+            dropKept(self, 0);
+            var w2: Writer = .{ .gpa = self.gpa };
+            defer w2.buf.deinit(self.gpa);
+            try w2.int(m);
+            for (again[0..m]) |i| {
+                try w2.int(ls[ask[i]].id);
+                try w2.int(targets[ask[i]]);
+            }
+            try self.send(.grow, &w2);
+            const oks = try self.answer(m);
+            defer self.gpa.free(oks);
+            for (again[0..m], oks) |i, ok| theirs[i] = ok == 1;
+        }
+        for (ask[0..n], 0..) |k, i| if (!theirs[i] or !mine[i]) {
             try self.refuse(ss[k]);
             refused = true;
         };
@@ -927,16 +967,31 @@ fn agree(self: *Owned, prompts: []const forward.Prompt) !void {
         self.grow(pr.s, target) catch |err| switch (err) {
             error.OutOfDeviceMemory => ok = false,
             else => {
-                self.verdict(false) catch {};
+                self.verdict(0, null) catch {};
                 return err;
             },
         };
     }
-    const theirs = try self.answer(1);
-    defer self.gpa.free(theirs);
-    ok = ok and theirs[0] == 1;
-    try self.verdict(ok);
-    if (!ok) return error.OutOfDeviceMemory;
+    while (true) {
+        const theirs = try self.answer(1);
+        const short = theirs[0] == 0;
+        self.gpa.free(theirs);
+        if (!short or !ok) {
+            try self.verdict(if (ok and !short) 1 else 0, null);
+            if (ok and !short) return;
+            return error.OutOfDeviceMemory;
+        }
+        // rank 1 is short where rank 0 is not (kept prompt states hold rank 1's memory as much as rank 0's): the
+        // oldest goes on both ranks and rank 1 tries again, while there is one
+        if (self.kept.items.len == 0) {
+            try self.verdict(0, null);
+            return error.OutOfDeviceMemory;
+        }
+        const k = self.kept.orderedRemove(0);
+        self.gpa.free(k.ids);
+        self.retire(k.seq);
+        try self.verdict(2, k.id);
+    }
 }
 
 /// Rank 1 has heard of none of these prompts: their lanes undone, a kept state each resumed dropped there.
@@ -1289,7 +1344,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 try self.gramScratch();
                 var grown: ?bool = null;
                 const pr = try followPrefill(self, &r, 0, &grown);
-                if (try self.settleGrowth(grown)) _ = try forward.prefill(self.e, pr.s, pr.ids, pr.start);
+                if (try self.settleGrowth(grown, &.{pr})) _ = try forward.prefill(self.e, pr.s, pr.ids, pr.start);
             },
             .prefills => {
                 const n: usize = @intCast(try r.int());
@@ -1299,7 +1354,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 var grown: ?bool = null;
                 for (prompts[0..n], 0..) |*pr, k| pr.* = try followPrefill(self, &r, k, &grown);
                 var firsts: [max_streams]u32 = undefined;
-                if (try self.settleGrowth(grown)) try forward.prefillMany(self.e, prompts[0..n], firsts[0..n]);
+                if (try self.settleGrowth(grown, prompts[0..n])) try forward.prefillMany(self.e, prompts[0..n], firsts[0..n]);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
