@@ -1,5 +1,7 @@
 //! The engine a server drives (``Engine``), and ``LaneHost``: the lane core served on one thread, rounds left to it.
 const std = @import("std");
+/// Image inputs (decode, resize, patches) for families with a vision tower; the server reaches them here.
+pub const qwen_image = @import("qwen_image");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
 
