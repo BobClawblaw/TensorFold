@@ -552,7 +552,7 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     try w.tokens(&prompt);
     try writeSampling(&w, null);
     try w.int(0); // no grammar rows
-    try w.int(0); // nor a kept state, nor a kept point, nor a growth to agree on
+    try w.int(0); // nor a kept state, nor a kept point, nor a reach to agree on
     try w.int(0);
     try w.int(0);
     try w.int(0);
@@ -795,7 +795,7 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     }
     if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
     try self.send(.prefill, &w);
-    if (bytes > 0) try agree(self, &.{pr}); // the lane is released as any failed one when either rank is short
+    try agree(self, &.{pr}); // the lane is released as any failed one when either rank is short
     if (pos) |q| try forward.attach(self.e, pr.s, q.rows, feats.?.ptr, q.pos, q.delta);
     self.lanes_by.getPtr(s).?.first = self.take(try forward.prefill(self.e, pr.s, pr.ids, pr.start));
 }
@@ -855,9 +855,9 @@ fn setupPrefill(self: *Owned, s: *lanes.Stream, w: *Writer, at: usize, resumed: 
     try w.int(start);
     try w.int(if (cut) |c| @as(u64, @intCast(c)) else 0);
     const seq = if (reuse) |k| k.seq else try self.obtain();
-    // the growth the prompt and its first drafts need (rank 1 then answers whether it grew too)
-    const target: i64 = @intCast(ids.len + grow_margin);
-    try w.int(if (forward.wants(seq, target) > 0) @as(u64, @intCast(target)) else 0);
+    // the positions the prompt and its first drafts reach: each rank backs its caches through them (a sequence comes
+    // new on one rank and reused on the other, so only then do both map the same) and rank 1 answers whether it could
+    try w.int(ids.len + grow_margin);
     if (reuse) |k| {
         resumed.* = k.id;
         self.gpa.free(k.ids);
@@ -905,7 +905,7 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         return false;
     }
     try self.send(.prefills, &w);
-    if (bytes > 0) try agree(self, prompts[0..ss.len]);
+    try agree(self, prompts[0..ss.len]);
     var firsts: [max_streams]u32 = undefined;
     const t0 = std.Io.Timestamp.now(self.io, .awake);
     try forward.prefillMany(self.e, prompts[0..ss.len], firsts[0..ss.len]);
@@ -915,9 +915,10 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
 }
 
 
-/// A prompt frame's growth, both ranks at once: rank 0 grows its prompts' caches while rank 1 grows its own from the
+/// A prompt frame's growth, both ranks at once: rank 0 backs its prompts' caches while rank 1 backs its own from the
 /// frame, then rank 1's answer and rank 0's verdict (rank 1 runs the pass only on a go); error.OutOfDeviceMemory,
-/// neither rank having run anything, when either is short.
+/// neither rank having run anything, when either is short. Every prompt frame asks: a sequence new on one rank may be
+/// reused on the other (its first step mapped), and only once both back the prompt do they map the same.
 fn agree(self: *Owned, prompts: []const forward.Prompt) !void {
     var ok = true;
     for (prompts) |pr| {
@@ -1246,12 +1247,12 @@ fn followPrefill(self: *Owned, r: *Reader, at: usize, grown: *?bool) !forward.Pr
     const reuse = try r.int();
     const start: usize = @intCast(try r.int());
     const cut = try r.int();
-    const grow: i64 = @intCast(try r.int());
+    const reach: i64 = @intCast(try r.int());
     const seq = if (reuse != 0) (self.by_id.fetchRemove(reuse) orelse return error.NoSequence).value else try self.obtain();
     try self.by_id.put(id, seq);
-    if (grow > 0) { // rank 0 grew for this prompt and waits for rank 1's answer
+    if (reach > 0) { // backed through the prompt's reach, as rank 0 backs its own (0: the calibration's, unasked)
         var ok = true;
-        self.grow(seq, grow) catch |err| switch (err) {
+        self.grow(seq, reach) catch |err| switch (err) {
             error.OutOfDeviceMemory => ok = false,
             else => return err,
         };

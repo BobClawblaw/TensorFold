@@ -696,12 +696,12 @@ pub fn fits(e: *const Engine, bytes: u64) bool {
 
 /// ``s``'s caches backed through ``positions`` now (error.OutOfDeviceMemory past the budget, nothing launched).
 pub fn reserve(e: *Engine, s: *Seq, positions: i64) !void {
-    try s.grow.ensure(@min(positions, s.capacity), e.k.stream.handle);
+    try s.grow.ensure(@min(positions, s.capacity), e.k.stream.handle, true);
 }
 
 /// ``s``'s caches backed through ``positions`` (its main and MTP positions), before a forward writes them.
 fn room(e: *Engine, s: *Seq, extra: i64) !void {
-    try s.grow.ensure(@max(s.pos, s.mtp_len) + extra, e.k.stream.handle);
+    try s.grow.ensure(@max(s.pos, s.mtp_len) + extra, e.k.stream.handle, false);
 }
 
 pub fn newSeq(e: *Engine) !*Seq {
