@@ -12,6 +12,8 @@ const api = @import("api.zig");
 const kern = @import("kern.zig");
 const ngram_mod = @import("ngram.zig");
 const grow_mod = @import("grow.zig");
+const draw_mod = @import("draw.zig");
+const lanes = @import("lanes");
 pub const devstore = @import("devstore.zig");
 pub const api_ = api;
 
@@ -141,6 +143,7 @@ pub const Buffers = struct {
     mtp_e: u64 = 0, mtp_eo: u64 = 0, mtp_hn: u64 = 0, mtp_xh: u64 = 0, mtp_hs: u64 = 0, mtp_in: u64 = 0,
     kpart: u64 = 0, hcpart: u64 = 0, dnf: u64 = 0, sgu: u64 = 0,
     seg_nk: u64 = 0, seg_sparse: u64 = 0, // a shared round's per-stream key counts, 64 bytes a stream (16-aligned)
+    tk: u64 = 0, gtk: u64 = 0, invt: u64 = 0, // sampled rows: each row's candidates, both ranks' gathered, 1 / temperature
 
     fn lay(b: *Buffers, c: *Carve) void {
         const R = b.rows;
@@ -216,6 +219,10 @@ pub const Buffers = struct {
         b.hcpart = c.take(8 * @min(R, 128) * 324 * 4);
         b.dnf = c.take(R * 324 * 4);
         b.sgu = c.take(R * 640 * 2);
+        const srows = if (b.prefill) 1 else R; // a prompt draws its last row only
+        b.tk = c.take(srows * draw_mod.W * 4);
+        b.gtk = c.take(2 * srows * draw_mod.W * 4);
+        b.invt = c.take(srows * 4);
         b.seg_nk = c.take(max_parts * 64);
         b.seg_sparse = c.take(max_parts * 64);
     }
@@ -255,6 +262,7 @@ pub const Seq = struct {
     last_streams: u64 = 0,
     grow: grow_mod.Range = undefined, // the caches that grow with the position (kc_*, ikc, pooled)
     img: ?Image = null, // an image prompt's rotary table and (until its prefill ends) its features
+    sampling: ?lanes.Sampling = null, // the stream's draw (null: greedy); its rows step eagerly
     // host
     pos: i64 = 0,
     mtp_len: i64 = 0,
@@ -409,6 +417,9 @@ pub const Engine = struct {
     confidence: f64 = 0,
     draft_p: [16]f64 = undefined, // the last draftUpTo's head probability for each draft it returned
     gran: u64 = 0, // device memory's mapping granularity
+    cand_host: []i32 = &.{}, // gathered candidates, read back
+    full: cuda.DeviceBuffer = undefined, // a full row of both ranks' logits (a rule past the candidates)
+    full_host: []u16 = &.{},
     budget: grow_mod.Budget = .{ .cap = std.math.maxInt(u64) }, // what every sequence's caches may map together
     /// Verify windows and MTP head steps as CUDA graphs (each width, DeltaNet parity and attention geometry).
     use_graphs: bool = true,
@@ -489,7 +500,7 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
 
 /// ``body`` from its graph (captured the first time this width, parity and geometry run).
 fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
-    if (!e.use_graphs or e.k.sync_each or s.img != null) return body(e, kind, s, R); // image sequences: eager, as Python
+    if (!e.use_graphs or e.k.sync_each or s.img != null or (kind == 0 and s.sampling != null)) return body(e, kind, s, R); // image and sampled sequences: eager
     try capture(e, kind, s, R);
     return e.graphs.get(keyOf(e, kind, s, R)).?.launchOn(e.k.stream);
 }
@@ -504,6 +515,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.opts = opts;
     e.capacity = @intCast(opts.context + opts.depth + 1);
     e.gran = try grow_mod.Range.granularity(ctx.d);
+    e.cand_host = try gpa.alloc(i32, @intCast(2 * @max(rows_for(opts), 1) * draw_mod.W));
+    e.full = try cuda.DeviceBuffer.alloc(ctx.d, 2 * HEAD_N * 2);
+    e.full_host = try gpa.alloc(u16, 2 * HEAD_N);
     e.budget = .{ .cap = std.math.maxInt(u64) };
     e.k = try K.init(gpa, ctx.d, ctx.ctx, ctx.stream, &kernels.triton, &kernels.ext);
     var ai: usize = 0;
@@ -571,6 +585,9 @@ pub fn deinit(e: *Engine) void {
     e.host.free();
     e.gpa.free(e.idbuf);
     e.gpa.free(e.rowbuf);
+    e.gpa.free(e.cand_host);
+    e.gpa.free(e.full_host);
+    e.full.free();
     e.gpa.free(e.valbuf);
     e.gpa.destroy(e);
 }
@@ -1036,6 +1053,11 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
             var picks: [1]Pick = undefined;
             try readPicks(e, b, 1, &picks);
             first = picks[0];
+            if (s.sampling) |rule| { // the first token draws at the prompt's length
+                var tok: [1]u32 = .{@intCast(first.tok)};
+                try drawRows(e, b, b.logits, 1, &.{.{ .row = 0, .s = rule, .position = prompt.len }}, &tok);
+                first.tok = tok[0];
+            }
             try e.k.copy(s.last_streams, b.streams + @as(u64, @intCast(R - 1)) * WIDE * 2, WIDE * 2);
         } else {
             try e.k.copy(b.streams, b.h, @intCast(R * WIDE * 2));
@@ -1068,6 +1090,53 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
 }
 
 /// One window over ``ids`` (the pending token, then drafts): out[r] is the greedy token after row r.
+fn rows_for(opts: Options) i64 {
+    return @max(@as(i64, opts.max_rows), 16);
+}
+
+/// A sampled row of a window: its row in the logits, its stream's rule and the position its draw is keyed at.
+const Want = struct { row: usize, s: lanes.Sampling, position: u64 };
+
+/// The sampled rows' tokens into ``out`` (by row): each rank's 64 candidates of every row and its log-sum-exps
+/// (fn_rows_topk at each row's temperature), gathered, drawn on the host (draw.zig); a rule past the candidates draws
+/// over the row's gathered logits. Both ranks run it with the same rows and rules, so their gathers pair up.
+fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want, out: []u32) !void {
+    if (want.len == 0) return;
+    const k = &e.k;
+    var inv: [64]f32 = @splat(1);
+    for (want) |w| inv[w.row] = @floatCast(1.0 / @max(w.s.temperature, 1e-6));
+    try k.upload(b.invt, std.mem.sliceAsBytes(inv[0..@intCast(rows)]));
+    {
+        const f = try k.ext(.sample, "fn_rows_topk");
+        var a: cuda.Args = .{};
+        a.add(logits); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(e.vocab_offset)));
+        a.add(b.invt); a.add(b.tk);
+        try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
+    }
+    const n: usize = @intCast(rows * draw_mod.W);
+    try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(b.tk, b.gtk, n, .i32, e.ctx.comm, k.stream.handle), "candidates");
+    try k.stream.synchronize();
+    try e.ctx.d.check(e.ctx.d.api.cuMemcpyDtoH_v2(@ptrCast(e.cand_host.ptr), b.gtk, 2 * n * 4), "candidates");
+    for (want) |w| {
+        const blocks = [2][]const i32{ e.cand_host[w.row * draw_mod.W ..][0..draw_mod.W], e.cand_host[n + w.row * draw_mod.W ..][0..draw_mod.W] };
+        switch (try draw_mod.draw(e.gpa, blocks, w.s, w.position)) {
+            .token => |t| out[w.row] = t,
+            .full => out[w.row] = try drawFull(e, logits + @as(u64, @intCast(w.row)) * HEAD_N * 2, w.s, w.position),
+        }
+    }
+}
+
+/// A row's draw over the whole vocabulary: both ranks' logits gathered (rank r's columns are ids r * HEAD_N + c).
+fn drawFull(e: *Engine, row: u64, s: lanes.Sampling, position: u64) !u32 {
+    try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(row, e.full.ptr, @intCast(HEAD_N), .bf16, e.ctx.comm, e.k.stream.handle), "full row");
+    try e.k.stream.synchronize();
+    try e.ctx.d.check(e.ctx.d.api.cuMemcpyDtoH_v2(@ptrCast(e.full_host.ptr), e.full.ptr, e.full_host.len * 2), "full row");
+    const values = try e.gpa.alloc(f64, e.full_host.len);
+    defer e.gpa.free(values);
+    for (values, e.full_host) |*v, h| v.* = @as(f32, @bitCast(@as(u32, h) << 16));
+    return draw_mod.drawFull(e.gpa, values, s, position);
+}
+
 pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     const R: i64 = @intCast(ids.len);
     if (R > e.buf.rows) return error.WindowTooWide;
@@ -1093,6 +1162,11 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     var picks: [16]Pick = undefined;
     try readPicks(e, b, R, picks[0..ids.len]);
     for (out[0..ids.len], picks[0..ids.len]) |*o, p| o.* = @intCast(p.tok);
+    if (s.sampling) |rule| { // row r draws the token at position pos + 1 + r
+        var want: [16]Want = undefined;
+        for (0..ids.len) |r| want[r] = .{ .row = r, .s = rule, .position = @intCast(s.pos + 1 + @as(i64, @intCast(r))) };
+        try drawRows(e, b, b.logits, R, want[0..ids.len], out);
+    }
     s.last_rows = R;
     s.last_row0 = 0;
     @memcpy(s.last_tokens[0..ids.len], toks[0..ids.len]);
@@ -1125,6 +1199,15 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
     var picks: [max_parts * 16]Pick = undefined;
     try readPicks(e, b, R, picks[0..@intCast(R)]);
     for (out[0..@intCast(R)], picks[0..@intCast(R)]) |*o, p| o.* = @intCast(p.tok);
+    var want: [max_parts * 16]Want = undefined;
+    var nw: usize = 0;
+    for (parts, segs[0..parts.len]) |p, sg| if (p.s.sampling) |rule| {
+        for (0..@intCast(sg.rows)) |r| {
+            want[nw] = .{ .row = @intCast(sg.row0 + @as(i64, @intCast(r))), .s = rule, .position = @intCast(p.s.pos + 1 + @as(i64, @intCast(r))) };
+            nw += 1;
+        }
+    };
+    try drawRows(e, b, b.logits, R, want[0..nw], out);
     for (parts, segs[0..parts.len]) |p, sg| {
         p.s.last_rows = sg.rows;
         p.s.last_row0 = sg.row0;
