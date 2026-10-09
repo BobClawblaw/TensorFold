@@ -331,13 +331,13 @@ pub fn pleConv(k: *K, gated: u64, pss: u64, nc: u64, tail: u64, cw: u64, h: u64,
 /// device ``delta`` the rows past the prompt add to their position.
 pub const Rope = struct { table: u64, delta: u64, length: i64 };
 
-pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, iq: u64, ikc: u64, R: i64, rope: ?Rope) !void {
+pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, iq: u64, ikc: u64, R: i64, rope: ?Rope, bits: u8) !void {
     const table = if (rope) |r| r.table else pos;
     const delta = if (rope) |r| r.delta else pos;
     const length = if (rope) |r| r.length else 0;
     try k.tri("_attn_prep", .{ R, 12 + 1 + 4 + 1, 1 }, &.{ P("P", p), P("POS0", pos), P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q),
         P("KC", kc), P("VC", vc), P("KS", ks), P("VS", vs), P("IQ", iq), P("IKC", ikc), P("ROPE", table), P("DELTA", delta), I("length", length), F("eps", EPS) },
-        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 8), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
+        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
 }
 
 pub fn attnGate(k: *K, o: u64, p: u64, out: u64, xs: u64, R: i64) !void {
@@ -376,19 +376,20 @@ pub fn qsaRows(k: *K, iq: u64, pooled: u64, pos: u64, sc: u64, ids: u64, nkr: u6
 }
 
 /// attention: 512-key chunks over at most 2051 keys, then the merge into ``out``.
-pub fn attention(k: *K, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, spr: u64, out: u64, rows: i64, context: i64) !void {
+pub fn attention(k: *K, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, spr: u64, out: u64, rows: i64, context: i64, bits: u8) !void {
     const keys = @min(context, KEYS_MAX);
     const chunks = @min(NCH, cdiv(keys, CHUNK));
     try k.tri("_chunks", .{ rows, 1, chunks }, &.{ P("Q", q), P("KC", kc), P("VC", vc), P("KSC", ks), P("VSC", vs), P("POS0", pos), P("PO", po), P("PM", pm), P("PL", pl),
         P("IDS", ids), P("NKR", nkr), P("SPR", spr) }, &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH),
-        cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", 8) });
+        cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", bits) });
     try k.tri("_merge", .{ rows, 1, 1 }, &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POS0", pos), P("OUT", out), P("NKR", nkr), P("SPR", spr) },
-        &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", 8) });
+        &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits) });
 }
 
 // -- attn_multi.py: a shared round's attention, one launch a kernel for every stream ---------------------------------
 /// A Triton dtype constexpr in the packed set (the packer's codes for KT, the cache's element type).
 pub const KT_INT8: i64 = 1;
+pub const KT_UINT8: i64 = 2; // the int4 cache's codes, two a byte
 
 /// A shared round's attention tables: each row's position and stream, each stream's first position and rows, and
 /// for each layer the streams' cache pointers ([6][streams]: keys, values, key scales, value scales, index keys,
@@ -401,12 +402,13 @@ const Launch = struct { name: []const u8, grid: [3]i64, args: []const Arg, const
 /// attn_multi.layer for every stream of a shared step: prep (q, the caches' new rows), pool, chunks, merge into
 /// ``out``, each one launch. False, with nothing launched, when the set lacks one of the launches' variants (the
 /// caller attends stream by stream).
-pub fn attentionMulti(k: *K, t: MultiTab, p: u64, qw: u64, kw: u64, iw: u64, ikw: u64, inv: u64, q: u64, iq: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, out: u64) !bool {
+pub fn attentionMulti(k: *K, t: MultiTab, p: u64, qw: u64, kw: u64, iw: u64, ikw: u64, inv: u64, q: u64, iq: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, out: u64, bits: u8) !bool {
+    const kt: i64 = if (bits == 4) KT_UINT8 else KT_INT8;
     const chunks = @min(NCH, cdiv(@min(t.keys, KEYS_MAX), CHUNK));
     const launches = [_]Launch{
         .{ .name = "_prep_multi", .grid = .{ t.rows, 12 + 1 + 4 + 1, 1 }, .args = &.{ P("P", p), P("POSR", t.posr), P("SID", t.sid), P("CP", t.cp), P("VP", t.cp),
             P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q), P("IQ", iq), F("eps", EPS), I("N", t.streams) },
-            .consts = &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 8), ci("KT", KT_INT8),
+            .consts = &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("KT", kt),
             ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
         .{ .name = "_pool_multi", .grid = .{ t.streams, @divFloor(t.most, RATIO) + 2, 1 }, .args = &.{ P("CP", t.cp), P("VP", t.cp), P("P0", t.first), P("RS", t.counts),
             P("W", ikw), P("INV", inv), F("eps", EPS), I("N", t.streams) },
@@ -414,9 +416,9 @@ pub fn attentionMulti(k: *K, t: MultiTab, p: u64, qw: u64, kw: u64, iw: u64, ikw
         .{ .name = "_chunks_multi", .grid = .{ t.rows, 1, chunks }, .args = &.{ P("Q", q), P("CP", t.cp), P("POSR", t.posr), P("SID", t.sid), P("PO", po), P("PM", pm),
             P("PL", pl), P("IDS", ids), P("NKR", nkr), I("N", t.streams) },
             .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1),
-            ci("BITS", 8), ci("KT", KT_INT8), ci("RATIO", RATIO), ci("TOP", TOP) } },
+            ci("BITS", bits), ci("KT", kt), ci("RATIO", RATIO), ci("TOP", TOP) } },
         .{ .name = "_merge_multi", .grid = .{ t.rows, 1, 1 }, .args = &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POSR", t.posr), P("OUT", out), P("NKR", nkr) },
-            .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", 8), ci("RATIO", RATIO), ci("TOP", TOP) } },
+            .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits), ci("RATIO", RATIO), ci("TOP", TOP) } },
     };
     for (launches) |l| if (!try k.has(l.name, l.args, l.consts)) return false;
     for (launches) |l| try k.tri(l.name, l.grid, l.args, l.consts);
