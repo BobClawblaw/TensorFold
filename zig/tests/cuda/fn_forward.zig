@@ -14,7 +14,7 @@ fn ints(gpa: std.mem.Allocator, v: std.json.Value) ![]i64 {
     return out;
 }
 
-/// fn-native <rank> <rank 0 address> <port> <triton dir> <pack.bin> <pack.json> <ngram.json> <ngram root> <reference.json> [more prompt lengths ...]
+/// fn-native <rank> <rank 0 address> <port> <triton dir> <pack.bin> <pack.json> <ngram.json> <ngram root> <reference.json> [more prompt lengths ...] [kv4]
 pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     const gpa = gpu.gpa;
     const io = gpu.io;
@@ -41,11 +41,16 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         try @import("flashnext_weights").load(gpa, io, &ctx, &kernels, args[4][5..], rank)
     else
         try fwd.devstore.load(gpa, io, gpu.d, args[4], args[5], args[6], args[7]);
+    // "kv4" among the trailing words: the int4 attention cache (Python's --kv-dtype int4; its reference then)
+    var kv_bits: u8 = 8;
+    for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "kv4")) {
+        kv_bits = 4;
+    };
     const e = try fwd.init(gpa, io, &ctx, &kernels, &store, .{ .context = 16384, .max_rows = rows: {
         // "rows=<n>": the shared rounds' rows at most (the server's batch_rows)
         for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "rows=")) break :rows try std.fmt.parseInt(u32, a[5..], 10);
         break :rows 16;
-    }, .depth = 15 });
+    }, .depth = 15, .kv_bits = kv_bits });
     try fwd.prefetchTables(e);
     e.k.sync_each = std.mem.indexOf(u8, args[1], "sync") != null or (args.len > 9 and std.mem.eql(u8, args[args.len - 1], "sync"));
     // "nographs" among the trailing words: verify and draft steps eager (the graphs' A/B)

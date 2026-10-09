@@ -22,6 +22,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
         .lanes_fixed = cli.parallelFixed(args.parallel),
         .drafts = !args.no_drafts,
         .vision = args.vision,
+        .kv_bits = if (std.mem.eql(u8, args.kv_dtype, "int4")) 4 else 8,
         .speed_up = args.speed_up,
         .prompt_cache_gib = args.prompt_cache_gib,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
