@@ -113,12 +113,12 @@ pub const Kernels = struct {
     triton: cuda.aot.Set,
     ext: [ext_names.len]cuda.Module,
 
-    pub const ext_names = [_][]const u8{ "fn_experts", "fn_experts_prefill", "fn_gdn_prefill", "fn_qmm", "fn_qmm_prefill", "fn_gdn", "fn_gdn_io", "fn_sample" };
+    pub const ext_names = [_][]const u8{ "fn_experts", "fn_experts_prefill", "fn_gdn_prefill", "fn_qmm", "fn_qmm_prefill", "fn_gdn", "fn_gdn_io", "fn_sample", "fn_vision" };
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, device: cuda.abi.Device, triton_dir: []const u8) !Kernels {
         var k: Kernels = .{ .triton = try cuda.aot.Set.load(gpa, io, d, device, triton_dir), .ext = undefined };
         const images = [_][]const u8{ cuda.kernels.fn_experts, cuda.kernels.fn_experts_prefill, cuda.kernels.fn_gdn_prefill,
-            cuda.kernels.fn_qmm, cuda.kernels.fn_qmm_prefill, cuda.kernels.fn_gdn, cuda.kernels.fn_gdn_io, cuda.kernels.fn_sample };
+            cuda.kernels.fn_qmm, cuda.kernels.fn_qmm_prefill, cuda.kernels.fn_gdn, cuda.kernels.fn_gdn_io, cuda.kernels.fn_sample, cuda.kernels.fn_vision };
         for (images, 0..) |img, i| k.ext[i] = try cuda.Module.load(d, img);
         return k;
     }

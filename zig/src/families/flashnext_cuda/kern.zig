@@ -77,15 +77,15 @@ fn matches(k: anytype, args: []const Arg, consts: []const Const) bool {
     return runtime == k.params.len;
 }
 
-pub const Ext = enum(u8) { experts, experts_prefill, gdn_prefill, qmm, qmm_prefill, gdn, gdn_io, sample };
+pub const Ext = enum(u8) { experts, experts_prefill, gdn_prefill, qmm, qmm_prefill, gdn, gdn_io, sample, vision };
 
 /// The launch context: the stream, the Triton set, the extension modules' functions by name.
 pub const K = struct {
     d: *const cuda.Driver,
     stream: cuda.Stream,
     set: *const aot.Set,
-    names: [8][]const [:0]const u8 = @splat(&.{}),
-    funcs: [8][]cuda.Function = @splat(&.{}),
+    names: [16][]const [:0]const u8 = @splat(&.{}),
+    funcs: [16][]cuda.Function = @splat(&.{}),
     sms: i64 = 48,
     cache: std.AutoHashMap(u64, cuda.Function) = undefined,
     gpa: std.mem.Allocator,

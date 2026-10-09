@@ -131,6 +131,8 @@ const Owned = struct {
     next: u64 = 0,
     costs: [max_rows]lanes.config.Cost = undefined, // a window's ms by width (rank 0, timed at open)
     cost_count: usize = 0,
+    shared: [8]lanes.config.Cost = undefined, // a shared round's ms by its total rows
+    shared_count: usize = 0,
     mtp_ms: f64 = 0, // one chained head step
     spare: ?*forward.Seq = null, // a released sequence, reset and reused by the next request (its memory, its graphs)
 
@@ -207,6 +209,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.next_id = 1;
     own.next = 0;
     own.cost_count = 0;
+    own.shared_count = 0;
     own.spare = null;
     own.mtp_ms = 0;
     if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
@@ -220,6 +223,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
                     .hidden_rows = o.drafts, .max_streams = if (o.drafts) max_streams else 1, .batch_rows = batch_rows,
                     .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms,
+                    .shared_costs = own.shared[0..own.shared_count],
                     .draft_probabilities = o.drafts, .draft_streams = o.drafts },
         .rows = if (o.drafts) max_rows else 1,
         .stream_bytes = forward.seqBytes(own.e),
@@ -291,8 +295,70 @@ fn calibrate(self: *Owned, drafts: bool) !void {
         }
     }
     self.mtp_ms = @max(0, (at[1] - at[0]) / 7);
+    try calibrateShared(self);
     std.log.info("flash next costs: window 1/4/8/16 rows {d:.1}/{d:.1}/{d:.1}/{d:.1} ms, head step {d:.2} ms", .{
         self.costs[0].ms, self.costs[3].ms, self.costs[7].ms, self.costs[15].ms, self.mtp_ms });
+}
+
+/// Shared rounds timed on throwaway sequences: 2-row windows over 2, 4, 8 and 16 streams and 4-row windows over 16
+/// (best of two after a warm-up), the lane core's prices for a round by its total rows.
+fn calibrateShared(self: *Owned) !void {
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    var ids: [max_streams]u64 = undefined;
+    var seqs: [max_streams]*forward.Seq = undefined;
+    var made: usize = 0;
+    defer for (ids[0..made], seqs[0..made]) |id, sq| {
+        w.int(id) catch {};
+        self.send(.release, &w) catch {};
+        forward.freeSeq(self.e, sq);
+    };
+    var prompt: [32]u32 = undefined;
+    var first: [max_streams]u32 = undefined;
+    for (0..max_streams) |k| {
+        for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + ((i + k * 7) * 37) % 5000);
+        ids[k] = self.next_id;
+        self.next_id += 1;
+        try w.int(ids[k]);
+        try w.tokens(&prompt);
+        try self.send(.prefill, &w);
+        seqs[k] = try forward.newSeq(self.e);
+        made += 1;
+        first[k] = try forward.prefill(self.e, seqs[k], &prompt);
+    }
+    const shapes = [_][2]usize{ .{ 2, 2 }, .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 16, 4 } };
+    for (shapes) |sh| {
+        const n = sh[0];
+        const rows = sh[1];
+        var best: f64 = std.math.inf(f64);
+        for (0..3) |rep| {
+            var toks: [max_streams][4]u32 = undefined;
+            var parts: [max_streams]forward.Part = undefined;
+            try w.int(n);
+            for (0..n) |k| {
+                @memset(toks[k][0..rows], first[k]);
+                parts[k] = .{ .s = seqs[k], .ids = toks[k][0..rows] };
+                try w.int(ids[k]);
+                try w.tokens(toks[k][0..rows]);
+            }
+            try self.send(.shared, &w);
+            var flat: [batch_rows]u32 = undefined;
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
+            try forward.verifyShared(self.e, parts[0..n], flat[0 .. n * rows]);
+            if (rep > 0) best = @min(best, msSince(self.io, t0));
+            for (0..n) |k| { // keep one row: the caches advance a little each pass
+                try w.int(ids[k]);
+                try w.int(rows);
+                try w.int(1);
+                try self.send(.keep, &w);
+                try forward.keep(self.e, seqs[k], @intCast(rows), 1);
+            }
+        }
+        self.shared[self.shared_count] = .{ .width = @intCast(n * rows), .ms = best };
+        self.shared_count += 1;
+    }
+    std.log.info("flash next shared rounds: 4/8/16/32/64 rows {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} ms", .{
+        self.shared[0].ms, self.shared[1].ms, self.shared[2].ms, self.shared[3].ms, self.shared[4].ms });
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
