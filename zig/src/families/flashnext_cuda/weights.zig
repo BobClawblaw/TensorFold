@@ -12,6 +12,9 @@ const cuda = @import("cuda");
 pub const api = @import("api.zig");
 /// The forward and its engine API (tf-cuda-test fn-native reaches it through this module).
 pub const forward = @import("forward.zig");
+/// The vision tower (rank 0 encodes images; tf-cuda-test fn-vision checks it against the Python tower).
+pub const vision = @import("vision.zig");
+pub const kern = @import("kern.zig");
 
 const BASE = "model.language_model.";
 const WORLD = 2;
