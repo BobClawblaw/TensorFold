@@ -683,10 +683,15 @@ pub fn reach(s: *const Seq, rows: i64) i64 {
     return @max(s.pos, s.mtp_len) + rows;
 }
 
-/// Whether backing ``s``'s caches through ``positions`` maps memory (the two ranks then agree on it first: a growth
-/// refused on one rank alone would leave the other in a forward whose collectives never meet).
-pub fn short(s: *const Seq, positions: i64) bool {
-    return s.grow.short(@min(positions, s.capacity));
+/// The bytes backing ``s``'s caches through ``positions`` maps (the two ranks agree on a growth first: one refused on
+/// one rank alone would leave the other in a forward whose collectives never meet).
+pub fn wants(s: *const Seq, positions: i64) u64 {
+    return s.grow.wants(@min(positions, s.capacity));
+}
+
+/// Whether the budget takes ``bytes`` more now.
+pub fn fits(e: *const Engine, bytes: u64) bool {
+    return e.budget.used + bytes <= e.budget.cap;
 }
 
 /// ``s``'s caches backed through ``positions`` now (error.OutOfDeviceMemory past the budget, nothing launched).

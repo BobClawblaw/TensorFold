@@ -52,14 +52,16 @@ pub const Range = struct {
         try self.d.check(self.d.api.cuMemAddressReserve(&self.base, self.size, self.gran, 0, 0), "cuMemAddressReserve");
     }
 
-    /// Whether ``ensure(positions)`` would map memory (a growth both ranks agree on before a forward needs it).
-    pub fn short(self: *const Range, positions: i64) bool {
+    /// The bytes ``ensure(positions)`` would map (a growth both ranks agree on before a forward needs it).
+    pub fn wants(self: *const Range, positions: i64) u64 {
         const want_pos = std.mem.alignForward(u64, @intCast(@max(positions, 1)), @intCast(step_positions));
+        var bytes: u64 = 0;
         for (self.regions.items) |r| {
             const units = std.math.divCeil(u64, want_pos, @intCast(r.per)) catch unreachable;
-            if (@min(r.cap, std.mem.alignForward(u64, units * r.bytes_per, self.gran)) > r.mapped) return true;
+            const need = @min(r.cap, std.mem.alignForward(u64, units * r.bytes_per, self.gran));
+            if (need > r.mapped) bytes += std.mem.alignForward(u64, need - r.mapped, self.gran);
         }
-        return false;
+        return bytes;
     }
 
     /// Every region backed through ``positions`` (in steps of step_positions), new memory zeroed on ``stream``.
