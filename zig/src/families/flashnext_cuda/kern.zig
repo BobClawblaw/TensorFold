@@ -77,7 +77,36 @@ fn matches(k: anytype, args: []const Arg, consts: []const Const) bool {
     return runtime == k.params.len;
 }
 
-pub const Ext = enum(u8) { experts, experts_prefill, gdn_prefill, qmm, qmm_prefill, gdn, gdn_io, sample, vision };
+/// A launch shape's variant and, for each of its parameters, the call's argument that fills it.
+const Picked = struct { variant: u32, n: u8, order: [48]u8 = undefined };
+const none: u8 = 255; // a shape the set has no variant for
+
+/// What picks a launch's variant: its kernel, constexprs and each argument's name and specialization (``matches``).
+fn shapeOf(name: []const u8, args: []const Arg, consts: []const Const) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(name);
+    for (consts) |c| {
+        h.update(c.name);
+        const tag: [2]u8 = .{ @intFromBool(c.int != null), @intFromBool(c.f32 != null) };
+        h.update(&tag);
+        if (c.int) |x| h.update(std.mem.asBytes(&x));
+        if (c.f32) |x| h.update(std.mem.asBytes(&x));
+    }
+    for (args) |a| {
+        h.update(a.name);
+        const cls: [2]u8 = switch (a.value) {
+            .ptr => |x| .{ 1, @intFromBool(x.addr % 16 == 0) },
+            .i32 => |x| .{ 2, @as(u8, @intFromBool(x == 1)) | @as(u8, @intFromBool(@mod(x, 16) == 0)) << 1 },
+            .f32 => .{ 3, 0 },
+            .u64 => |x| .{ 4, @intFromBool(x % 16 == 0) },
+        };
+        h.update(&cls);
+        if (a.value == .ptr) h.update(a.value.ptr.ty);
+    }
+    return h.final();
+}
+
+pub const Ext = enum(u8) { experts, experts_prefill, gdn_prefill, qmm, qmm_prefill, gdn, gdn_io, sample, vision, gdn_multi };
 
 /// The launch context: the stream, the Triton set, the extension modules' functions by name.
 pub const K = struct {
@@ -88,6 +117,7 @@ pub const K = struct {
     funcs: [16][]cuda.Function = @splat(&.{}),
     sms: i64 = 48,
     cache: std.AutoHashMap(u64, cuda.Function) = undefined,
+    picked: std.AutoHashMap(u64, Picked) = undefined, // a launch's variant and argument order, by its shape (shapeOf)
     gpa: std.mem.Allocator,
     /// Development: synchronize after every launch and name the one that faulted.
     sync_each: bool = false,
@@ -103,6 +133,7 @@ pub const K = struct {
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, ctx: *const cuda.Context, stream: cuda.Stream, set: *const aot.Set, modules: []const cuda.Module) !K {
         var k: K = .{ .d = d, .stream = stream, .set = set, .gpa = gpa };
         k.cache = .init(gpa);
+        k.picked = .init(gpa);
         k.sms = try ctx.attribute(.multiprocessor_count);
         for (modules, 0..) |m, i| {
             var n: c_uint = 0;
@@ -155,26 +186,50 @@ pub const K = struct {
         }
     }
 
-    /// One Triton launch: the variant whose constexprs and specialization fit, its runtime arguments in order.
+    /// One Triton launch: the variant whose constexprs and specialization fit, its runtime arguments in order (the
+    /// choice remembered by the launch's shape: an eager round makes thousands of launches of a few dozen shapes).
     pub fn tri(self: *K, name: []const u8, grid: [3]i64, args: []const Arg, consts: []const Const) !void {
-        for (self.set.variants) |*v| {
+        const pk = try self.pick(name, args, consts) orelse return self.missing(name, grid, args, consts);
+        const v = &self.set.variants[pk.variant];
+        var packed_args: cuda.Args = .{};
+        for (pk.order[0..pk.n]) |ai| switch (args[ai].value) {
+            .ptr => |x| packed_args.add(x.addr),
+            .i32 => |x| packed_args.add(x),
+            .f32 => |x| packed_args.add(x),
+            .u64 => |x| packed_args.add(x),
+        };
+        try v.kernel.launchOn(.{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, self.stream, &packed_args, .{}, &.{});
+        return self.after(name);
+    }
+
+    /// The launch's variant and argument order (null: the set has none), remembered by the launch's shape.
+    fn pick(self: *K, name: []const u8, args: []const Arg, consts: []const Const) !?Picked {
+        const key = shapeOf(name, args, consts);
+        if (self.picked.get(key)) |pk| return if (pk.n == none) null else pk;
+        for (self.set.variants, 0..) |*v, vi| {
             if (!std.mem.eql(u8, v.spec.@"fn", name)) continue;
             if (!matches(v.spec, args, consts)) continue;
-            var packed_args: cuda.Args = .{};
-            for (v.spec.params) |p| {
-                const a = for (args) |x| {
-                    if (std.mem.eql(u8, x.name, p.name)) break x;
+            var pk: Picked = .{ .variant = @intCast(vi), .n = @intCast(v.spec.params.len) };
+            if (v.spec.params.len > pk.order.len) return error.TooManyParams;
+            for (v.spec.params, 0..) |p, j| {
+                pk.order[j] = for (args, 0..) |x, ai| {
+                    if (std.mem.eql(u8, x.name, p.name)) break @intCast(ai);
                 } else unreachable;
-                switch (a.value) {
-                    .ptr => |x| packed_args.add(x.addr),
-                    .i32 => |x| packed_args.add(x),
-                    .f32 => |x| packed_args.add(x),
-                    .u64 => |x| packed_args.add(x),
-                }
             }
-            try v.kernel.launchOn(.{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, self.stream, &packed_args, .{}, &.{});
-            return self.after(name);
+            try self.picked.put(key, pk);
+            return pk;
         }
+        try self.picked.put(key, .{ .variant = 0, .n = none });
+        return null;
+    }
+
+    /// Whether the set holds a variant for this launch (a family's optional path checks before it starts).
+    pub fn has(self: *K, name: []const u8, args: []const Arg, consts: []const Const) !bool {
+        return try self.pick(name, args, consts) != null;
+    }
+
+    fn missing(self: *K, name: []const u8, grid: [3]i64, args: []const Arg, consts: []const Const) error{MissingTritonVariant} {
+        _ = self;
         std.log.err("flash next: no captured {s} variant for this launch (grid {any})", .{ name, grid });
         for (consts) |c| std.log.err("  const {s} = {?d} {?d}", .{ c.name, c.int, c.f32 });
         for (args) |a| switch (a.value) {
@@ -329,6 +384,49 @@ pub fn attention(k: *K, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, pos: u64, po
         cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", 8) });
     try k.tri("_merge", .{ rows, 1, 1 }, &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POS0", pos), P("OUT", out), P("NKR", nkr), P("SPR", spr) },
         &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", 8) });
+}
+
+// -- attn_multi.py: a shared round's attention, one launch a kernel for every stream ---------------------------------
+/// A Triton dtype constexpr in the packed set (the packer's codes for KT, the cache's element type).
+pub const KT_INT8: i64 = 1;
+
+/// A shared round's attention tables: each row's position and stream, each stream's first position and rows, and
+/// for each layer the streams' cache pointers ([6][streams]: keys, values, key scales, value scales, index keys,
+/// pooled), as attn_multi.Step lays them out.
+pub const MultiTab = struct { posr: u64, sid: u64, first: u64, counts: u64, cp: u64, streams: i64, rows: i64, most: i64, keys: i64 };
+
+/// One launch: its kernel, grid, arguments and constexprs (checked against the set before any of a step's runs).
+const Launch = struct { name: []const u8, grid: [3]i64, args: []const Arg, consts: []const Const };
+
+/// attn_multi.layer for every stream of a shared step: prep (q, the caches' new rows), pool, chunks, merge into
+/// ``out``, each one launch. False, with nothing launched, when the set lacks one of the launches' variants (the
+/// caller attends stream by stream).
+pub fn attentionMulti(k: *K, t: MultiTab, p: u64, qw: u64, kw: u64, iw: u64, ikw: u64, inv: u64, q: u64, iq: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, out: u64) !bool {
+    const chunks = @min(NCH, cdiv(@min(t.keys, KEYS_MAX), CHUNK));
+    const launches = [_]Launch{
+        .{ .name = "_prep_multi", .grid = .{ t.rows, 12 + 1 + 4 + 1, 1 }, .args = &.{ P("P", p), P("POSR", t.posr), P("SID", t.sid), P("CP", t.cp), P("VP", t.cp),
+            P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q), P("IQ", iq), F("eps", EPS), I("N", t.streams) },
+            .consts = &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 8), ci("KT", KT_INT8),
+            ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
+        .{ .name = "_pool_multi", .grid = .{ t.streams, @divFloor(t.most, RATIO) + 2, 1 }, .args = &.{ P("CP", t.cp), P("VP", t.cp), P("P0", t.first), P("RS", t.counts),
+            P("W", ikw), P("INV", inv), F("eps", EPS), I("N", t.streams) },
+            .consts = &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
+        .{ .name = "_chunks_multi", .grid = .{ t.rows, 1, chunks }, .args = &.{ P("Q", q), P("CP", t.cp), P("POSR", t.posr), P("SID", t.sid), P("PO", po), P("PM", pm),
+            P("PL", pl), P("IDS", ids), P("NKR", nkr), I("N", t.streams) },
+            .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1),
+            ci("BITS", 8), ci("KT", KT_INT8), ci("RATIO", RATIO), ci("TOP", TOP) } },
+        .{ .name = "_merge_multi", .grid = .{ t.rows, 1, 1 }, .args = &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POSR", t.posr), P("OUT", out), P("NKR", nkr) },
+            .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", 8), ci("RATIO", RATIO), ci("TOP", TOP) } },
+    };
+    for (launches) |l| if (!try k.has(l.name, l.args, l.consts)) return false;
+    for (launches) |l| try k.tri(l.name, l.grid, l.args, l.consts);
+    return true;
+}
+
+/// Whether the kernel set holds the shared rounds' attention (a set packed before them does not).
+pub fn hasMulti(k: *const K) bool {
+    for (k.set.variants) |*v| if (std.mem.eql(u8, v.spec.@"fn", "_chunks_multi")) return true;
+    return false;
 }
 
 // -- moe.py, affine_moe.py --------------------------------------------------------------------------------------------
@@ -500,6 +598,26 @@ pub fn gdnReplay(k: *K, state_in: u64, sk: u64, sv: u64, sg: u64, sb: u64, rows:
     for ([_]u64{ state_in, sk, sv, sg, sb }) |x| a.add(x);
     a.add(@as(i32, @intCast(rows))); a.add(state_out);
     try k.go(f, .{ .x = @intCast(NV) }, 1024, 0, &a);
+}
+
+/// gdn_multi.cu: every stream's chain in a shared round, one block per value head and stream (``tab``: the layer's
+/// ChainSeg entries; each stream's rows land at its row0 of ``out``/``xs``).
+pub fn gdnChainMulti(k: *K, tab: u64, streams: i64, conv_w: u64, a_log: u64, dt_bias: u64, norm: u64, out: u64, xs: u64) !void {
+    var buf: [96]u8 = undefined;
+    const f = try k.ext(.gdn_multi, try std.fmt.bufPrint(&buf, "18chain_multi_kernelILi{d}ELi{d}E", .{ NK, NV }));
+    var a: cuda.Args = .{};
+    a.add(tab); a.add(conv_w); a.add(a_log); a.add(dt_bias); a.add(norm); a.add(@as(f32, EPS)); a.add(out); a.add(xs);
+    try k.go(f, .{ .x = @intCast(NV), .y = @intCast(streams) }, 1024, 0, &a);
+}
+
+/// gdn_multi.cu: every stream's replay of its kept rows in every layer, one block per value head, stream and layer
+/// (``tab``: ReplaySeg entries [layer][stream]; rows 0 replays nothing).
+pub fn gdnReplayMulti(k: *K, tab: u64, streams: i64) !void {
+    var buf: [96]u8 = undefined;
+    const f = try k.ext(.gdn_multi, try std.fmt.bufPrint(&buf, "19replay_multi_kernelILi{d}ELi{d}E", .{ NK, NV }));
+    var a: cuda.Args = .{};
+    a.add(tab); a.add(@as(i32, @intCast(streams)));
+    try k.go(f, .{ .x = @intCast(NV), .y = @intCast(streams), .z = 36 }, 1024, 0, &a);
 }
 
 /// gdn_io.front: a prompt piece's conv taps and gates -> q, k (fp32), v (bf16), g, beta.

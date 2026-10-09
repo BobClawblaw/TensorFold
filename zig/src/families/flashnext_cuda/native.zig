@@ -52,7 +52,7 @@ pub fn deviceWeightBytes(io: std.Io, dir: []const u8) u64 {
 }
 
 const max_rows = 16;            // a verify window's rows at most (pending + 15 drafts)
-const batch_rows = 64;          // a shared round's rows at most, every stream's window together
+const batch_rows = 128;         // a shared round's rows at most, every stream's window together (16 streams x 8)
 const max_streams = 16;         // streams a shared round packs at most
 const max_depth = max_rows - 1;
 /// The head stops at a draft it gives less than this (the Python engine's --mtp-confidence, the recipe's 0.70);
@@ -61,7 +61,7 @@ const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10, keeps = 11, prefills = 12 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -120,6 +120,7 @@ const Lane = struct {
     nheld: u32 = 0,
     rows: u32 = 0,                      // the last verify's rows, not yet committed (0: nothing pending)
     g: ?Gram = null,                    // the reply's grammar (rank 0)
+    first: u64 = 0,                     // the prompt's first token (a handle: readFn)
 };
 
 /// A reply's grammar on rank 0 (engine/grammar.py's Constraint): its matcher at the reply's committed tokens.
@@ -229,6 +230,29 @@ fn settle(self: *Owned, l: *Lane, kept: u32) !void {
     l.rows = 0;
 }
 
+/// ``settle`` for several lanes: one frame and one keep for all of them (forward.keepMany).
+fn settleMany(self: *Owned, ls: []const *Lane, kept: []const u32) !void {
+    var items: [max_streams]forward.Keep = undefined;
+    var n: usize = 0;
+    for (ls, kept) |l, kp| {
+        if (l.rows == 0) continue;
+        items[n] = .{ .s = l.seq, .rows = l.rows, .kept = kp };
+        n += 1;
+    }
+    if (n == 0) return;
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    try w.int(n);
+    for (ls, kept) |l, kp| if (l.rows != 0) {
+        try w.int(l.id);
+        try w.int(l.rows);
+        try w.int(kp);
+    };
+    try self.send(.keeps, &w);
+    try forward.keepMany(self.e, items[0..n]);
+    for (ls) |l| l.rows = 0;
+}
+
 const Owned = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -251,7 +275,7 @@ const Owned = struct {
     shared: [8]lanes.config.Cost = undefined, // a shared round's ms by its total rows
     shared_count: usize = 0,
     mtp_ms: f64 = 0, // one chained head step
-    spare: ?*forward.Seq = null, // a released sequence, reset and reused by the next request (its memory, its graphs)
+    spares: std.ArrayList(*forward.Seq) = .empty, // released sequences, reset and reused by the next requests (their memory, their graphs)
     kept: std.ArrayList(Kept) = .empty, // released sequences kept at their prompts' kept points (oldest first)
     streams: usize = max_streams, // the streams admission budgeted: active, kept and spare sequences stay within it
     gfull: []u32 = &.{}, // a grammar row's bits over the whole vocabulary
@@ -266,16 +290,17 @@ const Owned = struct {
     }
 
     fn obtain(self: *Owned) !*forward.Seq {
-        if (self.spare) |s| {
-            self.spare = null;
-            try forward.resetSeq(self.e, s);
-            return s;
-        }
-        return forward.newSeq(self.e);
+        return self.spares.pop() orelse forward.newSeq(self.e);
     }
 
+    /// A released sequence, reset now (its grown caches back to the budget, its state zeroed on the stream) and kept
+    /// for the next request while every sequence stays within the budgeted streams: the Python engine holds a state
+    /// per slot, where allocating and zeroing one per request held up each new stream's first token.
     fn retire(self: *Owned, s: *forward.Seq) void {
-        if (self.spare == null) self.spare = s else forward.freeSeq(self.e, s);
+        const live = if (self.rank == 0) self.lanes_by.count() + self.kept.items.len else self.by_id.count();
+        if (live + self.spares.items.len >= self.streams) return forward.freeSeq(self.e, s);
+        forward.resetSeq(self.e, s) catch return forward.freeSeq(self.e, s);
+        self.spares.append(self.gpa, s) catch forward.freeSeq(self.e, s);
     }
 
     fn take(self: *Owned, t: u32) u64 {
@@ -342,7 +367,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.next = 0;
     own.cost_count = 0;
     own.shared_count = 0;
-    own.spare = null;
+    own.spares = .empty;
     own.kept = .empty;
     own.streams = max_streams;
     own.gfull = &.{};
@@ -350,10 +375,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.mtp_ms = 0;
     if (o.rank == 0) try calibrate(own, o.drafts); // rank 1 replays it in its follow loop
     // the calibration's sequence is not kept: the server budgets streams from the memory left after open
-    if (own.spare) |sp| {
-        forward.freeSeq(own.e, sp);
-        own.spare = null;
-    }
+    while (own.spares.pop()) |sp| forward.freeSeq(own.e, sp);
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
         .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
@@ -443,8 +465,8 @@ fn calibrate(self: *Owned, drafts: bool) !void {
         self.costs[0].ms, self.costs[3].ms, self.costs[7].ms, self.costs[15].ms, self.mtp_ms });
 }
 
-/// Shared rounds timed on throwaway sequences: 2-row windows over 2, 4, 8 and 16 streams and 4-row windows over 16
-/// (best of two after a warm-up), the lane core's prices for a round by its total rows.
+/// Shared rounds timed on throwaway sequences: 2-row windows over 2, 4, 8 and 16 streams and 4-, 6- and 8-row windows
+/// over 16 (best of two after a warm-up), the lane core's prices for a round by its total rows.
 fn calibrateShared(self: *Owned) !void {
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
@@ -472,13 +494,13 @@ fn calibrateShared(self: *Owned) !void {
         made += 1;
         first[k] = try forward.prefill(self.e, seqs[k], &prompt, 0);
     }
-    const shapes = [_][2]usize{ .{ 2, 2 }, .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 16, 4 } };
+    const shapes = [_][2]usize{ .{ 2, 2 }, .{ 4, 2 }, .{ 8, 2 }, .{ 16, 2 }, .{ 16, 4 }, .{ 16, 6 }, .{ 16, 8 } };
     for (shapes) |sh| {
         const n = sh[0];
         const rows = sh[1];
         var best: f64 = std.math.inf(f64);
         for (0..3) |rep| {
-            var toks: [max_streams][4]u32 = undefined;
+            var toks: [max_streams][8]u32 = undefined;
             var parts: [max_streams]forward.Part = undefined;
             try w.int(n);
             for (0..n) |k| {
@@ -504,8 +526,8 @@ fn calibrateShared(self: *Owned) !void {
         self.shared[self.shared_count] = .{ .width = @intCast(n * rows), .ms = best };
         self.shared_count += 1;
     }
-    std.log.info("flash next shared rounds: 4/8/16/32/64 rows {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} ms", .{
-        self.shared[0].ms, self.shared[1].ms, self.shared[2].ms, self.shared[3].ms, self.shared[4].ms });
+    std.log.info("flash next shared rounds: 4/8/16/32/64/96/128 rows {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} ms", .{
+        self.shared[0].ms, self.shared[1].ms, self.shared[2].ms, self.shared[3].ms, self.shared[4].ms, self.shared[5].ms, self.shared[6].ms });
 }
 
 /// The streams admission budgeted (native/cuda.zig after open): kept prompt states stay within them.
@@ -527,7 +549,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
     if (own.rank == 0) own.link.send(@intFromEnum(Op.stop), "") catch {};
-    if (own.spare) |s| forward.freeSeq(own.e, s);
+    while (own.spares.pop()) |s| forward.freeSeq(own.e, s);
+    own.spares.deinit(own.gpa);
     forward.deinit(own.e);
     own.store.deinit();
     own.kernels.deinit();
@@ -548,6 +571,7 @@ fn of(p: *anyopaque) *Owned {
 
 const vtable: be.Backend.VTable = .{
     .prefill = prefillFn,
+    .prefill_many = prefillManyFn,
     .first = firstFn,
     .queue = queueFn,
     .read = readFn,
@@ -605,6 +629,21 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         try self.ctx.d.check(self.ctx.d.api.cuMemcpyDtoH_v2(w0.buf.items[fat..].ptr, feats.?.ptr, rows * 2560 * 2), "image features");
         frame = try w0.buf.toOwnedSlice(self.gpa);
     }
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    var resumed: u64 = 0;
+    const pr = try setupPrefill(self, s, &w, 0, &resumed);
+    if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
+    try self.send(.prefill, &w);
+    if (pos) |q| try forward.attach(self.e, pr.s, q.rows, feats.?.ptr, q.pos, q.delta);
+    self.lanes_by.getPtr(s).?.first = self.take(try forward.prefill(self.e, pr.s, pr.ids, pr.start));
+}
+
+/// A stream's lane for its prompt pass (prefillFn, prefillManyFn): the kept state it resumes from, its grammar (its
+/// first row's bits at grammar row ``at`` of the scratch), its sequence; rank 1's frame fields into ``w``.
+fn setupPrefill(self: *Owned, s: *lanes.Stream, w: *Writer, at: usize, resumed: *u64) !forward.Prompt {
+    const ids = s.prompt();
+    resumed.* = 0;
     // a kept prompt state this prompt extends (the longest), and the point this prompt keeps (drafting, no images)
     const cutting = s.drafts and s.images.len == 0;
     var reuse: ?Kept = null;
@@ -622,12 +661,15 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     const gop = try self.lanes_by.getOrPut(s);
     if (gop.found_existing) self.retire(gop.value_ptr.seq);
     // every sequence within the budgeted streams: the oldest kept states go first
-    while (self.kept.items.len > 0 and self.lanes_by.count() + self.kept.items.len + @intFromBool(self.spare != null) > self.streams) dropKept(self, 0);
+    while (true) { // spares first, then the oldest kept states (a new stream takes a spare when it resumes none)
+        const spares = self.spares.items.len - @intFromBool(reuse == null and self.spares.items.len > 0);
+        if (self.lanes_by.count() + self.kept.items.len + spares <= self.streams) break;
+        if (spares > 0) {
+            forward.freeSeq(self.e, self.spares.orderedRemove(0));
+        } else if (self.kept.items.len > 0) dropKept(self, 0) else break;
+    }
     const id = self.next_id;
     self.next_id += 1;
-    var w: Writer = .{ .gpa = self.gpa };
-    defer w.buf.deinit(self.gpa);
-    if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
     // a grammar: compiled (the server's compile is cached), its first row when it starts with the reply
     var gram: ?Gram = null;
     errdefer if (gram) |g| g.m.free();
@@ -639,37 +681,83 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         const compiled = try st.compiler.compile(self.io, st.kind, st.text, &err);
         defer compiled.free();
         gram = .{ .m = try compiled.matcher(), .after = st.after, .active = st.after == null };
-        grows.bits = .{ self.gbits[0], self.gbits[1] };
+        grows.bits = .{ self.gbits[0][at * MW ..], self.gbits[1][at * MW ..] };
         try gramRows(&gram.?, s, &.{0}, self.gfull, &grows);
     }
     try w.int(id);
     try w.tokens(ids);
-    try writeSampling(&w, s.sampling);
-    try writeRows(&w, &grows);
+    try writeSampling(w, s.sampling);
+    try writeRows(w, &grows);
     const start: usize = if (reuse) |k| k.ids.len else 0;
     const cut: ?i64 = if (cutting) @max(1, @as(i64, @intCast(ids.len)) - 1) else null;
     try w.int(if (reuse) |k| k.id else 0);
     try w.int(start);
     try w.int(if (cut) |c| @as(u64, @intCast(c)) else 0);
-    try self.send(.prefill, &w);
     const seq = if (reuse) |k| k.seq else try self.obtain();
-    if (reuse) |k| self.gpa.free(k.ids);
+    if (reuse) |k| {
+        resumed.* = k.id;
+        self.gpa.free(k.ids);
+    }
     reuse = null;
     seq.sampling = s.sampling;
     seq.cut_at = cut;
     s.cached = @intCast(start);
-    if (grows.n > 0) seq.mask = .{ .rows = grows.rows[0..grows.n], .bits = grows.bits[0][0 .. grows.n * MW] };
+    if (grows.n > 0) { // the rows outlive this call (the pass reads them): kept in the scratch beside the bits
+        @memcpy(self.growsbuf[at..][0..grows.n], grows.rows[0..grows.n]);
+        seq.mask = .{ .rows = self.growsbuf[at..][0..grows.n], .bits = grows.bits[0][0 .. grows.n * MW] };
+    }
     if (gop.found_existing) if (gop.value_ptr.g) |g| g.m.free();
     gop.value_ptr.* = .{ .seq = seq, .id = id, .g = gram };
     gram = null;
-    if (pos) |q| try forward.attach(self.e, seq, q.rows, feats.?.ptr, q.pos, q.delta);
-    _ = self.take(try forward.prefill(self.e, seq, ids, start));
+    return .{ .s = seq, .ids = ids, .start = start };
 }
+
+/// Several streams' prompts in one pass (forward.prefillMany): text prompts that fill one prompt chunk together,
+/// each set up as prefillFn sets one up, one frame for rank 1; false (nothing done) when they do not go together.
+fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+    const self = of(p);
+    if (ss.len < 2 or ss.len > max_streams) return false;
+    var rows: usize = 0;
+    for (ss) |s| {
+        const ids = s.prompt();
+        if (s.images.len > 0 or ids.len == 0 or ids.len + s.max_new + max_rows > forward.maxLen(self.e)) return false;
+        rows += ids.len;
+    }
+    if (rows > forward.PREFILL_ROWS) return false;
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    try w.int(ss.len);
+    for (ss) |s| if (s.structure != null) return false; // grammars one by one (a refused one stays alone)
+    var prompts: [max_streams]forward.Prompt = undefined;
+    var resumed: [max_streams]u64 = undefined;
+    for (ss, 0..) |s, k| prompts[k] = setupPrefill(self, s, &w, k, &resumed[k]) catch |err| {
+        // rank 1 has heard of none of them: the lanes set up so far undone, a kept state each resumed dropped there
+        for (ss[0..k], resumed[0..k]) |done, rid| {
+            const kv = self.lanes_by.fetchRemove(done) orelse continue;
+            if (kv.value.g) |g| g.m.free();
+            if (rid != 0) {
+                var wr: Writer = .{ .gpa = self.gpa };
+                defer wr.buf.deinit(self.gpa);
+                wr.int(rid) catch {};
+                wr.int(0) catch {};
+                self.send(.release, &wr) catch {};
+            }
+            self.retire(kv.value.seq);
+        }
+        return err;
+    };
+    try self.send(.prefills, &w);
+    var firsts: [max_streams]u32 = undefined;
+    try forward.prefillMany(self.e, prompts[0..ss.len], firsts[0..ss.len]);
+    for (ss, 0..) |s, k| self.lanes_by.getPtr(s).?.first = self.take(firsts[k]);
+    return true;
+}
+
 
 fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
     const self = of(p);
     if (position != s.prompt_len) return error.PositionMismatch;
-    return self.next - 1;
+    return (self.lanes_by.get(s) orelse return error.NoLane).first;
 }
 
 fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
@@ -729,9 +817,11 @@ fn verifyShared(self: *Owned, windows: []const be.Window, out: []be.Verified) an
         total += rows;
     }
     if (total > batch_rows) return error.WindowTooWide;
+    var whole: [max_streams]u32 = undefined; // each lane's previous window, accepted whole
+    for (lanes_of[0..windows.len], 0..) |l, k| whole[k] = l.rows;
+    try settleMany(self, lanes_of[0..windows.len], whole[0..windows.len]);
     for (windows, 0..) |win, k| {
         const l = lanes_of[k];
-        try settle(self, l, l.rows);
         ids[k][0] = win.pending;
         if (win.held > 0) @memcpy(ids[k][1..][0..win.held], l.held[0..win.held]) else @memcpy(ids[k][1..][0..win.tokens.len], win.tokens);
     }
@@ -771,12 +861,17 @@ fn verifyShared(self: *Owned, windows: []const be.Window, out: []be.Verified) an
 
 fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
     const self = of(p);
-    for (windows, paths) |win, path| {
+    if (windows.len > max_streams) return error.TooManyStreams;
+    var ls: [max_streams]*Lane = undefined;
+    var kept: [max_streams]u32 = undefined;
+    for (windows, paths, 0..) |win, path, k| {
         if (path.len == 0) return error.EmptyPath;
         for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
-        const l = self.lanes_by.getPtr(win.stream) orelse return error.NoLane;
-        try settle(self, l, @intCast(path.len));
+        ls[k] = self.lanes_by.getPtr(win.stream) orelse return error.NoLane;
+        kept[k] = @intCast(path.len);
     }
+    if (windows.len == 1) return settle(self, ls[0], kept[0]);
+    try settleMany(self, ls[0..windows.len], kept[0..windows.len]);
 }
 
 fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
@@ -830,9 +925,10 @@ fn draftMany(self: *Owned, requests: []const be.DraftRequest) anyerror!void {
         } else if (r.first == null) return error.NoFirstToken;
         depth[k] = @min(r.depth, max_depth);
     }
+    var kept: [max_streams]u32 = undefined;
+    for (requests, 0..) |r, k| kept[k] = if (r.rows) |rows| @intCast(rows.len) else lanes_of[k].rows;
+    try settleMany(self, lanes_of[0..requests.len], kept[0..requests.len]);
     for (requests, 0..) |r, k| {
-        const l = lanes_of[k];
-        try settle(self, l, if (r.rows) |rows| @intCast(rows.len) else l.rows);
         if (r.rows) |rows| {
             nf[k] = rows.len;
             @memcpy(follow[k][0..rows.len], r.follow[0..rows.len]);
@@ -920,6 +1016,28 @@ fn attachFrame(self: *Owned, seq: *forward.Seq, f: []const u8) !void {
     try forward.attach(self.e, seq, idx, fd.ptr, pos, delta);
 }
 
+/// Rank 1: a prompt's frame fields (prefillFn's): its sequence (a kept one it resumes, else a new one) set up with
+/// its draw, grammar row (at row ``at`` of the scratch), kept point and image.
+fn followPrefill(self: *Owned, r: *Reader, at: usize) !forward.Prompt {
+    const id = try r.int();
+    const toks = try r.tokens();
+    const sampling = try readSampling(r);
+    const mask = try readRows(r, self.growsbuf[at..], self.gbits[1][at * MW ..]);
+    const reuse = try r.int();
+    const start: usize = @intCast(try r.int());
+    const cut = try r.int();
+    const seq = if (reuse != 0) (self.by_id.fetchRemove(reuse) orelse return error.NoSequence).value else try self.obtain();
+    try self.by_id.put(id, seq);
+    if (self.images.fetchRemove(id)) |kv| {
+        defer self.gpa.free(kv.value);
+        try attachFrame(self, seq, kv.value);
+    }
+    seq.sampling = sampling;
+    seq.mask = mask;
+    seq.cut_at = if (cut != 0) @intCast(cut) else null;
+    return .{ .s = seq, .ids = toks, .start = start };
+}
+
 /// Rank 1: rank 0's calls, replayed in order on this rank's half of the model, until rank 0 stops.
 fn followLoop(p: *anyopaque) anyerror!void {
     const self = of(p);
@@ -938,24 +1056,18 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 try self.images.put(id, try self.gpa.dupe(u8, m.bytes));
             },
             .prefill => {
-                const id = try r.int();
-                const toks = try r.tokens();
-                const sampling = try readSampling(&r);
                 try self.gramScratch();
-                const mask = try readRows(&r, self.growsbuf[0..], self.gbits[1]);
-                const reuse = try r.int();
-                const start: usize = @intCast(try r.int());
-                const cut = try r.int();
-                const seq = if (reuse != 0) (self.by_id.fetchRemove(reuse) orelse return error.NoSequence).value else try self.obtain();
-                try self.by_id.put(id, seq);
-                if (self.images.fetchRemove(id)) |kv| {
-                    defer self.gpa.free(kv.value);
-                    try attachFrame(self, seq, kv.value);
-                }
-                seq.sampling = sampling;
-                seq.mask = mask;
-                seq.cut_at = if (cut != 0) @intCast(cut) else null;
-                _ = try forward.prefill(self.e, seq, toks, start);
+                const pr = try followPrefill(self, &r, 0);
+                _ = try forward.prefill(self.e, pr.s, pr.ids, pr.start);
+            },
+            .prefills => {
+                const n: usize = @intCast(try r.int());
+                if (n < 2 or n > max_streams) return error.TooManyStreams;
+                try self.gramScratch();
+                var prompts: [max_streams]forward.Prompt = undefined;
+                for (prompts[0..n], 0..) |*pr, k| pr.* = try followPrefill(self, &r, k);
+                var firsts: [max_streams]u32 = undefined;
+                try forward.prefillMany(self.e, prompts[0..n], firsts[0..n]);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
@@ -968,6 +1080,17 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                 const rows: u32 = @intCast(try r.int());
                 try forward.keep(self.e, seq, rows, @intCast(try r.int()));
+            },
+            .keeps => {
+                const n: usize = @intCast(try r.int());
+                if (n == 0 or n > max_streams) return error.TooManyStreams;
+                var items: [max_streams]forward.Keep = undefined;
+                for (items[0..n]) |*it| {
+                    const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
+                    const rows: u32 = @intCast(try r.int());
+                    it.* = .{ .s = seq, .rows = rows, .kept = @intCast(try r.int()) };
+                }
+                try forward.keepMany(self.e, items[0..n]);
             },
             .draft => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;

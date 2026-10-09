@@ -143,8 +143,14 @@ pub const Buffers = struct {
     mtp_e: u64 = 0, mtp_eo: u64 = 0, mtp_hn: u64 = 0, mtp_xh: u64 = 0, mtp_hs: u64 = 0, mtp_in: u64 = 0,
     kpart: u64 = 0, hcpart: u64 = 0, dnf: u64 = 0, sgu: u64 = 0,
     seg_nk: u64 = 0, seg_sparse: u64 = 0, // a shared round's per-stream key counts, 64 bytes a stream (16-aligned)
+    gdn_tab: u64 = 0, // a shared round's DeltaNet table: each layer's streams (ChainSeg), or each layer's replays at a keep
+    attn_ints: u64 = 0, attn_ptrs: u64 = 0, // a shared round's attention tables (attnTable)
+    attn: ?kern.MultiTab = null, // set while a forward's streams attend through the tables
     tk: u64 = 0, gtk: u64 = 0, invt: u64 = 0, // sampled rows: each row's candidates, both ranks' gathered, 1 / temperature
-    cut_row: i64 = 0, // a prompt chunk's kept point (rows before it; 0: none)
+    // several prompts in one pass (prefillMany): each row's conv taps and sequence, each DeltaNet layer's conv windows
+    mwindows: u64 = 0, msid: u64 = 0, conv_tab: u64 = 0,
+    multi_prompts: bool = false,
+    chains_staged: bool = false, // gdn_tab holds this forward's chains (a shared round of the main forward)
 
     fn lay(b: *Buffers, c: *Carve) void {
         const R = b.rows;
@@ -189,6 +195,9 @@ pub const Buffers = struct {
             b.windows = c.take(R * 4 * 4);
             b.sid = c.take(R * 4);
             b.pos_blk = c.take(4);
+            b.mwindows = c.take(R * 4 * 4);
+            b.msid = c.take(R * 4);
+            b.conv_tab = c.take(LIN * max_parts * 8);
         }
         b.gout = c.take(R * 3072 * 2);
         b.gxs = c.take(R * 96 * 4);
@@ -220,12 +229,15 @@ pub const Buffers = struct {
         b.hcpart = c.take(8 * @min(R, 128) * 324 * 4);
         b.dnf = c.take(R * 324 * 4);
         b.sgu = c.take(R * 640 * 2);
-        const srows = if (b.prefill) 1 else R; // a prompt draws its last row only
+        const srows = if (b.prefill) max_parts else R; // a prompt draws its last row only (prefillMany: each prompt's)
         b.tk = c.take(srows * draw_mod.W * 4);
         b.gtk = c.take(2 * srows * draw_mod.W * 4);
         b.invt = c.take(srows * 4);
         b.seg_nk = c.take(max_parts * 64);
         b.seg_sparse = c.take(max_parts * 64);
+        b.gdn_tab = c.take(LIN * max_parts * @sizeOf(ChainSeg));
+        b.attn_ints = c.take((2 * R + 2 * max_parts) * 4);
+        b.attn_ptrs = c.take((ATT + 1) * 6 * max_parts * 8);
     }
 
     fn init(d: *const cuda.Driver, rows: i64, is_prefill: bool, moe_prefill: bool, nb: i64) !Buffers {
@@ -415,7 +427,7 @@ pub fn detach(e: *Engine, s: *Seq) void {
 
 /// One sequence's rows of a forward: rows ``row0 .. row0 + rows`` of the buffers belong to ``s`` (a shared round
 /// packs several streams' windows; a lone window or a prompt chunk is one segment from row 0).
-pub const Seg = struct { s: *Seq, row0: i64 = 0, rows: i64 };
+pub const Seg = struct { s: *Seq, row0: i64 = 0, rows: i64, cut: i64 = 0 }; // cut: a prompt piece's kept point (prefillMany)
 
 fn rowAt(base: u64, row0: i64, row_bytes: i64) u64 {
     return base + @as(u64, @intCast(row0 * row_bytes));
@@ -458,6 +470,11 @@ pub const Engine = struct {
     budget: grow_mod.Budget = .{ .cap = std.math.maxInt(u64) }, // what every sequence's caches may map together
     /// Verify windows and MTP head steps as CUDA graphs (each width, DeltaNet parity and attention geometry).
     use_graphs: bool = true,
+    /// Shared rounds attend every stream in one launch a kernel (the kernel set holds attn_multi's kernels).
+    multi_attn: bool = false,
+    /// Shared rounds run every stream's DeltaNet chain (and every keep's replays) in one launch.
+    multi_gdn: bool = true,
+    multi_layers: [2]u64 = .{ 0, 0 }, // shared attention layers in one launch a kernel, and those the set had no variant for
     stage_ms: f64 = 0, // host time staging windows (ids, n-gram rows)
     gpu_ms: f64 = 0, // GPU time of verify windows (events around the step), when ``timing``
     timing: bool = false,
@@ -553,9 +570,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.cand_host = try gpa.alloc(i32, @intCast(2 * @max(rows_for(opts), 1) * draw_mod.W));
     e.full = try cuda.DeviceBuffer.alloc(ctx.d, 2 * HEAD_N * 2);
     e.full_host = try gpa.alloc(u16, 2 * HEAD_N);
-    e.gbits = try cuda.DeviceBuffer.alloc(ctx.d, @intCast(64 * MASK_WORDS * 4));
-    e.grows = try cuda.DeviceBuffer.alloc(ctx.d, 64 * 4);
-    e.gbits_host = try gpa.alloc(u32, @intCast(64 * MASK_WORDS));
+    e.gbits = try cuda.DeviceBuffer.alloc(ctx.d, @intCast(max_round_rows * MASK_WORDS * 4));
+    e.grows = try cuda.DeviceBuffer.alloc(ctx.d, max_round_rows * 4);
+    e.gbits_host = try gpa.alloc(u32, @intCast(max_round_rows * MASK_WORDS));
     e.budget = .{ .cap = std.math.maxInt(u64) };
     e.k = try K.init(gpa, ctx.d, ctx.ctx, ctx.stream, &kernels.triton, &kernels.ext);
     var ai: usize = 0;
@@ -603,6 +620,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.rowbuf = try gpa.alloc(i64, @intCast(PREFILL_ROWS * 16));
     e.valbuf = try gpa.alloc(u16, @intCast(PREFILL_ROWS * 16 * 160));
     e.use_graphs = true;
+    e.multi_attn = kern.hasMulti(&e.k);
+    e.multi_gdn = true;
     e.confidence = 0;
     e.stage_ms = 0;
     e.split = .{ 0, 0, 0 };
@@ -640,10 +659,15 @@ pub fn maxLen(e: *const Engine) usize {
 pub fn seqBytes(e: *const Engine) usize {
     var s: Seq = .{ .capacity = e.capacity };
     var c: Carve = .{};
-    s.lay(&c, e.buf.rows);
+    s.lay(&c, windowRows(e));
     // and the caches' first growth step (the rest is mapped as the sequence grows, within the engine's budget)
     const per_pos: u64 = (ATT + 1) * (256 + 256 + 16 + 16 + 256 + 64);
     return c.at + per_pos * @as(u64, @intCast(grow_mod.step_positions));
+}
+
+/// A sequence's widest window: the pending token and its drafts (a shared round's rows are several such windows).
+fn windowRows(e: *const Engine) i64 {
+    return @min(@as(i64, e.opts.depth) + 1, 16);
 }
 
 /// The bytes every sequence's growing caches may map together (the server's room for streams).
@@ -661,11 +685,11 @@ pub fn newSeq(e: *Engine) !*Seq {
     errdefer e.gpa.destroy(s);
     s.* = .{ .capacity = e.capacity };
     var c: Carve = .{};
-    s.lay(&c, e.buf.rows);
+    s.lay(&c, windowRows(e));
     s.mem = try cuda.DeviceBuffer.alloc(e.ctx.d, c.at);
     try e.ctx.d.check(e.ctx.d.api.cuMemsetD8_v2(s.mem.ptr, 0, c.at), "zero state");
     c = .{ .base = s.mem.ptr };
-    s.lay(&c, e.buf.rows);
+    s.lay(&c, windowRows(e));
     var ptrs: [LIN]u64 = undefined;
     for (0..LIN) |i| ptrs[i] = s.conv + i * 3 * CONV_DIM * 2;
     try e.ctx.d.check(e.ctx.d.api.cuMemcpyHtoD_v2(s.conv_ptrs, &ptrs, LIN * 8), "conv pointers");
@@ -688,7 +712,7 @@ pub fn resetSeq(e: *Engine, s: *Seq) !void {
     s.grow = g;
     s.pointGrow();
     var c: Carve = .{ .base = mem.ptr };
-    s.lay(&c, e.buf.rows);
+    s.lay(&c, windowRows(e));
     try e.ctx.d.check(e.ctx.d.api.cuMemsetD8Async(mem.ptr, 0, c.at, e.k.stream.handle), "zero state");
     var ptrs: [LIN]u64 = undefined;
     for (0..LIN) |i| ptrs[i] = s.conv + i * 3 * CONV_DIM * 2;
@@ -762,10 +786,8 @@ fn gdnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64) !u64 
     const k = &e.k;
     const g = l.gdn;
     const li = l.li;
-    if (b.prefill) {
-        const s = segs[0].s; // a prompt chunk: one sequence
+    if (b.prefill) { // a prompt chunk, or several prompts' pieces (prefillMany): each sequence's rows on its own state
         try kern.matmul(k, b.mixed, D, g.proj, b.proj, PROJ_W, false, R, b.kpart);
-        const cur = s.cur[li];
         // q, k (fp32), v (bf16), g, beta of the piece: carved from the MTP/ple scratch of the prompt buffers
         const qb = b.ple_keys; // [R, 8, 128] fp32 = R * 4096 bytes (ple_keys holds R * 20480)
         const kb = b.ple_keys + @as(u64, @intCast(R * 4096));
@@ -773,27 +795,43 @@ fn gdnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64) !u64 
         const gb = b.ple_vals; // [R, 24] fp32
         const bb = b.ple_vals + @as(u64, @intCast(R * 96));
         const yb = b.mtp_hn; // [R, 24, 128] bf16 (the MTP head runs after the main forward)
-        try kern.gdnFront(k, b.proj, s.conv_ptrs + li * 8, b.sid, b.windows, g.conv, g.a_log, g.dt_bias, qb, kb, vb, gb, bb, R);
-        const m = b.cut_row; // a kept point inside the chunk: the rows before it, its state, then the rest from it
-        if (m > 0 and m < R) {
-            const sn = &s.snap;
-            const u: u64 = @intCast(m);
-            try kern.gdnPrefill(k, qb, kb, vb, gb, bb, s.recAt(cur, li), sn.rec(li), yb, m);
-            try kern.gdnPrefill(k, qb + u * 4096, kb + u * 4096, vb + u * 6144, gb + u * 96, bb + u * 96, sn.rec(li), s.recAt(1 - cur, li), yb + u * 6144, R - m);
-            try k.copy(sn.conv(li), s.conv + li * 3 * CONV_DIM * 2, 3 * CONV_DIM * 2);
-            try kern.shiftWindows(k, sn.conv(li), b.proj, m, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, 1, CONV_DIM, 3);
-        } else try kern.gdnPrefill(k, qb, kb, vb, gb, bb, s.recAt(cur, li), s.recAt(1 - cur, li), yb, R);
+        if (b.multi_prompts) {
+            try kern.gdnFront(k, b.proj, b.conv_tab + li * max_parts * 8, b.msid, b.mwindows, g.conv, g.a_log, g.dt_bias, qb, kb, vb, gb, bb, R);
+        } else try kern.gdnFront(k, b.proj, segs[0].s.conv_ptrs + li * 8, b.sid, b.windows, g.conv, g.a_log, g.dt_bias, qb, kb, vb, gb, bb, R);
+        for (segs) |sg| {
+            const s = sg.s;
+            const cur = s.cur[li];
+            const o: u64 = @intCast(sg.row0);
+            const n = sg.rows;
+            const m = sg.cut; // a kept point inside the piece: the rows before it, its state, then the rest from it
+            if (m > 0 and m < n) {
+                const sn = &s.snap;
+                const u: u64 = o + @as(u64, @intCast(m));
+                try kern.gdnPrefill(k, qb + o * 4096, kb + o * 4096, vb + o * 6144, gb + o * 96, bb + o * 96, s.recAt(cur, li), sn.rec(li), yb + o * 6144, m);
+                try kern.gdnPrefill(k, qb + u * 4096, kb + u * 4096, vb + u * 6144, gb + u * 96, bb + u * 96, sn.rec(li), s.recAt(1 - cur, li), yb + u * 6144, n - m);
+                try k.copy(sn.conv(li), s.conv + li * 3 * CONV_DIM * 2, 3 * CONV_DIM * 2);
+                try kern.shiftWindows(k, sn.conv(li), rowAt(b.proj, sg.row0, PROJ_W * 2), m, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, 1, CONV_DIM, 3);
+            } else try kern.gdnPrefill(k, qb + o * 4096, kb + o * 4096, vb + o * 6144, gb + o * 96, bb + o * 96, s.recAt(cur, li), s.recAt(1 - cur, li), yb + o * 6144, n);
+        }
         try kern.gdnBack(k, yb, b.proj, g.norm, b.gout, b.gxs, R);
-        s.cur[li] = 1 - cur;
-        try kern.shiftWindows(k, s.conv + li * 3 * CONV_DIM * 2, b.proj, R, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, 1, CONV_DIM, 3);
-        if (m == R) { // the point ends the chunk: the state as committed
-            try k.copy(s.snap.rec(li), s.recAt(1 - cur, li), @intCast(Seq.REC_LAYER));
-            try k.copy(s.snap.conv(li), s.conv + li * 3 * CONV_DIM * 2, 3 * CONV_DIM * 2);
+        for (segs) |sg| {
+            const s = sg.s;
+            const cur = s.cur[li];
+            s.cur[li] = 1 - cur;
+            try kern.shiftWindows(k, s.conv + li * 3 * CONV_DIM * 2, rowAt(b.proj, sg.row0, PROJ_W * 2), sg.rows, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, 1, CONV_DIM, 3);
+            if (sg.cut == sg.rows) { // the point ends the piece: the state as committed
+                try k.copy(s.snap.rec(li), s.recAt(1 - cur, li), @intCast(Seq.REC_LAYER));
+                try k.copy(s.snap.conv(li), s.conv + li * 3 * CONV_DIM * 2, 3 * CONV_DIM * 2);
+            }
         }
         return outProj(e, b, b.gout, 3072, g.out, R);
     }
     const proj = b.proj + @as(u64, @intCast(@as(i64, @intCast(li)) * b.rows * PROJ_W * 2));
     try kern.matmul(k, b.mixed, D, g.proj, proj, PROJ_W, false, R, b.kpart);
+    if (segs.len > 1 and b.chains_staged) { // every stream's chain in one launch (the round's table, chainTable)
+        try kern.gdnChainMulti(k, b.gdn_tab + li * max_parts * @sizeOf(ChainSeg), @intCast(segs.len), g.conv, g.a_log, g.dt_bias, g.norm, b.gout, b.gxs);
+        return outProj(e, b, b.gout, 3072, g.out, R);
+    }
     for (segs) |sg| { // each stream's chain on its own state, over its rows
         const s = sg.s;
         const cur = s.cur[li];
@@ -808,6 +846,16 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
     const a = l.attn;
     const ai = if (mtp) ATT else l.li;
     try kern.matmul(k, b.mixed, D, a.proj, b.pa, 7296, false, R, b.kpart);
+    if (b.attn) |tab0| if (segs.len > 1) { // every stream in one launch a kernel (attn_multi.layer)
+        var tab = tab0;
+        tab.cp = b.attn_ptrs + ai * 6 * max_parts * 8;
+        if (try kern.attentionMulti(k, tab, b.pa, a.q_scale, a.k_scale, a.iq_scale, a.ik_scale, e.inv_freq, b.q, b.iq, b.a_po, b.a_pm, b.a_pl, b.a_ids, b.a_nk, b.a_out)) {
+            e.multi_layers[0] += 1;
+            try kern.attnGate(k, b.a_out, b.pa, b.gated, b.xs_gated, R);
+            return outProj(e, b, b.gated, 3072, a.o, R);
+        }
+        e.multi_layers[1] += 1;
+    };
     for (segs) |sg| { // each stream's rows into its own caches, at its own positions
         const s = sg.s;
         const pos = if (mtp) s.mtp_pos else s.pos_dev;
@@ -815,19 +863,21 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
             s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows, if (s.img) |*im| im.rope() else null);
         try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, sg.rows, if (s.img) |*im| im.rope() else null);
     }
-    if (b.prefill) {
-        const s = segs[0].s; // a prompt chunk: one sequence
+    if (b.prefill) for (segs) |sg| { // a prompt chunk, or several prompts' pieces: each in blocks of ATT_ROWS rows
+        const s = sg.s;
         const host_pos = if (mtp) s.mtp_len else s.pos;
         var r0: i64 = 0;
-        while (r0 < R) : (r0 += ATT_ROWS) {
-            const n = @min(ATT_ROWS, R - r0);
+        while (r0 < sg.rows) : (r0 += ATT_ROWS) {
+            const n = @min(ATT_ROWS, sg.rows - r0);
             try k.memset32(b.pos_blk, @bitCast(@as(i32, @intCast(host_pos + r0))), 1);
             const ends = host_pos + r0 + n;
-            const ro: u64 = @intCast(r0);
+            const ro: u64 = @intCast(sg.row0 + r0);
             try kern.qsaRows(k, b.iq + ro * 4 * 128 * 2, s.pooled[ai], b.pos_blk, b.a_scores, b.a_ids, b.a_nk, b.a_sparse, b.nb, n, ends);
             try kern.attention(k, b.q + ro * 12 * 256 * 2, s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], b.pos_blk, b.a_po, b.a_pm, b.a_pl,
                 b.a_ids, b.a_nk, b.a_sparse, b.attn_o + ro * 12 * 256 * 2, n, ends);
         }
+    };
+    if (b.prefill) {
         try kern.attnGate(k, b.attn_o, b.pa, b.gated, b.xs_gated, R);
     } else {
         for (segs, 0..) |sg, j| {
@@ -1001,6 +1051,71 @@ fn stageParts(e: *Engine, b: *Buffers, parts: []const Part, segs: []const Seg) !
     try e.k.upload(b.ple_v, std.mem.sliceAsBytes(e.valbuf[0 .. n * heads * e.ng.width]));
 }
 
+/// gdn_multi.cu's table entries (its ChainSeg and ReplaySeg, 80 and 64 bytes).
+pub const ChainSeg = extern struct { p: u64, cs: u64, state_in: u64, state_out: u64, k_save: u64, v_save: u64, g_save: u64, b_save: u64, rows: i64, row0: i64 };
+pub const ReplaySeg = extern struct { state_in: u64, k_save: u64, v_save: u64, g_save: u64, b_save: u64, state_out: u64, rows: i64, pad: i64 = 0 };
+
+/// A shared round's chains into ``b.gdn_tab``: each DeltaNet layer's streams (their projection rows, conv windows,
+/// states at their parities, replay scratch), one upload for the whole forward.
+fn chainTable(e: *Engine, b: *Buffers, segs: []const Seg) !void {
+    var tab: [LIN * max_parts]ChainSeg = undefined;
+    for (0..LIN) |li| {
+        const proj = b.proj + @as(u64, @intCast(@as(i64, @intCast(li)) * b.rows * PROJ_W * 2));
+        for (segs, 0..) |sg, j| {
+            const s = sg.s;
+            const cur = s.cur[li];
+            tab[li * max_parts + j] = .{ .p = rowAt(proj, sg.row0, PROJ_W * 2), .cs = s.conv + li * 3 * CONV_DIM * 2, .state_in = s.recAt(cur, li),
+                .state_out = s.recAt(1 - cur, li), .k_save = s.sc_k[li], .v_save = s.sc_v[li], .g_save = s.sc_g[li], .b_save = s.sc_b[li],
+                .rows = sg.rows, .row0 = sg.row0 };
+        }
+    }
+    try e.k.upload(b.gdn_tab, std.mem.sliceAsBytes(&tab));
+}
+
+/// A shared forward's attention tables (attn_multi.Step): every row's position and stream, each stream's first
+/// position and rows, each attention layer's cache pointers [6][streams] (the MTP head's: its own caches, slot ATT).
+/// Null when a stream has an image (its own rotary table) or a stream's keys reach the sparse selection: those
+/// forwards attend stream by stream, as do kernel sets packed before the shared kernels.
+fn attnTable(e: *Engine, b: *Buffers, segs: []const Seg, R: i64, mtp: bool) !?kern.MultiTab {
+    if (!e.multi_attn or segs.len < 2) return null;
+    var most: i64 = 0;
+    var keys: i64 = 0;
+    for (segs) |sg| {
+        if (sg.s.img != null) return null;
+        const end = (if (mtp) sg.s.mtp_len else sg.s.pos) + sg.rows;
+        if (end > kern.KEYS_MAX) return null;
+        most = @max(most, sg.rows);
+        keys = @max(keys, end);
+    }
+    const n = segs.len;
+    const rows: usize = @intCast(R);
+    var ints: [2 * max_round_rows + 2 * max_parts]i32 = undefined;
+    for (segs, 0..) |sg, j| {
+        const p0 = if (mtp) sg.s.mtp_len else sg.s.pos;
+        for (0..@intCast(sg.rows)) |r| {
+            ints[@as(usize, @intCast(sg.row0)) + r] = @intCast(p0 + @as(i64, @intCast(r)));
+            ints[rows + @as(usize, @intCast(sg.row0)) + r] = @intCast(j);
+        }
+        ints[2 * rows + j] = @intCast(p0);
+        ints[2 * rows + n + j] = @intCast(sg.rows);
+    }
+    try e.k.upload(b.attn_ints, std.mem.sliceAsBytes(ints[0 .. 2 * rows + 2 * n]));
+    var ptrs: [(ATT + 1) * 6 * max_parts]u64 = undefined;
+    const layers: []const usize = if (mtp) &.{ATT} else &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    for (layers) |ai| {
+        const base = ai * 6 * max_parts;
+        for (segs, 0..) |sg, j| {
+            const s = sg.s;
+            for ([_]u64{ s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], s.ikc[ai], s.pooled[ai] }, 0..) |x, f| ptrs[base + f * n + j] = x;
+        }
+    }
+    if (mtp) {
+        try e.k.upload(b.attn_ptrs + ATT * 6 * max_parts * 8, std.mem.sliceAsBytes(ptrs[ATT * 6 * max_parts ..][0 .. 6 * n]));
+    } else try e.k.upload(b.attn_ptrs, std.mem.sliceAsBytes(ptrs[0 .. ATT * 6 * max_parts]));
+    return .{ .posr = b.attn_ints, .sid = b.attn_ints + rows * 4, .first = b.attn_ints + 2 * rows * 4, .counts = b.attn_ints + (2 * rows + n) * 4,
+        .cp = b.attn_ptrs, .streams = @intCast(n), .rows = R, .most = most, .keys = keys };
+}
+
 fn mainForward(e: *Engine, b: *Buffers, segs: []const Seg, R: i64) !Pending {
     try kern.embed(&e.k, b.ids, e.embed, b.h, R, 4);
     for (segs) |sg| try splice(e, b, sg);
@@ -1051,8 +1166,11 @@ fn mtpComputeSegs(e: *Engine, b: *Buffers, segs: []const Seg, n: i64) !void {
     try kern.rmsnorm(k, b.mtp_in, m.norm_h, b.mtp_hn, b.mtp_xh, WIDE, n, WIDE);
     try kern.matmul(k, b.mtp_hn, D, m.fc_h, b.mtp_hs, D, false, n * 4, b.kpart);
     try kern.addStreams(k, b.mtp_eo, b.mtp_hs, b.h, n);
+    if (!b.prefill) b.attn = try attnTable(e, b, segs, n, true);
+    defer b.attn = null;
     const pending = try layerForward(e, b, segs, m.layer, n, null, true);
     _ = try finish(e, b, m.mixer, n, pending);
+    if (b.prefill and segs.len > 1) return; // several prompts absorbed: no draft from a prompt pass
     if (b.prefill) {
         try kern.qmmPrefill(k, b.mixed, e.dh, b.logits);
     } else for (segs, 0..) |sg, j| {
@@ -1109,11 +1227,10 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32, start: usize) !u32 {
         const R: i64 = @intCast(end - at);
         const final = end == prompt.len;
         const row: i64 = if (cut) |kp| (if (kp > @as(i64, @intCast(at)) and kp <= @as(i64, @intCast(end))) kp - @as(i64, @intCast(at)) else 0) else 0;
-        b.cut_row = row;
-        defer b.cut_row = 0;
+
         try room(e, s, R + 1);
         try stage(e, b, s, prompt[at..end]);
-        const pending = try mainForward(e, b, &.{.{ .s = s, .rows = R }}, R);
+        const pending = try mainForward(e, b, &.{.{ .s = s, .rows = R, .cut = row }}, R);
         if (final) { // the head on the last row, its candidates before the MTP head reuses the logits buffer
             _ = try finish(e, b, e.mixer, R, pending);
             try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, 1, b.kpart);
@@ -1168,6 +1285,151 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32, start: usize) !u32 {
     return @intCast(first.tok);
 }
 
+/// A prompt in ``prefillMany``: its sequence, its tokens and where it resumes (a kept point, as ``prefill``).
+pub const Prompt = struct { s: *Seq, ids: []const u32, start: usize = 0 };
+
+/// Whether ``prompts`` fit one prompt pass together: text prompts whose rows past their kept points fill one chunk.
+pub fn prefillsTogether(e: *const Engine, prompts: []const Prompt) bool {
+    if (prompts.len < 2 or prompts.len > max_parts) return false;
+    var rows: usize = 0;
+    for (prompts) |p| {
+        if (p.s.img != null or p.ids.len == 0 or p.start >= p.ids.len) return false;
+        rows += p.ids.len - p.start;
+    }
+    return rows <= @as(usize, @intCast(e.pbuf.rows));
+}
+
+/// ``prefill`` for several short prompts in one pass (multi.py's prompt passes): every prompt's rows through each
+/// layer's shared weights once (a prompt alone reads most of the experts), each sequence's DeltaNet, conv, attention
+/// and n-gram rows on its own state; ``firsts`` gets each prompt's first token. The prompts must fit together
+/// (``prefillsTogether``); a sequence's kept point (``cut_at``) and kept state (``start``) as ``prefill``.
+pub fn prefillMany(e: *Engine, prompts: []const Prompt, firsts: []u32) !void {
+    if (!prefillsTogether(e, prompts)) return error.NotTogether;
+    const b = &e.pbuf;
+    const k = &e.k;
+    var segs: [max_parts]Seg = undefined;
+    var cuts: [max_parts]?i64 = undefined;
+    var R: i64 = 0;
+    for (prompts, 0..) |p, j| {
+        const s = p.s;
+        if (@as(i64, @intCast(p.ids.len)) + @as(i64, e.opts.depth) + 1 > e.capacity) return error.PromptTooLong;
+        if (p.start > 0 and s.snap.at != @as(i64, @intCast(p.start))) return error.NoKeptState;
+        const rows: i64 = @intCast(p.ids.len - p.start);
+        cuts[j] = s.cut_at;
+        const cut_row: i64 = if (s.cut_at) |c| (if (c > p.start and c <= p.ids.len) c - @as(i64, @intCast(p.start)) else 0) else 0;
+        segs[j] = .{ .s = s, .row0 = R, .rows = rows, .cut = cut_row };
+        R += rows;
+    }
+    const n = prompts.len;
+    for (prompts, 0..) |p, j| {
+        const s = p.s;
+        if (p.start > 0) try restore(e, b, s, p.ids[p.start]);
+        s.snap.at = 0; // the kept point is this prompt's (or none)
+        s.cut_at = null;
+        if (cuts[j] != null and s.snap.buf == null) s.snap.buf = try cuda.DeviceBuffer.alloc(e.ctx.d, Snap.REC + Snap.CONV + Snap.PLE + Snap.TAIL);
+        try room(e, s, segs[j].rows + 1);
+    }
+    // the rows' ids and n-gram rows (each from its own history), each row's conv taps and sequence, the layers' windows
+    const heads = e.ng.heads;
+    var toks: [PREFILL_ROWS]i64 = undefined;
+    const tk = toks[0..@intCast(R)];
+    var wins: [4 * PREFILL_ROWS]i32 = undefined;
+    var sids: [PREFILL_ROWS]i32 = undefined;
+    for (prompts, segs[0..n], 0..) |p, sg, j| {
+        const r0: usize = @intCast(sg.row0);
+        for (p.ids[p.start..], 0..) |t_, i| {
+            tk[r0 + i] = t_;
+            e.idbuf[r0 + i] = @intCast(t_);
+            sids[r0 + i] = @intCast(j);
+            for (0..4) |tap| {
+                const src = i + tap;
+                wins[(r0 + i) * 4 + tap] = @intCast(if (src < 3) src else r0 + src);
+            }
+        }
+        try e.ng.ids(&p.s.hist, tk[r0..][0..@intCast(sg.rows)], e.rowbuf[r0 * heads .. (r0 + @as(usize, @intCast(sg.rows))) * heads]);
+    }
+    const rows_u: usize = @intCast(R);
+    try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..rows_u]));
+    try e.ng.gather(e.rowbuf[0 .. rows_u * heads], e.valbuf[0 .. rows_u * heads * e.ng.width]);
+    try k.upload(b.ple_v, std.mem.sliceAsBytes(e.valbuf[0 .. rows_u * heads * e.ng.width]));
+    try k.upload(b.mwindows, std.mem.sliceAsBytes(wins[0 .. 4 * rows_u]));
+    try k.upload(b.msid, std.mem.sliceAsBytes(sids[0..rows_u]));
+    var conv: [LIN * max_parts]u64 = undefined;
+    for (0..LIN) |li| for (segs[0..n], 0..) |sg, j| {
+        conv[li * max_parts + j] = sg.s.conv + li * 3 * CONV_DIM * 2;
+    };
+    try k.upload(b.conv_tab, std.mem.sliceAsBytes(&conv));
+    b.multi_prompts = true;
+    defer b.multi_prompts = false;
+    const pending = try mainForward(e, b, segs[0..n], R);
+    // every row's streams; each prompt's last row (streams and sums) gathered to rows 0 .. n - 1 for the head
+    try k.copy(b.streams, b.h, @intCast(R * WIDE * 2));
+    try kern.hcWriteback(k, b.streams, b.pss, pending.g, pending.inj, R, 3);
+    for (segs[0..n], 0..) |sg, j| {
+        const last: u64 = @intCast(sg.row0 + sg.rows - 1);
+        try k.copy(b.pss + j * 160, b.pss + last * 160, 160);
+        try k.copy(b.mtp_hn + j * WIDE * 2, b.streams + last * WIDE * 2, WIDE * 2);
+        try k.copy(sg.s.last_streams, b.streams + last * WIDE * 2, WIDE * 2);
+    }
+    const nr: i64 = @intCast(n);
+    try readout(e, b, e.mixer, b.mtp_hn, nr, null, false);
+    try kern.matmul(k, b.mixed, D, e.head, b.logits, HEAD_N, false, nr, b.kpart);
+    var heads_segs: [max_parts]Seg = undefined;
+    for (segs[0..n], 0..) |sg, j| heads_segs[j] = .{ .s = sg.s, .row0 = @intCast(j), .rows = 1 };
+    _ = try applyMasks(e, b.logits, heads_segs[0..n]);
+    try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, nr);
+    var picks: [max_parts]Pick = undefined;
+    try readPicks(e, b, nr, picks[0..n]);
+    for (picks[0..n], 0..) |pk, j| firsts[j] = @intCast(pk.tok);
+    var want: [max_parts]Want = undefined;
+    var nw: usize = 0;
+    for (prompts, 0..) |p, j| if (p.s.sampling) |rule| { // the first token draws at the prompt's length
+        want[nw] = .{ .row = j, .s = rule, .position = p.ids.len };
+        nw += 1;
+    };
+    try drawRows(e, b, b.logits, nr, want[0..nw], firsts[0..n]);
+    // kept points: the state before each prompt's point (its last row's streams, MTP length, n-gram windows)
+    for (prompts, segs[0..n]) |p, sg| if (sg.cut > 0) {
+        const s = sg.s;
+        const sn = &s.snap;
+        try k.copy(sn.tail(), b.streams + @as(u64, @intCast(sg.row0 + sg.cut - 1)) * WIDE * 2, WIDE * 2);
+        sn.mtp_len = s.mtp_len + sg.cut - 1;
+        sn.hist = s.hist;
+        sn.hist.advance(tk[@intCast(sg.row0)..][0..@intCast(sg.cut)]);
+        try k.copy(sn.ple(), s.ple_tail, Snap.PLE);
+        try kern.shiftWindows(k, sn.ple(), rowAt(b.ple_nrow, sg.row0, WIDE * 2), sg.cut, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
+        sn.at = @intCast(p.start + @as(usize, @intCast(sg.cut)));
+    };
+    // the MTP head takes each prompt's rows with their next tokens (every row but its last)
+    var msegs: [max_parts]Seg = undefined;
+    var nm: usize = 0;
+    var M: i64 = 0;
+    for (prompts, segs[0..n]) |p, sg| {
+        const nn = sg.rows - 1;
+        if (nn <= 0) continue;
+        for (p.ids[p.start + 1 ..][0..@intCast(nn)], 0..) |t_, i| e.idbuf[@as(usize, @intCast(M)) + i] = @intCast(t_);
+        try k.copy(rowAt(b.mtp_in, M, WIDE * 2), rowAt(b.streams, sg.row0, WIDE * 2), @intCast(nn * WIDE * 2));
+        msegs[nm] = .{ .s = sg.s, .row0 = M, .rows = nn };
+        nm += 1;
+        M += nn;
+    }
+    if (nm > 0) {
+        try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..@intCast(M)]));
+        try mtpComputeSegs(e, b, msegs[0..nm], M);
+        for (msegs[0..nm]) |sg| try setMtpLen(e, sg.s, sg.s.mtp_len + sg.rows);
+    }
+    // commit: each prompt's n-gram tail keeps its rows, positions move on
+    for (segs[0..n]) |sg| {
+        const s = sg.s;
+        try kern.shiftWindows(k, s.ple_tail, rowAt(b.ple_nrow, sg.row0, WIDE * 2), sg.rows, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
+        s.hist.advance(tk[@intCast(sg.row0)..][0..@intCast(sg.rows)]);
+        try setPos(e, s, s.pos + sg.rows);
+        s.fresh = true;
+        s.mtp_drafted = 0;
+    }
+    try k.stream.synchronize();
+}
+
 /// One window over ``ids`` (the pending token, then drafts): out[r] is the greedy token after row r.
 /// A stream's grammar rows for its next forward: each row of its window the grammar constrains (in window order)
 /// and that row's allowed bits over this rank's columns, MASK_WORDS words a row.
@@ -1177,7 +1439,7 @@ pub const MASK_WORDS: usize = @intCast(@divExact(HEAD_N, 32));
 /// Every segment's grammar rows to -inf in ``logits`` (both ranks, before the picks); whether any was masked.
 fn applyMasks(e: *Engine, logits: u64, segs: []const Seg) !bool {
     var n: usize = 0;
-    var rows: [64]i32 = undefined;
+    var rows: [max_round_rows]i32 = undefined;
     for (segs) |sg| if (sg.s.mask) |m| {
         for (m.rows, 0..) |r, i| {
             if (n == rows.len) return error.WindowTooWide;
@@ -1212,7 +1474,7 @@ const Want = struct { row: usize, s: lanes.Sampling, position: u64 };
 fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want, out: []u32) !void {
     if (want.len == 0) return;
     const k = &e.k;
-    var inv: [64]f32 = @splat(1);
+    var inv: [max_round_rows]f32 = @splat(1);
     for (want) |w| inv[w.row] = @floatCast(1.0 / @max(w.s.temperature, 1e-6));
     try k.upload(b.invt, std.mem.sliceAsBytes(inv[0..@intCast(rows)]));
     {
@@ -1326,6 +1588,11 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
     if (R > b.rows) return error.WindowTooWide;
     for (segs[0..parts.len]) |sg| try room(e, sg.s, sg.rows + 1);
     try stageParts(e, b, parts, segs[0..parts.len]);
+    if (e.multi_gdn) try chainTable(e, b, segs[0..parts.len]);
+    b.chains_staged = e.multi_gdn;
+    defer b.chains_staged = false;
+    b.attn = try attnTable(e, b, segs[0..parts.len], R, false);
+    defer b.attn = null;
     const pending = try mainForward(e, b, segs[0..parts.len], R);
     _ = try finish(e, b, e.mixer, R, pending);
     try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, R, b.kpart);
@@ -1352,6 +1619,8 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
 
 /// Streams a shared round packs at most.
 pub const max_parts = 16;
+/// A shared round's rows at most: every stream's widest window.
+pub const max_round_rows = max_parts * 16;
 
 /// forward.commit: keep the first ``kept`` of the last window's ``rows`` (DeltaNet replays, conv and n-gram windows).
 pub fn keep(e: *Engine, s: *Seq, rows: u32, kept: u32) !void {
@@ -1370,6 +1639,48 @@ pub fn keep(e: *Engine, s: *Seq, rows: u32, kept: u32) !void {
     try kern.shiftWindows(k, s.ple_tail, rowAt(b.ple_nrow, s.last_row0, WIDE * 2), kp, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
     s.hist.advance(s.last_tokens[0..@intCast(kp)]);
     try setPos(e, s, s.pos + kp);
+}
+
+/// A stream's keep in ``keepMany``: its last window's rows and how many of them it keeps.
+pub const Keep = struct { s: *Seq, rows: u32, kept: u32 };
+
+/// ``keep`` for several streams: every stream's DeltaNet replays (all layers) in one launch, then each stream's
+/// windows and positions; the states and windows each stream's own keep gives.
+pub fn keepMany(e: *Engine, items: []const Keep) !void {
+    if (items.len == 1 or !e.multi_gdn) {
+        for (items) |it| try keep(e, it.s, it.rows, it.kept);
+        return;
+    }
+    if (items.len == 0) return;
+    if (items.len > max_parts) return error.TooManyParts;
+    const k = &e.k;
+    var tab: [LIN * max_parts]ReplaySeg = undefined;
+    var any = false;
+    for (items, 0..) |it, j| {
+        if (it.kept < 1 or it.kept > it.rows) return error.BadKeep;
+        const s = it.s;
+        const replay: i64 = if (it.kept < it.rows) it.kept else 0;
+        any = any or replay > 0;
+        for (0..LIN) |li| {
+            const cur = s.cur[li];
+            tab[li * items.len + j] = .{ .state_in = s.recAt(cur, li), .k_save = s.sc_k[li], .v_save = s.sc_v[li], .g_save = s.sc_g[li], .b_save = s.sc_b[li],
+                .state_out = s.recAt(1 - cur, li), .rows = replay };
+        }
+    }
+    const b = &e.buf;
+    if (any) {
+        try k.upload(b.gdn_tab, std.mem.sliceAsBytes(tab[0 .. LIN * items.len]));
+        try kern.gdnReplayMulti(k, b.gdn_tab, @intCast(items.len));
+    }
+    for (items) |it| {
+        const s = it.s;
+        for (0..LIN) |li| s.cur[li] = 1 - s.cur[li];
+        const kp: i64 = it.kept;
+        try kern.shiftWindows(k, s.conv, rowAt(b.proj, s.last_row0, PROJ_W * 2), kp, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, LIN, CONV_DIM, 3);
+        try kern.shiftWindows(k, s.ple_tail, rowAt(b.ple_nrow, s.last_row0, WIDE * 2), kp, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
+        s.hist.advance(s.last_tokens[0..@intCast(kp)]);
+        try setPos(e, s, s.pos + kp);
+    }
 }
 
 /// decode.draft: the MTP head absorbs the kept rows (``follow``: the token after each), then chains ``depth`` drafts.

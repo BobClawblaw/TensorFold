@@ -31,6 +31,7 @@ const kernels = [_]Kernel{
     .{ .name = "fn_gdn", .src = "flashnext/fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py
     .{ .name = "fn_gdn_io", .src = "flashnext/gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py
     .{ .name = "fn_sample", .src = "flashnext/sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: greedy candidates
+    .{ .name = "fn_gdn_multi", .src = "flashnext/gdn_multi", .flags = &.{ "-O3", "--fmad=false" } }, // ours: fn_gdn's chain and replay over a shared round's streams
     .{ .name = "fn_vision", .src = "flashnext/vision", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the vision tower's kernels
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
