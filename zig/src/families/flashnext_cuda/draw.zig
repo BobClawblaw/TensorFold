@@ -1,4 +1,4 @@
-//! A sampled row's token from both ranks' gathered candidates (fn_rows_topk): each rank's 64 largest logits, global
+//! A sampled row's token from both ranks' gathered candidates (fn_cand_topk): each rank's 64 largest logits, global
 //! ids, its log-sum-exp and its log-sum-exp at the row's temperature. The merged 128 hold the vocabulary's top 64
 //! exactly, so a rule within them draws as lanes.sampling.choose over the whole vocabulary would: top_k 1..64 by
 //! choose itself (only the top k take part), a wider rule when its nucleus (top_p) or floor (min_p) ends within the
