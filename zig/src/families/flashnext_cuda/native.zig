@@ -19,6 +19,9 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 2048;
 pub const two_ranks = true;
 
+/// Structured output: rank 0 masks each window's grammar rows (gramRows), rank 1 the same rows from its frames.
+pub const structures = true;
+
 pub const Options = struct {
     context: usize,
     drafts: bool,
@@ -116,7 +119,83 @@ const Lane = struct {
     probs: [max_depth]f64 = undefined,  // the head's chance for each (0 past the confidence cut)
     nheld: u32 = 0,
     rows: u32 = 0,                      // the last verify's rows, not yet committed (0: nothing pending)
+    g: ?Gram = null,                    // the reply's grammar (rank 0)
 };
+
+/// A reply's grammar on rank 0 (engine/grammar.py's Constraint): its matcher at the reply's committed tokens.
+const Gram = struct {
+    m: lanes.grammar.Matcher,
+    after: ?u32,          // with thinking on: the grammar starts after this token
+    active: bool,
+    fed: usize = 0,       // reply tokens the matcher has followed
+};
+
+/// A window's grammar rows: which rows and their bits, both ranks' halves.
+const Rows = struct {
+    n: usize = 0,
+    rows: [max_rows]u32 = undefined,
+    bits: [2][]u32 = undefined, // rank r's MASK_WORDS words a row (views into the owner's scratch)
+};
+
+const MW = forward.MASK_WORDS;
+
+/// Follow the reply's committed tokens, then the rows of a window over ``ids`` (row 0 the pending token, drafts
+/// after) the grammar constrains, as grammar.py's window(): each row the matcher reaches (a draft it rejects ends the
+/// path: no later row can be accepted), its allowed bits. The matcher is rolled back to the committed tokens.
+fn gramRows(g: *Gram, s: *const lanes.Stream, ids: []const u32, full: []u32, out: *Rows) !void {
+    out.n = 0;
+    const emitted = s.context.items[s.prompt_len..];
+    for (emitted[g.fed..]) |t| {
+        if (!g.active) {
+            g.active = g.after != null and t == g.after.?;
+            continue;
+        }
+        if (g.m.terminated()) break;
+        if (!try g.m.accept(t)) return error.GrammarRejected;
+    }
+    g.fed = emitted.len;
+    var active = g.active;
+    var taken: usize = 0;
+    defer g.m.rollback(taken) catch {};
+    for (0..ids.len) |r| {
+        if (active and !g.m.terminated()) {
+            const words = full[0 .. 2 * MW];
+            try g.m.fill(words);
+            @memcpy(out.bits[0][out.n * MW ..][0..MW], words[0..MW]);
+            @memcpy(out.bits[1][out.n * MW ..][0..MW], words[MW..]);
+            out.rows[out.n] = @intCast(r);
+            out.n += 1;
+        }
+        if (r + 1 == ids.len) break;
+        const next = ids[r + 1];
+        if (!active) {
+            active = g.after != null and next == g.after.?;
+            continue;
+        }
+        if (g.m.terminated() or !try g.m.accept(next)) break;
+        taken += 1;
+    }
+}
+
+/// A frame's grammar rows for rank 1: the count, the rows, rank 1's bits.
+fn writeRows(w: *Writer, rows: *const Rows) !void {
+    try w.int(rows.n);
+    for (rows.rows[0..rows.n]) |r| try w.int(r);
+    try w.buf.appendSlice(w.gpa, std.mem.sliceAsBytes(rows.bits[1][0 .. rows.n * MW]));
+}
+
+/// Rank 1: a frame's grammar rows into ``rows``/``bits`` from ``at`` on (null: none).
+fn readRows(r: *Reader, rows: []u32, bits: []u32) !?forward.Mask {
+    const n: usize = @intCast(try r.int());
+    if (n == 0) return null;
+    if (n > rows.len) return error.WindowTooWide;
+    for (rows[0..n]) |*x| x.* = @intCast(try r.int());
+    const bytes = n * MW * 4;
+    if (r.at + bytes > r.bytes.len) return error.ShortFrame;
+    @memcpy(std.mem.sliceAsBytes(bits[0 .. n * MW]), r.bytes[r.at..][0..bytes]);
+    r.at += bytes;
+    return .{ .rows = rows[0..n], .bits = bits[0 .. n * MW] };
+}
 
 /// Commits the lane's last window: ``kept`` of its rows (the lane core calls keep only to cut a window short, so a
 /// window it accepted whole is committed here, before the lane's next call). Rank 1 commits the same.
@@ -155,6 +234,16 @@ const Owned = struct {
     shared_count: usize = 0,
     mtp_ms: f64 = 0, // one chained head step
     spare: ?*forward.Seq = null, // a released sequence, reset and reused by the next request (its memory, its graphs)
+    gfull: []u32 = &.{}, // a grammar row's bits over the whole vocabulary
+    gbits: [2][]u32 = .{ &.{}, &.{} }, // a round's grammar rows, each rank's half (rank 1: what the frames carry)
+    growsbuf: [batch_rows]u32 = undefined,
+
+    /// The scratch grammar rows need, made on first use.
+    fn gramScratch(self: *Owned) !void {
+        if (self.gfull.len > 0) return;
+        self.gfull = try self.gpa.alloc(u32, 2 * MW);
+        for (&self.gbits) |*b| b.* = try self.gpa.alloc(u32, batch_rows * MW);
+    }
 
     fn obtain(self: *Owned) !*forward.Seq {
         if (self.spare) |s| {
@@ -272,6 +361,7 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     try w.int(id);
     try w.tokens(&prompt);
     try writeSampling(&w, null);
+    try w.int(0); // no grammar rows
     try self.send(.prefill, &w);
     const seq = try self.obtain();
     defer {
@@ -288,6 +378,7 @@ fn calibrate(self: *Owned, drafts: bool) !void {
             @memset(ids[0..width], tok);
             try w.int(id);
             try w.tokens(ids[0..width]);
+            try w.int(0);
             try self.send(.verify, &w);
             const t0 = std.Io.Timestamp.now(self.io, .awake);
             try forward.verify(self.e, seq, ids[0..width], out[0..width]);
@@ -346,6 +437,7 @@ fn calibrateShared(self: *Owned) !void {
         try w.int(ids[k]);
         try w.tokens(&prompt);
         try writeSampling(&w, null);
+        try w.int(0);
         try self.send(.prefill, &w);
         seqs[k] = try forward.newSeq(self.e);
         made += 1;
@@ -365,6 +457,7 @@ fn calibrateShared(self: *Owned) !void {
                 parts[k] = .{ .s = seqs[k], .ids = toks[k][0..rows] };
                 try w.int(ids[k]);
                 try w.tokens(toks[k][0..rows]);
+                try w.int(0);
             }
             try self.send(.shared, &w);
             var flat: [batch_rows]u32 = undefined;
@@ -387,6 +480,8 @@ fn calibrateShared(self: *Owned) !void {
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+    if (err == error.GrammarRejected) return "the reply's grammar rejected a token it was made to take";
+    if (err == error.Grammar) return "the reply's grammar failed (xgrammar)";
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
@@ -483,13 +578,31 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
+    // a grammar: compiled (the server's compile is cached), its first row when it starts with the reply
+    var gram: ?Gram = null;
+    errdefer if (gram) |g| g.m.free();
+    var grows: Rows = .{};
+    if (s.structure) |st| {
+        try self.gramScratch();
+        if (st.compiler.words != 2 * MW) return error.GrammarVocabulary;
+        var err: [512]u8 = undefined;
+        const compiled = try st.compiler.compile(self.io, st.kind, st.text, &err);
+        defer compiled.free();
+        gram = .{ .m = try compiled.matcher(), .after = st.after, .active = st.after == null };
+        grows.bits = .{ self.gbits[0], self.gbits[1] };
+        try gramRows(&gram.?, s, &.{0}, self.gfull, &grows);
+    }
     try w.int(id);
     try w.tokens(ids);
     try writeSampling(&w, s.sampling);
+    try writeRows(&w, &grows);
     try self.send(.prefill, &w);
     const seq = try self.obtain();
     seq.sampling = s.sampling;
-    gop.value_ptr.* = .{ .seq = seq, .id = id };
+    if (grows.n > 0) seq.mask = .{ .rows = grows.rows[0..grows.n], .bits = grows.bits[0][0 .. grows.n * MW] };
+    if (gop.found_existing) if (gop.value_ptr.g) |g| g.m.free();
+    gop.value_ptr.* = .{ .seq = seq, .id = id, .g = gram };
+    gram = null;
     if (pos) |q| try forward.attach(self.e, seq, q.rows, feats.?.ptr, q.pos, q.delta);
     _ = self.take(try forward.prefill(self.e, seq, ids));
 }
@@ -524,11 +637,18 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     var ids: [max_rows]u32 = undefined;
     ids[0] = win.pending;
     if (win.held > 0) @memcpy(ids[1..][0..win.held], l.held[0..win.held]) else @memcpy(ids[1..][0..win.tokens.len], win.tokens);
+    var grows: Rows = .{};
+    if (l.g) |*g| {
+        grows.bits = .{ self.gbits[0], self.gbits[1] };
+        try gramRows(g, win.stream, ids[0..rows], self.gfull, &grows);
+    }
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     try w.int(l.id);
     try w.tokens(ids[0..rows]);
+    try writeRows(&w, &grows);
     try self.send(.verify, &w);
+    if (grows.n > 0) l.seq.mask = .{ .rows = grows.rows[0..grows.n], .bits = grows.bits[0][0 .. grows.n * MW] };
     try forward.verify(self.e, l.seq, ids[0..rows], out[0].sampled[0..rows]);
     @memcpy(out[0].drafts[0 .. rows - 1], ids[1..rows]);
     l.rows = @intCast(rows);
@@ -559,12 +679,22 @@ fn verifyShared(self: *Owned, windows: []const be.Window, out: []be.Verified) an
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     var parts: [max_streams]forward.Part = undefined;
+    var grows: [max_streams]Rows = undefined;
+    var used: usize = 0; // grammar rows so far: each part's bits after the previous parts'
     try w.int(windows.len);
     for (windows, 0..) |win, k| {
         const rows = win.rows();
+        grows[k] = .{};
+        if (lanes_of[k].g) |*g| {
+            grows[k].bits = .{ self.gbits[0][used * MW ..], self.gbits[1][used * MW ..] };
+            try gramRows(g, win.stream, ids[k][0..rows], self.gfull, &grows[k]);
+            used += grows[k].n;
+        }
         try w.int(lanes_of[k].id);
         try w.tokens(ids[k][0..rows]);
+        try writeRows(&w, &grows[k]);
         parts[k] = .{ .s = lanes_of[k].seq, .ids = ids[k][0..rows] };
+        if (grows[k].n > 0) lanes_of[k].seq.mask = .{ .rows = grows[k].rows[0..grows[k].n], .bits = grows[k].bits[0][0 .. grows[k].n * MW] };
     }
     try self.send(.shared, &w);
     var flat: [batch_rows]u32 = undefined;
@@ -690,6 +820,7 @@ fn probabilitiesFn(p: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
 fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     const self = of(p);
     const kv = self.lanes_by.fetchRemove(s) orelse return;
+    if (kv.value.g) |g| g.m.free();
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     w.int(kv.value.id) catch {};
@@ -746,11 +877,15 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 }
                 const toks = try r.tokens();
                 seq.sampling = try readSampling(&r);
+                try self.gramScratch();
+                seq.mask = try readRows(&r, self.growsbuf[0..], self.gbits[1]);
                 _ = try forward.prefill(self.e, seq, toks);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                 const ids = try r.tokens();
+                try self.gramScratch();
+                seq.mask = try readRows(&r, self.growsbuf[0..], self.gbits[1]);
                 try forward.verify(self.e, seq, ids, sampled[0..ids.len]);
             },
             .keep => {
@@ -794,9 +929,13 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 if (n == 0 or n > max_streams) return error.TooManyStreams;
                 var parts: [max_streams]forward.Part = undefined;
                 var total: usize = 0;
+                var used: usize = 0;
+                try self.gramScratch();
                 for (parts[0..n]) |*pt| {
                     const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
                     pt.* = .{ .s = seq, .ids = try r.tokens() };
+                    seq.mask = try readRows(&r, self.growsbuf[used..], self.gbits[1][used * MW ..]);
+                    if (seq.mask) |mk| used += mk.rows.len;
                     total += pt.ids.len;
                 }
                 var flat: [batch_rows]u32 = undefined;

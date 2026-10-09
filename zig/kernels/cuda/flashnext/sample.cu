@@ -123,3 +123,13 @@ extern "C" __global__ void __launch_bounds__(256) fn_cand_topk(const __nv_bfloat
         __syncthreads();
     }
 }
+
+// Structured output: each listed row's tokens its grammar does not allow to -inf (rows[i]: the logits row, bits: the
+// row's allowed bits over this rank's columns, token c: bit c % 32 of word c / 32), before the picks and draws.
+extern "C" __global__ void __launch_bounds__(256) fn_grammar_rows(__nv_bfloat16* __restrict__ logits, int stride, int cols,
+        const unsigned* __restrict__ bits, int words, const int* __restrict__ rows) {
+    __nv_bfloat16* x = logits + (size_t)rows[blockIdx.x] * stride;
+    const unsigned* w = bits + (size_t)blockIdx.x * words;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        if (!((w[c >> 5] >> (c & 31)) & 1u)) x[c] = __ushort_as_bfloat16((unsigned short)0xff80);
+}

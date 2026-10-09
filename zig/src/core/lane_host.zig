@@ -318,6 +318,7 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,
+            .structure = if (r.structure) |st| if (st.compiler) |c| .{ .compiler = c, .kind = @enumFromInt(@intFromEnum(st.kind)), .text = st.text, .after = st.after } else null else null,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
