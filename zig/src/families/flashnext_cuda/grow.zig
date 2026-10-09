@@ -88,6 +88,29 @@ pub const Range = struct {
         for (self.regions.items) |*r| r.mapped = 0;
     }
 
+    /// ``shrink`` but each region's first chunk (its first step of positions, which every request maps) stays,
+    /// zeroed on ``stream``: a reused sequence starts without mapping its caches again.
+    pub fn trim(self: *Range, stream: abi.Stream) !void {
+        var kept: usize = 0;
+        for (self.regions.items) |*r| r.mapped = 0;
+        for (self.chunks.items) |c| {
+            const r = for (self.regions.items) |*x| {
+                if (c.at == self.base + x.off) break x;
+            } else null;
+            if (r) |first| {
+                try self.d.check(self.d.api.cuMemsetD8Async(c.at, 0, c.size, stream), "zero kept cache");
+                first.mapped = c.size;
+                self.chunks.items[kept] = c;
+                kept += 1;
+                continue;
+            }
+            _ = self.d.api.cuMemUnmap(c.at, c.size);
+            _ = self.d.api.cuMemRelease(c.handle);
+            self.budget.used -= c.size;
+        }
+        self.chunks.shrinkRetainingCapacity(kept);
+    }
+
     pub fn deinit(self: *Range) void {
         self.shrink();
         if (self.base != 0) _ = self.d.api.cuMemAddressFree(self.base, self.size);
