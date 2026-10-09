@@ -231,6 +231,12 @@ pub const Engine = struct {
         try e.live.append(e.gpa, s);
     }
 
+    /// After ``step`` failed: the streams the backend refused alone (the caller ends them; the rest go on).
+    pub fn refused(e: *Engine, out: []*Stream) usize {
+        const ask = e.backend.vtable.refused orelse return 0;
+        return ask(e.backend.ptr, out);
+    }
+
     /// Release a cancelled stream between rounds: no pending draws or drafts.
     pub fn discard(e: *Engine, s: *Stream) void {
         s.finished = true;

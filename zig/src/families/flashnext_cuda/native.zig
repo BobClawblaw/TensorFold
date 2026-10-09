@@ -56,13 +56,16 @@ const max_rows = 16;            // a verify window's rows at most (pending + 15 
 const batch_rows = 128;         // a shared round's rows at most, every stream's window together (16 streams x 8)
 const max_streams = 16;         // streams a shared round packs at most
 const max_depth = max_rows - 1;
+/// Rows a stream's caches are backed past what its next forward writes before rank 1 hears of it: a verify window,
+/// the kept rows and the head's drafts after it all fall within (so the forwards' own growth finds them mapped).
+const grow_margin = 2 * max_rows + 2;
 /// The head stops at a draft it gives less than this (the Python engine's --mtp-confidence, the recipe's 0.70);
 /// the slots past it are held with chance 0, so the lane core's allocator leaves them out of the window.
 const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10, keeps = 11, prefills = 12 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10, keeps = 11, prefills = 12, grow = 13 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -278,6 +281,7 @@ const Owned = struct {
     mtp_ms: f64 = 0, // one chained head step
     spares: std.ArrayList(*forward.Seq) = .empty, // released sequences, reset and reused by the next requests (their memory, their graphs)
     kept: std.ArrayList(Kept) = .empty, // released sequences kept at their prompts' kept points (oldest first)
+    refused: std.ArrayList(*lanes.Stream) = .empty, // streams a round's cache growth was refused for (refusedFn)
     streams: usize = max_streams, // the streams admission budgeted: active, kept and spare sequences stay within it
     gfull: []u32 = &.{}, // a grammar row's bits over the whole vocabulary
     gbits: [2][]u32 = .{ &.{}, &.{} }, // a round's grammar rows, each rank's half (rank 1: what the frames carry)
@@ -314,7 +318,71 @@ const Owned = struct {
         try self.link.send(@intFromEnum(op), w.buf.items);
         w.buf.clearRetainingCapacity();
     }
+
+    fn refuse(self: *Owned, s: *lanes.Stream) !void {
+        for (self.refused.items) |x| if (x == s) return;
+        try self.refused.append(self.gpa, s);
+    }
+
+    /// Rank 1's answer to a growth it was asked for (a .grow frame, or a prompt frame's): 1 a byte where it grew.
+    fn answer(self: *Owned, n: usize) ![]u8 {
+        const m = try self.link.recv(self.gpa);
+        if (m.tag != @intFromEnum(Op.grow) or m.bytes.len != n) {
+            self.gpa.free(m.bytes);
+            return error.RankOneOutOfStep;
+        }
+        return m.bytes;
+    }
 };
+
+/// Every lane's caches backed through its target before rank 1 hears of the round: rank 0 grows first, then rank 1
+/// (a .grow frame it answers), so a growth refused on either rank refuses the round on both before any forward (one
+/// refused on one rank alone left the other in a forward whose collectives never met). The streams refused wait in
+/// ``refused`` for the lane host (refusedFn), which ends them alone; the round's other streams go on.
+fn reserveRound(self: *Owned, ls: []const *Lane, ss: []const *lanes.Stream, targets: []const i64) !void {
+    var ask: [max_streams]usize = undefined;
+    var n: usize = 0;
+    var refused = false;
+    for (ls, targets, 0..) |l, t, k| {
+        if (!forward.short(l.seq, t)) continue;
+        forward.reserve(self.e, l.seq, t) catch |err| switch (err) {
+            error.OutOfDeviceMemory => {
+                try self.refuse(ss[k]);
+                refused = true;
+                continue;
+            },
+            else => return err,
+        };
+        ask[n] = k;
+        n += 1;
+    }
+    if (n > 0) {
+        var w: Writer = .{ .gpa = self.gpa };
+        defer w.buf.deinit(self.gpa);
+        try w.int(n);
+        for (ask[0..n]) |k| {
+            try w.int(ls[k].id);
+            try w.int(targets[k]);
+        }
+        try self.send(.grow, &w);
+        const oks = try self.answer(n);
+        defer self.gpa.free(oks);
+        for (ask[0..n], oks) |k, ok| if (ok == 0) {
+            try self.refuse(ss[k]);
+            refused = true;
+        };
+    }
+    if (refused) return error.OutOfDeviceMemory;
+}
+
+/// The streams the last rounds' cache growth was refused for (the lane host ends them; the others go on).
+fn refusedFn(p: *anyopaque, out: []*lanes.Stream) usize {
+    const self = of(p);
+    const n = @min(out.len, self.refused.items.len);
+    @memcpy(out[0..n], self.refused.items[0..n]);
+    self.refused.clearRetainingCapacity();
+    return n;
+}
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels_dir: []const u8, o: Options) !Loaded {
     if (o.tp != 2) return error.TwoRanksOnly;
@@ -354,10 +422,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         forward.setGrowthBudget(own.e, if (free > keep_free) free - keep_free else 0);
     }
     // both halves loaded before rank 0 serves: rank 1 says so once its engine is up (it loads more slowly)
-    if (o.rank == 1) try own.link.send(@intFromEnum(Op.ready), "") else {
+    // and with its growth budget: rank 0 grows within the smaller of the two, so rank 1's growth (the same as rank 0's)
+    // fits its own budget too
+    if (o.rank == 1) try own.link.send(@intFromEnum(Op.ready), std.mem.asBytes(&own.e.budget.cap)) else {
         const m = try own.link.recv(gpa);
-        gpa.free(m.bytes);
+        defer gpa.free(m.bytes);
         if (m.tag != @intFromEnum(Op.ready)) return error.RankOneNotReady;
+        if (m.bytes.len == 8) forward.setGrowthBudget(own.e, @min(own.e.budget.cap, std.mem.readInt(u64, m.bytes[0..8], .little)));
     }
     own.lanes_by = .init(gpa);
     own.by_id = .init(gpa);
@@ -370,6 +441,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.shared_count = 0;
     own.spares = .empty;
     own.kept = .empty;
+    own.refused = .empty;
     own.streams = max_streams;
     own.gfull = &.{};
     own.gbits = .{ &.{}, &.{} };
@@ -409,7 +481,8 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     try w.tokens(&prompt);
     try writeSampling(&w, null);
     try w.int(0); // no grammar rows
-    try w.int(0); // nor a kept state, nor a kept point
+    try w.int(0); // nor a kept state, nor a kept point, nor a growth to agree on
+    try w.int(0);
     try w.int(0);
     try w.int(0);
     try self.send(.prefill, &w);
@@ -489,7 +562,7 @@ fn calibrateShared(self: *Owned) !void {
         try w.int(ids[k]);
         try w.tokens(&prompt);
         try writeSampling(&w, null);
-        for (0..4) |_| try w.int(0);
+        for (0..5) |_| try w.int(0);
         try self.send(.prefill, &w);
         seqs[k] = try forward.newSeq(self.e);
         made += 1;
@@ -581,6 +654,7 @@ const vtable: be.Backend.VTable = .{
     .draft = draftFn,
     .release = releaseFn,
     .probabilities = probabilitiesFn,
+    .refused = refusedFn,
 };
 
 /// A new sequence for the stream and its prompt (the head absorbs it); the first token is drawn here.
@@ -634,8 +708,27 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
     defer w.buf.deinit(self.gpa);
     var resumed: u64 = 0;
     const pr = try setupPrefill(self, s, &w, 0, &resumed);
+    const target: i64 = @intCast(pr.ids.len + grow_margin);
+    const asked = forward.short(pr.s, target);
+    if (asked) forward.reserve(self.e, pr.s, target) catch |err| {
+        // refused before rank 1 hears of the prompt: a kept state it resumed is dropped there (the lane is released
+        // as any failed one, its id unknown to rank 1)
+        if (resumed != 0) {
+            var wr: Writer = .{ .gpa = self.gpa };
+            defer wr.buf.deinit(self.gpa);
+            try wr.int(resumed);
+            try wr.int(0);
+            try self.send(.release, &wr);
+        }
+        return err;
+    };
     if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
     try self.send(.prefill, &w);
+    if (asked) { // rank 1 grew too, or skipped the prompt (the lane is released as any failed one)
+        const ok = try self.answer(1);
+        defer self.gpa.free(ok);
+        if (ok[0] == 0) return error.OutOfDeviceMemory;
+    }
     if (pos) |q| try forward.attach(self.e, pr.s, q.rows, feats.?.ptr, q.pos, q.delta);
     self.lanes_by.getPtr(s).?.first = self.take(try forward.prefill(self.e, pr.s, pr.ids, pr.start));
 }
@@ -695,6 +788,9 @@ fn setupPrefill(self: *Owned, s: *lanes.Stream, w: *Writer, at: usize, resumed: 
     try w.int(start);
     try w.int(if (cut) |c| @as(u64, @intCast(c)) else 0);
     const seq = if (reuse) |k| k.seq else try self.obtain();
+    // the growth the prompt and its first drafts need (rank 1 then answers whether it grew too)
+    const target: i64 = @intCast(ids.len + grow_margin);
+    try w.int(if (forward.short(seq, target)) @as(u64, @intCast(target)) else 0);
     if (reuse) |k| {
         resumed.* = k.id;
         self.gpa.free(k.ids);
@@ -732,22 +828,28 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
     var prompts: [max_streams]forward.Prompt = undefined;
     var resumed: [max_streams]u64 = undefined;
     for (ss, 0..) |s, k| prompts[k] = setupPrefill(self, s, &w, k, &resumed[k]) catch |err| {
-        // rank 1 has heard of none of them: the lanes set up so far undone, a kept state each resumed dropped there
-        for (ss[0..k], resumed[0..k]) |done, rid| {
-            const kv = self.lanes_by.fetchRemove(done) orelse continue;
-            if (kv.value.g) |g| g.m.free();
-            if (rid != 0) {
-                var wr: Writer = .{ .gpa = self.gpa };
-                defer wr.buf.deinit(self.gpa);
-                wr.int(rid) catch {};
-                wr.int(0) catch {};
-                self.send(.release, &wr) catch {};
-            }
-            self.retire(kv.value.seq);
-        }
+        undoSetups(self, ss[0..k], resumed[0..k]);
         return err;
     };
+    var asked = false;
+    for (prompts[0..ss.len]) |pr| {
+        const target: i64 = @intCast(pr.ids.len + grow_margin);
+        if (!forward.short(pr.s, target)) continue;
+        asked = true;
+        forward.reserve(self.e, pr.s, target) catch |err| switch (err) {
+            error.OutOfDeviceMemory => { // each alone then: the refused one ends on its own
+                undoSetups(self, ss, resumed[0..ss.len]);
+                return false;
+            },
+            else => return err,
+        };
+    }
     try self.send(.prefills, &w);
+    if (asked) {
+        const ok = try self.answer(1);
+        defer self.gpa.free(ok);
+        if (ok[0] == 0) return error.OutOfDeviceMemory;
+    }
     var firsts: [max_streams]u32 = undefined;
     const t0 = std.Io.Timestamp.now(self.io, .awake);
     try forward.prefillMany(self.e, prompts[0..ss.len], firsts[0..ss.len]);
@@ -756,6 +858,22 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
     return true;
 }
 
+
+/// Rank 1 has heard of none of these prompts: their lanes undone, a kept state each resumed dropped there.
+fn undoSetups(self: *Owned, ss: []const *lanes.Stream, resumed: []const u64) void {
+    for (ss, resumed) |done, rid| {
+        const kv = self.lanes_by.fetchRemove(done) orelse continue;
+        if (kv.value.g) |g| g.m.free();
+        if (rid != 0) {
+            var wr: Writer = .{ .gpa = self.gpa };
+            defer wr.buf.deinit(self.gpa);
+            wr.int(rid) catch {};
+            wr.int(0) catch {};
+            self.send(.release, &wr) catch {};
+        }
+        self.retire(kv.value.seq);
+    }
+}
 
 fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
     const self = of(p);
@@ -782,6 +900,7 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     const rows = win.rows();
     if (rows > max_rows) return error.WindowTooWide;
     try settle(self, l, l.rows); // the previous window, accepted whole
+    try reserveRound(self, &.{l}, &.{win.stream}, &.{forward.reach(l.seq, @as(i64, @intCast(rows)) + grow_margin)});
     // the core keys row r's draw at position pos + 1 + r, as the forward draws it
     if (win.positions.len > 0 and win.positions[0] != @as(u64, @intCast(l.seq.pos + 1))) return error.PositionMismatch;
     var ids: [max_rows]u32 = undefined;
@@ -823,6 +942,15 @@ fn verifyShared(self: *Owned, windows: []const be.Window, out: []be.Verified) an
     var whole: [max_streams]u32 = undefined; // each lane's previous window, accepted whole
     for (lanes_of[0..windows.len], 0..) |l, k| whole[k] = l.rows;
     try settleMany(self, lanes_of[0..windows.len], whole[0..windows.len]);
+    {
+        var ss: [max_streams]*lanes.Stream = undefined;
+        var targets: [max_streams]i64 = undefined;
+        for (windows, 0..) |win, k| {
+            ss[k] = win.stream;
+            targets[k] = forward.reach(lanes_of[k].seq, @as(i64, @intCast(win.rows())) + grow_margin);
+        }
+        try reserveRound(self, lanes_of[0..windows.len], ss[0..windows.len], targets[0..windows.len]);
+    }
     for (windows, 0..) |win, k| {
         const l = lanes_of[k];
         ids[k][0] = win.pending;
@@ -895,6 +1023,7 @@ fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
             .value => |v| v,
         };
         const depth: u32 = @min(r.depth, max_depth);
+        try reserveRound(self, &.{l}, &.{r.stream}, &.{forward.reach(l.seq, @as(i64, @intCast(n + depth)) + 2)});
         var w: Writer = .{ .gpa = self.gpa };
         defer w.buf.deinit(self.gpa);
         try w.int(l.id);
@@ -942,6 +1071,15 @@ fn draftMany(self: *Owned, requests: []const be.DraftRequest) anyerror!void {
                 .value => |v| v,
             };
         }
+    }
+    {
+        var ss: [max_streams]*lanes.Stream = undefined;
+        var targets: [max_streams]i64 = undefined;
+        for (requests, 0..) |r, k| {
+            ss[k] = r.stream;
+            targets[k] = forward.reach(lanes_of[k].seq, @as(i64, @intCast(nf[k] + depth[k])) + 2);
+        }
+        try reserveRound(self, lanes_of[0..requests.len], ss[0..requests.len], targets[0..requests.len]);
     }
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
@@ -1021,7 +1159,7 @@ fn attachFrame(self: *Owned, seq: *forward.Seq, f: []const u8) !void {
 
 /// Rank 1: a prompt's frame fields (prefillFn's): its sequence (a kept one it resumes, else a new one) set up with
 /// its draw, grammar row (at row ``at`` of the scratch), kept point and image.
-fn followPrefill(self: *Owned, r: *Reader, at: usize) !forward.Prompt {
+fn followPrefill(self: *Owned, r: *Reader, at: usize, grown: *?bool) !forward.Prompt {
     const id = try r.int();
     const toks = try r.tokens();
     const sampling = try readSampling(r);
@@ -1029,8 +1167,17 @@ fn followPrefill(self: *Owned, r: *Reader, at: usize) !forward.Prompt {
     const reuse = try r.int();
     const start: usize = @intCast(try r.int());
     const cut = try r.int();
+    const grow: i64 = @intCast(try r.int());
     const seq = if (reuse != 0) (self.by_id.fetchRemove(reuse) orelse return error.NoSequence).value else try self.obtain();
     try self.by_id.put(id, seq);
+    if (grow > 0) { // rank 0 grew for this prompt and waits for rank 1's answer
+        var ok = true;
+        forward.reserve(self.e, seq, grow) catch |err| switch (err) {
+            error.OutOfDeviceMemory => ok = false,
+            else => return err,
+        };
+        grown.* = (grown.* orelse true) and ok;
+    }
     if (self.images.fetchRemove(id)) |kv| {
         defer self.gpa.free(kv.value);
         try attachFrame(self, seq, kv.value);
@@ -1060,17 +1207,21 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .prefill => {
                 try self.gramScratch();
-                const pr = try followPrefill(self, &r, 0);
-                _ = try forward.prefill(self.e, pr.s, pr.ids, pr.start);
+                var grown: ?bool = null;
+                const pr = try followPrefill(self, &r, 0, &grown);
+                if (grown) |ok| try self.link.send(@intFromEnum(Op.grow), &.{@intFromBool(ok)});
+                if (grown orelse true) _ = try forward.prefill(self.e, pr.s, pr.ids, pr.start);
             },
             .prefills => {
                 const n: usize = @intCast(try r.int());
                 if (n < 2 or n > max_streams) return error.TooManyStreams;
                 try self.gramScratch();
                 var prompts: [max_streams]forward.Prompt = undefined;
-                for (prompts[0..n], 0..) |*pr, k| pr.* = try followPrefill(self, &r, k);
+                var grown: ?bool = null;
+                for (prompts[0..n], 0..) |*pr, k| pr.* = try followPrefill(self, &r, k, &grown);
+                if (grown) |ok| try self.link.send(@intFromEnum(Op.grow), &.{@intFromBool(ok)});
                 var firsts: [max_streams]u32 = undefined;
-                try forward.prefillMany(self.e, prompts[0..n], firsts[0..n]);
+                if (grown orelse true) try forward.prefillMany(self.e, prompts[0..n], firsts[0..n]);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
@@ -1114,6 +1265,21 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .stop => return,
             .ready => {},
+            .grow => { // rank 0 grew these sequences' caches for its next frame: rank 1 grows them too, and answers
+                const n: usize = @intCast(try r.int());
+                if (n == 0 or n > max_streams) return error.TooManyStreams;
+                var oks: [max_streams]u8 = undefined;
+                for (oks[0..n]) |*ok| {
+                    const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
+                    const target: i64 = @intCast(try r.int());
+                    ok.* = 1;
+                    forward.reserve(self.e, seq, target) catch |err| switch (err) {
+                        error.OutOfDeviceMemory => ok.* = 0,
+                        else => return err,
+                    };
+                }
+                try self.link.send(@intFromEnum(Op.grow), oks[0..n]);
+            },
             .drafts => {
                 const n: usize = @intCast(try r.int());
                 if (n == 0 or n > max_streams) return error.TooManyStreams;

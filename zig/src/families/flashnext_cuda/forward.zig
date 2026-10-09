@@ -678,6 +678,22 @@ pub fn setGrowthBudget(e: *Engine, cap: u64) void {
     e.budget.cap = cap;
 }
 
+/// The position ``s``'s caches must hold for ``rows`` more rows past its main and MTP positions.
+pub fn reach(s: *const Seq, rows: i64) i64 {
+    return @max(s.pos, s.mtp_len) + rows;
+}
+
+/// Whether backing ``s``'s caches through ``positions`` maps memory (the two ranks then agree on it first: a growth
+/// refused on one rank alone would leave the other in a forward whose collectives never meet).
+pub fn short(s: *const Seq, positions: i64) bool {
+    return s.grow.short(@min(positions, s.capacity));
+}
+
+/// ``s``'s caches backed through ``positions`` now (error.OutOfDeviceMemory past the budget, nothing launched).
+pub fn reserve(e: *Engine, s: *Seq, positions: i64) !void {
+    try s.grow.ensure(@min(positions, s.capacity), e.k.stream.handle);
+}
+
 /// ``s``'s caches backed through ``positions`` (its main and MTP positions), before a forward writes them.
 fn room(e: *Engine, s: *Seq, extra: i64) !void {
     try s.grow.ensure(@max(s.pos, s.mtp_len) + extra, e.k.stream.handle);
