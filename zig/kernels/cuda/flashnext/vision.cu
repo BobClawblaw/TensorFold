@@ -139,3 +139,13 @@ extern "C" __global__ void fn_vis_head_out(const __nv_bfloat16* __restrict__ o, 
         out[(int64_t)r * H * D + h * D + d] = o[i];
     }
 }
+
+// image features into a prompt piece's hidden rows: for each (row, feature) pair, the feature in every one of the
+// row's ``copies`` hyper-connection streams (the Python engine's index_copy of features.repeat(1, streams))
+extern "C" __global__ void fn_vis_splice(__nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ feats,
+                                         const int* __restrict__ pairs, int width, int copies) {
+    const int row = pairs[blockIdx.x * 2], src = pairs[blockIdx.x * 2 + 1];
+    const __nv_bfloat16* f = feats + (int64_t)src * width;
+    __nv_bfloat16* dst = h + (int64_t)row * width * copies;
+    for (int i = threadIdx.x; i < width * copies; i += blockDim.x) dst[i] = f[i % width];
+}

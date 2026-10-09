@@ -272,10 +272,17 @@ pub fn pleConv(k: *K, gated: u64, pss: u64, nc: u64, tail: u64, cw: u64, h: u64,
         P("NROW", nrow), F("eps", EPS), I("R", R) }, &.{ ci("D", D), ci("S", S), ci("TAPS", 4), ci("DIL", 3), ci("BLOCK", 512) });
 }
 
-pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, iq: u64, ikc: u64, R: i64) !void {
+/// A sequence's image positions (rotary MODE 2): ``table`` [length, 3] (t, h, w) int32 for the prompt's rows, and the
+/// device ``delta`` the rows past the prompt add to their position.
+pub const Rope = struct { table: u64, delta: u64, length: i64 };
+
+pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, iq: u64, ikc: u64, R: i64, rope: ?Rope) !void {
+    const table = if (rope) |r| r.table else pos;
+    const delta = if (rope) |r| r.delta else pos;
+    const length = if (rope) |r| r.length else 0;
     try k.tri("_attn_prep", .{ R, 12 + 1 + 4 + 1, 1 }, &.{ P("P", p), P("POS0", pos), P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q),
-        P("KC", kc), P("VC", vc), P("KS", ks), P("VS", vs), P("IQ", iq), P("IKC", ikc), P("ROPE", pos), P("DELTA", pos), I("length", 0), F("eps", EPS) },
-        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 8), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
+        P("KC", kc), P("VC", vc), P("KS", ks), P("VS", vs), P("IQ", iq), P("IKC", ikc), P("ROPE", table), P("DELTA", delta), I("length", length), F("eps", EPS) },
+        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 8), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
 }
 
 pub fn attnGate(k: *K, o: u64, p: u64, out: u64, xs: u64, R: i64) !void {
@@ -290,7 +297,10 @@ pub const CHUNK: i64 = 512;
 pub const NCH: i64 = 5;
 pub const KEYS_MAX: i64 = 2051; // (budget / ratio + 1) * ratio - 1
 
-pub fn pool(k: *K, ikc: u64, pooled: u64, pos: u64, w: u64, inv: u64, R: i64) !void {
+pub fn pool(k: *K, ikc: u64, pooled: u64, pos: u64, w: u64, inv: u64, R: i64, rope: ?Rope) !void {
+    if (rope) |r| return k.tri("_pool", .{ @divFloor(R, RATIO) + 2, 1, 1 }, &.{ P("IKC", ikc), P("POOLED", pooled), P("POS0", pos), P("W", w), P("INV", inv),
+        P("ROPE", r.table), P("DELTA", r.delta), F("eps", EPS), I("R", R), I("length", r.length) },
+        &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), ci("MODE", 2), ci("S1", 11), ci("S2", 10) });
     try k.tri("_pool", .{ @divFloor(R, RATIO) + 2, 1, 1 }, &.{ P("IKC", ikc), P("POOLED", pooled), P("POS0", pos), P("W", w), P("INV", inv), F("eps", EPS), I("R", R), I("length", 0) },
         &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), cnone("ROPE"), cnone("DELTA"), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
 }

@@ -340,3 +340,67 @@ fn taps(i: i64, size: i64) Taps {
     }
     return out;
 }
+
+/// An image prompt's rotary positions: ``pos`` [3, L] (t, h, w), the decode ``delta`` (the position the text after
+/// the prompt resumes at, less the prompt's length) and the placeholder ``rows`` (the features' rows, in order).
+pub const Positions = struct {
+    pos: []i32,
+    delta: i64,
+    rows: []u32,
+
+    pub fn deinit(p: *Positions, gpa: std.mem.Allocator) void {
+        gpa.free(p.pos);
+        gpa.free(p.rows);
+    }
+};
+
+/// The image token ids (config.json: image_token_id, vision_start_token_id, vision_end_token_id).
+pub const Ids = struct { image: u32 = 248056, start: u32 = 248053, end: u32 = 248054 };
+
+/// Qwen3.5's rope index for images (the Python engine's media_positions): text counts up on all three axes; each
+/// image's merged grid sits at the next position, rows on the h axis and columns on the w axis, and the text after it
+/// resumes past its larger side. ``grids``: each image's [t, h, w] in patches (t = 1), in prompt order.
+pub fn mediaPositions(gpa: std.mem.Allocator, tokens: []const u32, grids: []const [3]i64, ids: Ids) !Positions {
+    const L = tokens.len;
+    const pos = try gpa.alloc(i32, 3 * L);
+    errdefer gpa.free(pos);
+    var rows: std.ArrayList(u32) = .empty;
+    errdefer rows.deinit(gpa);
+    var cursor: usize = 0;
+    var next_pos: i64 = 0;
+    var used: usize = 0;
+    while (true) {
+        const begin = for (cursor..L) |i| {
+            if (tokens[i] == ids.image) break i;
+        } else break;
+        if (used >= grids.len) return error.ImageWithoutGrid;
+        const g = grids[used];
+        used += 1;
+        if (g[0] != 1 or @mod(g[1], MERGE) != 0 or @mod(g[2], MERGE) != 0 or g[1] <= 0 or g[2] <= 0) return error.BadImageGrid;
+        const h: usize = @intCast(@divExact(g[1], MERGE));
+        const w: usize = @intCast(@divExact(g[2], MERGE));
+        const end = begin + h * w;
+        if (begin == 0 or tokens[begin - 1] != ids.start or end >= L or tokens[end] != ids.end) return error.ImagePlaceholdersMismatch;
+        for (tokens[begin..end]) |t| if (t != ids.image) return error.ImagePlaceholdersMismatch;
+        for (cursor..begin) |i| {
+            const v: i32 = @intCast(next_pos + @as(i64, @intCast(i - cursor)));
+            for (0..3) |a| pos[a * L + i] = v;
+        }
+        const base: i64 = next_pos + @as(i64, @intCast(begin - cursor));
+        for (0..h * w) |j| {
+            const i = begin + j;
+            pos[i] = @intCast(base);
+            pos[L + i] = @intCast(base + @as(i64, @intCast(j / w)));
+            pos[2 * L + i] = @intCast(base + @as(i64, @intCast(j % w)));
+            try rows.append(gpa, @intCast(i));
+        }
+        next_pos = base + @as(i64, @intCast(@max(h, w)));
+        cursor = end;
+    }
+    if (used < grids.len) return error.GridWithoutImage;
+    for (cursor..L) |i| {
+        const v: i32 = @intCast(next_pos + @as(i64, @intCast(i - cursor)));
+        for (0..3) |a| pos[a * L + i] = v;
+    }
+    return .{ .pos = pos, .delta = next_pos - @as(i64, @intCast(cursor)), .rows = try rows.toOwnedSlice(gpa) };
+}

@@ -148,6 +148,88 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     try check.expect(same == count, "{d} of {d} tokens equal Python's", .{ same, count });
     check.pass("EXACT rank {d}: native forward, prefill + {d} tokens with MTP drafts equal the Python engine's", .{ rank, count });
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "shared")) try sharedCheck(e, prompt, rank);
+    for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "vision=")) try visionCheck(e, gpu, rank, a["vision=".len..]);
+}
+
+/// Image prompts against the Python engine (flashnext-zig/tools/capture_vision.py): the rotary positions computed
+/// here (and checked against Python's where it saved them), Python's tower features attached, prefill and an MTP
+/// decode (depth 15, confidence 0.7, as the capture ran): the same tokens, rounds, drafts and acceptances.
+fn visionCheck(e: *fwd.Engine, gpu: Gpu, rank: u8, dir: []const u8) !void {
+    const gpa = gpu.gpa;
+    const io = gpu.io;
+    const vision = @import("flashnext_weights").vision;
+    var nb: [512]u8 = undefined;
+    const refs_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/rank{d}/references.json", .{ dir, rank }), gpa, .limited(1 << 24));
+    const refs = try std.json.parseFromSlice(std.json.Value, gpa, refs_text, .{});
+    var all_same: usize = 0;
+    for (refs.value.array.items) |ref| {
+        const o = ref.object;
+        const name = o.get("name").?.string;
+        const meta_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/ref/{s}.json", .{ dir, name }), gpa, .limited(1 << 22));
+        const meta = try std.json.parseFromSlice(std.json.Value, gpa, meta_text, .{});
+        const g = meta.value.object.get("grid").?.array.items[0].array.items;
+        const grid = [3]i64{ g[0].integer, g[1].integer, g[2].integer };
+        const p64 = try ints(gpa, o.get("prompt").?);
+        const prompt = try gpa.alloc(u32, p64.len);
+        for (prompt, p64) |*d, x| d.* = @intCast(x);
+        var pos = try vision.mediaPositions(gpa, prompt, &.{grid}, .{});
+        defer pos.deinit(gpa);
+        if (o.get("extra").?.integer == 0) { // Python saved this prompt's positions: compare
+            const pbytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/ref/{s}.positions.i32", .{ dir, name }), gpa, .limited(1 << 24));
+            const want = try gpa.alloc(i32, pbytes.len / 4);
+            @memcpy(std.mem.sliceAsBytes(want), pbytes[0 .. want.len * 4]);
+            try check.expect(std.mem.eql(i32, pos.pos, want), "{s}: rotary positions equal Python's", .{name});
+        }
+        try check.expect(pos.delta == o.get("rope_delta").?.integer, "{s}: delta {d} (Python {d})", .{ name, pos.delta, o.get("rope_delta").?.integer });
+        const fbytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/ref/{s}.features.bf16", .{ dir, name }), gpa, .limited(1 << 28));
+        var fdev = try cuda.DeviceBuffer.alloc(gpu.d, fbytes.len);
+        defer fdev.free();
+        try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(fdev.ptr, fbytes.ptr, fbytes.len), "features");
+        const s = try fwd.newSeq(e);
+        defer fwd.freeSeq(e, s);
+        try fwd.attach(e, s, pos.rows, fdev.ptr, pos.pos, pos.delta);
+        const want = try ints(gpa, o.get("tokens").?);
+        const count = want.len;
+        var out: std.ArrayList(u32) = .empty;
+        const first = try fwd.prefill(e, s, prompt);
+        try out.append(gpa, first);
+        var drafts: [16]u32 = undefined;
+        const depth: usize = 15;
+        var nd = try fwd.draftUpTo(e, s, &[1]u32{first}, @intCast(@min(depth, count - out.items.len)), 0.7, &drafts);
+        var rounds: usize = 0;
+        var drafted: usize = 0;
+        var accepted: usize = 0;
+        while (out.items.len < count) {
+            var tokens: [16]u32 = undefined;
+            tokens[0] = out.items[out.items.len - 1];
+            @memcpy(tokens[1 .. 1 + nd], drafts[0..nd]);
+            const R = 1 + nd;
+            var sampled: [16]u32 = undefined;
+            try fwd.verify(e, s, tokens[0..R], sampled[0..R]);
+            var keep: usize = 1;
+            for (drafts[0..nd], 0..) |d, i| {
+                if (sampled[i] != d) break;
+                keep += 1;
+            }
+            try fwd.keep(e, s, @intCast(R), @intCast(keep));
+            rounds += 1;
+            drafted += nd;
+            accepted += keep - 1;
+            try out.appendSlice(gpa, sampled[0..keep]);
+            if (out.items.len >= count) break;
+            nd = try fwd.draftUpTo(e, s, sampled[0..keep], @intCast(@min(depth, count - out.items.len)), 0.7, &drafts);
+        }
+        var same: usize = 0;
+        for (out.items[0..count], want) |a, b| {
+            if (a == b) same += 1 else break;
+        }
+        std.debug.print("rank {d}: {s}+{d} ({d} tokens): {d} of {d} tokens equal Python's; rounds {d} drafted {d} accepted {d} (Python {d}, {d}, {d})\n", .{
+            rank, name, o.get("extra").?.integer, prompt.len, same, count, rounds, drafted, accepted,
+            o.get("rounds").?.integer, o.get("drafted").?.integer, o.get("accepted").?.integer });
+        if (same == count) all_same += 1;
+    }
+    try check.expect(all_same == refs.value.array.items.len, "{d} of {d} image prompts equal Python's", .{ all_same, refs.value.array.items.len });
+    check.pass("EXACT rank {d}: {d} image prompts (Python's features, positions computed here) equal the Python engine's replies", .{ rank, all_same });
 }
 
 /// Shared rounds against lone ones: three prompts of different lengths decode 16 greedy tokens each alone, then
