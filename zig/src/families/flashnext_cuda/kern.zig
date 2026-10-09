@@ -276,13 +276,13 @@ pub fn pleConv(k: *K, gated: u64, pss: u64, nc: u64, tail: u64, cw: u64, h: u64,
 /// device ``delta`` the rows past the prompt add to their position.
 pub const Rope = struct { table: u64, delta: u64, length: i64 };
 
-pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, iq: u64, ikc: u64, R: i64, rope: ?Rope) !void {
+pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, iq: u64, ikc: u64, R: i64, rope: ?Rope, bits: u8) !void {
     const table = if (rope) |r| r.table else pos;
     const delta = if (rope) |r| r.delta else pos;
     const length = if (rope) |r| r.length else 0;
     try k.tri("_attn_prep", .{ R, 12 + 1 + 4 + 1, 1 }, &.{ P("P", p), P("POS0", pos), P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q),
         P("KC", kc), P("VC", vc), P("KS", ks), P("VS", vs), P("IQ", iq), P("IKC", ikc), P("ROPE", table), P("DELTA", delta), I("length", length), F("eps", EPS) },
-        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", 8), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
+        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
 }
 
 pub fn attnGate(k: *K, o: u64, p: u64, out: u64, xs: u64, R: i64) !void {
@@ -321,14 +321,14 @@ pub fn qsaRows(k: *K, iq: u64, pooled: u64, pos: u64, sc: u64, ids: u64, nkr: u6
 }
 
 /// attention: 512-key chunks over at most 2051 keys, then the merge into ``out``.
-pub fn attention(k: *K, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, spr: u64, out: u64, rows: i64, context: i64) !void {
+pub fn attention(k: *K, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, spr: u64, out: u64, rows: i64, context: i64, bits: u8) !void {
     const keys = @min(context, KEYS_MAX);
     const chunks = @min(NCH, cdiv(keys, CHUNK));
     try k.tri("_chunks", .{ rows, 1, chunks }, &.{ P("Q", q), P("KC", kc), P("VC", vc), P("KSC", ks), P("VSC", vs), P("POS0", pos), P("PO", po), P("PM", pm), P("PL", pl),
         P("IDS", ids), P("NKR", nkr), P("SPR", spr) }, &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH),
-        cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", 8) });
+        cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", bits) });
     try k.tri("_merge", .{ rows, 1, 1 }, &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POS0", pos), P("OUT", out), P("NKR", nkr), P("SPR", spr) },
-        &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", 8) });
+        &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits) });
 }
 
 // -- moe.py, affine_moe.py --------------------------------------------------------------------------------------------

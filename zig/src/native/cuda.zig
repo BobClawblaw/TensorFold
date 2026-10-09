@@ -360,6 +360,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
     if (@hasField(F.Options, "vision")) fo.vision = o.vision;
+    if (@hasField(F.Options, "kv_bits")) fo.kv_bits = o.kv_bits else if (o.kv_bits != 8) {
+        problem.* = try std.fmt.allocPrint(a, "{s} keeps an int8 attention cache only: drop --kv-dtype", .{F.model_type});
+        return null;
+    }
     if (@hasField(F.Options, "rank")) {
         fo.tp = o.tp;
         fo.rank = o.rank;

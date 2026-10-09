@@ -84,7 +84,7 @@ pub const flags = [_]Flag{
     .{ .name = "--rank", .choices = &.{ "0", "1" }, .native = cuda_build },
     .{ .name = "--master", .native = cuda_build },
     .{ .name = "--master-port", .native = cuda_build },
-    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" } },
+    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" }, .native = cuda_build, .native_values = &.{ "int8", "int4" } },
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
     .{ .name = "--precision", .choices = &.{ "checkpoint", "full" } },
@@ -141,6 +141,7 @@ pub const Args = struct {
     backend: []const u8 = "auto",
     device: ?u32 = null,
     segments: ?u32 = null,
+    kv_dtype: []const u8 = "int8", // --kv-dtype (CUDA): the attention cache's codes, int8 or int4
     tp: u8 = 1,
     rank: u8 = 0,
     master: ?[]const u8 = null,
@@ -250,6 +251,8 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
 fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
     if (std.mem.eql(u8, name, "--device")) {
         out.device = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --device: a GPU ordinal from 0: '{s}'", .{v});
+    } else if (std.mem.eql(u8, name, "--kv-dtype")) {
+        out.kv_dtype = v;
     } else if (std.mem.eql(u8, name, "--segments")) {
         const n = try int(u, a, name, v);
         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
