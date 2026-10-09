@@ -9,8 +9,8 @@ const layout_names = [_][:0]const u8{ "qwen35_embed", "qwen35_head_norm", "qwen3
 pub const fixed_total = sources.all.len + layout_names.len;
 const max_projections = 16;
 
-/// `qmv1` and `qmv8`: the FP32-ALU path for one row and for up to eight (Encoder.projection picks it when asked).
-pub const Projection = struct { n: usize, k: usize, pipeline: mtl.Pipeline, columns: usize, threads: usize, qmv1: ?mtl.Pipeline = null, qmv2: ?mtl.Pipeline = null, qmv4: ?mtl.Pipeline = null, qmv8: ?mtl.Pipeline = null };
+/// `qmv`: the FP32-ALU path for the decode widths, one kernel for any row count (Encoder.projection picks it when asked).
+pub const Projection = struct { n: usize, k: usize, pipeline: mtl.Pipeline, columns: usize, threads: usize, qmv: ?mtl.Pipeline = null };
 pub const qmv_rows = 16; // output rows a qmv threadgroup (4 simdgroups of 4)
 
 pub const Kernels = struct {
@@ -42,7 +42,7 @@ pub const Kernels = struct {
         for (self.fixed) |p| p.deinit();
         for (self.projections[0..self.count]) |p| {
             p.pipeline.deinit();
-            inline for (.{ "qmv1", "qmv2", "qmv4", "qmv8" }) |f| if (@field(p, f)) |q| q.deinit();
+            if (p.qmv) |q| q.deinit();
         }
     }
 };
@@ -136,12 +136,10 @@ pub fn load(gpa: std.mem.Allocator, device: mtl.Device, g: cfg.Geometry) !Kernel
         out.projections[out.count] = .{ .n = n, .k = k, .pipeline = try mtl.Pipeline.init(device, lib, sources.qmm.function, false), .columns = 8 * tiles(n), .threads = 256 };
         out.count += 1;
         if (k % 1024 == 0) {
-            inline for (.{ .{ 1, 32, "qmv1" }, .{ 2, 16, "qmv2" }, .{ 4, 8, "qmv4" }, .{ 8, 8, "qmv8" } }) |v| {
-                const h = try std.fmt.bufPrint(&buf, "#define K {d}\n#define N {d}\n#define RM {d}\n#define VPL {d}\n", .{ k, n, v[0], v[1] });
-                const l = try library(gpa, device, h, sources.qmv.source);
-                defer l.deinit();
-                @field(out.projections[out.count - 1], v[2]) = try mtl.Pipeline.init(device, l, sources.qmv.function, false);
-            }
+            const h = try std.fmt.bufPrint(&buf, "#define K {d}\n#define N {d}\n", .{ k, n });
+            const l = try library(gpa, device, h, sources.qmv.source);
+            defer l.deinit();
+            out.projections[out.count - 1].qmv = try mtl.Pipeline.init(device, l, sources.qmv.function, false);
         }
     }
     return out;

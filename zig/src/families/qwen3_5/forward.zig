@@ -25,8 +25,8 @@ const Encoder = struct {
     }
     fn projection(self: Encoder, linear: wts.Linear, x: Buffer, offset: usize, y: Buffer, y_offset: usize, rows: usize) void {
         const p = self.m.kernels.projection(linear.outputs, linear.inputs).?;
-        // The FP32 path at one or two rows, where it beats the matrix kernel in the step on every shape.
-        const qmv: ?mtl.Pipeline = if (std.c.getenv("TF_QWEN_QMV") == null) null else if (rows == 1) p.qmv1 else if (rows == 2) p.qmv2 else null;
+        // The FP32 path for every decode width (the same bytes a row whatever the batch); prefill chunks stay on the matrix kernel.
+        const qmv: ?mtl.Pipeline = if (std.c.getenv("TF_QWEN_QMV") == null or rows > st.batch_rows) null else p.qmv;
         self.e.setPipeline(qmv orelse p.pipeline);
         self.e.setBuffer(x, offset, 0);
         self.e.setValue([2]i32{ @intCast(rows), @intCast(linear.inputs) }, 1);

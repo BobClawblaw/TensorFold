@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
             const base = time(m, shipped.pipeline, c.lin, nt0, x, y, rows, n_reps);
             @memcpy(y_ref[0 .. rows * n * 2], y.contents()[0 .. rows * n * 2]);
             std.debug.print("  rows {d:>2} ({d} reps): shipped {d:>7.1}", .{ rows, n_reps, base });
-            if (rows <= 8) if (if (rows == 1) shipped.qmv1 else if (rows == 2) shipped.qmv2 else if (rows <= 4) shipped.qmv4 else shipped.qmv8) |pq| {
+            if (shipped.qmv) |pq| {
                 @memset(y.contents()[0 .. rows * n * 2], 0);
                 _ = timeQmv(m, pq, c.lin, x, y, rows, n_reps / 2);
                 const t = timeQmv(m, pq, c.lin, x, y, rows, n_reps);
@@ -145,26 +145,15 @@ pub fn main(init: std.process.Init) !void {
                     scale = @max(scale, @abs(bf(u)));
                     if (u != v) differ += 1;
                 }
-                std.debug.print("  fp32 {d:.1} (max diff {e:.1} of {e:.1}, {d}/{d} differ)", .{ t, worst, scale, differ, rows * n });
-                // Row independence: the same lane width built for more rows must give these rows the same bytes.
-                if (rows <= 2) {
-                    const vpl: usize = if (rows == 1) 32 else 16;
-                    var hb: [128]u8 = undefined;
-                    const hdr = try std.fmt.bufPrint(&hb, "#define K {d}\n#define N {d}\n#define RM {d}\n#define VPL {d}\n", .{ k, n, 4, vpl });
-                    const txt = try std.mem.concat(gpa, u8, &.{ hdr, @import("kernel_sources").qwen35.qmv.source });
-                    defer gpa.free(txt);
-                    const lib = try mtl.Library.fromSource(m.device, txt, mtl.CompileOptions.mlx());
-                    defer lib.deinit();
-                    const p4 = try mtl.Pipeline.init(m.device, lib, "qwen35_qmv", false);
-                    defer p4.deinit();
-                    const mine = try gpa.alloc(u8, rows * n * 2);
-                    defer gpa.free(mine);
-                    @memcpy(mine, y.contents()[0 .. rows * n * 2]);
-                    @memset(y.contents()[0 .. rows * n * 2], 0);
-                    _ = timeQmv(m, p4, c.lin, x, y, rows, 3);
-                    std.debug.print("  [RM4@VPL{d} {s}]", .{ vpl, if (std.mem.eql(u8, mine, y.contents()[0 .. rows * n * 2])) "same bytes" else "DIFFERENT" });
-                }
-            };
+                // row independence: the first row alone must give the same bytes it got inside this batch
+                const mine = try gpa.alloc(u8, n * 2);
+                defer gpa.free(mine);
+                @memcpy(mine, y.contents()[0 .. n * 2]);
+                @memset(y.contents()[0 .. n * 2], 0);
+                _ = timeQmv(m, pq, c.lin, x, y, 1, 3);
+                const row0 = std.mem.eql(u8, mine, y.contents()[0 .. n * 2]);
+                std.debug.print("  fp32 {d:.1} (max diff {e:.1} of {e:.1}, {d}/{d} differ; row 0 alone {s})", .{ t, worst, scale, differ, rows * n, if (row0) "same" else "DIFFERENT" });
+            }
             for (ss) |s| for (nts) |nt| {
                 if (!grid or s * nt * 64 * 4 > 32768 or (s == s0 and nt == nt0)) continue;
                 if (n % (8 * nt) != 0) continue;
