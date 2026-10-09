@@ -144,6 +144,7 @@ pub const Buffers = struct {
     kpart: u64 = 0, hcpart: u64 = 0, dnf: u64 = 0, sgu: u64 = 0,
     seg_nk: u64 = 0, seg_sparse: u64 = 0, // a shared round's per-stream key counts, 64 bytes a stream (16-aligned)
     tk: u64 = 0, gtk: u64 = 0, invt: u64 = 0, // sampled rows: each row's candidates, both ranks' gathered, 1 / temperature
+    cut_row: i64 = 0, // a prompt chunk's kept point (rows before it; 0: none)
 
     fn lay(b: *Buffers, c: *Carve) void {
         const R = b.rows;
@@ -249,6 +250,34 @@ pub const Buffers = struct {
 
 const S4: i64 = 4;
 
+/// A prompt's state after ``at`` tokens (forward.py's cut_snapshot): each DeltaNet layer's recurrent state and conv
+/// window, the n-gram tail and history, the MTP head's length (every row but the point's last) and that last row's
+/// streams, which the head absorbs with the next prompt's token when a turn resumes here.
+pub const Snap = struct {
+    buf: ?cuda.DeviceBuffer = null,
+    at: i64 = 0, // 0: none kept
+    mtp_len: i64 = 0,
+    hist: ngram_mod.History = .{},
+
+    const REC: u64 = @intCast(LIN * Seq.REC_LAYER);
+    const CONV: u64 = @intCast(LIN * 3 * CONV_DIM * 2);
+    const PLE: u64 = @intCast(9 * WIDE * 2);
+    const TAIL: u64 = @intCast(WIDE * 2);
+
+    fn rec(sn: *const Snap, li: usize) u64 {
+        return sn.buf.?.ptr + li * @as(u64, @intCast(Seq.REC_LAYER));
+    }
+    fn conv(sn: *const Snap, li: usize) u64 {
+        return sn.buf.?.ptr + REC + li * @as(u64, @intCast(3 * CONV_DIM * 2));
+    }
+    fn ple(sn: *const Snap) u64 {
+        return sn.buf.?.ptr + REC + CONV;
+    }
+    fn tail(sn: *const Snap) u64 {
+        return sn.buf.?.ptr + REC + CONV + PLE;
+    }
+};
+
 /// One sequence's committed state (state.py's State) on the device, plus its host bookkeeping.
 pub const Seq = struct {
     capacity: i64,
@@ -264,6 +293,8 @@ pub const Seq = struct {
     img: ?Image = null, // an image prompt's rotary table and (until its prefill ends) its features
     sampling: ?lanes.Sampling = null, // the stream's draw (null: greedy); its rows step eagerly
     mask: ?Mask = null, // the next forward's grammar rows (set before each call, cleared by it)
+    cut_at: ?i64 = null, // the next prefill keeps its state after this many prompt tokens (snap)
+    snap: Snap = .{}, // the kept prompt state a next turn resumes from (multi.py's kept points)
     // host
     pos: i64 = 0,
     mtp_len: i64 = 0,
@@ -650,7 +681,9 @@ pub fn resetSeq(e: *Engine, s: *Seq) !void {
     const mem = s.mem;
     var g = s.grow;
     g.shrink(); // the caches' memory back to the budget (mapped again, zeroed, as the next request grows)
+    const snap_buf = s.snap.buf;
     s.* = .{ .capacity = e.capacity };
+    s.snap.buf = snap_buf;
     s.mem = mem;
     s.grow = g;
     s.pointGrow();
@@ -675,6 +708,7 @@ pub fn freeSeq(e: *Engine, s: *Seq) void {
     detach(e, s);
     s.grow.deinit();
     s.mem.free();
+    if (s.snap.buf) |*sb| sb.free();
     e.gpa.destroy(s);
 }
 
@@ -740,10 +774,22 @@ fn gdnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64) !u64 
         const bb = b.ple_vals + @as(u64, @intCast(R * 96));
         const yb = b.mtp_hn; // [R, 24, 128] bf16 (the MTP head runs after the main forward)
         try kern.gdnFront(k, b.proj, s.conv_ptrs + li * 8, b.sid, b.windows, g.conv, g.a_log, g.dt_bias, qb, kb, vb, gb, bb, R);
-        try kern.gdnPrefill(k, qb, kb, vb, gb, bb, s.recAt(cur, li), s.recAt(1 - cur, li), yb, R);
+        const m = b.cut_row; // a kept point inside the chunk: the rows before it, its state, then the rest from it
+        if (m > 0 and m < R) {
+            const sn = &s.snap;
+            const u: u64 = @intCast(m);
+            try kern.gdnPrefill(k, qb, kb, vb, gb, bb, s.recAt(cur, li), sn.rec(li), yb, m);
+            try kern.gdnPrefill(k, qb + u * 4096, kb + u * 4096, vb + u * 6144, gb + u * 96, bb + u * 96, sn.rec(li), s.recAt(1 - cur, li), yb + u * 6144, R - m);
+            try k.copy(sn.conv(li), s.conv + li * 3 * CONV_DIM * 2, 3 * CONV_DIM * 2);
+            try kern.shiftWindows(k, sn.conv(li), b.proj, m, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, 1, CONV_DIM, 3);
+        } else try kern.gdnPrefill(k, qb, kb, vb, gb, bb, s.recAt(cur, li), s.recAt(1 - cur, li), yb, R);
         try kern.gdnBack(k, yb, b.proj, g.norm, b.gout, b.gxs, R);
         s.cur[li] = 1 - cur;
         try kern.shiftWindows(k, s.conv + li * 3 * CONV_DIM * 2, b.proj, R, 3 * CONV_DIM, b.rows * PROJ_W, PROJ_W, 1, CONV_DIM, 3);
+        if (m == R) { // the point ends the chunk: the state as committed
+            try k.copy(s.snap.rec(li), s.recAt(1 - cur, li), @intCast(Seq.REC_LAYER));
+            try k.copy(s.snap.conv(li), s.conv + li * 3 * CONV_DIM * 2, 3 * CONV_DIM * 2);
+        }
         return outProj(e, b, b.gout, 3072, g.out, R);
     }
     const proj = b.proj + @as(u64, @intCast(@as(i64, @intCast(li)) * b.rows * PROJ_W * 2));
@@ -1039,7 +1085,8 @@ fn setMtpLen(e: *Engine, s: *Seq, n: i64) !void {
 }
 
 /// The whole prompt in chunks of 2048 rows, the MTP head absorbing each; returns the greedy first token.
-pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
+/// ``start`` > 0: resume from the kept point there (the sequence's snap); the prompt's rows from it on.
+pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32, start: usize) !u32 {
     const prompt = try e.gpa.alloc(i64, prompt_u.len);
     defer e.gpa.free(prompt);
     for (prompt_u, prompt) |t, *x| x.* = t;
@@ -1047,12 +1094,23 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
     if (s.img) |im| if (im.length != @as(i64, @intCast(prompt.len))) return error.ImageLengthMismatch;
     if (@as(i64, @intCast(prompt.len)) + @as(i64, e.opts.depth) + 1 > e.capacity) return error.PromptTooLong;
     const b = &e.pbuf;
-    var at: usize = 0;
+    var at: usize = start;
+    if (start > 0) {
+        if (start >= prompt.len or s.snap.at != @as(i64, @intCast(start))) return error.NoKeptState;
+        try restore(e, b, s, prompt[start]);
+    }
+    s.snap.at = 0; // the kept point is this prompt's (or none)
+    const cut = s.cut_at;
+    s.cut_at = null;
+    if (cut != null and s.snap.buf == null) s.snap.buf = try cuda.DeviceBuffer.alloc(e.ctx.d, Snap.REC + Snap.CONV + Snap.PLE + Snap.TAIL);
     var first: Pick = undefined;
     while (at < prompt.len) {
         const end = @min(at + @as(usize, @intCast(PREFILL_ROWS)), prompt.len);
         const R: i64 = @intCast(end - at);
         const final = end == prompt.len;
+        const row: i64 = if (cut) |kp| (if (kp > @as(i64, @intCast(at)) and kp <= @as(i64, @intCast(end))) kp - @as(i64, @intCast(at)) else 0) else 0;
+        b.cut_row = row;
+        defer b.cut_row = 0;
         try room(e, s, R + 1);
         try stage(e, b, s, prompt[at..end]);
         const pending = try mainForward(e, b, &.{.{ .s = s, .rows = R }}, R);
@@ -1073,6 +1131,16 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32) !u32 {
         } else {
             try e.k.copy(b.streams, b.h, @intCast(R * WIDE * 2));
             try kern.hcWriteback(&e.k, b.streams, b.pss, pending.g, pending.inj, R, 3);
+        }
+        if (row > 0) { // the kept point: its last row's streams, MTP length, n-gram windows, before the head and the commit
+            const sn = &s.snap;
+            try e.k.copy(sn.tail(), b.streams + @as(u64, @intCast(row - 1)) * WIDE * 2, WIDE * 2);
+            sn.mtp_len = s.mtp_len + row - 1;
+            sn.hist = s.hist;
+            sn.hist.advance(prompt[at..][0..@intCast(row)]);
+            try e.k.copy(sn.ple(), s.ple_tail, Snap.PLE);
+            try kern.shiftWindows(&e.k, sn.ple(), b.ple_nrow, row, 9 * WIDE, b.rows * WIDE, WIDE, 1, WIDE, 9);
+            sn.at = cut.?;
         }
         // the MTP head takes the rows with their next tokens (a final piece: every row but the last)
         const nn: i64 = if (final) R - 1 else R;
@@ -1176,6 +1244,30 @@ fn drawFull(e: *Engine, row: u64, s: lanes.Sampling, position: u64) !u32 {
     defer e.gpa.free(values);
     for (values, e.full_host) |*v, h| v.* = @as(f32, @bitCast(@as(u32, h) << 16));
     return draw_mod.drawFull(e.gpa, values, s, position);
+}
+
+/// The live state the kept point's (snap): its DeltaNet states and windows, n-gram tail and history, positions; the
+/// MTP head then absorbs the point's last row with ``next`` (the resumed prompt's token there).
+fn restore(e: *Engine, b: *Buffers, s: *Seq, next: i64) !void {
+    const sn = &s.snap;
+    const k = &e.k;
+    detach(e, s);
+    for (0..LIN) |li| {
+        try k.copy(s.recAt(0, li), sn.rec(li), @intCast(Seq.REC_LAYER));
+        s.cur[li] = 0;
+    }
+    try k.copy(s.conv, sn.conv(0), Snap.CONV);
+    try k.copy(s.ple_tail, sn.ple(), Snap.PLE);
+    s.hist = sn.hist;
+    s.mtp_drafted = 0;
+    try setPos(e, s, sn.at);
+    try setMtpLen(e, s, sn.mtp_len);
+    try room(e, s, 2);
+    e.idbuf[0] = @intCast(next);
+    try k.upload(b.ids, std.mem.sliceAsBytes(e.idbuf[0..1]));
+    try k.copy(b.mtp_in, sn.tail(), WIDE * 2);
+    try mtpCompute(e, b, s, 1);
+    try setMtpLen(e, s, s.mtp_len + 1);
 }
 
 pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
