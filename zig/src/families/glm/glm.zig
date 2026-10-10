@@ -13,6 +13,8 @@ pub const pool = @import("pool.zig");
 pub const backend = @import("backend.zig");
 pub const mirror = @import("mirror.zig");
 pub const timing = @import("timing.zig");
+pub const vision = @import("vision.zig");
+pub const image = @import("image.zig");
 
 test {
     _ = config;
@@ -30,4 +32,6 @@ test {
     _ = pool;
     _ = mirror;
     _ = timing;
+    _ = vision;
+    _ = image;
 }
