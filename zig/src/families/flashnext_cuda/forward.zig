@@ -1339,9 +1339,10 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32, start: usize) !u32 {
         if (start >= prompt.len or s.snap.at != @as(i64, @intCast(start))) return error.NoKeptState;
         try restore(e, b, s, prompt[start]);
     }
-    s.snap.at = 0; // the kept point is this prompt's (or none)
     const cut = s.cut_at;
     s.cut_at = null;
+    // the kept point is this prompt's (or none); one the prompt resumes at stays kept (a repeat has nothing before it)
+    s.snap.at = if (start > 0 and cut != null and cut.? == @as(i64, @intCast(start))) cut.? else 0;
     if (cut != null and s.snap.buf == null) s.snap.buf = try cuda.DeviceBuffer.alloc(e.ctx.d, Snap.REC + Snap.CONV + Snap.PLE + Snap.TAIL);
     var first: Pick = undefined;
     while (at < prompt.len) {
@@ -1446,7 +1447,8 @@ pub fn prefillMany(e: *Engine, prompts: []const Prompt, firsts: []u32) !void {
     for (prompts, 0..) |p, j| {
         const s = p.s;
         if (p.start > 0) try restore(e, b, s, p.ids[p.start]);
-        s.snap.at = 0; // the kept point is this prompt's (or none)
+        // the kept point is this prompt's (or none); one the prompt resumes at stays kept (see prefill)
+        s.snap.at = if (p.start > 0 and cuts[j] != null and cuts[j].? == @as(i64, @intCast(p.start))) cuts[j].? else 0;
         s.cut_at = null;
         if (cuts[j] != null and s.snap.buf == null) s.snap.buf = try cuda.DeviceBuffer.alloc(e.ctx.d, Snap.REC + Snap.CONV + Snap.PLE + Snap.TAIL);
         try room(e, s, segs[j].rows + 1);
