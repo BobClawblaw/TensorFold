@@ -665,6 +665,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.split = .{ 0, 0, 0 };
     e.timing = false; // the engine is built field by field: a default left out is whatever the allocator held
     e.gpu_ms = 0;
+    e.split_gathers = false;
+    e.rec = null;
     e.graphs = .init(gpa);
     e.graph_log = std.c.getenv("TENSORFOLD_FN_GRAPHLOG") != null;
     e.captures = 0;
