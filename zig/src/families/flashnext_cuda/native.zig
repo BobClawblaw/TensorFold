@@ -520,7 +520,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
     errdefer own.store.deinit();
     own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = batch_rows, .depth = if (o.drafts) max_depth else 0, .kv_bits = o.kv_bits });
-    if (std.c.getenv("TENSORFOLD_FN_SPLIT_GRAPHS")) |v| own.e.split_gathers = std.mem.eql(u8, std.mem.span(v), "1");
+    own.e.split_gathers = if (std.c.getenv("TENSORFOLD_FN_SPLIT_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
     errdefer forward.deinit(own.e);
     try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
     { // the sequences' caches grow within what is free now, less the server's reserve and a margin (a GB10 shares
