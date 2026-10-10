@@ -207,8 +207,8 @@ fn resumeCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
     defer gpa.free(next);
     @memcpy(next[0..k], prompt[0..k]);
     for (next[k..], 0..) |*x, j| x.* = prompt[(j * 7 + 3) % prompt.len];
-    var runs: [2][32]u32 = undefined;
-    for (0..2) |way| {
+    var runs: [3][32]u32 = undefined; // fresh; resumed; resumed after a repeat of the kept prompt (a regenerate)
+    for (0..3) |way| {
         const s = try fwd.newSeq(e);
         defer fwd.freeSeq(e, s);
         var tok: u32 = undefined;
@@ -219,6 +219,11 @@ fn resumeCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
             s.cut_at = @intCast(k);
             _ = try fwd.prefill(e, s, prompt, 0);
             try check.expect(s.snap.at == @as(i64, @intCast(k)), "the kept point is at {d} (want {d})", .{ s.snap.at, k });
+            if (way == 2) { // the same prompt again, resumed at its own kept point: the point must stay kept
+                s.cut_at = @intCast(k);
+                _ = try fwd.prefill(e, s, prompt, k);
+                try check.expect(s.snap.at == @as(i64, @intCast(k)), "a repeat keeps the point at {d} (want {d})", .{ s.snap.at, k });
+            }
             s.cut_at = @intCast(next.len - 1);
             tok = try fwd.prefill(e, s, next, k);
         }
@@ -230,9 +235,10 @@ fn resumeCheck(e: *fwd.Engine, prompt: []const u32, rank: u8) !void {
             tok = out[0];
         }
     }
-    std.debug.print("fresh:   {any}\nresumed: {any}\n", .{ runs[0][0..16], runs[1][0..16] });
+    std.debug.print("fresh:   {any}\nresumed: {any}\nrepeat:  {any}\n", .{ runs[0][0..16], runs[1][0..16], runs[2][0..16] });
     try check.expect(std.mem.eql(u32, &runs[0], &runs[1]), "the resumed turn's 32 tokens equal the fresh turn's", .{});
-    check.pass("EXACT rank {d}: a turn resumed from its kept point ({d} of {d} prompt tokens kept) decodes as prefilled fresh", .{ rank, k, next.len });
+    try check.expect(std.mem.eql(u32, &runs[0], &runs[2]), "after a repeat, the resumed turn's 32 tokens equal the fresh turn's", .{});
+    check.pass("EXACT rank {d}: a turn resumed from its kept point ({d} of {d} prompt tokens kept), also after a repeat, decodes as prefilled fresh", .{ rank, k, next.len });
 }
 
 /// Each probe prompt of <dir> (vision_ref.py's tokens and grid) decoded greedily (40 tokens, one row a step) with
