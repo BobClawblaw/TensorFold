@@ -65,6 +65,10 @@ const grow_margin = 2 * max_rows + 2;
 /// the slots past it are held with chance 0, so the lane core's allocator leaves them out of the window.
 /// TENSORFOLD_FN_CONFIDENCE overrides it (a measurement's knob; both ranks must see the same value).
 var draft_confidence: f64 = 0.7;
+/// What the lane core's allocator gets for a held draft (TENSORFOLD_FN_CHANCES, a measurement's knob): ``step`` the
+/// head's probability for it given the drafts before it, ``chain`` that times theirs (its chance of landing), ``off``
+/// none (the depth rule sizes chains from each stream's acceptance by depth, as the Python engine's Flash Next does).
+var chances: enum { step, chain, off } = .step;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
@@ -504,6 +508,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.io = io;
     own.rank = o.rank;
     own.prof = if (o.rank == 0) .init() else .{};
+    if (std.c.getenv("TENSORFOLD_FN_CHANCES")) |v| chances = std.meta.stringToEnum(@TypeOf(chances), std.mem.span(v)) orelse chances;
     if (std.c.getenv("TENSORFOLD_FN_CONFIDENCE")) |v| draft_confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch draft_confidence;
     // the link and the communicator first, while memory is fresh (NCCL registers its buffers at its first use)
     own.link = if (o.rank == 0) try cuda.tp_link.Link.lead(o.master_port, 600_000)
@@ -578,7 +583,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
                     .hidden_rows = o.drafts, .max_streams = if (o.drafts) max_streams else 1, .batch_rows = batch_rows,
                     .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms,
                     .shared_costs = own.shared[0..own.shared_count],
-                    .draft_probabilities = o.drafts, .draft_streams = o.drafts },
+                    .draft_probabilities = o.drafts and chances != .off, .draft_streams = o.drafts },
         .rows = if (o.drafts) max_rows else 1,
         .stream_bytes = forward.seqBytes(own.e),
         .ctx = own,
@@ -1289,6 +1294,9 @@ fn probabilitiesFn(p: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
     const l = self.lanes_by.getPtr(s) orelse return false;
     if (out.len > l.nheld) return false;
     @memcpy(out, l.probs[0..out.len]);
+    if (chances == .chain) for (1..out.len) |i| {
+        out[i] *= out[i - 1];
+    };
     return true;
 }
 
