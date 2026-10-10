@@ -62,6 +62,8 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         if (std.mem.eql(u8, a, "nomultigdn")) e.multi_gdn = false;
         if (std.mem.eql(u8, a, "nomultiattn")) e.multi_attn = false;
         if (std.mem.eql(u8, a, "split")) e.split_gathers = true; // graphs split at the gathers (eager between)
+        if (std.mem.eql(u8, a, "nosplit")) e.split_gathers = false;
+        if (std.mem.eql(u8, a, "noshare")) e.share_graphs = false; // each sequence captures its own graphs
     }
     // "multi=on|off" between benches below: both on or both off from there
     std.debug.print("rank {d}: shared rounds: DeltaNet {s}, attention {s}\n", .{ rank, if (e.multi_gdn) "one launch" else "per stream", if (e.multi_attn) "one launch" else "per stream" });

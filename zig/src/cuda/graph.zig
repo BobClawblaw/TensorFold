@@ -93,6 +93,26 @@ pub const Graph = struct {
         return out[0..@min(n, out.len)];
     }
 
+    /// The node's kind: kernel 0, memcpy 1, memset 2, host 3, child graph 4, empty 5, event wait 6, event record 7, ...
+    pub fn nodeType(self: Graph, node: Node) Error!c_int {
+        var t: c_int = -1;
+        try self.d.check(self.d.api.cuGraphNodeGetType(node, &t), "cuGraphNodeGetType");
+        return t;
+    }
+
+    /// A copy or memset node's parameter block (CUDA_MEMCPY3D or CUDA_MEMSET_NODE_PARAMS) into ``out``.
+    pub fn copyParams(self: Graph, node: Node, kind: c_int, out: *[256]u64) Error!void {
+        out.* = @splat(0);
+        if (kind == 1) try self.d.check(self.d.api.cuGraphMemcpyNodeGetParams(node, out), "cuGraphMemcpyNodeGetParams") else try self.d.check(self.d.api.cuGraphMemsetNodeGetParams(node, out), "cuGraphMemsetNodeGetParams");
+    }
+
+    /// A kernel node's launch, its argument pointers owned by the graph.
+    pub fn kernelParams(self: Graph, node: Node) Error!abi.KernelNodeParams {
+        var p: abi.KernelNodeParams = undefined;
+        try self.d.check(self.d.api.cuGraphKernelNodeGetParams_v2(node, &p), "cuGraphKernelNodeGetParams");
+        return p;
+    }
+
     pub fn instantiate(self: Graph) Error!Exec {
         var e: abi.GraphExec = null;
         try self.d.check(self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
@@ -122,6 +142,11 @@ pub const Exec = struct {
     pub fn setKernel(self: Exec, node: Node, f: Function, cfg: launch.Config, args: *launch.Args) Error!void {
         const p = try nodeParams(f, cfg, args);
         try self.d.check(self.d.api.cuGraphExecKernelNodeSetParams_v2(self.handle, node, &p), "cuGraphExecKernelNodeSetParams");
+    }
+
+    /// One kernel node's launch as raw driver parameters (its argument values where ``p.params`` points).
+    pub fn setKernelRaw(self: Exec, node: Node, p: *const abi.KernelNodeParams) Error!void {
+        try self.d.check(self.d.api.cuGraphExecKernelNodeSetParams_v2(self.handle, node, p), "cuGraphExecKernelNodeSetParams");
     }
 
     /// Takes every node's parameters from `g`, which must have the same topology; returns the driver's verdict.

@@ -485,6 +485,10 @@ pub const Engine = struct {
     /// Captured steps end a graph at each cross-rank gather, which runs eager between the segments (TENSORFOLD_FN_SPLIT_GRAPHS).
     split_gathers: bool = false,
     rec: ?*plan.Recorder = null, // the capture in progress, which takes the gathers its step issues
+    /// A captured step serves every sequence, its pointers moved to the one it runs (TENSORFOLD_FN_SHARE_GRAPHS=0: not).
+    share_graphs: bool = true,
+    graph_cap: usize = 96, // the graphs kept at most; the least recently launched go first
+    use_tick: u64 = 0,
     graph_log: bool = false, // TENSORFOLD_FN_GRAPHLOG: live graphs, captures and launch time logged a request
     captures: u64 = 0,
     capture_ms: f64 = 0,
@@ -526,15 +530,34 @@ pub fn warm(e: *Engine, s: *Seq, widths: u32) !void {
     }
 }
 
-fn keyOf(e: *Engine, kind: u8, s: *Seq, R: i64) GKey {
+/// ``seq`` 0 keys a plan every sequence shares; a sequence's address keys one only it runs.
+fn keyOf(e: *Engine, kind: u8, s: *Seq, R: i64, seq: usize) GKey {
     const keys = (if (kind == 0) s.pos else s.mtp_len) + R;
-    return .{ .kind = kind, .rows = R, .par = if (kind == 0) s.cur[0] else 0, .sig = geometry(keys, e.buf.nb), .seq = @intFromPtr(s) };
+    return .{ .kind = kind, .rows = R, .par = if (kind == 0) s.cur[0] else 0, .sig = geometry(keys, e.buf.nb), .seq = seq };
+}
+
+fn basesOf(s: *const Seq) plan.Bases {
+    return .{ .mem = s.mem.ptr, .mem_len = s.mem.len, .grow = s.grow.base, .grow_len = s.grow.size };
+}
+
+/// The least recently launched plans freed until fewer than ``graph_cap`` remain.
+fn trimGraphs(e: *Engine) void {
+    while (e.graphs.count() >= e.graph_cap) {
+        var it = e.graphs.iterator();
+        var oldest: ?GKey = null;
+        var at: u64 = std.math.maxInt(u64);
+        while (it.next()) |en| if (en.value_ptr.last < at) {
+            at = en.value_ptr.last;
+            oldest = en.key_ptr.*;
+        };
+        var p = e.graphs.fetchRemove(oldest orelse return).?.value;
+        p.deinit(e.gpa);
+    }
 }
 
 /// ``body`` captured into this key's graph (a new geometry replaces the width's older graph: the context only grows).
 fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
-    const key = keyOf(e, kind, s, R);
-    if (e.graphs.contains(key)) return;
+    const key = keyOf(e, kind, s, R, @intFromPtr(s));
     var it = e.graphs.iterator();
     var stale: ?GKey = null;
     while (it.next()) |en| {
@@ -550,7 +573,8 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
         e.captures += 1;
         e.capture_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
     }
-    var rec: plan.Recorder = .{ .gpa = e.gpa, .stream = e.k.stream, .split = e.split_gathers };
+    trimGraphs(e);
+    var rec: plan.Recorder = .{ .gpa = e.gpa, .stream = e.k.stream, .split = e.split_gathers, .seq = if (e.share_graphs) basesOf(s) else .{} };
     try rec.begin();
     if (e.split_gathers) e.rec = &rec;
     defer e.rec = null;
@@ -563,19 +587,25 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
         return err;
     };
     errdefer p.deinit(e.gpa);
-    try e.graphs.put(key, p);
+    try e.graphs.put(if (p.shareable) keyOf(e, kind, s, R, 0) else key, p);
 }
 
 /// ``body`` from its graph (captured the first time this width, parity and geometry run).
 fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
     if (!e.use_graphs or e.k.sync_each or s.img != null or (kind == 0 and s.sampling != null)) return body(e, kind, s, R); // image and sampled sequences: eager
-    try capture(e, kind, s, R);
+    const shared = keyOf(e, kind, s, R, 0);
+    const own = keyOf(e, kind, s, R, @intFromPtr(s));
+    if (!e.graphs.contains(shared) and !e.graphs.contains(own)) try capture(e, kind, s, R);
     const t0 = std.Io.Timestamp.now(e.io, .awake);
     defer {
         e.launches += 1;
         e.launch_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
     }
-    return e.graphs.get(keyOf(e, kind, s, R)).?.launch(e.ctx.nccl, e.ctx.comm, e.k.stream);
+    const p = e.graphs.getPtr(shared) orelse e.graphs.getPtr(own).?;
+    if (p.shareable) try p.bind(basesOf(s));
+    e.use_tick += 1;
+    p.last = e.use_tick;
+    return p.launch(e.ctx.nccl, e.ctx.comm, e.k.stream);
 }
 
 /// TENSORFOLD_FN_GRAPHLOG: the graphs held, and the captures and launches since the last call (one line a request).
@@ -584,10 +614,13 @@ pub fn logGraphs(e: *Engine) void {
     var seqs: std.AutoHashMap(usize, void) = .init(e.gpa);
     defer seqs.deinit();
     var it = e.graphs.keyIterator();
-    while (it.next()) |k| seqs.put(k.seq, {}) catch {};
+    var shared: usize = 0;
+    while (it.next()) |k| if (k.seq == 0) {
+        shared += 1;
+    } else seqs.put(k.seq, {}) catch {};
     const per = if (e.launches > 0) e.launch_ms / @as(f64, @floatFromInt(e.launches)) else 0;
-    std.log.info("flash next graphs: {d} held over {d} sequences; {d} captures ({d:.1} ms), {d} launches ({d:.3} ms each)", .{
-        e.graphs.count(), seqs.count(), e.captures, e.capture_ms, e.launches, per });
+    std.log.info("flash next graphs: {d} held, {d} shared and the rest over {d} sequences; {d} captures ({d:.1} ms), {d} launches ({d:.3} ms each)", .{
+        e.graphs.count(), shared, seqs.count(), e.captures, e.capture_ms, e.launches, per });
     e.captures = 0;
     e.capture_ms = 0;
     e.launches = 0;
@@ -667,6 +700,9 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.gpu_ms = 0;
     e.split_gathers = false;
     e.rec = null;
+    e.share_graphs = if (std.c.getenv("TENSORFOLD_FN_SHARE_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    e.graph_cap = 96;
+    e.use_tick = 0;
     e.graphs = .init(gpa);
     e.graph_log = std.c.getenv("TENSORFOLD_FN_GRAPHLOG") != null;
     e.captures = 0;
