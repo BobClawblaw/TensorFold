@@ -627,6 +627,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.confidence = 0;
     e.stage_ms = 0;
     e.split = .{ 0, 0, 0 };
+    e.timing = false; // the engine is built field by field: a default left out is whatever the allocator held
+    e.gpu_ms = 0;
     e.graphs = .init(gpa);
     return e;
 }
