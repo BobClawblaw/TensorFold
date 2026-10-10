@@ -13,6 +13,7 @@ const kern = @import("kern.zig");
 const ngram_mod = @import("ngram.zig");
 const grow_mod = @import("grow.zig");
 const draw_mod = @import("draw.zig");
+const plan = @import("plan.zig");
 const lanes = @import("lanes");
 pub const devstore = @import("devstore.zig");
 pub const api_ = api;
@@ -480,7 +481,10 @@ pub const Engine = struct {
     gpu_ms: f64 = 0, // GPU time of verify windows (events around the step), when ``timing``
     timing: bool = false,
     split: [3]f64 = .{ 0, 0, 0 }, // staging: ids upload, n-gram ids, table rows
-    graphs: std.AutoHashMap(GKey, cuda.graph.Exec) = undefined,
+    graphs: std.AutoHashMap(GKey, plan.Plan) = undefined,
+    /// Captured steps end a graph at each cross-rank gather, which runs eager between the segments (TENSORFOLD_FN_SPLIT_GRAPHS).
+    split_gathers: bool = false,
+    rec: ?*plan.Recorder = null, // the capture in progress, which takes the gathers its step issues
     graph_log: bool = false, // TENSORFOLD_FN_GRAPHLOG: live graphs, captures and launch time logged a request
     captures: u64 = 0,
     capture_ms: f64 = 0,
@@ -539,26 +543,27 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
     }
     if (stale) |o| {
         var ex = e.graphs.fetchRemove(o).?.value;
-        ex.deinit();
+        ex.deinit(e.gpa);
     }
     const t0 = std.Io.Timestamp.now(e.io, .awake);
     defer {
         e.captures += 1;
         e.capture_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
     }
-    try cuda.graph.beginCapture(e.k.stream, .thread_local);
+    var rec: plan.Recorder = .{ .gpa = e.gpa, .stream = e.k.stream, .split = e.split_gathers };
+    try rec.begin();
+    if (e.split_gathers) e.rec = &rec;
+    defer e.rec = null;
     body(e, kind, s, R) catch |err| {
-        if (cuda.graph.endCapture(e.k.stream)) |g| {
-            var gg = g;
-            gg.deinit();
-        } else |_| {}
+        rec.abandon();
         return err;
     };
-    var g = try cuda.graph.endCapture(e.k.stream);
-    defer g.deinit();
-    const ex = try g.instantiate();
-    try ex.upload(e.k.stream);
-    try e.graphs.put(key, ex);
+    var p = rec.finish() catch |err| {
+        rec.abandon();
+        return err;
+    };
+    errdefer p.deinit(e.gpa);
+    try e.graphs.put(key, p);
 }
 
 /// ``body`` from its graph (captured the first time this width, parity and geometry run).
@@ -570,7 +575,7 @@ fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
         e.launches += 1;
         e.launch_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
     }
-    return e.graphs.get(keyOf(e, kind, s, R)).?.launchOn(e.k.stream);
+    return e.graphs.get(keyOf(e, kind, s, R)).?.launch(e.ctx.nccl, e.ctx.comm, e.k.stream);
 }
 
 /// TENSORFOLD_FN_GRAPHLOG: the graphs held, and the captures and launches since the last call (one line a request).
@@ -790,7 +795,7 @@ fn freeGraphs(e: *Engine, s: *Seq) void {
     while (it.next()) |en| if (en.key_ptr.seq == @intFromPtr(s)) gone.append(e.gpa, en.key_ptr.*) catch {};
     for (gone.items) |key| {
         var ex = e.graphs.fetchRemove(key).?.value;
-        ex.deinit();
+        ex.deinit(e.gpa);
     }
 }
 
@@ -812,8 +817,14 @@ pub fn freeSeq(e: *Engine, s: *Seq) void {
 // -- the forward ----------------------------------------------------------------------------------------------------
 const Pending = struct { g: u64, inj: u64 };
 
+/// Both ranks' ``count`` values from ``send`` into ``recv`` in rank order; inside a split capture, between its graphs.
+fn gather(e: *Engine, send: u64, recv: u64, count: usize, dt: cuda.nccl.DataType) !void {
+    if (e.rec) |r| return r.gather(.{ .send = send, .recv = recv, .count = count, .dt = dt });
+    try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(send, recv, count, dt, e.ctx.comm, e.k.stream.handle), "ncclAllGather");
+}
+
 fn allGather(e: *Engine, send: u64, recv: u64, count: usize) !void {
-    try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(send, recv, count, .f32, e.ctx.comm, e.k.stream.handle), "ncclAllGather");
+    try gather(e, send, recv, count, .f32);
 }
 
 /// forward._readout_b16: norm (unless done), down with SiLU and inject gates, up and the mix -> mixed [R, D].
@@ -1037,7 +1048,7 @@ fn finish(e: *Engine, b: *Buffers, mixer: HCW, R: i64, pending: Pending) !i64 {
 /// Each row's greedy token across both ranks' shards: our candidate kernel and an all-gather (rows <= 16).
 fn candidates(e: *Engine, b: *Buffers, logits: u64, cols: i64, id_map: u64, offset: i64, rows: i64) !void {
     try kern.rowsTop(&e.k, logits, cols, id_map, offset, b.cand, rows);
-    try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(b.cand, b.gath, @intCast(4 * rows), .i32, e.ctx.comm, e.k.stream.handle), "candidates");
+    try gather(e, b.cand, b.gath, @intCast(4 * rows), .i32);
 }
 
 const Pick = struct { tok: i64, p: f64 };
@@ -1261,7 +1272,7 @@ fn mtpComputeSegs(e: *Engine, b: *Buffers, segs: []const Seg, n: i64) !void {
     if (segs.len == 1) try candidates(e, b, b.logits, e.dh.n, e.draft_ids.ptr, 0, 1) else {
         const rows: i64 = @intCast(segs.len);
         try kern.rowsTopStrided(k, b.logits, e.dh.n, headStride(e), e.draft_ids.ptr, 0, b.cand, rows);
-        try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(b.cand, b.gath, @intCast(4 * rows), .i32, e.ctx.comm, k.stream.handle), "candidates");
+        try gather(e, b.cand, b.gath, @intCast(4 * rows), .i32);
     }
 }
 
