@@ -56,6 +56,7 @@ pub const LaneHost = struct {
         started: bool = false,
         prefill_sent: bool = false, // a lone driver's prefilled event went out
         began: i96 = 0,
+        gathered: bool = false, // admission waited for others to join this request's prompt pass (gather)
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
@@ -296,6 +297,7 @@ pub const LaneHost = struct {
         const waiting = h.queued.items.len;
         const free = h.info_.lanes -| h.admitted.items.len;
         h.unlock();
+        if (waiting == 1 and free >= 2 and h.gather()) return true;
         if (waiting < 2 or free < 2) return h.admitOne();
         var jobs: [lanes.Engine.max_together]*Job = undefined;
         var n: usize = 0;
@@ -319,6 +321,35 @@ pub const LaneHost = struct {
             if (h.deliver(job)) h.remove(job);
         }
         return true;
+    }
+
+    /// TENSORFOLD_ADMIT_GATHER_MS: an idle engine's one waiting request waits this long for others to share its prompt
+    /// pass (requests sent together arrive a few ms apart; the first admitted alone holds the rest up for its pass).
+    /// True when it waited (the caller admits again), false when off or busy.
+    fn gather(h: *LaneHost) bool {
+        const ms = gatherMs();
+        if (ms == 0 or h.core.activeCount() != 0) return false;
+        h.lock();
+        defer h.unlock();
+        if (h.queued.items.len != 1 or h.queued.items[0].gathered) return false;
+        h.queued.items[0].gathered = true;
+        const t0 = std.Io.Timestamp.now(h.io, .awake);
+        while (true) {
+            const spent: i64 = @intCast(@divFloor(t0.durationTo(std.Io.Timestamp.now(h.io, .awake)).toNanoseconds(), std.time.ns_per_ms));
+            if (spent >= ms) break;
+            h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(ms - spent), .clock = .awake } }) catch {};
+        }
+        return true;
+    }
+
+    fn gatherMs() i64 {
+        const Once = struct {
+            var ms: ?i64 = null;
+        };
+        if (Once.ms) |m| return m;
+        const v = std.c.getenv("TENSORFOLD_ADMIT_GATHER_MS");
+        Once.ms = if (v) |x| std.fmt.parseInt(i64, std.mem.span(x), 10) catch 0 else 0;
+        return Once.ms.?;
     }
 
     /// The next queued request into the admitted ones (null: none waits or no lane is free).
