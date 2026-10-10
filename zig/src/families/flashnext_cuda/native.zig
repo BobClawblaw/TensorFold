@@ -523,6 +523,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
     errdefer own.store.deinit();
     own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = batch_rows, .depth = if (o.drafts) max_depth else 0, .kv_bits = o.kv_bits });
+    if (std.c.getenv("TENSORFOLD_FN_SPLIT_GRAPHS")) |v| own.e.split_gathers = std.mem.eql(u8, std.mem.span(v), "1");
     if (own.prof.every > 0) {
         own.prof.enq = &own.e.enq_ms;
         own.prof.wait = &own.e.wait_ms;
