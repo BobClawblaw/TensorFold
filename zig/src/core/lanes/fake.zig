@@ -53,12 +53,16 @@ pub const Fake = struct {
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+    refuse_after: ?usize = null, // a round refuses a stream whose prompt starts with refuse_marker past this many tokens
+    refuse_marker: u32 = 0,
+    refused: std.ArrayList(*Stream) = .empty,
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
         while (it.next()) |l| freeLane(x.gpa, l);
         x.lanes.deinit(x.gpa);
         x.drawn.deinit(x.gpa);
+        x.refused.deinit(x.gpa);
     }
 
     fn freeLane(gpa: Allocator, l: *Lane) void {
@@ -68,7 +72,7 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .refused = refusedFn } };
     }
 
     fn self(ptr: *anyopaque) *Fake {
@@ -173,8 +177,20 @@ pub const Fake = struct {
         return self(ptr).drawn.items[handle];
     }
 
+    fn refusedFn(ptr: *anyopaque, out: []*Stream) usize {
+        const x = self(ptr);
+        const n = @min(out.len, x.refused.items.len);
+        @memcpy(out[0..n], x.refused.items[0..n]);
+        x.refused.clearRetainingCapacity();
+        return n;
+    }
+
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
+        if (x.refuse_after) |after| { // the round refused before anything ran, for its marked streams alone
+            for (windows) |w| if (w.stream.prompt()[0] == x.refuse_marker and x.lane(w.stream).history.items.len > after) try x.refused.append(x.gpa, w.stream);
+            if (x.refused.items.len > 0) return error.OutOfDeviceMemory;
+        }
         x.rounds += 1;
         for (windows, out) |w, o| {
             const l = x.lane(w.stream);

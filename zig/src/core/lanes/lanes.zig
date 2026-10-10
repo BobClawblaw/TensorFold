@@ -25,9 +25,11 @@ pub const fake = @import("fake.zig");
 pub const drafter = @import("drafter.zig");
 pub const drafted = @import("drafted.zig");
 pub const logprob = @import("logprob.zig");
+pub const grammar = @import("grammar.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;
+pub const Image = @import("stream.zig").Image;
 pub const Model = config.Model;
 pub const Stream = stream.Stream;
 pub const Sampling = sampling.Sampling;

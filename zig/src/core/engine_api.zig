@@ -1,5 +1,8 @@
 //! The engine a server drives (``Engine``), and ``LaneHost``: the lane core served on one thread, rounds left to it.
 const std = @import("std");
+/// Image inputs (decode, resize, patches) for families with a vision tower; the server reaches them here.
+pub const Image = lanes.Image;
+pub const qwen_image = @import("qwen_image");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
 
@@ -40,7 +43,11 @@ pub const Structure = struct {
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
+    /// The server's compiler (it has compiled ``text`` once already: the engine's compile is a cache hit).
+    compiler: ?*grammar.Compiler = null,
 };
+
+pub const grammar = lanes.grammar;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
@@ -76,6 +83,8 @@ pub const Request = struct {
     loop_guard: bool = false,
     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
     logprobs: ?u8 = null,
+    /// An image prompt's inputs in prompt order (Info.vision engines only; the prompt holds their placeholder rows).
+    images: []const lanes.Image = &.{},
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -142,6 +151,8 @@ pub const Info = struct {
     prompt_cache_plan: ?PromptCachePlan = null,
     /// The engine decodes greedily only: the server refuses a request with a temperature before admitting it.
     greedy_only: bool = false,
+    /// The engine encodes image inputs (Request.images): it was opened with ``vision`` and its family has a tower.
+    vision: bool = false,
 };
 
 pub const PromptCachePlan = struct {
@@ -186,10 +197,25 @@ pub const Open = struct {
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
+    /// --tp 2 (CUDA): this rank and rank 0's address; rank 1 follows rank 0 and serves no requests itself.
+    tp: u8 = 1,
+    rank: u8 = 0,
+    master: ?[]const u8 = null,
+    master_port: u16 = 29600,
+    /// --vision: load the family's vision tower and accept image inputs.
+    vision: bool = false,
+    /// --kv-dtype: bits of the attention cache's codes (8 or 4) for families that keep a quantized cache.
+    kv_bits: u8 = 8,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+pub const Opened = struct {
+    engine: Engine,
+    close: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+    /// Rank 1 of two: replay rank 0's engine calls until it stops (the server then serves no HTTP); null elsewhere.
+    follow: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+};
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
 
