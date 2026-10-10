@@ -223,6 +223,27 @@ pub fn split(c: *Config, rank: u32, ranks: u32) !void {
     c.own = .{ rank * per, (rank + 1) * per };
 }
 
+/// The most one Mac with `ram` bytes may load: TENSORFOLD_MEMORY_LIMIT_GB's GB (`budget`) at most 90% of RAM, else 70%.
+pub fn loadLimit(ram: u64, budget: ?[]const u8) usize {
+    const bytes: f64 = @floatFromInt(ram);
+    if (budget) |text| {
+        const gb = std.fmt.parseFloat(f64, std.mem.trim(u8, text, " \t")) catch 0;
+        if (gb > 0 and std.math.isFinite(gb)) return @intFromFloat(@min(gb * 1e9, bytes * 0.9));
+    }
+    return @intFromFloat(bytes / (1 << 30) * 0.7 * 1e9);
+}
+
+test "the one-Mac load limit: 70% of RAM, or TENSORFOLD_MEMORY_LIMIT_GB at most 90% of it" {
+    const ram: u64 = 256 << 30;
+    try std.testing.expectEqual(@as(usize, 179_200_000_000), loadLimit(ram, null));
+    try std.testing.expectEqual(@as(usize, 200_000_000_000), loadLimit(ram, "200"));
+    try std.testing.expectEqual(@as(usize, 190_500_000_000), loadLimit(ram, " 190.5 "));
+    const cap: usize = @intFromFloat(@as(f64, @floatFromInt(ram)) * 0.9);
+    try std.testing.expectEqual(cap, loadLimit(ram, "100000"));
+    try std.testing.expectEqual(@as(usize, 179_200_000_000), loadLimit(ram, "0"));
+    try std.testing.expectEqual(@as(usize, 179_200_000_000), loadLimit(ram, "nope"));
+}
+
 test "GLM-5.3-Flash's layer kinds: 34 KDA and 11 MLA in the backbone, the MTP layer MLA" {
     const c = Config{};
     try std.testing.expectEqual(@as(u32, 34), c.countKind(.kda));

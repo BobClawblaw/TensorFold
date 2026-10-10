@@ -168,7 +168,7 @@ pub const Engine = struct {
         errdefer if (e.pr) |*p| p.deinit();
         const limit = loadLimit();
         if (plan_bytes + e.arena.bytes > limit) { // refused before any weight is read: the floor's one-Mac limit
-            std.log.err("glm: {d:.1} GB of weights and {d:.1} GB of caches pass this Mac's {d:.1} GB load limit (70% of RAM); load a layer subset or the expert-parallel pair", .{ @as(f64, @floatFromInt(plan_bytes)) / 1e9, @as(f64, @floatFromInt(e.arena.bytes)) / 1e9, @as(f64, @floatFromInt(limit)) / 1e9 });
+            std.log.err("glm: {d:.1} GB of weights and {d:.1} GB of caches pass this Mac's {d:.1} GB load limit (70% of RAM, or TENSORFOLD_MEMORY_LIMIT_GB); set that limit, load a layer subset or the expert-parallel pair", .{ @as(f64, @floatFromInt(plan_bytes)) / 1e9, @as(f64, @floatFromInt(e.arena.bytes)) / 1e9, @as(f64, @floatFromInt(limit)) / 1e9 });
             return error.OverMemoryLimit;
         }
         e.w = try wts.load(gpa, e.device, dir, &e.c, 16, false);
@@ -221,11 +221,12 @@ pub const Engine = struct {
     }
 
     /// The most this Mac may load: 70% of its RAM in GiB, read as GB (the floor's 179 GB on a 256 GiB Mac, the strict reading).
+    /// TENSORFOLD_MEMORY_LIMIT_GB, as the Python engine reads it, names the limit in GB instead (cfg.loadLimit).
     pub fn loadLimit() usize {
         var mem: u64 = 0;
         var len: usize = @sizeOf(u64);
         if (std.c.sysctlbyname("hw.memsize", &mem, &len, null, 0) != 0 or mem == 0) return 0;
-        return @intFromFloat(@as(f64, @floatFromInt(mem)) / (1 << 30) * 0.7 * 1e9);
+        return cfg.loadLimit(mem, if (std.c.getenv("TENSORFOLD_MEMORY_LIMIT_GB")) |v| std.mem.span(v) else null);
     }
 
     /// The KDA decay rates A = exp(A_log) with MLX's Exp, on the GPU.
