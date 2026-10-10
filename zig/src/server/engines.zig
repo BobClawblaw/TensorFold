@@ -23,6 +23,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
         .drafts = !args.no_drafts,
         .drafter = args.drafter,
         .drafter_bits = args.drafter_bits,
+        .vision = args.vision,
+        .kv_bits = if (std.mem.eql(u8, args.kv_dtype, "int4")) 4 else 8,
         .speed_up = args.speed_up,
         .prompt_cache_gib = args.prompt_cache_gib,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
@@ -31,5 +33,9 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
         .slide = args.slide,
         .device = args.device,
         .segments = args.segments,
+        .tp = args.tp,
+        .rank = args.rank,
+        .master = args.master,
+        .master_port = args.master_port,
     }, problem);
 }

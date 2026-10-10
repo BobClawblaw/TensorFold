@@ -146,9 +146,119 @@ pub const Engine = struct {
         try e.live.append(e.gpa, s);
     }
 
+    /// Whether the backend prefills several prompts in one pass (addStreams then batches admissions).
+    pub fn batchesPrompts(e: *const Engine) bool {
+        return e.backend.vtable.prefill_many != null;
+    }
+
+    /// addStream for several streams: their prompts in one pass when the backend takes them together (else each
+    /// alone), their first drafts in one batch. ``errs[i]``: stream i's error (a cancelled one is released already;
+    /// the caller discards a failed one).
+    pub fn addStreams(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
+        for (errs) |*x| x.* = null;
+        const many = e.backend.vtable.prefill_many orelse return e.addEach(ss, errs);
+        if (ss.len < 2 or ss.len > max_together) return e.addEach(ss, errs);
+        _ = e.arena.reset(.retain_capacity);
+        for (ss) |s| trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch {};
+        const together = many(e.backend.ptr, ss) catch |err| {
+            for (errs) |*x| x.* = err;
+            return;
+        };
+        if (!together) return e.addEach(ss, errs);
+        var feeds: [max_together]Feed = undefined;
+        var asked: [max_together]?u32 = @splat(null);
+        var reqs: [max_together]be.DraftRequest = undefined;
+        var drawns: [max_together]u64 = undefined;
+        var nr: usize = 0;
+        for (ss, 0..) |s, i| {
+            if (s.isCancelled()) { // cancelled in its pass: no first token
+                e.backend.release(s);
+                errs[i] = error.Cancelled;
+                continue;
+            }
+            s.context.shrinkRetainingCapacity(s.prompt_len);
+            s.pending = null;
+            s.cache_len = s.prompt_len;
+            const position: u64 = s.prompt_len;
+            const drawn = e.backend.first(s, position) catch |err| {
+                errs[i] = err;
+                continue;
+            };
+            drawns[i] = drawn;
+            feeds[i] = .{ .handle = drawn };
+            if (e.forcedNext(s) catch |err| {
+                errs[i] = err;
+                continue;
+            }) |tk| feeds[i] = .{ .value = tk };
+            if (e.cfg.family_mtp and s.drafts) {
+                const d: u32 = @intCast(e.rule.depth(win.who(s)) catch |err| {
+                    errs[i] = err;
+                    continue;
+                });
+                asked[i] = d;
+                reqs[nr] = .{ .stream = s, .follow = &.{}, .first = feeds[i], .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d };
+                nr += 1;
+            } else if (e.cfg.pipelined) e.queueNext(s, feeds[i]) catch |err| {
+                errs[i] = err;
+            };
+        }
+        // the heads read each prompt's last row and first token, and draft the one after it: one batch for all
+        if (nr > 0) e.backend.draft(reqs[0..nr]) catch |err| {
+            for (reqs[0..nr]) |r| for (ss, 0..) |s, i| {
+                if (s == r.stream) errs[i] = err;
+            };
+        };
+        for (ss, 0..) |s, i| {
+            if (errs[i] != null) continue;
+            if (asked[i]) |d| {
+                s.dropHeld(e.gpa);
+                s.next = .{ .count = d };
+            }
+            const value = e.readFeed(feeds[i]) catch |err| {
+                errs[i] = err;
+                continue;
+            };
+            const position: u64 = s.prompt_len;
+            if (asked[i]) |d| trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) }) catch {};
+            if (e.log != null) {
+                const first = if (feeds[i] == .handle) value else e.backend.read(drawns[i]) catch value;
+                trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) }) catch {};
+            }
+            _ = s.commit(e.gpa, &.{value}) catch |err| {
+                errs[i] = err;
+                continue;
+            };
+            s.pending = value;
+            trail.resolve(e) catch {};
+            if (s.finished) {
+                trail.finish(e, s) catch {};
+                e.release(s);
+                continue;
+            }
+            e.live.append(e.gpa, s) catch |err| {
+                errs[i] = err;
+            };
+        }
+    }
+
+    /// Streams a backend prefills in one pass at most.
+    pub const max_together = 16;
+
+    fn addEach(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
+        for (ss, errs) |s, *x| e.addStream(s) catch |err| {
+            x.* = err;
+        };
+    }
+
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {
         try e.live.append(e.gpa, s);
+    }
+
+    /// After ``step`` failed: the streams the backend refused alone (the caller ends them; the rest go on).
+    pub fn refused(e: *Engine, out: []*Stream) usize {
+        const ask = e.backend.vtable.refused orelse return 0;
+        return ask(e.backend.ptr, out);
     }
 
     /// Release a cancelled stream between rounds: no pending draws or drafts.

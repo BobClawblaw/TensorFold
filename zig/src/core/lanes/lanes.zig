@@ -22,9 +22,11 @@ pub const windows = @import("windows.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
 pub const fake = @import("fake.zig");
+pub const grammar = @import("grammar.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;
+pub const Image = @import("stream.zig").Image;
 pub const Model = config.Model;
 pub const Stream = stream.Stream;
 pub const Sampling = sampling.Sampling;
