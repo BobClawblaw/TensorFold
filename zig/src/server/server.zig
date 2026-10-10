@@ -30,9 +30,14 @@ pub const CompactAt = union(enum) { auto, fraction: f64 };
 
 pub const Config = struct {
     served_name: []const u8,
+    model_dir: []const u8 = "",
     /// The served name first, then aliases, without repeats.
     model_ids: []const []const u8,
     default_max_tokens: i64 = 4096,
+    tool_system: ?[]const u8 = null, // --tool-system (trimmed; null when empty)
+    vision_max_images: usize = 4, // --vision-max-images
+    vision_urls: bool = false, // --vision-urls: public HTTPS media URLs are fetched (media_fetch.zig)
+    vision_image_tokens: u64 = 4096, // --vision-image-tokens: the visual tokens a request's images share
     enable_thinking: bool = true,
     reasoning_effort: ?[]const u8 = null,
     thinking_budget: i64 = 0,
@@ -85,6 +90,10 @@ pub const Server = struct {
     /// The facts the learner was taught and whether the weights recall them.
     slide: slide_graph.Graph,
     teacher: slide_lesson.Teacher, // what every Sliding Weights lesson shares: keep prompts, the turn's end
+    /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
+    grammars: ?*api.grammar.Compiler = null,
+    grammar_problem: ?[]const u8 = null,
+    grammar_mutex: std.Io.Mutex = .init,
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
@@ -118,6 +127,7 @@ pub const Server = struct {
 
     pub fn deinit(srv: *Server) void {
         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
+        if (srv.grammars) |g| g.close();
         srv.arena.deinit();
         srv.store.deinit();
         srv.slide.deinit();
@@ -171,8 +181,48 @@ pub const Server = struct {
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
-            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
+            const c = srv.grammarCompiler() orelse return cx.fail(.request, "structured output: {s}", .{srv.grammar_problem.?});
+            var err: [512]u8 = undefined;
+            const compiled = c.compile(srv.io, @enumFromInt(@intFromEnum(s.kind)), s.text, &err) catch
+                return cx.fail(.request, "{s}: the grammar cannot be enforced: {s}", .{ s.field, std.mem.sliceTo(&err, 0) });
+            compiled.free();
+            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiler = c };
         }
+    }
+
+    /// The model's grammar compiler: tokenizer.json, config.json's vocab_size (text_config first), the eos ids.
+    fn grammarCompiler(srv: *Server) ?*api.grammar.Compiler {
+        srv.grammar_mutex.lockUncancelable(srv.io);
+        defer srv.grammar_mutex.unlock(srv.io);
+        if (srv.grammars) |g| return g;
+        if (srv.grammar_problem != null) return null;
+        const a = srv.arena.allocator();
+        srv.grammar_problem = blk: {
+            const tok = std.Io.Dir.cwd().readFileAlloc(srv.io, std.fs.path.join(a, &.{ srv.config.model_dir, "tokenizer.json" }) catch break :blk "out of memory", a, .limited(256 << 20)) catch break :blk "the checkpoint has no tokenizer.json";
+            const cfg_text = std.Io.Dir.cwd().readFileAlloc(srv.io, std.fs.path.join(a, &.{ srv.config.model_dir, "config.json" }) catch break :blk "out of memory", a, .limited(16 << 20)) catch break :blk "the checkpoint has no config.json";
+            const cfg = switch (json.parse(a, cfg_text) catch break :blk "out of memory") {
+                .ok => |v| v,
+                .err => break :blk "config.json is not JSON",
+            };
+            var vocab: ?u32 = null;
+            if (cfg.get("text_config")) |tc| if (tc.get("vocab_size")) |v| if (v.int64()) |n| {
+                vocab = @intCast(n);
+            };
+            if (vocab == null) if (cfg.get("vocab_size")) |v| if (v.int64()) |n| {
+                vocab = @intCast(n);
+            };
+            if (vocab == null) break :blk "structured output needs the checkpoint's config.json vocab_size";
+            var err: [512]u8 = undefined;
+            const c = a.create(api.grammar.Compiler) catch break :blk "out of memory";
+            c.* = api.grammar.Compiler.open(tok, vocab.?, srv.eos, &err) catch |e| break :blk switch (e) {
+                error.NoGrammarLibrary => "the server cannot load libtfgrammar (xgrammar)",
+                else => a.dupe(u8, std.mem.sliceTo(&err, 0)) catch "out of memory",
+            };
+            srv.grammars = c;
+            log.line("structured output: xgrammar over {d} tokens", .{vocab.?});
+            break :blk null;
+        };
+        return srv.grammars;
     }
 
     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };
