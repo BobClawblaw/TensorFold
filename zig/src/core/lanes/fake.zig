@@ -64,6 +64,7 @@ pub const Fake = struct {
         while (it.next()) |l| freeLane(x.gpa, l);
         x.lanes.deinit(x.gpa);
         x.drawn.deinit(x.gpa);
+        x.refused.deinit(x.gpa);
     }
 
     fn freeLane(gpa: Allocator, l: *Lane) void {
@@ -240,8 +241,20 @@ pub const Fake = struct {
         return self(ptr).drawn.items[handle];
     }
 
+    fn refusedFn(ptr: *anyopaque, out: []*Stream) usize {
+        const x = self(ptr);
+        const n = @min(out.len, x.refused.items.len);
+        @memcpy(out[0..n], x.refused.items[0..n]);
+        x.refused.clearRetainingCapacity();
+        return n;
+    }
+
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
+        if (x.refuse_after) |after| { // the round refused before anything ran, for its marked streams alone
+            for (windows) |w| if (w.stream.prompt()[0] == x.refuse_marker and x.lane(w.stream).history.items.len > after) try x.refused.append(x.gpa, w.stream);
+            if (x.refused.items.len > 0) return error.OutOfDeviceMemory;
+        }
         x.rounds += 1;
         for (windows, out) |w, o| {
             const l = x.lane(w.stream);
