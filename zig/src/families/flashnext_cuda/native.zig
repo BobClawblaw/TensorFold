@@ -1258,6 +1258,7 @@ fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     const seq = kv.value.seq;
+    forward.releaseGraphs(self.e, seq);
     const at: usize = @intCast(seq.snap.at);
     const kept_ids: ?[]u32 = if (at > 0 and at <= s.prompt_len) self.gpa.dupe(u32, s.context.items[0..at]) catch null else null;
     w.int(kv.value.id) catch {};
@@ -1391,8 +1392,12 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
             .release => {
                 const rid = try r.int();
-                if (try r.int() == 1) continue; // kept: it stays under its id until a prefill resumes it or it is dropped
+                if (try r.int() == 1) { // kept: it stays under its id until a prefill resumes it or it is dropped
+                    if (self.by_id.get(rid)) |sq| forward.releaseGraphs(self.e, sq);
+                    continue;
+                }
                 const kv = self.by_id.fetchRemove(rid) orelse continue;
+                forward.releaseGraphs(self.e, kv.value);
                 if (kv.key == 1) { // the calibration's sequence (rank 0 frees its own at open, see there)
                     forward.freeSeq(self.e, kv.value);
                     continue;

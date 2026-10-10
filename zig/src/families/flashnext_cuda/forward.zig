@@ -481,6 +481,7 @@ pub const Engine = struct {
     timing: bool = false,
     split: [3]f64 = .{ 0, 0, 0 }, // staging: ids upload, n-gram ids, table rows
     graphs: std.AutoHashMap(GKey, cuda.graph.Exec) = undefined,
+    drop_graphs: bool = false, // TENSORFOLD_FN_DROP_GRAPHS: a released sequence's graphs freed (kept or spare)
     graph_log: bool = false, // TENSORFOLD_FN_GRAPHLOG: live graphs, captures and launch time logged a request
     captures: u64 = 0,
     capture_ms: f64 = 0,
@@ -662,6 +663,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.gpu_ms = 0;
     e.graphs = .init(gpa);
     e.graph_log = std.c.getenv("TENSORFOLD_FN_GRAPHLOG") != null;
+    e.drop_graphs = std.c.getenv("TENSORFOLD_FN_DROP_GRAPHS") != null;
     e.captures = 0;
     e.capture_ms = 0;
     e.launches = 0;
@@ -782,7 +784,8 @@ pub fn resetSeq(e: *Engine, s: *Seq) !void {
     s.hist = e.ng.start();
 }
 
-pub fn freeSeq(e: *Engine, s: *Seq) void {
+/// ``s``'s graphs freed.
+fn freeGraphs(e: *Engine, s: *Seq) void {
     var gone: std.ArrayList(GKey) = .empty;
     defer gone.deinit(e.gpa);
     var it = e.graphs.iterator();
@@ -791,6 +794,15 @@ pub fn freeSeq(e: *Engine, s: *Seq) void {
         var ex = e.graphs.fetchRemove(key).?.value;
         ex.deinit();
     }
+}
+
+/// A released sequence's graphs freed (kept or a spare): its next request starts at another geometry anyway.
+pub fn releaseGraphs(e: *Engine, s: *Seq) void {
+    if (e.drop_graphs) freeGraphs(e, s);
+}
+
+pub fn freeSeq(e: *Engine, s: *Seq) void {
+    freeGraphs(e, s);
     detach(e, s);
     s.grow.deinit();
     s.mem.free();
