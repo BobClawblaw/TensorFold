@@ -638,6 +638,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.gpu_ms = 0;
     e.enq_ms = 0;
     e.wait_ms = 0;
+    e.split_gathers = false;
+    e.rec = null;
     e.graphs = .init(gpa);
     return e;
 }
