@@ -324,14 +324,15 @@ pub const Cuda = struct {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
         self.e.stream.synchronize() catch {};
-        if (replay.logFromEnv()) {
-            const d = self.e.stats.since(kv.value.stats);
-            std.log.info("graphs: {s} sequence, {d} captures in {d:.1} ms, {d} moves, {d} replays, {d} eager windows", .{ if (kv.value.own) "own" else "another", d.captures, @as(f64, @floatFromInt(d.capture_ns)) / 1e6, d.moves, d.replays, d.eager });
-        }
         self.drop(kv.value);
     }
 
     fn drop(self: *Cuda, l: Lane) void {
+        if (replay.logFromEnv()) {
+            const d = self.e.stats.since(l.stats);
+            const ms = @as(f64, @floatFromInt(d.capture_ns)) / 1e6;
+            std.log.info("graphs: {s} sequence, {d} captures in {d:.1} ms, {d} moves, {d} replays, {d} eager windows", .{ if (l.own) "own" else "another", d.captures, ms, d.moves, d.replays, d.eager });
+        }
         if (l.own) self.own_free = true else self.e.freeSeq(l.seq);
     }
 };
