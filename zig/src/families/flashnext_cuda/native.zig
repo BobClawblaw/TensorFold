@@ -10,6 +10,7 @@ const api = @import("api.zig");
 const weights = @import("weights.zig");
 const forward = @import("forward.zig");
 const vision = @import("vision.zig");
+const Prof = @import("prof.zig").Prof;
 const be = lanes.backend;
 
 pub const model_type = "qwen4_exp";
@@ -61,7 +62,8 @@ const max_depth = max_rows - 1;
 const grow_margin = 2 * max_rows + 2;
 /// The head stops at a draft it gives less than this (the Python engine's --mtp-confidence, the recipe's 0.70);
 /// the slots past it are held with chance 0, so the lane core's allocator leaves them out of the window.
-const draft_confidence: f64 = 0.7;
+/// TENSORFOLD_FN_CONFIDENCE overrides it (a measurement's knob; both ranks must see the same value).
+var draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
@@ -286,6 +288,7 @@ const Owned = struct {
     gfull: []u32 = &.{}, // a grammar row's bits over the whole vocabulary
     gbits: [2][]u32 = .{ &.{}, &.{} }, // a round's grammar rows, each rank's half (rank 1: what the frames carry)
     growsbuf: [batch_rows]u32 = undefined,
+    prof: Prof = .{}, // TENSORFOLD_FN_PROFILE (prof.zig)
 
     /// The scratch grammar rows need, made on first use.
     fn gramScratch(self: *Owned) !void {
@@ -498,6 +501,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.gpa = gpa;
     own.io = io;
     own.rank = o.rank;
+    own.prof = if (o.rank == 0) .init() else .{};
+    if (std.c.getenv("TENSORFOLD_FN_CONFIDENCE")) |v| draft_confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch draft_confidence;
     // the link and the communicator first, while memory is fresh (NCCL registers its buffers at its first use)
     own.link = if (o.rank == 0) try cuda.tp_link.Link.lead(o.master_port, 600_000)
         else try cuda.tp_link.Link.follow(io, try std.Io.net.IpAddress.parse(o.master orelse return error.NoMaster, o.master_port), 600_000);
@@ -518,6 +523,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
     errdefer own.store.deinit();
     own.e = try forward.init(gpa, io, &own.ctx, &own.kernels, &own.store, .{ .context = o.context, .max_rows = batch_rows, .depth = if (o.drafts) max_depth else 0, .kv_bits = o.kv_bits });
+    if (own.prof.every > 0) {
+        own.prof.enq = &own.e.enq_ms;
+        own.prof.wait = &own.e.wait_ms;
+    }
     errdefer forward.deinit(own.e);
     try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
     { // the sequences' caches grow within what is free now, less the server's reserve and a margin (a GB10 shares
@@ -755,18 +764,50 @@ fn of(p: *anyopaque) *Owned {
 }
 
 const vtable: be.Backend.VTable = .{
-    .prefill = prefillFn,
-    .prefill_many = prefillManyFn,
+    .prefill = timedPrefill,
+    .prefill_many = timedPrefillMany,
     .first = firstFn,
     .queue = queueFn,
     .read = readFn,
-    .verify = verifyFn,
-    .keep = keepFn,
-    .draft = draftFn,
+    .verify = timedVerify,
+    .keep = timedKeep,
+    .draft = timedDraft,
     .release = releaseFn,
     .probabilities = probabilitiesFn,
     .refused = refusedFn,
 };
+
+fn timedPrefill(p: *anyopaque, s: *lanes.Stream) anyerror!void {
+    const t = of(p).prof.begin(of(p).io);
+    defer of(p).prof.end(of(p).io, .prefill, t, 0, 0);
+    return prefillFn(p, s);
+}
+
+fn timedPrefillMany(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
+    const t = of(p).prof.begin(of(p).io);
+    defer of(p).prof.end(of(p).io, .prefills, t, 0, ss.len);
+    return prefillManyFn(p, ss);
+}
+
+fn timedVerify(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
+    const t = of(p).prof.begin(of(p).io);
+    var rows: usize = 0;
+    for (windows) |w| rows += w.rows();
+    defer of(p).prof.end(of(p).io, if (windows.len > 1) .shared else .verify, t, rows, if (windows.len > 1) windows.len else 0);
+    return verifyFn(p, windows, out);
+}
+
+fn timedKeep(p: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+    const t = of(p).prof.begin(of(p).io);
+    defer of(p).prof.end(of(p).io, .keep, t, 0, 0);
+    return keepFn(p, windows, paths);
+}
+
+fn timedDraft(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+    const t = of(p).prof.begin(of(p).io);
+    defer of(p).prof.end(of(p).io, if (requests.len > 1) .drafts else .draft, t, 0, 0);
+    return draftFn(p, requests);
+}
 
 /// A new sequence for the stream and its prompt (the head absorbs it); the first token is drawn here.
 fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {

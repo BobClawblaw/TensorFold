@@ -477,6 +477,8 @@ pub const Engine = struct {
     multi_gdn: bool = true,
     multi_layers: [2]u64 = .{ 0, 0 }, // shared attention layers in one launch a kernel, and those the set had no variant for
     stage_ms: f64 = 0, // host time staging windows (ids, n-gram rows)
+    enq_ms: f64 = 0, // verify forwards' host time until the picks' read-back (launches, staging)
+    wait_ms: f64 = 0, // and the read-back's wait for the GPU
     gpu_ms: f64 = 0, // GPU time of verify windows (events around the step), when ``timing``
     timing: bool = false,
     split: [3]f64 = .{ 0, 0, 0 }, // staging: ids upload, n-gram ids, table rows
@@ -1563,6 +1565,7 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     const b = &e.buf;
     var toks: [16]i64 = undefined;
     for (ids, 0..) |t, i| toks[i] = t;
+    const t0 = std.Io.Timestamp.now(e.io, .awake);
     try room(e, s, R + 1);
     try stage(e, b, s, toks[0..ids.len]);
     var ev: [2]cuda.Event = undefined;
@@ -1580,7 +1583,9 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     };
     if (try applyMasks(e, b.logits, &.{.{ .s = s, .row0 = 0, .rows = R }})) try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
     var picks: [16]Pick = undefined;
+    const t1 = std.Io.Timestamp.now(e.io, .awake);
     try readPicks(e, b, R, picks[0..ids.len]);
+    split(e, t0, t1);
     for (out[0..ids.len], picks[0..ids.len]) |*o, p| o.* = @intCast(p.tok);
     if (s.sampling) |rule| { // row r draws the token at position pos + 1 + r
         var want: [16]Want = undefined;
@@ -1590,6 +1595,12 @@ pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     s.last_rows = R;
     s.last_row0 = 0;
     @memcpy(s.last_tokens[0..ids.len], toks[0..ids.len]);
+}
+
+fn split(e: *Engine, t0: std.Io.Timestamp, t1: std.Io.Timestamp) void {
+    const t2 = std.Io.Timestamp.now(e.io, .awake);
+    e.enq_ms += @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6;
+    e.wait_ms += @as(f64, @floatFromInt(t1.durationTo(t2).toNanoseconds())) / 1e6;
 }
 
 /// A stream's window in a shared round: its sequence and its rows' tokens (the pending one, then its drafts).
@@ -1610,6 +1621,7 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
     }
     const b = &e.buf;
     if (R > b.rows) return error.WindowTooWide;
+    const t0 = std.Io.Timestamp.now(e.io, .awake);
     for (segs[0..parts.len]) |sg| try room(e, sg.s, sg.rows + 1);
     try stageParts(e, b, parts, segs[0..parts.len]);
     if (e.multi_gdn) try chainTable(e, b, segs[0..parts.len]);
@@ -1623,7 +1635,9 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
     _ = try applyMasks(e, b.logits, segs[0..parts.len]);
     try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, R);
     var picks: [max_parts * 16]Pick = undefined;
+    const t1 = std.Io.Timestamp.now(e.io, .awake);
     try readPicks(e, b, R, picks[0..@intCast(R)]);
+    split(e, t0, t1);
     for (out[0..@intCast(R)], picks[0..@intCast(R)]) |*o, p| o.* = @intCast(p.tok);
     var want: [max_parts * 16]Want = undefined;
     var nw: usize = 0;
