@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
 const runtime_tests = @import("runtime_tests.zig");
+const relocate_tests = @import("relocate_tests.zig");
 const bench = @import("bench.zig");
 const oracle_tests = @import("oracle_tests.zig");
 const libs_tests = @import("libs_tests.zig");
@@ -39,6 +40,7 @@ const usage =
     \\  grouped-plan <dir>        the shared expert plan against experts.route's bytes (oracle/grouped_plan.py)
     \\  fp8-lane <dir>            block-FP8 projections against the Python lane matmul's bytes (oracle/fp8_lane.py)
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
+    \\  relocate                  a captured graph moved to another buffer (cuda.relocate)
     \\
 ;
 
@@ -75,6 +77,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
     if (std.mem.eql(u8, cmd, "graph")) return runtime_tests.graphs(gpu);
+    if (std.mem.eql(u8, cmd, "relocate")) return relocate_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "overhead") or std.mem.eql(u8, cmd, "overhead-pdl")) {
         const n = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 1000;
         const reps = if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 20;

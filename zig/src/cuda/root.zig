@@ -19,6 +19,7 @@ pub const Args = launch.Args;
 pub const Config = launch.Config;
 pub const Dim3 = launch.Dim3;
 pub const graph = @import("graph.zig");
+pub const relocate = @import("relocate.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
 pub const triton = @import("triton.zig");
@@ -34,6 +35,7 @@ test {
     _ = @import("grouped.zig");
     _ = @import("qlinear.zig");
     _ = launch;
+    _ = @import("relocate.zig");
     _ = abi;
     _ = aot;
     _ = segments;

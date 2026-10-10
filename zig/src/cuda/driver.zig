@@ -13,14 +13,16 @@ pub const Driver = struct {
         return openPath("libcuda.so.1");
     }
 
-    /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver.
+    /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver, unless optional.
     pub fn openPath(path: []const u8) Error!Driver {
         var lib = std.DynLib.open(path) catch return error.DriverUnavailable;
         errdefer lib.close();
         var api: abi.Api = undefined;
         const info = @typeInfo(abi.Api).@"struct";
         inline for (info.field_names, info.field_types) |name, T| {
-            @field(api, name) = lib.lookup(T, name) orelse {
+            if (@typeInfo(T) == .optional) {
+                @field(api, name) = lib.lookup(@typeInfo(T).optional.child, name); // a newer driver's, null when absent
+            } else @field(api, name) = lib.lookup(T, name) orelse {
                 std.log.err("{s} has no {s}", .{ path, name });
                 return error.MissingSymbol;
             };

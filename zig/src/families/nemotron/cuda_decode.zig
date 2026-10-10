@@ -47,7 +47,7 @@ pub fn generate(gpa: std.mem.Allocator, io: std.Io, e: *Engine, drafter: ?*draft
 
 /// serial_decode as one graph replay a round, queued `lookahead` deep: the device feeds each token to the next round.
 fn serialGraphs(gpa: std.mem.Allocator, e: *Engine, out: *std.ArrayList(u32), count: usize, stop_eos: bool) !usize {
-    const g = e.serial.?;
+    const g = e.serial.?.exec;
     try e.upload(out.items[out.items.len - 1]);
     const base = e.pos;
     const total = count - out.items.len;

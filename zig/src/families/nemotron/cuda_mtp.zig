@@ -7,6 +7,7 @@ const sampler = @import("cuda_sampler.zig");
 const weights = @import("cuda_weights.zig");
 const state = @import("cuda_state.zig");
 const Engine = @import("cuda_engine.zig").Engine;
+const replay = @import("cuda_replay.zig");
 
 pub const max_chain = 15; // drafts a window holds beside the pending token
 /// What a sequence keeps of the head between rounds: its caches and its drafts' confidences.
@@ -20,9 +21,9 @@ pub const Head = struct {
     pinned: cuda.HostBuffer,
     copied: cuda.Event,
     ready: [max_chain]cuda.Event,
-    absorb_graphs: [state.max_rows + 1]?cuda.graph.Exec = @splat(null),
-    first_graphs: [2][state.max_rows + 1]?cuda.graph.Exec = @splat(@splat(null)), // [greedy, sampled] draws
-    chain_graphs: [2][max_chain + 1]?cuda.graph.Exec = @splat(@splat(null)),
+    absorb_graphs: [state.max_rows + 1]?replay.Replay = @splat(null),
+    first_graphs: [2][state.max_rows + 1]?replay.Replay = @splat(@splat(null)), // [greedy, sampled] draws
+    chain_graphs: [2][max_chain + 1]?replay.Replay = @splat(@splat(null)),
     k_cache: u64,
     v_cache: u64,
     meta: u64,
@@ -84,7 +85,7 @@ pub const Head = struct {
     pub fn deinit(h: *Head) void {
         h.e.stream.synchronize() catch {};
         h.e.head = null;
-        for ([_][]?cuda.graph.Exec{ &h.absorb_graphs, &h.first_graphs[0], &h.first_graphs[1], &h.chain_graphs[0], &h.chain_graphs[1] }) |set| for (set) |*g| if (g.*) |*x| x.deinit();
+        for ([_][]?replay.Replay{ &h.absorb_graphs, &h.first_graphs[0], &h.first_graphs[1], &h.chain_graphs[0], &h.chain_graphs[1] }) |set| for (set) |*g| if (g.*) |*x| x.deinit(h.e.gpa);
         for (&h.ready) |*r| r.deinit();
         h.copied.deinit();
         h.pinned.free();
@@ -157,7 +158,7 @@ pub const Head = struct {
     }
 
     /// MTPHead._level: 0 absorbs the window's kept rows, 1 absorbs them and drafts after them, j > 1 extends the chain.
-    fn level(h: *Head, rows: usize, j: usize) !void {
+    pub fn level(h: *Head, rows: usize, j: usize) !void {
         const e = h.e;
         const o = e.ops();
         const D: u64 = e.c.hidden;
@@ -193,29 +194,28 @@ pub const Head = struct {
 
     /// MTPHead.capture: levels 0 and 1 at every kept-row count, later levels at one row, in the bound draw mode.
     pub fn capture(h: *Head) !void {
-        const s = h.e.stream;
         const m = @intFromBool(h.e.sampling != null);
         for (1..state.max_rows + 1) |k| {
-            if (h.absorb_graphs[k] == null) h.absorb_graphs[k] = try record(s, h, @intCast(k), 0);
-            h.first_graphs[m][k] = try record(s, h, @intCast(k), 1);
+            if (h.absorb_graphs[k] == null) h.absorb_graphs[k] = try h.record(k, 0);
+            if (h.first_graphs[m][k]) |*old| old.deinit(h.e.gpa);
+            h.first_graphs[m][k] = try h.record(k, 1);
         }
-        for (2..max_chain + 1) |j| h.chain_graphs[m][j] = try record(s, h, 1, @intCast(j));
+        for (2..max_chain + 1) |j| {
+            if (h.chain_graphs[m][j]) |*old| old.deinit(h.e.gpa);
+            h.chain_graphs[m][j] = try h.record(1, j);
+        }
     }
 
-    fn record(s: cuda.Stream, h: *Head, rows: usize, j: usize) !cuda.graph.Exec {
-        try cuda.graph.beginCapture(s, .thread_local);
-        h.level(rows, j) catch |err| {
-            if (cuda.graph.endCapture(s)) |g| {
-                var x = g;
-                x.deinit();
-            } else |_| {}
-            return err;
-        };
-        var g = try cuda.graph.endCapture(s);
-        defer g.deinit();
-        const exec = try g.instantiate();
-        try exec.upload(s);
-        return exec;
+    fn record(h: *Head, rows: usize, j: usize) !replay.Replay {
+        return h.e.record(.{ .head = .{ .h = h, .rows = rows, .j = j } }, true);
+    }
+
+    /// Level j's replay and its id among the engine's replays (absorb, then each mode's first, then each mode's chain).
+    fn replayOf(h: *Head, m: usize, j: usize) ?struct { r: *replay.Replay, id: u32 } {
+        const w = state.max_rows + 1;
+        const slot = if (j == 0) &h.absorb_graphs[h.keep] else if (j == 1) &h.first_graphs[m][h.keep] else &h.chain_graphs[m][j];
+        const id = if (j == 0) 1000 + h.keep else if (j == 1) 2000 + m * w + h.keep else 3000 + m * (max_chain + 1) + j;
+        return if (slot.*) |*r| .{ .r = r, .id = @intCast(id) } else null;
     }
 
     /// MTPHead.begin: the head absorbs the last window's first `keep` rows, then drafts the positions after them.
@@ -233,9 +233,11 @@ pub const Head = struct {
 
     /// MTPHead.level: queue level j of this round (0: absorb only) into the engine's ids[j].
     pub fn launch(h: *Head, j: usize) !void {
-        const m = @intFromBool(h.e.sampling != null);
-        const g = if (!h.e.graphsBound()) null else if (j == 0) h.absorb_graphs[h.keep] else if (j == 1) h.first_graphs[m][h.keep] else h.chain_graphs[m][j];
-        if (g) |x| try x.launchOn(h.e.stream) else try h.level(if (j <= 1) h.keep else 1, j);
+        const m: usize = @intFromBool(h.e.sampling != null);
+        const rows = if (j <= 1) h.keep else 1;
+        if (if (h.e.graphsBound()) h.replayOf(m, j) else null) |x| {
+            try h.e.launchReplay(x.r, x.id, .{ .head = .{ .h = h, .rows = rows, .j = j } });
+        } else try h.level(rows, j);
         if (j > 0) {
             try h.ready[j - 1].record(h.e.stream);
             h.levels = j;

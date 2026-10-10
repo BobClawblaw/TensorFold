@@ -110,6 +110,47 @@ pub const KernelNodeParams = extern struct {
     ctx: Context = null,
 };
 
+/// CUDA_MEMCPY3D_v2, a captured copy's description (graph memcpy nodes).
+pub const Memcpy3D = extern struct {
+    src_x: usize = 0,
+    src_y: usize = 0,
+    src_z: usize = 0,
+    src_lod: usize = 0,
+    src_type: c_uint = 0, // 1 host, 2 device, 3 array, 4 unified
+    src_host: ?*const anyopaque = null,
+    src_device: DevicePtr = 0,
+    src_array: ?*anyopaque = null,
+    reserved0: ?*anyopaque = null,
+    src_pitch: usize = 0,
+    src_height: usize = 0,
+    dst_x: usize = 0,
+    dst_y: usize = 0,
+    dst_z: usize = 0,
+    dst_lod: usize = 0,
+    dst_type: c_uint = 0,
+    dst_host: ?*anyopaque = null,
+    dst_device: DevicePtr = 0,
+    dst_array: ?*anyopaque = null,
+    reserved1: ?*anyopaque = null,
+    dst_pitch: usize = 0,
+    dst_height: usize = 0,
+    width: usize = 0,
+    height: usize = 0,
+    depth: usize = 0,
+};
+
+/// CUDA_MEMSET_NODE_PARAMS.
+pub const MemsetParams = extern struct { dst: DevicePtr = 0, pitch: usize = 0, value: c_uint = 0, element: c_uint = 0, width: usize = 0, height: usize = 0 };
+
+pub const node_kernel: c_int = 0;
+pub const node_memcpy: c_int = 1;
+pub const node_memset: c_int = 2;
+pub const node_empty: c_int = 5;
+pub const node_wait_event: c_int = 6;
+pub const node_event_record: c_int = 7;
+pub const memory_device: c_uint = 2;
+pub const memory_unified: c_uint = 4;
+
 pub const ExecUpdateResult = enum(c_uint) {
     success = 0,
     @"error" = 1,
@@ -209,6 +250,14 @@ pub const Api = struct {
     cuGraphExecDestroy: *const fn (GraphExec) callconv(.c) R,
     cuGraphExecUpdate_v2: *const fn (GraphExec, Graph, *ExecUpdateResultInfo) callconv(.c) R,
     cuGraphExecKernelNodeSetParams_v2: *const fn (GraphExec, GraphNode, *const KernelNodeParams) callconv(.c) R,
+    cuGraphNodeGetType: *const fn (GraphNode, *c_int) callconv(.c) R,
+    cuGraphMemcpyNodeGetParams: *const fn (GraphNode, *Memcpy3D) callconv(.c) R,
+    cuGraphMemsetNodeGetParams: *const fn (GraphNode, *MemsetParams) callconv(.c) R,
+    cuGraphExecMemcpyNodeSetParams: *const fn (GraphExec, GraphNode, *const Memcpy3D, Context) callconv(.c) R,
+    cuGraphExecMemsetNodeSetParams: *const fn (GraphExec, GraphNode, *const MemsetParams, Context) callconv(.c) R,
+    // CUDA 12.4: a kernel's argument layout; an older driver leaves them null and nothing is relocated
+    cuFuncGetParamInfo: ?*const fn (Function, usize, *usize, *usize) callconv(.c) R,
+    cuKernelGetParamInfo: ?*const fn (Kernel, usize, *usize, *usize) callconv(.c) R,
     cuGetErrorName: *const fn (R, *?[*:0]const u8) callconv(.c) R,
     cuGetErrorString: *const fn (R, *?[*:0]const u8) callconv(.c) R,
 };
@@ -219,4 +268,6 @@ comptime {
     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
+    std.debug.assert(@sizeOf(Memcpy3D) == 200 and @offsetOf(Memcpy3D, "src_device") == 48 and @offsetOf(Memcpy3D, "dst_device") == 136);
+    std.debug.assert(@sizeOf(MemsetParams) == 40);
 }
