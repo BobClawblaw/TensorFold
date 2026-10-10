@@ -1253,6 +1253,7 @@ fn probabilitiesFn(p: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
 fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     const self = of(p);
     const kv = self.lanes_by.fetchRemove(s) orelse return;
+    forward.logGraphs(self.e);
     if (kv.value.g) |g| g.m.free();
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);

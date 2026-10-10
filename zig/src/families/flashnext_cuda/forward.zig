@@ -481,6 +481,11 @@ pub const Engine = struct {
     timing: bool = false,
     split: [3]f64 = .{ 0, 0, 0 }, // staging: ids upload, n-gram ids, table rows
     graphs: std.AutoHashMap(GKey, cuda.graph.Exec) = undefined,
+    graph_log: bool = false, // TENSORFOLD_FN_GRAPHLOG: live graphs, captures and launch time logged a request
+    captures: u64 = 0,
+    capture_ms: f64 = 0,
+    launches: u64 = 0,
+    launch_ms: f64 = 0,
 };
 
 const GKey = struct { kind: u8, rows: i64, par: u1, sig: [3]i64, seq: usize };
@@ -536,6 +541,11 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
         var ex = e.graphs.fetchRemove(o).?.value;
         ex.deinit();
     }
+    const t0 = std.Io.Timestamp.now(e.io, .awake);
+    defer {
+        e.captures += 1;
+        e.capture_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
+    }
     try cuda.graph.beginCapture(e.k.stream, .thread_local);
     body(e, kind, s, R) catch |err| {
         if (cuda.graph.endCapture(e.k.stream)) |g| {
@@ -555,7 +565,28 @@ fn capture(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
 fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
     if (!e.use_graphs or e.k.sync_each or s.img != null or (kind == 0 and s.sampling != null)) return body(e, kind, s, R); // image and sampled sequences: eager
     try capture(e, kind, s, R);
+    const t0 = std.Io.Timestamp.now(e.io, .awake);
+    defer {
+        e.launches += 1;
+        e.launch_ms += @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(e.io, .awake)).toNanoseconds())) / 1e6;
+    }
     return e.graphs.get(keyOf(e, kind, s, R)).?.launchOn(e.k.stream);
+}
+
+/// TENSORFOLD_FN_GRAPHLOG: the graphs held, and the captures and launches since the last call (one line a request).
+pub fn logGraphs(e: *Engine) void {
+    if (!e.graph_log) return;
+    var seqs: std.AutoHashMap(usize, void) = .init(e.gpa);
+    defer seqs.deinit();
+    var it = e.graphs.keyIterator();
+    while (it.next()) |k| seqs.put(k.seq, {}) catch {};
+    const per = if (e.launches > 0) e.launch_ms / @as(f64, @floatFromInt(e.launches)) else 0;
+    std.log.info("flash next graphs: {d} held over {d} sequences; {d} captures ({d:.1} ms), {d} launches ({d:.3} ms each)", .{
+        e.graphs.count(), seqs.count(), e.captures, e.capture_ms, e.launches, per });
+    e.captures = 0;
+    e.capture_ms = 0;
+    e.launches = 0;
+    e.launch_ms = 0;
 }
 
 
@@ -630,6 +661,11 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
     e.timing = false; // the engine is built field by field: a default left out is whatever the allocator held
     e.gpu_ms = 0;
     e.graphs = .init(gpa);
+    e.graph_log = std.c.getenv("TENSORFOLD_FN_GRAPHLOG") != null;
+    e.captures = 0;
+    e.capture_ms = 0;
+    e.launches = 0;
+    e.launch_ms = 0;
     return e;
 }
 
