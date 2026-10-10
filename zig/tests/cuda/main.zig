@@ -6,6 +6,9 @@ const check = @import("check.zig");
 const runtime_tests = @import("runtime_tests.zig");
 const bench = @import("bench.zig");
 const oracle_tests = @import("oracle_tests.zig");
+const fn_fixtures = @import("fn_fixtures.zig");
+const fn_ext = @import("fn_ext.zig");
+const fn_run = @import("fn_run.zig");
 const libs_tests = @import("libs_tests.zig");
 const sample_tests = @import("sample_tests.zig");
 const glue_tests = @import("glue_tests.zig");
@@ -31,6 +34,8 @@ const usage =
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
     \\  gdn-tree <dir>            tree_kernel bits against the Python oracle's fixture
     \\  triton <dir>              a Triton cubin's bits against the Python oracle's fixture
+    \\  fn-triton <dir>           a Flash Next launch captured from the engine, replayed from its cubin
+    \\  fn-ext <dir>              a Flash Next extension call captured from the engine, relaunched from its cubin
     \\  sample                    sample.cu's keyed draws against the Metal rule's host references (synthetic rows)
     \\  glue                      Nemotron's glue kernels against their host references at its shapes (synthetic rows)
     \\  window-profile MODEL WIDTHS IDS_FILE   a decode window's GPU ms by kernel class (WIDTHS like 1,4,16), beside its graph
@@ -58,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     run(gpu, cmd, rest) catch |e| {
         std.debug.print("FAIL {s}: {t}\n", .{ cmd, e });
+        if (@errorReturnTrace()) |t| std.debug.dumpStackTrace(t);
         return 1;
     };
     return 0;
@@ -99,6 +105,31 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         const mib = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else cuda.carveout.default_bytes >> 20;
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
+    if (std.mem.eql(u8, cmd, "fn-triton")) return fn_fixtures.tritonRegions(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-ext")) return fn_ext.extCall(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-aot")) return @import("fn_native.zig").aotLoad(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-native")) return @import("fn_forward.zig").native(gpu, rest);
+    if (std.mem.eql(u8, cmd, "video-prep")) return @import("fn_vision.zig").videoPrep(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "vision-prep")) return @import("fn_vision.zig").prep(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-vision")) return @import("fn_vision.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "fn-tp")) return @import("fn_native.zig").tpLink(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "fn-weights")) return @import("fn_native.zig").weightsCheck(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "fn-fatbins")) return @import("fn_native.zig").fatbins(gpu);
+    if (std.mem.eql(u8, cmd, "fn-uid")) return fn_run.writeUid(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "fn-run")) return fn_run.decode(gpu, rest);
+    if (std.mem.eql(u8, cmd, "fn-gen")) return fn_run.generate(gpu, rest, .graph);
+    if (std.mem.eql(u8, cmd, "fn-gen-compiled")) return fn_run.generate(gpu, rest, .compiled);
+    if (std.mem.eql(u8, cmd, "fn-mtp")) return @import("fn_mtp.zig").generate(gpu, rest, true, true);
+    if (std.mem.eql(u8, cmd, "fn-mtp-profile")) return @import("fn_mtp.zig").generateP(gpu, rest, true, true, true);
+    if (std.mem.eql(u8, cmd, "fn-mtp-parallel")) {
+        @import("fn_mtp.zig").parallel = true;
+        return @import("fn_mtp.zig").generate(gpu, rest, true, true);
+    }
+    if (std.mem.eql(u8, cmd, "fn-mtp-host")) return @import("fn_mtp.zig").generate(gpu, rest, true, false);
+    if (std.mem.eql(u8, cmd, "fn-mtp-eager")) return @import("fn_mtp.zig").generate(gpu, rest, false, true);
+    if (std.mem.eql(u8, cmd, "fn-gen-profile")) return fn_run.generate(gpu, rest, .profile);
+    if (std.mem.eql(u8, cmd, "fn-gen-interp")) return fn_run.generate(gpu, rest, .interp);
+    if (std.mem.eql(u8, cmd, "fn-check")) return fn_run.checkChunk(gpu, rest);
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;
 }
