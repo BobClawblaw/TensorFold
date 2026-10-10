@@ -151,7 +151,7 @@ pub const Engine = struct {
             gpa.destroy(e.k);
         }
         const plan_bytes = blk: { // the weights' plan from the headers: names, dtypes, shapes and bytes, nothing read
-            const plan = try wts.load(gpa, e.device, dir, &e.c, 16, true);
+            const plan = try wts.load(gpa, e.device, dir, &e.c, 16, true, null, false);
             defer gpa.destroy(plan);
             defer plan.deinit();
             break :blk plan.bytes;
@@ -171,7 +171,12 @@ pub const Engine = struct {
             std.log.err("glm: {d:.1} GB of weights and {d:.1} GB of caches pass this Mac's {d:.1} GB load limit (70% of RAM); load a layer subset or the expert-parallel pair", .{ @as(f64, @floatFromInt(plan_bytes)) / 1e9, @as(f64, @floatFromInt(e.arena.bytes)) / 1e9, @as(f64, @floatFromInt(limit)) / 1e9 });
             return error.OverMemoryLimit;
         }
-        e.w = try wts.load(gpa, e.device, dir, &e.c, 16, false);
+        // opt-in: wiring 181 GB leaves macOS nothing to reclaim if another model shares the Mac (Flash Next runs without)
+        const resident: ?mtl.ResidencySet = if (std.c.getenv("GLM_RESIDENCY") == null) null else e.device.residencySet(1024) catch null;
+        errdefer if (resident) |set| set.deinit();
+        const wire = std.c.getenv("GLM_WIRE") != null; // every buffer's pages wired before it fills: nothing compresses
+        if (wire) for (e.arena.buffers.items) |b| try wts.wireBuffer(b);
+        e.w = try wts.load(gpa, e.device, dir, &e.c, 16, false, resident, wire);
         errdefer {
             e.w.deinit();
             gpa.destroy(e.w);
@@ -185,15 +190,13 @@ pub const Engine = struct {
             me.rest[2] = @intFromBool(learn); // --learn on both Macs or neither: each holds its half of a learned state
             e.ep = try ep_mod.Ep.init(gpa, e.device, s, me);
         }
-        // opt-in: wiring 181 GB leaves macOS nothing to reclaim if another model shares the Mac (Flash Next runs without)
-        if (std.c.getenv("GLM_RESIDENCY") == null) {} else if (e.device.residencySet(e.w.buffers.items.len + e.arena.buffers.items.len)) |set| {
-            for (e.w.buffers.items) |b| set.add(b);
+        if (resident) |set| { // the weights joined before their reads; the caches and scratch join here
             for (e.arena.buffers.items) |b| set.add(b);
             set.commit();
             set.requestResidency();
             e.queue.addResidencySet(set);
             e.residency = set;
-        } else |_| {}
+        }
         // every Metal engine offers its queue to the idle keepalive; the sets list only when the model is resident
         if (e.residency) |set| e.keepalive_sets[0] = set;
         e.keepalive_target = .{ .queue = e.queue, .sets = if (e.residency != null) &e.keepalive_sets else &.{} };

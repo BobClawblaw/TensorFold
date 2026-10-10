@@ -498,7 +498,8 @@ fn runCopies(l: *Loader, threads: usize) !void {
 }
 
 /// The first `c.run` layers, the MTP layer (when stored) and the head; `dry`: check names, dtypes and shapes, read nothing.
-pub fn load(gpa: std.mem.Allocator, device: mtl.Device, dir: []const u8, c: *const cfg.Config, threads: usize, dry: bool) !*Weights {
+/// `resident`: a set the buffers join, requested resident before the reads; `wire`: their pages wired before the reads.
+pub fn load(gpa: std.mem.Allocator, device: mtl.Device, dir: []const u8, c: *const cfg.Config, threads: usize, dry: bool, resident: ?mtl.ResidencySet, wire: bool) !*Weights {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const w = try gpa.create(Weights);
@@ -526,6 +527,22 @@ pub fn load(gpa: std.mem.Allocator, device: mtl.Device, dir: []const u8, c: *con
         std.debug.print("glm plan: {d} of {d} layers{s}, {d:.2} GB in buffers, every tensor's name, dtype and shape checked\n", .{ c.run, c.layers, if (has_mtp) " and the MTP layer" else "", @as(f64, @floatFromInt(w.bytes)) / 1e9 });
         return w;
     }
+    if (wire) for (w.buffers.items) |b| try wireBuffer(b);
+    if (resident) |set| { // before the reads: the driver's wired collector reclaims buffers no command has used yet
+        for (w.buffers.items) |b| set.add(b);
+        set.commit();
+        set.requestResidency();
+    }
     try runCopies(&l, threads);
     return w;
+}
+
+extern "c" fn mlock(addr: *const anyopaque, len: usize) c_int;
+
+/// A buffer's pages faulted in and wired: never compressed, paged out or reclaimed while the buffer lives (GLM_WIRE).
+pub fn wireBuffer(b: mtl.Buffer) !void {
+    if (mlock(b.contents(), b.length()) != 0) {
+        std.log.err("glm: wiring a {d} MiB buffer failed (errno {d}): vm.user_wire_limit or free memory is short", .{ b.length() >> 20, std.c._errno().* });
+        return error.WireFailed;
+    }
 }
