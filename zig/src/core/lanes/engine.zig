@@ -107,8 +107,39 @@ pub const Engine = struct {
     /// Streams a backend prefills in one pass at most.
     pub const max_together = 16;
 
+    /// Whether the backend prefills several prompts in one pass (addStreams batches them).
+    pub fn batchesPrompts(e: *const Engine) bool {
+        return e.backend.vtable.prefill_many != null;
+    }
+
+    /// open.add for several streams: their prompts in one pass when the backend takes them together (else each
+    /// alone), then each opened as after its own prefill. ``errs[i]``: stream i's error (a cancelled one is released
+    /// already; the caller discards a failed one).
+    pub fn addStreams(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
+        for (errs) |*x| x.* = null;
+        const many = e.backend.vtable.prefill_many orelse return e.addEach(ss, errs);
+        if (ss.len < 2 or ss.len > max_together) return e.addEach(ss, errs);
+        _ = e.arena.reset(.retain_capacity);
+        for (ss) |s| trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch {};
+        const together = many(e.backend.ptr, ss) catch |err| {
+            for (errs) |*x| x.* = err;
+            return;
+        };
+        if (!together) return e.addEach(ss, errs);
+        for (ss, errs) |s, *x| {
+            if (s.isCancelled()) { // cancelled in its pass: no first token
+                e.backend.release(s);
+                x.* = error.Cancelled;
+                continue;
+            }
+            open.opened(e, s) catch |err| {
+                x.* = err;
+            };
+        }
+    }
+
     fn addEach(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
-        for (ss, errs) |s, *x| e.addStream(s) catch |err| {
+        for (ss, errs) |s, *x| open.add(e, s) catch |err| {
             x.* = err;
         };
     }

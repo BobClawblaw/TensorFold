@@ -726,6 +726,7 @@ fn of(p: *anyopaque) *Owned {
 
 const vtable: be.Backend.VTable = .{
     .prefill = prefillFn,
+    .prefill_many = prefillManyFn,
     .first = firstFn,
     .first_masked = firstMaskedFn,
     .queue = queueFn,
