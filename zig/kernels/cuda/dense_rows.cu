@@ -32,6 +32,7 @@ __device__ __forceinline__ void tile(const __nv_bfloat16* x, int64_t x_stride, c
 #pragma unroll
     for (int r = 0; r < RT; ++r) acc[r] = 0.f;
     const __nv_bfloat16* wr = w + static_cast<int64_t>(col) * k;
+#pragma unroll 4 // several 16-byte weight loads in flight a lane (memory-level parallelism)
     for (int k0 = lane * VEC; k0 < k; k0 += 32 * VEC) {
         float wf[VEC];
         unpack(*reinterpret_cast<const uint4*>(wr + k0), wf);
