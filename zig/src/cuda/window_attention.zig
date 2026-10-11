@@ -58,8 +58,7 @@ pub const WindowAttention = struct {
         return parts * w.d * 4 + 2 * parts * 4;
     }
 
-    /// n rows: q [n, h, d] bf16 at pos (int32 [n]) of streams slot (int32 [n] or none) -> out [n, h, d] bf16;
-    /// `scratch` holds scratchBytes(w, n) (a key-tile split, merged in tile order).
+    /// n rows q [n, h, d] at pos/slot (int32 [n]) -> out [n, h, d]; `scratch`: scratchBytes(w, n) (d != 128).
     pub fn decode(g: *const WindowAttention, s: Stream, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slot: ?u64, w: Window, scratch: u64, n: usize) !void {
         if (w.hk == 0 or w.h % w.hk != 0 or w.h / w.hk > 16 or w.d > 128 or w.ring == 0) return error.WindowShape;
         if (w.win == 0 and w.ring > 4096) return error.WindowShape; // an unwindowed row's tiles come from the ring

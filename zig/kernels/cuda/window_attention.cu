@@ -21,9 +21,7 @@ constexpr int DMAX = 128;  // head dim (static shared memory: q, a K and a V til
 
 using namespace tf_window;
 
-// Decode, split by key tile: block (row, key head, tile j) scores the row's tile t0 + j (t0: its window's first
-// tile) and writes its partial (max, sum, weighted values) per query head; tf_window_merge folds a row's partials
-// in tile order. q [W, H, D] at pos/slot (int32 [W]) over keys (pos - win, pos] at row slot * ring + key % ring.
+// Decode split by key tile (block: row, key head, tile); tf_window_merge folds the partials in tile order.
 extern "C" __global__ void __launch_bounds__(NT) tf_window_part(const __nv_bfloat16* __restrict__ q,
                                                                 const __nv_bfloat16* __restrict__ kc,
                                                                 const __nv_bfloat16* __restrict__ vc,
@@ -353,8 +351,7 @@ wattn_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restric
 }
 
 
-// Decode rows on tensor cores (head dim 128): a block a (row, key head), its g <= 16 query heads the 16 rows of one
-// mma tile; warp w walks the window's 32-key tiles w, w + 4, ... and the four partials fold in warp order.
+// Decode on tensor cores (d 128): a row's heads one mma tile; warps take every 4th 32-key tile, fold in warp order.
 extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
     __nv_bfloat16* __restrict__ out, const int* __restrict__ pos, const int* __restrict__ slot, int h, int hk, int win,
