@@ -204,7 +204,6 @@ pub const Stream = struct {
             .yield_check = spec.yield_check,
             .think_budget = spec.think_budget,
             .images = spec.images,
-            .structure = spec.structure,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),

@@ -95,10 +95,6 @@ pub const Server = struct {
     /// The facts the learner was taught and whether the weights recall them.
     slide: slide_graph.Graph,
     teacher: slide_lesson.Teacher, // what every Sliding Weights lesson shares: keep prompts, the turn's end
-    /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
-    grammars: ?*api.grammar.Compiler = null,
-    grammar_problem: ?[]const u8 = null,
-    grammar_mutex: std.Io.Mutex = .init,
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {

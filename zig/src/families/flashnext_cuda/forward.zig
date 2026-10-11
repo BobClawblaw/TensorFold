@@ -302,6 +302,7 @@ pub const Seq = struct {
     ikc: [ATT + 1]u64 = undefined, pooled: [ATT + 1]u64 = undefined,
     ple_tail: u64 = 0,
     last_streams: u64 = 0,
+    first_logits: u64 = 0, // the prompt's last head row (firstAgain draws the first token again under a mask)
     grow: grow_mod.Range = undefined, // the caches that grow with the position (kc_*, ikc, pooled)
     img: ?Image = null, // an image prompt's rotary table and (until its prefill ends) its features
     sampling: ?lanes.Sampling = null, // the stream's draw (null: greedy); its rows step eagerly
@@ -337,6 +338,7 @@ pub const Seq = struct {
         _ = cap; // the position-sized caches live in ``grow`` (layGrow)
         s.ple_tail = c.take(9 * WIDE * 2);
         s.last_streams = c.take(WIDE * 2);
+        s.first_logits = c.take(HEAD_N * 2);
     }
 
     /// Each attention layer's caches as regions of one reserved range (mapped as positions reach them).
@@ -1357,6 +1359,7 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32, start: usize) !u32 {
         if (final) { // the head on the last row, its candidates before the MTP head reuses the logits buffer
             _ = try finish(e, b, e.mixer, R, pending);
             try kern.matmul(&e.k, b.mixed, D, e.head, b.logits, HEAD_N, false, 1, b.kpart);
+            try e.k.copy(s.first_logits, b.logits, @intCast(HEAD_N * 2));
             _ = try applyMasks(e, b.logits, &.{.{ .s = s, .row0 = 0, .rows = 1 }});
             try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, 1);
             var picks: [1]Pick = undefined;
@@ -1558,6 +1561,26 @@ pub fn prefillMany(e: *Engine, prompts: []const Prompt, firsts: []u32) !void {
 /// A stream's grammar rows for its next forward: each row of its window the grammar constrains (in window order)
 /// and that row's allowed bits over this rank's columns, MASK_WORDS words a row.
 pub const Mask = struct { rows: []const u32, bits: []const u32 };
+
+/// The prompt's first token drawn again under a grammar's ``bits`` for its row (Backend.first_masked), on both
+/// ranks: the prompt's last head row (kept at prefill) masked, its candidates, the pick, the stream's draw.
+pub fn firstAgain(e: *Engine, s: *Seq, bits: []const u32, position: u64) !u32 {
+    const b = &e.pbuf;
+    try e.k.copy(b.logits, s.first_logits, @intCast(HEAD_N * 2));
+    const rows = [_]u32{0};
+    s.mask = .{ .rows = &rows, .bits = bits };
+    _ = try applyMasks(e, b.logits, &.{.{ .s = s, .row0 = 0, .rows = 1 }});
+    try candidates(e, b, b.logits, HEAD_N, 0, e.vocab_offset, 1);
+    var picks: [1]Pick = undefined;
+    try readPicks(e, b, 1, &picks);
+    var tok: u32 = @intCast(picks[0].tok);
+    if (s.sampling) |rule| {
+        var t: [1]u32 = .{tok};
+        try drawRows(e, b, b.logits, 1, &.{.{ .row = 0, .s = rule, .position = @intCast(position) }}, &t);
+        tok = t[0];
+    }
+    return tok;
+}
 pub const MASK_WORDS: usize = @intCast(@divExact(HEAD_N, 32));
 
 /// Every segment's grammar rows to -inf in ``logits`` (both ranks, before the picks); whether any was masked.

@@ -20,7 +20,6 @@ pub const prompt_rows: u32 = 2048;
 pub const two_ranks = true;
 
 /// Structured output: rank 0 masks each window's grammar rows (gramRows), rank 1 the same rows from its frames.
-pub const structures = true;
 
 pub const Options = struct {
     context: usize,
@@ -66,7 +65,7 @@ const draft_confidence: f64 = 0.7;
 
 // -- the protocol rank 0 sends rank 1 ---------------------------------------------------------------------------
 
-const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10, keeps = 11, prefills = 12, grow = 13 };
+const Op = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, release = 5, stop = 6, ready = 7, shared = 8, drafts = 9, image = 10, keeps = 11, prefills = 12, grow = 13, first_masked = 14 };
 
 const Writer = struct {
     buf: std.ArrayList(u8) = .empty,
@@ -124,16 +123,7 @@ const Lane = struct {
     probs: [max_depth]f64 = undefined,  // the head's chance for each (0 past the confidence cut)
     nheld: u32 = 0,
     rows: u32 = 0,                      // the last verify's rows, not yet committed (0: nothing pending)
-    g: ?Gram = null,                    // the reply's grammar (rank 0)
     first: u64 = 0,                     // the prompt's first token (a handle: readFn)
-};
-
-/// A reply's grammar on rank 0 (engine/grammar.py's Constraint): its matcher at the reply's committed tokens.
-const Gram = struct {
-    m: lanes.grammar.Matcher,
-    after: ?u32,          // with thinking on: the grammar starts after this token
-    active: bool,
-    fed: usize = 0,       // reply tokens the matcher has followed
 };
 
 /// A released sequence kept to resume from (multi.py's kept): its prompt to the kept point, rank 1's id for it.
@@ -163,41 +153,18 @@ const Rows = struct {
 
 const MW = forward.MASK_WORDS;
 
-/// Follow the reply's committed tokens, then the rows of a window over ``ids`` (row 0 the pending token, drafts
-/// after) the grammar constrains, as grammar.py's window(): each row the matcher reaches (a draft it rejects ends the
-/// path: no later row can be accepted), its allowed bits. The matcher is rolled back to the committed tokens.
-fn gramRows(g: *Gram, s: *const lanes.Stream, ids: []const u32, full: []u32, out: *Rows) !void {
+/// A window's grammar rows from the lane core's masks (rows x 2 MW words over the whole vocabulary): each row's
+/// bits as each rank's half.
+fn maskRows(masks: []const u32, rows: usize, out: *Rows) !void {
     out.n = 0;
-    const emitted = s.context.items[s.prompt_len..];
-    for (emitted[g.fed..]) |t| {
-        if (!g.active) {
-            g.active = g.after != null and t == g.after.?;
-            continue;
-        }
-        if (g.m.terminated()) break;
-        if (!try g.m.accept(t)) return error.GrammarRejected;
-    }
-    g.fed = emitted.len;
-    var active = g.active;
-    var taken: usize = 0;
-    defer g.m.rollback(taken) catch {};
-    for (0..ids.len) |r| {
-        if (active and !g.m.terminated()) {
-            const words = full[0 .. 2 * MW];
-            try g.m.fill(words);
-            @memcpy(out.bits[0][out.n * MW ..][0..MW], words[0..MW]);
-            @memcpy(out.bits[1][out.n * MW ..][0..MW], words[MW..]);
-            out.rows[out.n] = @intCast(r);
-            out.n += 1;
-        }
-        if (r + 1 == ids.len) break;
-        const next = ids[r + 1];
-        if (!active) {
-            active = g.after != null and next == g.after.?;
-            continue;
-        }
-        if (g.m.terminated() or !try g.m.accept(next)) break;
-        taken += 1;
+    if (masks.len == 0) return;
+    if (masks.len != rows * 2 * MW or rows > max_rows) return error.InvalidGrammarMasks;
+    for (0..rows) |r| {
+        const w = masks[r * 2 * MW ..][0 .. 2 * MW];
+        @memcpy(out.bits[0][out.n * MW ..][0..MW], w[0..MW]);
+        @memcpy(out.bits[1][out.n * MW ..][0..MW], w[MW..]);
+        out.rows[out.n] = @intCast(r);
+        out.n += 1;
     }
 }
 
@@ -759,8 +726,8 @@ fn of(p: *anyopaque) *Owned {
 
 const vtable: be.Backend.VTable = .{
     .prefill = prefillFn,
-    .prefill_many = prefillManyFn,
     .first = firstFn,
+    .first_masked = firstMaskedFn,
     .queue = queueFn,
     .read = readFn,
     .verify = verifyFn,
@@ -874,20 +841,7 @@ fn setupPrefill(self: *Owned, s: *lanes.Stream, w: *Writer, at: usize, resumed: 
     }
     const id = self.next_id;
     self.next_id += 1;
-    // a grammar: compiled (the server's compile is cached), its first row when it starts with the reply
-    var gram: ?Gram = null;
-    errdefer if (gram) |g| g.m.free();
-    var grows: Rows = .{};
-    if (s.structure) |st| {
-        try self.gramScratch();
-        if (st.compiler.words != 2 * MW) return error.GrammarVocabulary;
-        var err: [512]u8 = undefined;
-        const compiled = try st.compiler.compile(self.io, st.kind, st.text, &err);
-        defer compiled.free();
-        gram = .{ .m = try compiled.matcher(), .after = st.after, .active = st.after == null };
-        grows.bits = .{ self.gbits[0][at * MW ..], self.gbits[1][at * MW ..] };
-        try gramRows(&gram.?, s, &.{0}, self.gfull, &grows);
-    }
+    var grows: Rows = .{}; // a grammar's first row: first_masked draws the first token again under the lane core's mask
     try w.int(id);
     try w.tokens(ids);
     try writeSampling(w, s.sampling);
@@ -913,9 +867,7 @@ fn setupPrefill(self: *Owned, s: *lanes.Stream, w: *Writer, at: usize, resumed: 
         @memcpy(self.growsbuf[at..][0..grows.n], grows.rows[0..grows.n]);
         seq.mask = .{ .rows = self.growsbuf[at..][0..grows.n], .bits = grows.bits[0][0 .. grows.n * MW] };
     }
-    if (gop.found_existing) if (gop.value_ptr.g) |g| g.m.free();
-    gop.value_ptr.* = .{ .seq = seq, .id = id, .g = gram };
-    gram = null;
+    gop.value_ptr.* = .{ .seq = seq, .id = id };
     return .{ .s = seq, .ids = ids, .start = start };
 }
 
@@ -934,7 +886,7 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     try w.int(ss.len);
-    for (ss) |s| if (s.structure != null) return false; // grammars one by one (a refused one stays alone)
+    for (ss) |s| if (s.grammar != null) return false; // grammars one by one (a refused one stays alone)
     var prompts: [max_streams]forward.Prompt = undefined;
     var resumed: [max_streams]u64 = undefined;
     for (ss, 0..) |s, k| prompts[k] = setupPrefill(self, s, &w, k, &resumed[k]) catch |err| {
@@ -1001,7 +953,6 @@ fn agree(self: *Owned, prompts: []const forward.Prompt) !void {
 fn undoSetups(self: *Owned, ss: []const *lanes.Stream, resumed: []const u64) void {
     for (ss, resumed) |done, rid| {
         const kv = self.lanes_by.fetchRemove(done) orelse continue;
-        if (kv.value.g) |g| g.m.free();
         if (rid != 0) {
             var wr: Writer = .{ .gpa = self.gpa };
             defer wr.buf.deinit(self.gpa);
@@ -1017,6 +968,25 @@ fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
     const self = of(p);
     if (position != s.prompt_len) return error.PositionMismatch;
     return (self.lanes_by.get(s) orelse return error.NoLane).first;
+}
+
+/// The first token drawn again among ``mask``'s allowed tokens (prefill drew it unmasked), on both ranks.
+fn firstMaskedFn(p: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+    const self = of(p);
+    if (position != s.prompt_len) return error.PositionMismatch;
+    const l = self.lanes_by.getPtr(s) orelse return error.NoLane;
+    try self.gramScratch();
+    var grows: Rows = .{ .bits = .{ self.gbits[0], self.gbits[1] } };
+    try maskRows(mask, 1, &grows);
+    var w: Writer = .{ .gpa = self.gpa };
+    defer w.buf.deinit(self.gpa);
+    try w.int(l.id);
+    try w.int(position);
+    try writeRows(&w, &grows);
+    try self.send(.first_masked, &w);
+    const tok = try forward.firstAgain(self.e, l.seq, grows.bits[0][0..MW], position);
+    l.first = self.take(tok);
+    return l.first;
 }
 
 fn queueFn(_: *anyopaque, _: *lanes.Stream, _: be.Feed, _: u64) anyerror!u64 {
@@ -1045,9 +1015,10 @@ fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyer
     ids[0] = win.pending;
     if (win.held > 0) @memcpy(ids[1..][0..win.held], l.held[0..win.held]) else @memcpy(ids[1..][0..win.tokens.len], win.tokens);
     var grows: Rows = .{};
-    if (l.g) |*g| {
+    if (win.masks.len > 0) {
+        try self.gramScratch();
         grows.bits = .{ self.gbits[0], self.gbits[1] };
-        try gramRows(g, win.stream, ids[0..rows], self.gfull, &grows);
+        try maskRows(win.masks, rows, &grows);
     }
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
@@ -1103,9 +1074,10 @@ fn verifyShared(self: *Owned, windows: []const be.Window, out: []be.Verified) an
     for (windows, 0..) |win, k| {
         const rows = win.rows();
         grows[k] = .{};
-        if (lanes_of[k].g) |*g| {
+        if (win.masks.len > 0) {
+            try self.gramScratch();
             grows[k].bits = .{ self.gbits[0][used * MW ..], self.gbits[1][used * MW ..] };
-            try gramRows(g, win.stream, ids[k][0..rows], self.gfull, &grows[k]);
+            try maskRows(win.masks, rows, &grows[k]);
             used += grows[k].n;
         }
         try w.int(lanes_of[k].id);
@@ -1255,7 +1227,6 @@ fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
     const self = of(p);
     const kv = self.lanes_by.fetchRemove(s) orelse return;
     forward.logGraphs(self.e);
-    if (kv.value.g) |g| g.m.free();
     var w: Writer = .{ .gpa = self.gpa };
     defer w.buf.deinit(self.gpa);
     const seq = kv.value.seq;
@@ -1360,6 +1331,13 @@ fn followLoop(p: *anyopaque) anyerror!void {
                 for (prompts[0..n], 0..) |*pr, k| pr.* = try followPrefill(self, &r, k, &grown);
                 var firsts: [max_streams]u32 = undefined;
                 if (try self.settleGrowth(grown, prompts[0..n])) try forward.prefillMany(self.e, prompts[0..n], firsts[0..n]);
+            },
+            .first_masked => {
+                const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;
+                const position = try r.int();
+                try self.gramScratch();
+                const mk = (try readRows(&r, self.growsbuf[0..], self.gbits[1])) orelse return error.InvalidGrammarMasks;
+                _ = try forward.firstAgain(self.e, seq, mk.bits, position);
             },
             .verify => {
                 const seq = self.by_id.get(try r.int()) orelse return error.NoSequence;

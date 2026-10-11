@@ -37,7 +37,6 @@ const kernels = [_]Kernel{
     .{ .name = "qmmf", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's device code (FP8G, FP4), tensorfold_nvfp4_v3
     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
-    .{ .name = "fp8_lane", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's FP8G device code, tensorfold_nvfp4_v3
     // Flash Next (qwen4_exp): device copies of the Python engine's extensions (zig/tests/cuda/flashnext/gen_copies.py)
     .{ .name = "fn_experts", .src = "flashnext/experts", .flags = &.{"-O3"} }, // cuda/experts.py, tensorfold_experts_v7
     .{ .name = "fn_experts_prefill", .src = "flashnext/experts_prefill", .flags = &.{"-O3"} },

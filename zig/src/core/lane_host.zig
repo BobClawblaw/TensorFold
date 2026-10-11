@@ -269,54 +269,10 @@ pub const LaneHost = struct {
 
     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
     fn admitOne(h: *LaneHost) bool {
-        const job = h.takeJob() orelse return false;
-        if (!h.prepare(job)) return true;
-        if (h.loneFits(job)) return h.runLone(job, job.began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
-        h.prefilled(job, job.began);
-        if (h.deliver(job)) h.remove(job);
-        return true;
-    }
-
-    /// Every queued request a lane is free for, their prompts in one pass where the backend takes several
-    /// (lanes.Engine.addStreams): one request alone goes through admitOne (the lone driver, a prompt alone).
-    fn admitMany(h: *LaneHost) bool {
-        if (!h.core.batchesPrompts()) return h.admitOne();
-        h.lock();
-        const waiting = h.queued.items.len;
-        const free = h.info_.lanes -| h.admitted.items.len;
-        h.unlock();
-        if (waiting < 2 or free < 2) return h.admitOne();
-        var jobs: [lanes.Engine.max_together]*Job = undefined;
-        var n: usize = 0;
-        while (n < jobs.len) {
-            const job = h.takeJob() orelse break;
-            if (!h.prepare(job)) continue;
-            jobs[n] = job;
-            n += 1;
-        }
-        if (n == 0) return true;
-        var streams: [lanes.Engine.max_together]*lanes.Stream = undefined;
-        for (jobs[0..n], 0..) |job, i| streams[i] = &job.stream;
-        var errs: [lanes.Engine.max_together]?anyerror = undefined;
-        h.core.addStreams(streams[0..n], errs[0..n]);
-        for (jobs[0..n], errs[0..n]) |job, err| {
-            if (err) |e| {
-                _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
-                continue;
-            }
-            h.prefilled(job, job.began);
-            if (h.deliver(job)) h.remove(job);
-        }
-        return true;
-    }
-
-    /// The next queued request into the admitted ones (null: none waits or no lane is free).
-    fn takeJob(h: *LaneHost) ?*Job {
         h.lock();
         if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
-            return null;
+            return false;
         }
         if (h.info_.admit) |a| { // a shared cache pool: the next request waits for room (always there when idle)
             const r = h.queued.items[0].request;
@@ -329,14 +285,9 @@ pub const LaneHost = struct {
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
-            return null;
+            return true;
         };
         h.unlock();
-        return job;
-    }
-
-    /// The admitted request's stream (the prompt cache's entry, its drafter); false when it was dropped instead.
-    fn prepare(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
@@ -346,10 +297,7 @@ pub const LaneHost = struct {
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch {
-            _ = h.drop(job, "the drafter could not start");
-            return false;
-        };
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -379,8 +327,7 @@ pub const LaneHost = struct {
             .decide = r.decide,
         }) catch {
             job.proposer.deinit();
-            _ = h.drop(job, "out of memory");
-            return false;
+            return h.drop(job, "out of memory");
         };
         job.started = true;
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
@@ -611,9 +558,7 @@ pub const LaneHost = struct {
             }
             h.unlock();
             h.core.step() catch |e| {
-                var refused: [lanes.Engine.max_together]*lanes.Stream = undefined;
-                const n = h.core.refused(&refused);
-                if (n > 0) h.failSome(refused[0..n], h.words(e)) else h.failAll(h.words(e));
+                h.failAll(@errorName(e));
                 continue;
             };
             var i: usize = 0;
@@ -625,32 +570,6 @@ pub const LaneHost = struct {
                     h.unlock();
                 } else i += 1;
             }
-        }
-    }
-
-    /// A round the backend refused for some streams alone (their caches could not grow): those end with its error,
-    /// the others take the next round.
-    fn failSome(h: *LaneHost, streams: []const *lanes.Stream, message: []const u8) void {
-        var i: usize = 0;
-        while (true) {
-            h.lock();
-            if (i >= h.admitted.items.len) {
-                h.unlock();
-                break;
-            }
-            const job = h.admitted.items[i];
-            const hit = for (streams) |s| {
-                if (s == &job.stream) break true;
-            } else false;
-            if (!hit) {
-                i += 1;
-                h.unlock();
-                continue;
-            }
-            _ = h.admitted.orderedRemove(i);
-            h.unlock();
-            if (!job.stream.finished) h.core.discard(&job.stream);
-            h.finish(job, .failed, message);
         }
     }
 

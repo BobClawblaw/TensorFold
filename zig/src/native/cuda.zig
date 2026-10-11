@@ -260,12 +260,6 @@ const Host = struct {
                     return x.inner.vtable.prefill(x.inner.ptr, s);
                 }
             }.f,
-            .prefill_many = if (v.prefill_many != null) struct {
-                fn f(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
-                    const x = bind(p);
-                    return x.inner.vtable.prefill_many.?(x.inner.ptr, ss);
-                }
-            }.f else null,
             .first = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
                     const x = bind(p);
@@ -469,7 +463,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    const room = after.room(model) -| loaded.learn_bytes;
+    const room = after.room(model) -| learnBytes(loaded);
     const free = loaded.free_streams;
     const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -485,7 +479,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // the lane core's kept states (Nemotron's snapshots); a family that keeps its own prompt states has no `target`
     const cache = if (@hasField(@TypeOf(loaded), "target")) budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free)) else 0;
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
-        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (@hasField(@TypeOf(loaded), "learn_bytes") and loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learnBytes(loaded) > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learnBytes(loaded))}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
@@ -500,7 +494,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         store.deinit();
         gpa.destroy(store);
     };
-    if (loaded.learns != null) {
+    if (comptime @hasField(@TypeOf(loaded), "learns")) { // a family with a Living Weights learner
+        if (loaded.learns != null) {
         const Slide = nemotron_slide.Adapter(F.slide);
         h.dir = try gpa.dupe(u8, o.dir);
         const s = try gpa.create(Slide);
@@ -514,6 +509,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             }
         }.f;
         h.learn = s.hook();
+        }
     }
     errdefer if (h.slide) |s| {
         h.slide_free.?(gpa, s);
@@ -528,6 +524,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = Host.followFamily };
     }
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// A family's bytes kept for --slide (0 for families without a learner).
+fn learnBytes(loaded: anytype) u64 {
+    return if (@hasField(@TypeOf(loaded), "learn_bytes")) loaded.learn_bytes else 0;
 }
 
 fn toGib(bytes: u64) f64 {
