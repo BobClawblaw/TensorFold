@@ -44,45 +44,122 @@ __device__ __forceinline__ float inv_rms(float part, int width, float eps) {
 
 using namespace tf_norms;
 
+namespace tf_norms {
+
+constexpr int CACHED = 32; // a thread keeps its row values in registers up to CACHED * NT = 8,192 wide
+
+// rms rows; WIDE re-reads the row from memory (wider than CACHED * NT), the same arithmetic in the same order.
+template <bool WIDE>
+__device__ __forceinline__ void rms_row(const void* x, int x_kind, const float* w, void* y, int y_kind, int width,
+                                        float eps) {
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
+    float v[WIDE ? 1 : CACHED];
+    float part = 0.f;
+#pragma unroll
+    for (int j = 0; j < (WIDE ? 1 : CACHED); ++j) v[j] = 0.f;
+    if (WIDE) {
+        for (int i = threadIdx.x; i < width; i += NT) {
+            const float a = load(x, x_kind, at + i);
+            part = __fmaf_rn(a, a, part);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < CACHED; ++j) {
+            const int i = threadIdx.x + j * NT;
+            if (i < width) {
+                v[j] = load(x, x_kind, at + i);
+                part = __fmaf_rn(v[j], v[j], part);
+            }
+        }
+    }
+    const float inv = inv_rms(part, width, eps);
+    if (WIDE) {
+        for (int i = threadIdx.x; i < width; i += NT) {
+            float a = __fmul_rn(load(x, x_kind, at + i), inv);
+            if (w != nullptr) a = __fmul_rn(a, w[i]);
+            store(y, y_kind, at + i, a);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < CACHED; ++j) {
+            const int i = threadIdx.x + j * NT;
+            if (i < width) {
+                float a = __fmul_rn(v[j], inv);
+                if (w != nullptr) a = __fmul_rn(a, w[i]);
+                store(y, y_kind, at + i, a);
+            }
+        }
+    }
+}
+
+template <bool WIDE>
+__device__ __forceinline__ void add_rms_row(const void* x, int x_kind, float* res, const float* w1, const float* w2,
+                                            void* y, int y_kind, int width, float eps) {
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
+    if (WIDE) {
+        float inv1 = 1.f;
+        if (w1 != nullptr) {
+            float part = 0.f;
+            for (int i = threadIdx.x; i < width; i += NT) {
+                const float a = load(x, x_kind, at + i);
+                part = __fmaf_rn(a, a, part);
+            }
+            inv1 = inv_rms(part, width, eps);
+        }
+        float part = 0.f;
+        for (int i = threadIdx.x; i < width; i += NT) {
+            float a = load(x, x_kind, at + i);
+            if (w1 != nullptr) a = __fmul_rn(__fmul_rn(a, inv1), w1[i]);
+            const float r = __fadd_rn(res[at + i], a);
+            res[at + i] = r;
+            part = __fmaf_rn(r, r, part);
+        }
+        const float inv2 = inv_rms(part, width, eps);
+        for (int i = threadIdx.x; i < width; i += NT) store(y, y_kind, at + i, __fmul_rn(__fmul_rn(res[at + i], inv2), w2[i]));
+        return;
+    }
+    float v[CACHED];
+    float part = 0.f;
+#pragma unroll
+    for (int j = 0; j < CACHED; ++j) {
+        const int i = threadIdx.x + j * NT;
+        v[j] = i < width ? load(x, x_kind, at + i) : 0.f;
+        if (i < width) part = __fmaf_rn(v[j], v[j], part);
+    }
+    const float inv1 = w1 != nullptr ? inv_rms(part, width, eps) : 1.f;
+    part = 0.f;
+#pragma unroll
+    for (int j = 0; j < CACHED; ++j) {
+        const int i = threadIdx.x + j * NT;
+        if (i < width) {
+            float a = v[j];
+            if (w1 != nullptr) a = __fmul_rn(__fmul_rn(a, inv1), w1[i]);
+            v[j] = __fadd_rn(res[at + i], a);
+            res[at + i] = v[j];
+            part = __fmaf_rn(v[j], v[j], part);
+        }
+    }
+    const float inv2 = inv_rms(part, width, eps);
+#pragma unroll
+    for (int j = 0; j < CACHED; ++j) {
+        const int i = threadIdx.x + j * NT;
+        if (i < width) store(y, y_kind, at + i, __fmul_rn(__fmul_rn(v[j], inv2), w2[i]));
+    }
+}
+
+}  // namespace tf_norms
+
 // y = x * rsqrt(mean(x^2) + eps) * w (w null: no weight), in fp32, rounded once to y's kind.
 extern "C" __global__ void __launch_bounds__(NT) tf_rms_rows(const void* x, int x_kind, const float* w, void* y,
                                                              int y_kind, int width, float eps) {
-    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
-    float part = 0.f;
-    for (int i = threadIdx.x; i < width; i += NT) {
-        const float v = load(x, x_kind, at + i);
-        part = __fmaf_rn(v, v, part);
-    }
-    const float inv = inv_rms(part, width, eps);
-    for (int i = threadIdx.x; i < width; i += NT) {
-        float v = __fmul_rn(load(x, x_kind, at + i), inv);
-        if (w != nullptr) v = __fmul_rn(v, w[i]);
-        store(y, y_kind, at + i, v);
-    }
+    if (width > CACHED * NT) rms_row<true>(x, x_kind, w, y, y_kind, width, eps);
+    else rms_row<false>(x, x_kind, w, y, y_kind, width, eps);
 }
 
 // res (fp32, in place) += rms(x) * w1 (a sandwich norm; null: res += x), then y = rms(res) * w2 in y's kind.
 extern "C" __global__ void __launch_bounds__(NT) tf_add_rms_rows(const void* x, int x_kind, float* res, const float* w1,
                                                                  const float* w2, void* y, int y_kind, int width,
                                                                  float eps) {
-    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
-    float inv1 = 1.f;
-    if (w1 != nullptr) {
-        float part = 0.f;
-        for (int i = threadIdx.x; i < width; i += NT) {
-            const float v = load(x, x_kind, at + i);
-            part = __fmaf_rn(v, v, part);
-        }
-        inv1 = inv_rms(part, width, eps);
-    }
-    float part = 0.f;
-    for (int i = threadIdx.x; i < width; i += NT) {
-        float v = load(x, x_kind, at + i);
-        if (w1 != nullptr) v = __fmul_rn(__fmul_rn(v, inv1), w1[i]);
-        const float r = __fadd_rn(res[at + i], v);
-        res[at + i] = r;
-        part = __fmaf_rn(r, r, part);
-    }
-    const float inv2 = inv_rms(part, width, eps);
-    for (int i = threadIdx.x; i < width; i += NT) store(y, y_kind, at + i, __fmul_rn(__fmul_rn(res[at + i], inv2), w2[i]));
+    if (width > CACHED * NT) add_rms_row<true>(x, x_kind, res, w1, w2, y, y_kind, width, eps);
+    else add_rms_row<false>(x, x_kind, res, w1, w2, y, y_kind, width, eps);
 }

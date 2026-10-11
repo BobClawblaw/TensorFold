@@ -7,7 +7,7 @@ const check = @import("check.zig");
 const ref = core.norms_ref;
 const Kind = cuda.norms.Kind;
 
-const widths = [_]usize{ 64, 2560, 5120, 7168 };
+const widths = [_]usize{ 64, 2560, 5120, 7168, 9216 }; // 9,216: past 8,192, the re-reading path
 const counts = [_]usize{ 1, 3, 17, 300 };
 const most = counts[counts.len - 1];
 const eps: f32 = 1e-6;
