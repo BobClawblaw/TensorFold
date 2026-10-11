@@ -16,11 +16,14 @@ pub const Window = struct { h: usize, hk: usize, d: usize, win: usize, ring: usi
 /// The prompt kernel's instances: head dim 128, 8 warps, 4 or 8 query heads a block (`hpc`), 8 staging slots.
 const prompt_name = "_ZN16tf_window_prompt12wattn_kernelILi128ELi8ELi{d}ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifii";
 const prompt_smem: u32 = 8 * 32 * 16 * 16; // NS * HALF * (D / 8) uint4
+/// tf_window_decode_tc: four warps' K and V slots of 32 keys (64 KiB), reused for the warps' partials.
+const tc_smem: u32 = 4 * 2 * 32 * 16 * 16;
 
 pub const WindowAttention = struct {
     mod: Module,
     part_fn: Function,
     merge_fn: Function,
+    tc_fn: Function,
     prompt_fns: [2]Function, // 4, then 8 query heads a block
 
     pub fn load(d: *const Driver) !WindowAttention {
@@ -32,7 +35,11 @@ pub const WindowAttention = struct {
             p[i] = try mod.function(std.fmt.comptimePrint(prompt_name, .{hpc}));
             try p[i].allowDynamicShared(prompt_smem);
         }
-        return .{ .mod = mod, .part_fn = try mod.function("tf_window_part"), .merge_fn = try mod.function("tf_window_merge"), .prompt_fns = p };
+        return .{ .mod = mod, .part_fn = try mod.function("tf_window_part"), .merge_fn = try mod.function("tf_window_merge"), .tc_fn = tc: {
+            const f = try mod.function("tf_window_decode_tc");
+            try f.allowDynamicShared(tc_smem);
+            break :tc f;
+        }, .prompt_fns = p };
     }
 
     pub fn unload(g: *WindowAttention) void {
@@ -46,6 +53,7 @@ pub const WindowAttention = struct {
 
     /// The fp32 partials `decode` writes for up to `rows` rows: o, then m and l.
     pub fn scratchBytes(w: Window, rows: usize) usize {
+        if (w.d == 128) return 16; // the tensor-core form keeps its partials in shared memory
         const parts = rows * w.hk * tiles(w) * (w.h / w.hk);
         return parts * w.d * 4 + 2 * parts * 4;
     }
@@ -56,6 +64,16 @@ pub const WindowAttention = struct {
         if (w.hk == 0 or w.h % w.hk != 0 or w.h / w.hk > 16 or w.d > 128 or w.ring == 0) return error.WindowShape;
         if (w.win == 0 and w.ring > 4096) return error.WindowShape; // an unwindowed row's tiles come from the ring
         if (n == 0) return;
+        if (w.d == 128) { // tensor cores; the heads of a row are one mma tile
+            var c: launch_.Args = .{};
+            for ([_]u64{ q, kc, vc, out, pos, slot orelse 0 }) |v| c.add(v);
+            c.add(@as(i32, @intCast(w.h)));
+            c.add(@as(i32, @intCast(w.hk)));
+            c.add(@as(i32, @intCast(w.win)));
+            c.add(@as(i64, @intCast(w.ring)));
+            c.add(w.scale);
+            return launch_.launch(g.tc_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk), .z = 1 }, .block = .{ .x = 128 }, .shared = tc_smem }, s, &c);
+        }
         const t = tiles(w);
         const parts = n * w.hk * t * (w.h / w.hk);
         const po = scratch;

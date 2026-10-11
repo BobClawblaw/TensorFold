@@ -352,6 +352,170 @@ wattn_kernel(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restric
     }
 }
 
+
+// Decode rows on tensor cores (head dim 128): a block a (row, key head), its g <= 16 query heads the 16 rows of one
+// mma tile; warp w walks the window's 32-key tiles w, w + 4, ... and the four partials fold in warp order.
+extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kc, const __nv_bfloat16* __restrict__ vc,
+    __nv_bfloat16* __restrict__ out, const int* __restrict__ pos, const int* __restrict__ slot, int h, int hk, int win,
+    long long ring, float scale) {
+    constexpr int D = 128, C = D / 8, K16 = D / 16, NB = D / 8, HB = 32;
+    extern __shared__ uint4 smem[];
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g8 = lane / 4, qd = lane % 4, mt = lane / 8;
+    const int64_t r = blockIdx.x;
+    const int kh = blockIdx.y, G = h / hk;
+    uint4* ks = smem + warp * 2 * HB * C;
+    uint4* vs = ks + HB * C;
+    const int p = pos[r];
+    const int64_t base = (slot != nullptr ? static_cast<int64_t>(slot[r]) : 0) * ring;
+    const int lo = win > 0 ? max(p - win + 1, 0) : 0;
+    uint32_t qa[K16][4];
+    {
+        const int h0 = g8, h1 = g8 + 8;
+        const uint32_t* q0 = reinterpret_cast<const uint32_t*>(q + ((int64_t)r * h + kh * G + min(h0, G - 1)) * D);
+        const uint32_t* q1 = reinterpret_cast<const uint32_t*>(q + ((int64_t)r * h + kh * G + min(h1, G - 1)) * D);
+#pragma unroll
+        for (int k = 0; k < K16; ++k) {
+            qa[k][0] = h0 < G ? q0[8 * k + qd] : 0u;
+            qa[k][1] = h1 < G ? q1[8 * k + qd] : 0u;
+            qa[k][2] = h0 < G ? q0[8 * k + qd + 4] : 0u;
+            qa[k][3] = h1 < G ? q1[8 * k + qd + 4] : 0u;
+        }
+    }
+    float o[NB][4];
+#pragma unroll
+    for (int i = 0; i < NB; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
+    for (int t = lo / HB + warp; t <= p / HB; t += 4) {
+        for (int i = lane; i < HB * C; i += 32) {
+            const int key = t * HB + i / C;
+            const bool in = key >= lo && key <= p;
+            const int64_t row = base + (in ? key : lo) % ring;
+            cp16z(ks + sw<D>(i / C, i % C), kc + (row * hk + kh) * D + (i % C) * 8, in);
+            cp16z(vs + sw<D>(i / C, i % C), vc + (row * hk + kh) * D + (i % C) * 8, in);
+        }
+        commit();
+        wait_group<0>();
+        __syncwarp();
+        float sc[4][4];
+#pragma unroll
+        for (int k = 0; k < K16; ++k) {
+#pragma unroll
+            for (int n = 0; n < 4; n += 2) {
+                uint32_t b[4];
+                ldmatrix4(b, ks + sw<D>(8 * (n + mt / 2) + lane % 8, 2 * k + mt % 2));
+                if (k == 0) {
+                    mma0(sc[n], qa[k], b[0], b[1]);
+                    mma0(sc[n + 1], qa[k], b[2], b[3]);
+                } else {
+                    mma(sc[n], qa[k], b[0], b[1]);
+                    mma(sc[n + 1], qa[k], b[2], b[3]);
+                }
+            }
+        }
+        const int kb = t * HB + 2 * qd;
+        float tm0 = -INFINITY, tm1 = -INFINITY;
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const int c = kb + 8 * n;
+            const bool i0 = c >= lo && c <= p, i1 = c + 1 >= lo && c + 1 <= p;
+            sc[n][0] = i0 ? __fmul_rn(sc[n][0], scale) : -INFINITY;
+            sc[n][1] = i1 ? __fmul_rn(sc[n][1], scale) : -INFINITY;
+            sc[n][2] = i0 ? __fmul_rn(sc[n][2], scale) : -INFINITY;
+            sc[n][3] = i1 ? __fmul_rn(sc[n][3], scale) : -INFINITY;
+            tm0 = fmaxf(tm0, fmaxf(sc[n][0], sc[n][1]));
+            tm1 = fmaxf(tm1, fmaxf(sc[n][2], sc[n][3]));
+        }
+        for (int x = 1; x <= 2; x *= 2) {
+            tm0 = fmaxf(tm0, __shfl_xor_sync(0xffffffffu, tm0, x));
+            tm1 = fmaxf(tm1, __shfl_xor_sync(0xffffffffu, tm1, x));
+        }
+        const bool act = tm0 != -INFINITY; // the keys' mask is the same for every head
+        const float n0 = act ? fmaxf(m0, tm0) : m0, n1 = act ? fmaxf(m1, tm1) : m1;
+        const float a0 = act ? (m0 == -INFINITY ? 0.0f : texp(__fsub_rn(m0, n0))) : 1.0f;
+        const float a1 = act ? (m1 == -INFINITY ? 0.0f : texp(__fsub_rn(m1, n1))) : 1.0f;
+        float c0 = 0.0f, c1 = 0.0f;
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            sc[n][0] = sc[n][0] != -INFINITY ? texp(__fsub_rn(sc[n][0], n0)) : 0.0f;
+            sc[n][1] = sc[n][1] != -INFINITY ? texp(__fsub_rn(sc[n][1], n0)) : 0.0f;
+            sc[n][2] = sc[n][2] != -INFINITY ? texp(__fsub_rn(sc[n][2], n1)) : 0.0f;
+            sc[n][3] = sc[n][3] != -INFINITY ? texp(__fsub_rn(sc[n][3], n1)) : 0.0f;
+            c0 = __fadd_rn(c0, __fadd_rn(sc[n][0], sc[n][1]));
+            c1 = __fadd_rn(c1, __fadd_rn(sc[n][2], sc[n][3]));
+        }
+        for (int x = 1; x <= 2; x *= 2) {
+            c0 = __fadd_rn(c0, __shfl_xor_sync(0xffffffffu, c0, x));
+            c1 = __fadd_rn(c1, __shfl_xor_sync(0xffffffffu, c1, x));
+        }
+        l0 = __fmaf_rn(l0, a0, c0);
+        l1 = __fmaf_rn(l1, a1, c1);
+        m0 = n0;
+        m1 = n1;
+#pragma unroll
+        for (int i = 0; i < NB; ++i) {
+            o[i][0] = __fmul_rn(o[i][0], a0);
+            o[i][1] = __fmul_rn(o[i][1], a0);
+            o[i][2] = __fmul_rn(o[i][2], a1);
+            o[i][3] = __fmul_rn(o[i][3], a1);
+        }
+        uint32_t pa[2][4];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            pa[j][0] = pack(sc[2 * j][0], sc[2 * j][1]);
+            pa[j][1] = pack(sc[2 * j][2], sc[2 * j][3]);
+            pa[j][2] = pack(sc[2 * j + 1][0], sc[2 * j + 1][1]);
+            pa[j][3] = pack(sc[2 * j + 1][2], sc[2 * j + 1][3]);
+        }
+#pragma unroll
+        for (int i = 0; i < NB; i += 2) {
+            uint32_t b[4];
+            ldmatrix4t(b, vs + sw<D>(8 * (mt % 2) + lane % 8, i + mt / 2));
+            mma(o[i], pa[0], b[0], b[1]);
+            mma(o[i + 1], pa[0], b[2], b[3]);
+        }
+#pragma unroll
+        for (int i = 0; i < NB; i += 2) {
+            uint32_t b[4];
+            ldmatrix4t(b, vs + sw<D>(16 + 8 * (mt % 2) + lane % 8, i + mt / 2));
+            mma(o[i], pa[1], b[0], b[1]);
+            mma(o[i + 1], pa[1], b[2], b[3]);
+        }
+        __syncwarp(); // the next tile's copies overwrite this warp's slots
+    }
+    __syncthreads();
+    float* os = reinterpret_cast<float*>(smem);   // [4 warps][16 heads][D]
+    float* ms = os + 4 * 16 * D;                  // [4][16]
+    float* ls = ms + 4 * 16;
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+        const int d = 8 * i + 2 * qd;
+        os[(warp * 16 + g8) * D + d] = o[i][0];
+        os[(warp * 16 + g8) * D + d + 1] = o[i][1];
+        os[(warp * 16 + g8 + 8) * D + d] = o[i][2];
+        os[(warp * 16 + g8 + 8) * D + d + 1] = o[i][3];
+    }
+    if (qd == 0) {
+        ms[warp * 16 + g8] = m0, ls[warp * 16 + g8] = l0;
+        ms[warp * 16 + g8 + 8] = m1, ls[warp * 16 + g8 + 8] = l1;
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < G * D; idx += 128) {
+        const int hd = idx / D, e = idx % D;
+        float mm = -INFINITY;
+        for (int w = 0; w < 4; ++w) mm = fmaxf(mm, ms[w * 16 + hd]);
+        float acc = 0.0f, l = 0.0f;
+        for (int w = 0; w < 4; ++w) {
+            const float mw = ms[w * 16 + hd];
+            if (mw == -INFINITY) continue;
+            const float a = texp(__fsub_rn(mw, mm));
+            acc = __fmaf_rn(a, os[(w * 16 + hd) * D + e], acc);
+            l = __fmaf_rn(a, ls[w * 16 + hd], l);
+        }
+        out[((int64_t)r * h + kh * G + hd) * D + e] = __float2bfloat16_rn(tdiv(acc, l));
+    }
+}
+
 } // namespace tf_window_prompt
 
 // Head dim 128, eight warps, four or eight query heads a block, eight staging slots.
