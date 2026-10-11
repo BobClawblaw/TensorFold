@@ -1,4 +1,8 @@
 //! CUDA family registration, device setup, memory admission and the native lane host.
+/// The serve flags this build's engine takes past the common ones (server/cli.zig served()): two GB10 ranks, the
+/// attention cache's codes.
+pub const serves: []const []const u8 = &.{ "--tp", "--kv-dtype" };
+
 const std = @import("std");
 const cuda = @import("cuda");
 const api = @import("engine_api");

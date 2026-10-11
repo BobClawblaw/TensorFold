@@ -100,7 +100,7 @@ pub const flags = [_]Flag{
     .{ .name = "--master-port", .native = served("--tp") },
     // the GPU engine's policy switches as key=value pairs, repeatable
     .{ .name = "--policy", .kind = .append, .native = served("--policy") },
-    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" }, .native = served("--tp"), .native_values = &.{ "int8", "int4" } },
+    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" }, .native = served("--kv-dtype"), .native_values = &.{ "int8", "int4" } },
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
     .{ .name = "--precision", .choices = &.{ "checkpoint", "full" } },
