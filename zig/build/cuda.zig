@@ -35,7 +35,8 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_keyed", .flags = glue },
     .{ .name = "qmmf", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's device code (FP8G, FP4), tensorfold_nvfp4_v3
     .{ .name = "norms", .flags = &.{"-O3"} },
-    .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k routing and the weighted combine (cuda/moe_glue.zig) // ours: RMS norm rows for every family (cuda/norms.zig)
+    .{ .name = "moe_glue", .flags = &.{"-O3"} },
+    .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig) // ours: sigmoid top-k routing and the weighted combine (cuda/moe_glue.zig) // ours: RMS norm rows for every family (cuda/norms.zig)
     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },

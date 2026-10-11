@@ -17,6 +17,7 @@ pub const registry = @import("registry.zig");
 pub const tuning = @import("tuning.zig");
 pub const norms_ref = @import("norms_ref.zig");
 pub const moe_ref = @import("moe_ref.zig");
+pub const dense_ref = @import("dense_ref.zig");
 
 test {
     _ = safetensors;
@@ -35,4 +36,5 @@ test {
     _ = ids_json;
     _ = norms_ref;
     _ = moe_ref;
+    _ = dense_ref;
 }
