@@ -22,6 +22,20 @@ pub fn fit(total: u64, ready: u64, gib: ?f64, over: bool) error{CacheOverCap}!Fi
     return .{ .budget = want, .room = room, .cap = cap };
 }
 
+/// The ceiling a served model may hold: 70% of `total`, or `text` (a load limit in GB, as GLM_LOAD_LIMIT_GB) up to
+/// `most` (the smaller of RAM and the GPU's recommended working set); text that is not a number above 0 is refused.
+pub const Ceiling = struct { bytes: u64, default: u64, asked: bool = false, capped: bool = false };
+
+pub fn ceiling(total: u64, most: u64, text: ?[]const u8) error{BadLoadLimit}!Ceiling {
+    const default = total / 100 * SHARE_PERCENT;
+    const t = std.mem.trim(u8, text orelse "", " \t");
+    if (t.len == 0) return .{ .bytes = default, .default = default };
+    const gb = std.fmt.parseFloat(f64, t) catch return error.BadLoadLimit;
+    if (!std.math.isFinite(gb) or gb <= 0) return error.BadLoadLimit;
+    const top: f64 = @floatFromInt(@min(total, most));
+    return .{ .bytes = @intFromFloat(@min(gb * 1e9, top)), .default = default, .asked = true, .capped = gb * 1e9 > top };
+}
+
 /// This machine's RAM (null where the OS does not say).
 pub fn ram() ?u64 {
     return std.process.totalSystemMemory() catch null;
@@ -96,6 +110,23 @@ test "a given budget that fits is kept, a larger one is refused unless the overr
     try std.testing.expectError(error.CacheOverCap, fit(ram256, 172 * GiB, 16, false));
     try std.testing.expectEqual(@as(u64, 16 * GiB), (try fit(ram256, 172 * GiB, 16, true)).budget);
     try std.testing.expectEqual(@as(u64, 64 * GiB), (try fit(512 * GiB, 172 * GiB, 64, false)).budget); // a 512 GB Mac has room
+}
+
+test "the ceiling: 70% of RAM, or a load limit in GB up to RAM and the GPU's working set; bad text refused" {
+    const ram256: u64 = 256 * GiB;
+    const ws: u64 = 239_000_000_000;
+    const d = try ceiling(ram256, ws, null);
+    try std.testing.expectEqual(ram256 / 100 * 70, d.bytes);
+    try std.testing.expect(!d.asked and !d.capped);
+    const asked = try ceiling(ram256, ws, "215");
+    try std.testing.expectEqual(@as(u64, 215_000_000_000), asked.bytes);
+    try std.testing.expect(asked.asked and !asked.capped and asked.bytes > asked.default);
+    try std.testing.expect((try ceiling(ram256, ws, " 300 ")).capped);
+    try std.testing.expectEqual(ws, (try ceiling(ram256, ws, "300")).bytes);
+    try std.testing.expectEqual(ram256 / 100 * 70, (try ceiling(ram256, ws, "  ")).bytes);
+    try std.testing.expectError(error.BadLoadLimit, ceiling(ram256, ws, "lots"));
+    try std.testing.expectError(error.BadLoadLimit, ceiling(ram256, ws, "0"));
+    try std.testing.expectError(error.BadLoadLimit, ceiling(ram256, ws, "-4"));
 }
 
 test "the OS readings: RAM and this process's footprint" {
