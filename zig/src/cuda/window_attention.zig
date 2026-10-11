@@ -19,7 +19,8 @@ const prompt_smem: u32 = 8 * 32 * 16 * 16; // NS * HALF * (D / 8) uint4
 
 pub const WindowAttention = struct {
     mod: Module,
-    decode_fn: Function,
+    part_fn: Function,
+    merge_fn: Function,
     prompt_fns: [2]Function, // 4, then 8 query heads a block
 
     pub fn load(d: *const Driver) !WindowAttention {
@@ -31,31 +32,51 @@ pub const WindowAttention = struct {
             p[i] = try mod.function(std.fmt.comptimePrint(prompt_name, .{hpc}));
             try p[i].allowDynamicShared(prompt_smem);
         }
-        return .{ .mod = mod, .decode_fn = try mod.function("tf_window_decode"), .prompt_fns = p };
+        return .{ .mod = mod, .part_fn = try mod.function("tf_window_part"), .merge_fn = try mod.function("tf_window_merge"), .prompt_fns = p };
     }
 
     pub fn unload(g: *WindowAttention) void {
         g.mod.unload();
     }
 
-    /// n rows: q [n, h, d] bf16 at pos (int32 [n]) of streams slot (int32 [n] or none) -> out [n, h, d] bf16.
-    pub fn decode(g: *const WindowAttention, s: Stream, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slot: ?u64, w: Window, n: usize) !void {
+    /// Key tiles a decode row's window can touch (its partials a key head).
+    pub fn tiles(w: Window) usize {
+        return if (w.win > 0) (w.win + 62) / 64 + 1 else (w.ring + 63) / 64 + 1;
+    }
+
+    /// The fp32 partials `decode` writes for up to `rows` rows: o, then m and l.
+    pub fn scratchBytes(w: Window, rows: usize) usize {
+        const parts = rows * w.hk * tiles(w) * (w.h / w.hk);
+        return parts * w.d * 4 + 2 * parts * 4;
+    }
+
+    /// n rows: q [n, h, d] bf16 at pos (int32 [n]) of streams slot (int32 [n] or none) -> out [n, h, d] bf16;
+    /// `scratch` holds scratchBytes(w, n) (a key-tile split, merged in tile order).
+    pub fn decode(g: *const WindowAttention, s: Stream, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slot: ?u64, w: Window, scratch: u64, n: usize) !void {
         if (w.hk == 0 or w.h % w.hk != 0 or w.h / w.hk > 16 or w.d > 128 or w.ring == 0) return error.WindowShape;
+        if (w.win == 0 and w.ring > 4096) return error.WindowShape; // an unwindowed row's tiles come from the ring
         if (n == 0) return;
+        const t = tiles(w);
+        const parts = n * w.hk * t * (w.h / w.hk);
+        const po = scratch;
+        const pm = po + parts * w.d * 4;
+        const pl = pm + parts * 4;
         var a: launch_.Args = .{};
-        a.add(q);
-        a.add(kc);
-        a.add(vc);
-        a.add(out);
-        a.add(pos);
-        a.add(slot orelse 0);
+        for ([_]u64{ q, kc, vc, pos, slot orelse 0, po, pm, pl }) |v| a.add(v);
         a.add(@as(i32, @intCast(w.h)));
         a.add(@as(i32, @intCast(w.hk)));
         a.add(@as(i32, @intCast(w.d)));
         a.add(@as(i32, @intCast(w.win)));
         a.add(@as(i64, @intCast(w.ring)));
         a.add(w.scale);
-        try launch_.launch(g.decode_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk), .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+        try launch_.launch(g.part_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk), .z = @intCast(t) }, .block = .{ .x = 256 } }, s, &a);
+        var b: launch_.Args = .{};
+        for ([_]u64{ po, pm, pl, out }) |v| b.add(v);
+        b.add(@as(i32, @intCast(w.h)));
+        b.add(@as(i32, @intCast(w.hk)));
+        b.add(@as(i32, @intCast(w.d)));
+        b.add(@as(i32, @intCast(t)));
+        try launch_.launch(g.merge_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(w.hk), .z = 1 }, .block = .{ .x = 256 } }, s, &b);
     }
 
     /// n prompt rows of one stream at p0, p0 + 1, ... (d 128); kc/vc that stream's ring, key p at row p % ring.

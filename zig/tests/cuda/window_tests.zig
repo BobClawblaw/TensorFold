@@ -53,12 +53,14 @@ fn run1(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const cuda.win
     const dsl = try up.f(gpu, &bufs, std.mem.sliceAsBytes(slot));
     const scale: f32 = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(c.d))));
     const w: cuda.window_attention.Window = .{ .h = c.h, .hk = c.hk, .d = c.d, .win = c.win, .ring = c.ring, .scale = scale };
+    const scratch = try cuda.DeviceBuffer.alloc(gpu.d, cuda.window_attention.WindowAttention.scratchBytes(w, most));
+    try bufs.append(gpu.gpa, scratch);
     const outs = try a.alloc(cuda.DeviceBuffer, counts.len);
     for (counts, outs) |m, *o| {
         o.* = try cuda.DeviceBuffer.alloc(gpu.d, m * c.h * c.d * 2);
         try bufs.append(gpu.gpa, o.*);
         try o.fill8(0xff, s.handle);
-        try g.decode(s, dq, dk, dv, o.ptr, dp, dsl, w, m);
+        try g.decode(s, dq, dk, dv, o.ptr, dp, dsl, w, scratch.ptr, m);
     }
     try s.synchronize();
     const wide = try a.alloc(u16, qn);

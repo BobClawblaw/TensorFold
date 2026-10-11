@@ -20,81 +20,96 @@ constexpr int DMAX = 128;  // head dim (static shared memory: q, a K and a V til
 
 using namespace tf_window;
 
-// q [W, H, D] at pos/slot (int32 [W]) over keys (pos - win, pos] (win 0: all) at cache row slot * ring + key % ring.
-extern "C" __global__ void __launch_bounds__(NT) tf_window_decode(const __nv_bfloat16* __restrict__ q,
-                                                                  const __nv_bfloat16* __restrict__ kc,
-                                                                  const __nv_bfloat16* __restrict__ vc,
-                                                                  __nv_bfloat16* __restrict__ out,
-                                                                  const int* __restrict__ pos,
-                                                                  const int* __restrict__ slot, int h, int hk, int d,
-                                                                  int win, long long ring, float scale) {
+// Decode, split by key tile: block (row, key head, tile j) scores the row's tile t0 + j (t0: its window's first
+// tile) and writes its partial (max, sum, weighted values) per query head; tf_window_merge folds a row's partials
+// in tile order. q [W, H, D] at pos/slot (int32 [W]) over keys (pos - win, pos] at row slot * ring + key % ring.
+extern "C" __global__ void __launch_bounds__(NT) tf_window_part(const __nv_bfloat16* __restrict__ q,
+                                                                const __nv_bfloat16* __restrict__ kc,
+                                                                const __nv_bfloat16* __restrict__ vc,
+                                                                const int* __restrict__ pos,
+                                                                const int* __restrict__ slot, float* __restrict__ po,
+                                                                float* __restrict__ pm, float* __restrict__ pl, int h,
+                                                                int hk, int d, int win, long long ring, float scale) {
     __shared__ float qs[GMAX * DMAX];
     __shared__ __nv_bfloat16 ks[BN * DMAX];
     __shared__ __nv_bfloat16 vs[BN * DMAX];
     __shared__ float sc[GMAX * BN];
-    __shared__ float mx[GMAX], al[GMAX], ls[GMAX];
+    __shared__ float mx[GMAX], ls[GMAX];
     const int64_t r = blockIdx.x;
-    const int kh = blockIdx.y;
+    const int kh = blockIdx.y, tiles = gridDim.z, j = blockIdx.z;
     const int g = h / hk;
     const int p = pos[r];
     const int64_t base = (slot != nullptr ? static_cast<int64_t>(slot[r]) : 0) * ring;
     const int lo = win > 0 ? max(p - win + 1, 0) : 0;
-    for (int i = threadIdx.x; i < g * d; i += NT)
-        qs[i] = __bfloat162float(q[(r * h + kh * g + i / d) * d + i % d]);
-    if (threadIdx.x < g) mx[threadIdx.x] = -INFINITY, ls[threadIdx.x] = 0.f;
-    float acc[(GMAX * DMAX) / NT]; // thread t owns outputs t, t + NT, ...
-    const int outs = g * d;
-#pragma unroll
-    for (int j = 0; j < (GMAX * DMAX) / NT; ++j) acc[j] = 0.f;
-    for (int t = lo / BN; t <= p / BN; ++t) {
-        __syncthreads();
-        for (int i = threadIdx.x; i < BN * d; i += NT) {
-            const int key = t * BN + i / d;
-            const bool in = key >= lo && key <= p;
-            const int64_t at = ((base + (in ? key : lo) % ring) * hk + kh) * d + i % d;
-            ks[i] = kc[at];
-            vs[i] = vc[at];
-        }
-        __syncthreads();
-        for (int i = threadIdx.x; i < g * BN; i += NT) { // score (head i / BN, key i % BN)
-            const int hd = i / BN, j = i % BN, key = t * BN + j;
-            float s = 0.f;
-            for (int e = 0; e < d; ++e) s = __fmaf_rn(qs[hd * d + e], __bfloat162float(ks[j * d + e]), s);
-            sc[i] = (key >= lo && key <= p) ? __fmul_rn(s, scale) : -INFINITY;
-        }
-        __syncthreads();
-        if (threadIdx.x < g) { // the head's running max, its rescale and the tile's weights, in key order
-            const int hd = threadIdx.x;
-            float tm = -INFINITY;
-            for (int j = 0; j < BN; ++j) tm = fmaxf(tm, sc[hd * BN + j]);
-            const float nm = fmaxf(mx[hd], tm);
-            const float a = mx[hd] == -INFINITY ? 0.f : expf(__fsub_rn(mx[hd], nm));
-            float l = __fmul_rn(ls[hd], a);
-            for (int j = 0; j < BN; ++j) {
-                const float e = sc[hd * BN + j] == -INFINITY ? 0.f : expf(__fsub_rn(sc[hd * BN + j], nm));
-                sc[hd * BN + j] = e;
-                l = __fadd_rn(l, e);
-            }
-            mx[hd] = nm, al[hd] = a, ls[hd] = l;
-        }
-        __syncthreads();
-#pragma unroll
-        for (int jj = 0; jj < (GMAX * DMAX) / NT; ++jj) {
-            const int o = threadIdx.x + jj * NT;
-            if (o >= outs) break;
-            const int hd = o / d, e = o % d;
-            float a = __fmul_rn(acc[jj], al[hd]);
-            for (int j = 0; j < BN; ++j) a = __fmaf_rn(sc[hd * BN + j], __bfloat162float(vs[j * d + e]), a);
-            acc[jj] = a;
+    const int t = lo / BN + j;
+    const int64_t part = (r * hk + kh) * tiles + j; // this block's partial, g heads of d values
+    if (t > p / BN) { // past the row's last tile: an empty partial
+        for (int i = threadIdx.x; i < g; i += NT) pm[part * g + i] = -INFINITY, pl[part * g + i] = 0.f;
+        return;
+    }
+    for (int i = threadIdx.x; i < g * d; i += NT) qs[i] = __bfloat162float(q[(r * h + kh * g + i / d) * d + i % d]);
+    for (int i = threadIdx.x; i < BN * d; i += NT) {
+        const int key = t * BN + i / d;
+        const bool in = key >= lo && key <= p;
+        const int64_t at = ((base + (in ? key : lo) % ring) * hk + kh) * d + i % d;
+        ks[i] = kc[at];
+        vs[i] = vc[at];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < g * BN; i += NT) { // score (head i / BN, key i % BN)
+        const int hd = i / BN, jj = i % BN, key = t * BN + jj;
+        float s = 0.f;
+        for (int e = 0; e < d; ++e) s = __fmaf_rn(qs[hd * d + e], __bfloat162float(ks[jj * d + e]), s);
+        sc[i] = (key >= lo && key <= p) ? __fmul_rn(s, scale) : -INFINITY;
+    }
+    __syncthreads();
+    { // a warp a head: the tile's max, the weights exp(s - max) and their sum, lanes in a fixed tree
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        for (int hd = warp; hd < g; hd += NT / 32) {
+            float a = sc[hd * BN + lane], b = sc[hd * BN + 32 + lane];
+            float m = fmaxf(a, b);
+            for (int k = 16; k > 0; k >>= 1) m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, k));
+            a = a == -INFINITY ? 0.f : expf(__fsub_rn(a, m));
+            b = b == -INFINITY ? 0.f : expf(__fsub_rn(b, m));
+            sc[hd * BN + lane] = a;
+            sc[hd * BN + 32 + lane] = b;
+            float l = __fadd_rn(a, b);
+            for (int k = 16; k > 0; k >>= 1) l = __fadd_rn(l, __shfl_xor_sync(0xFFFFFFFFu, l, k));
+            if (lane == 0) mx[hd] = m, ls[hd] = l;
         }
     }
     __syncthreads();
-#pragma unroll
-    for (int jj = 0; jj < (GMAX * DMAX) / NT; ++jj) {
-        const int o = threadIdx.x + jj * NT;
-        if (o >= outs) break;
+    for (int o = threadIdx.x; o < g * d; o += NT) {
         const int hd = o / d, e = o % d;
-        out[(r * h + kh * g + hd) * d + e] = __float2bfloat16_rn(__fdiv_rn(acc[jj], ls[hd]));
+        float a = 0.f;
+        for (int jj = 0; jj < BN; ++jj) a = __fmaf_rn(sc[hd * BN + jj], __bfloat162float(vs[jj * d + e]), a);
+        po[part * g * d + o] = a;
+    }
+    if (threadIdx.x < g) pm[part * g + threadIdx.x] = mx[threadIdx.x], pl[part * g + threadIdx.x] = ls[threadIdx.x];
+}
+
+// out [W, H, D] bf16: a row's partials folded in tile order, o = sum_j exp(m_j - M) o_j / sum_j exp(m_j - M) l_j.
+extern "C" __global__ void __launch_bounds__(NT) tf_window_merge(const float* __restrict__ po,
+                                                                 const float* __restrict__ pm,
+                                                                 const float* __restrict__ pl,
+                                                                 __nv_bfloat16* __restrict__ out, int h, int hk, int d,
+                                                                 int tiles) {
+    const int64_t r = blockIdx.x;
+    const int kh = blockIdx.y, g = h / hk;
+    const int64_t part0 = (r * hk + kh) * tiles;
+    for (int o = threadIdx.x; o < g * d; o += NT) {
+        const int hd = o / d;
+        float m = -INFINITY;
+        for (int j = 0; j < tiles; ++j) m = fmaxf(m, pm[(part0 + j) * g + hd]);
+        float acc = 0.f, l = 0.f;
+        for (int j = 0; j < tiles; ++j) {
+            const float mj = pm[(part0 + j) * g + hd];
+            if (mj == -INFINITY) continue;
+            const float a = expf(__fsub_rn(mj, m));
+            acc = __fmaf_rn(a, po[(part0 + j) * g * d + o], acc);
+            l = __fmaf_rn(a, pl[(part0 + j) * g + hd], l);
+        }
+        out[(r * h + kh * g + hd) * d + o % d] = __float2bfloat16_rn(__fdiv_rn(acc, l));
     }
 }
 
