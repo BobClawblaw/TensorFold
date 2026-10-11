@@ -37,6 +37,7 @@ pub const moe_glue = @import("moe_glue.zig");
 pub const dense_rows = @import("dense_rows.zig");
 pub const qk_rows = @import("qk_rows.zig");
 pub const window_attention = @import("window_attention.zig");
+pub const tree_attention = @import("tree_attention.zig");
 
 test {
     _ = @import("memory.zig");
@@ -57,4 +58,5 @@ test {
     _ = @import("dense_rows.zig");
     _ = @import("qk_rows.zig");
     _ = @import("window_attention.zig");
+    _ = @import("tree_attention.zig");
 }
