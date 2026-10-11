@@ -11,6 +11,7 @@ const sample_tests = @import("sample_tests.zig");
 const norms_tests = @import("norms_tests.zig");
 const moe_glue_tests = @import("moe_glue_tests.zig");
 const dense_rows_tests = @import("dense_rows_tests.zig");
+const qk_rows_tests = @import("qk_rows_tests.zig");
 const glue_tests = @import("glue_tests.zig");
 const window_profile = @import("window_profile.zig");
 const tree_accept = @import("tree_accept.zig");
@@ -53,6 +54,7 @@ const usage =
     \\  norms                     RMS norm and the residual step against float64 references (synthetic)
     \\  moe-glue                  sigmoid top-k routing and the weighted combine against float64 references (synthetic)
     \\  dense-rows                bf16 rows times weight rows (routers, heads) against float64 references (synthetic)
+    \\  qk-rows                   QK norm, RoPE and the cache write against float64 references (synthetic)
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
     \\  modelopt                  ModelOpt repack, FP8 and BF16 lane rows and relu^2 NVFP4 experts against fp64
@@ -114,6 +116,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "norms")) return norms_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "moe-glue")) return moe_glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "qk-rows")) return qk_rows_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);

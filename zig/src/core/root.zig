@@ -18,6 +18,7 @@ pub const tuning = @import("tuning.zig");
 pub const norms_ref = @import("norms_ref.zig");
 pub const moe_ref = @import("moe_ref.zig");
 pub const dense_ref = @import("dense_ref.zig");
+pub const qk_ref = @import("qk_ref.zig");
 
 test {
     _ = safetensors;
@@ -37,4 +38,5 @@ test {
     _ = norms_ref;
     _ = moe_ref;
     _ = dense_ref;
+    _ = qk_ref;
 }

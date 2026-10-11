@@ -35,6 +35,7 @@ pub const modelopt = @import("modelopt.zig");
 pub const norms = @import("norms.zig");
 pub const moe_glue = @import("moe_glue.zig");
 pub const dense_rows = @import("dense_rows.zig");
+pub const qk_rows = @import("qk_rows.zig");
 
 test {
     _ = @import("memory.zig");
@@ -53,4 +54,5 @@ test {
     _ = @import("norms.zig");
     _ = @import("moe_glue.zig");
     _ = @import("dense_rows.zig");
+    _ = @import("qk_rows.zig");
 }
