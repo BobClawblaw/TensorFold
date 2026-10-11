@@ -151,6 +151,8 @@ pub fn run(gpu: check.Gpu) !void {
     }
     try topkCase(&r, .{ .experts = 384, .topk = 6, .shared = true }, true); // Kolibri 1
     try topkCase(&r, .{ .experts = 256, .topk = 8, .shared = false, .normalize = true, .scale = 2.5 }, true); // DeepSeek-style
+    try topkCase(&r, .{ .experts = 512, .topk = 32, .shared = true }, true); // the warp form's widest
+    try topkCase(&r, .{ .experts = 513, .topk = 6, .shared = true }, true); // the block form's narrowest
     try topkCase(&r, .{ .experts = 4096, .topk = 64, .shared = false }, false);
     try combineCase(&r, 7, 2560, false);
     try combineCase(&r, 7, 2560, true);

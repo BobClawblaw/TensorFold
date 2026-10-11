@@ -83,6 +83,54 @@ extern "C" __global__ void __launch_bounds__(NT) tf_moe_topk_sigmoid(const float
     }
 }
 
+// tf_moe_topk_sigmoid with a warp a row (up to 32 * PER experts): values in registers, no block barrier.
+constexpr int PER = 16;
+
+extern "C" __global__ void __launch_bounds__(256) tf_moe_topk_sigmoid_warp(const float* logits, const float* bias,
+                                                                          int* pick, float* wts, int rows, int ne,
+                                                                          int topk, int shared, int normalize,
+                                                                          float scale) {
+    const int lane = threadIdx.x & 31;
+    const int64_t r = static_cast<int64_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (r >= rows) return;
+    const float* lg = logits + r * ne;
+    float v[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        const int e = lane + 32 * j;
+        v[j] = e < ne ? __fadd_rn(lg[e], bias != nullptr ? bias[e] : 0.f) : -INFINITY;
+    }
+    const int slots = topk + (shared ? 1 : 0);
+    float sum = 0.f;
+    float wk = 0.f; // lane k's weight
+    int pk = 0;     // lane k's pick
+    for (int k = 0; k < topk; ++k) {
+        float bv = -INFINITY;
+        int bi = ne;
+#pragma unroll
+        for (int j = 0; j < PER; ++j) {
+            const int e = lane + 32 * j;
+            if (e < ne && beats(v[j], e, bv, bi)) bv = v[j], bi = e;
+        }
+        for (int m = 16; m > 0; m >>= 1) {
+            const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
+            const int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
+            if (beats(ov, oi, bv, bi)) bv = ov, bi = oi;
+        }
+#pragma unroll
+        for (int j = 0; j < PER; ++j)
+            if (lane + 32 * j == bi) v[j] = -INFINITY;
+        const float w = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-lg[bi])));
+        sum = __fadd_rn(sum, w);
+        if (lane == k) wk = w, pk = bi;
+    }
+    if (lane < topk) {
+        pick[r * slots + lane] = pk;
+        wts[r * slots + lane] = __fmul_rn(normalize ? __fdiv_rn(wk, sum) : wk, scale);
+    }
+    if (shared && lane == 0) pick[r * slots + topk] = ne, wts[r * slots + topk] = 1.f;
+}
+
 // out[r, d] = sum over the row's slots, in slot order, of w[r, k] * y[r, k, d] (fp32 fma), rounded once to out's kind.
 extern "C" __global__ void __launch_bounds__(NT) tf_moe_combine(const void* y, int y_kind, const float* w, void* out,
                                                                 int out_kind, int slots, int dims) {
