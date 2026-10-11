@@ -14,6 +14,7 @@ namespace tf_window {
 constexpr int NT = 256;
 constexpr int BN = 64;     // keys a tile
 constexpr int GMAX = 16;   // query heads a key head
+constexpr int KT = BN + 2;  // kt's row stride: a bank further each dim
 constexpr int DMAX = 128;  // head dim (static shared memory: q, a K and a V tile, scores within 48 KiB)
 
 }  // namespace tf_window
@@ -31,7 +32,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_window_part(const __nv_bfloa
                                                                 float* __restrict__ pm, float* __restrict__ pl, int h,
                                                                 int hk, int d, int win, long long ring, float scale) {
     __shared__ float qs[GMAX * DMAX];
-    __shared__ __nv_bfloat16 ks[BN * DMAX];
+    __shared__ __nv_bfloat16 kt[DMAX * KT]; // K transposed, [d][key], padded: a warp reads 32 keys of one dim
     __shared__ __nv_bfloat16 vs[BN * DMAX];
     __shared__ float sc[GMAX * BN];
     __shared__ float mx[GMAX], ls[GMAX];
@@ -52,14 +53,15 @@ extern "C" __global__ void __launch_bounds__(NT) tf_window_part(const __nv_bfloa
         const int key = t * BN + i / d;
         const bool in = key >= lo && key <= p;
         const int64_t at = ((base + (in ? key : lo) % ring) * hk + kh) * d + i % d;
-        ks[i] = kc[at];
+        kt[(i % d) * KT + i / d] = kc[at];
         vs[i] = vc[at];
     }
     __syncthreads();
     for (int i = threadIdx.x; i < g * BN; i += NT) { // score (head i / BN, key i % BN)
         const int hd = i / BN, jj = i % BN, key = t * BN + jj;
         float s = 0.f;
-        for (int e = 0; e < d; ++e) s = __fmaf_rn(qs[hd * d + e], __bfloat162float(ks[jj * d + e]), s);
+#pragma unroll 8
+        for (int e = 0; e < d; ++e) s = __fmaf_rn(qs[hd * d + e], __bfloat162float(kt[e * KT + jj]), s);
         sc[i] = (key >= lo && key <= p) ? __fmul_rn(s, scale) : -INFINITY;
     }
     __syncthreads();
