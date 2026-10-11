@@ -359,6 +359,22 @@ const Host = struct {
     }
 };
 
+/// A tensor-parallel rank above 0 (server/engines.zig follow): the family opened as that rank, then its replay loop
+/// until rank 0 stops; false with ``problem`` set when it cannot.
+pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
+    const opened = (try open(a, gpa, io, o, problem)) orelse return false;
+    defer opened.close(opened.ctx);
+    const f = opened.follow orelse {
+        problem.* = "this family has no tensor-parallel ranks";
+        return false;
+    };
+    f(opened.ctx) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ o.rank, @errorName(e) });
+        return false;
+    };
+    return true;
+}
+
 /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     inline for (registry) |F| {
@@ -522,8 +538,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null, .vision = o.vision and @hasField(F.Options, "vision") }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
-    const follow: ?*const fn (*anyopaque) anyerror!void = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
-    if (follow) |f| {
+    const follow_loop: ?*const fn (*anyopaque) anyerror!void = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
+    if (follow_loop) |f| {
         h.follow_fn = f;
         return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = Host.followFamily };
     }
