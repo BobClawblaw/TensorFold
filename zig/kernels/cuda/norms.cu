@@ -8,7 +8,7 @@
 
 namespace tf_norms {
 
-constexpr int NT = 256;
+constexpr int NT = 1024;
 
 template <int K>
 __device__ __forceinline__ float ld(const void* p, int64_t i) {
@@ -43,10 +43,10 @@ __device__ __forceinline__ float inv_rms(float part, int width, float eps) {
     for (int m = 16; m > 0; m >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xFFFFFFFFu, part, m));
     if ((threadIdx.x & 31) == 0) warps[threadIdx.x >> 5] = part;
     __syncthreads();
-    if (threadIdx.x == 0) {
-        float s = 0.f;
-        for (int w = 0; w < NT / 32; ++w) s = __fadd_rn(s, warps[w]);
-        inv = rsqrtf(__fadd_rn(__fdiv_rn(s, static_cast<float>(width)), eps));
+    if (threadIdx.x < 32) {
+        float s = warps[threadIdx.x];
+        for (int m = 16; m > 0; m >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, m));
+        if (threadIdx.x == 0) inv = rsqrtf(__fadd_rn(__fdiv_rn(s, static_cast<float>(width)), eps));
     }
     __syncthreads();
     const float r = inv;
@@ -60,54 +60,47 @@ using namespace tf_norms;
 
 namespace tf_norms {
 
-constexpr int CACHED = 32; // a thread keeps its row values in registers up to CACHED * NT = 8,192 wide
+constexpr int CACHED = 8; // a thread keeps its values in registers up to CACHED * NT = 8,192 wide
 
 // rms rows; WIDE re-reads the row from memory (wider than CACHED * NT), the same arithmetic in the same order.
 template <bool WIDE, int XK, int YK>
-__device__ __forceinline__ void rms_row(const void* x, const float* w, void* y, int width, float eps) {
+__device__ __forceinline__ void rms_row(const void* __restrict__ x, const float* __restrict__ w, void* __restrict__ y,
+                                        int width, float eps) {
     const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
-    float v[WIDE ? 1 : CACHED];
     float part = 0.f;
-#pragma unroll
-    for (int j = 0; j < (WIDE ? 1 : CACHED); ++j) v[j] = 0.f;
     if (WIDE) {
         for (int i = threadIdx.x; i < width; i += NT) {
             const float a = ld<XK>(x, at + i);
             part = __fmaf_rn(a, a, part);
         }
-    } else {
-#pragma unroll
-        for (int j = 0; j < CACHED; ++j) {
-            const int i = threadIdx.x + j * NT;
-            if (i < width) {
-                v[j] = ld<XK>(x, at + i);
-                part = __fmaf_rn(v[j], v[j], part);
-            }
-        }
-    }
-    const float inv = inv_rms(part, width, eps);
-    if (WIDE) {
+        const float inv = inv_rms(part, width, eps);
         for (int i = threadIdx.x; i < width; i += NT) {
             float a = __fmul_rn(ld<XK>(x, at + i), inv);
             if (w != nullptr) a = __fmul_rn(a, w[i]);
             st<YK>(y, at + i, a);
         }
-    } else {
+        return;
+    }
+    float v[CACHED], wv[CACHED];
 #pragma unroll
-        for (int j = 0; j < CACHED; ++j) {
-            const int i = threadIdx.x + j * NT;
-            if (i < width) {
-                float a = __fmul_rn(v[j], inv);
-                if (w != nullptr) a = __fmul_rn(a, w[i]);
-                st<YK>(y, at + i, a);
-            }
-        }
+    for (int j = 0; j < CACHED; ++j) { // every load issued before any is used
+        const int i = threadIdx.x + j * NT;
+        v[j] = i < width ? ld<XK>(x, at + i) : 0.f;
+        wv[j] = (w != nullptr && i < width) ? w[i] : 1.f;
+    }
+#pragma unroll
+    for (int j = 0; j < CACHED; ++j) part = __fmaf_rn(v[j], v[j], part); // zeros past the row add nothing
+    const float inv = inv_rms(part, width, eps);
+#pragma unroll
+    for (int j = 0; j < CACHED; ++j) {
+        const int i = threadIdx.x + j * NT;
+        if (i < width) st<YK>(y, at + i, w != nullptr ? __fmul_rn(__fmul_rn(v[j], inv), wv[j]) : __fmul_rn(v[j], inv));
     }
 }
 
 template <bool WIDE, int XK, int YK>
-__device__ __forceinline__ void add_rms_row(const void* x, float* res, const float* w1, const float* w2, void* y, int width,
-                                            float eps) {
+__device__ __forceinline__ void add_rms_row(const void* __restrict__ x, float* __restrict__ res, const float* __restrict__ w1,
+                                            const float* __restrict__ w2, void* __restrict__ y, int width, float eps) {
     const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
     if (WIDE) {
         float inv1 = 1.f;
@@ -131,32 +124,38 @@ __device__ __forceinline__ void add_rms_row(const void* x, float* res, const flo
         for (int i = threadIdx.x; i < width; i += NT) st<YK>(y, at + i, __fmul_rn(__fmul_rn(res[at + i], inv2), w2[i]));
         return;
     }
-    float v[CACHED];
+    float v[CACHED], rv[CACHED], a1[CACHED], a2[CACHED];
+#pragma unroll
+    for (int j = 0; j < CACHED; ++j) { // every load issued before any is used
+        const int i = threadIdx.x + j * NT;
+        const bool in = i < width;
+        v[j] = in ? ld<XK>(x, at + i) : 0.f;
+        rv[j] = in ? res[at + i] : 0.f;
+        a1[j] = (w1 != nullptr && in) ? w1[i] : 0.f;
+        a2[j] = in ? w2[i] : 0.f;
+    }
+    float inv1 = 1.f;
+    if (w1 != nullptr) {
+        float part = 0.f;
+#pragma unroll
+        for (int j = 0; j < CACHED; ++j) part = __fmaf_rn(v[j], v[j], part);
+        inv1 = inv_rms(part, width, eps);
+    }
     float part = 0.f;
 #pragma unroll
     for (int j = 0; j < CACHED; ++j) {
-        const int i = threadIdx.x + j * NT;
-        v[j] = i < width ? ld<XK>(x, at + i) : 0.f;
-        if (i < width) part = __fmaf_rn(v[j], v[j], part);
-    }
-    const float inv1 = w1 != nullptr ? inv_rms(part, width, eps) : 1.f;
-    part = 0.f;
-#pragma unroll
-    for (int j = 0; j < CACHED; ++j) {
-        const int i = threadIdx.x + j * NT;
-        if (i < width) {
-            float a = v[j];
-            if (w1 != nullptr) a = __fmul_rn(__fmul_rn(a, inv1), w1[i]);
-            v[j] = __fadd_rn(res[at + i], a);
-            res[at + i] = v[j];
-            part = __fmaf_rn(v[j], v[j], part);
-        }
+        const float a = w1 != nullptr ? __fmul_rn(__fmul_rn(v[j], inv1), a1[j]) : v[j];
+        rv[j] = __fadd_rn(rv[j], a);
+        part = __fmaf_rn(rv[j], rv[j], part);
     }
     const float inv2 = inv_rms(part, width, eps);
 #pragma unroll
     for (int j = 0; j < CACHED; ++j) {
         const int i = threadIdx.x + j * NT;
-        if (i < width) st<YK>(y, at + i, __fmul_rn(__fmul_rn(v[j], inv2), w2[i]));
+        if (i < width) {
+            res[at + i] = rv[j];
+            st<YK>(y, at + i, __fmul_rn(__fmul_rn(rv[j], inv2), a2[j]));
+        }
     }
 }
 
@@ -187,4 +186,147 @@ extern "C" __global__ void __launch_bounds__(NT) tf_add_rms_rows(const void* x, 
     }
     TF_ADD(0, 0) TF_ADD(0, 1) TF_ADD(0, 2) TF_ADD(1, 0) TF_ADD(1, 1) TF_ADD(1, 2) TF_ADD(2, 0) TF_ADD(2, 1) TF_ADD(2, 2)
 #undef TF_ADD
+}
+
+// bf16 rows with 16-byte loads (width % 8, at most 8 * VEC_MOST * VNT, 16 B aligned): a short straight line.
+namespace tf_norms {
+
+constexpr int VNT = 256;
+constexpr int VEC_MOST = 4; // 8,192 wide
+
+__device__ __forceinline__ void unpack8(const uint4& u, float* f) {
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 t = __bfloat1622float2(h[i]);
+        f[2 * i] = t.x;
+        f[2 * i + 1] = t.y;
+    }
+}
+
+__device__ __forceinline__ uint4 pack8(const float* f) {
+    uint4 u;
+    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(&u);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+    return u;
+}
+
+__device__ __forceinline__ void load8f(const float* p, float* f) {
+    const float4 a = reinterpret_cast<const float4*>(p)[0];
+    const float4 b = reinterpret_cast<const float4*>(p)[1];
+    f[0] = a.x, f[1] = a.y, f[2] = a.z, f[3] = a.w, f[4] = b.x, f[5] = b.y, f[6] = b.z, f[7] = b.w;
+}
+
+__device__ __forceinline__ void store8f(float* p, const float* f) {
+    reinterpret_cast<float4*>(p)[0] = make_float4(f[0], f[1], f[2], f[3]);
+    reinterpret_cast<float4*>(p)[1] = make_float4(f[4], f[5], f[6], f[7]);
+}
+
+// rsqrt(sum / width + eps) over a VNT-thread block: warp trees, then warp 0's tree over the 8 warp sums.
+__device__ __forceinline__ float inv_rms_v(float part, int width, float eps) {
+    __shared__ float warps[VNT / 32];
+    __shared__ float inv;
+    for (int m = 16; m > 0; m >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xFFFFFFFFu, part, m));
+    if ((threadIdx.x & 31) == 0) warps[threadIdx.x >> 5] = part;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float s = threadIdx.x < VNT / 32 ? warps[threadIdx.x] : 0.f;
+        for (int m = 4; m > 0; m >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, m));
+        if (threadIdx.x == 0) inv = rsqrtf(__fadd_rn(__fdiv_rn(s, static_cast<float>(width)), eps));
+    }
+    __syncthreads();
+    const float r = inv;
+    __syncthreads();
+    return r;
+}
+
+}  // namespace tf_norms
+
+// tf_rms_rows for bf16 x and y (w fp32, null: none), 16-byte loads.
+extern "C" __global__ void __launch_bounds__(VNT) tf_rms_rows_bf16(const __nv_bfloat16* __restrict__ x,
+                                                                    const float* __restrict__ w,
+                                                                    __nv_bfloat16* __restrict__ y, int width, float eps) {
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
+    const int chunks = width / 8;
+    float v[VEC_MOST][8], wv[VEC_MOST][8];
+    float part = 0.f;
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j) {
+        const int c = threadIdx.x + j * VNT;
+        if (c < chunks) {
+            unpack8(reinterpret_cast<const uint4*>(x + at)[c], v[j]);
+            if (w != nullptr) load8f(w + 8 * c, wv[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j)
+        if (threadIdx.x + j * VNT < chunks)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) part = __fmaf_rn(v[j][i], v[j][i], part);
+    const float inv = inv_rms_v(part, width, eps);
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j) {
+        const int c = threadIdx.x + j * VNT;
+        if (c < chunks) {
+            float o[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[i] = w != nullptr ? __fmul_rn(__fmul_rn(v[j][i], inv), wv[j][i]) : __fmul_rn(v[j][i], inv);
+            reinterpret_cast<uint4*>(y + at)[c] = pack8(o);
+        }
+    }
+}
+
+// tf_add_rms_rows for bf16 x and y, 16-byte loads.
+extern "C" __global__ void __launch_bounds__(VNT) tf_add_rms_rows_bf16(const __nv_bfloat16* __restrict__ x,
+                                                                        float* __restrict__ res,
+                                                                        const float* __restrict__ w1,
+                                                                        const float* __restrict__ w2,
+                                                                        __nv_bfloat16* __restrict__ y, int width,
+                                                                        float eps) {
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
+    const int chunks = width / 8;
+    float v[VEC_MOST][8], rv[VEC_MOST][8], a1[VEC_MOST][8], a2[VEC_MOST][8];
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j) {
+        const int c = threadIdx.x + j * VNT;
+        if (c < chunks) {
+            unpack8(reinterpret_cast<const uint4*>(x + at)[c], v[j]);
+            load8f(res + at + 8 * c, rv[j]);
+            if (w1 != nullptr) load8f(w1 + 8 * c, a1[j]);
+            load8f(w2 + 8 * c, a2[j]);
+        }
+    }
+    float inv1 = 1.f;
+    if (w1 != nullptr) {
+        float part = 0.f;
+#pragma unroll
+        for (int j = 0; j < VEC_MOST; ++j)
+            if (threadIdx.x + j * VNT < chunks)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) part = __fmaf_rn(v[j][i], v[j][i], part);
+        inv1 = inv_rms_v(part, width, eps);
+    }
+    float part = 0.f;
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j)
+        if (threadIdx.x + j * VNT < chunks)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float a = w1 != nullptr ? __fmul_rn(__fmul_rn(v[j][i], inv1), a1[j][i]) : v[j][i];
+                rv[j][i] = __fadd_rn(rv[j][i], a);
+                part = __fmaf_rn(rv[j][i], rv[j][i], part);
+            }
+    const float inv2 = inv_rms_v(part, width, eps);
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j) {
+        const int c = threadIdx.x + j * VNT;
+        if (c < chunks) {
+            float o[8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[i] = __fmul_rn(__fmul_rn(rv[j][i], inv2), a2[j][i]);
+            store8f(res + at + 8 * c, rv[j]);
+            reinterpret_cast<uint4*>(y + at)[c] = pack8(o);
+        }
+    }
 }
