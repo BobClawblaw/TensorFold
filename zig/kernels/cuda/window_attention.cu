@@ -386,16 +386,21 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
 #pragma unroll
     for (int i = 0; i < NB; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
-    for (int t = lo / HB + warp; t <= p / HB; t += 4) {
-        for (int i = lane; i < HB * C; i += 32) {
-            const int key = t * HB + i / C;
-            const bool in = key >= lo && key <= p;
-            const int64_t row = base + (in ? key : lo) % ring;
-            cp16z(ks + sw<D>(i / C, i % C), kc + (row * hk + kh) * D + (i % C) * 8, in);
-            cp16z(vs + sw<D>(i / C, i % C), vc + (row * hk + kh) * D + (i % C) * 8, in);
-        }
+    // K of tile t loads while tile t - 4's values fold in, V of tile t while its scores run: one commit group each
+    auto stage = [&](uint4* dst, const __nv_bfloat16* src, int t) {
+        if (t <= p / HB)
+            for (int i = lane; i < HB * C; i += 32) {
+                const int key = t * HB + i / C;
+                const bool in = key >= lo && key <= p;
+                const int64_t row = base + (in ? key : lo) % ring;
+                cp16z(dst + sw<D>(i / C, i % C), src + (row * hk + kh) * D + (i % C) * 8, in);
+            }
         commit();
-        wait_group<0>();
+    };
+    stage(ks, kc, lo / HB + warp);
+    stage(vs, vc, lo / HB + warp);
+    for (int t = lo / HB + warp; t <= p / HB; t += 4) {
+        wait_group<1>(); // tile t's K (its V may still be in flight)
         __syncwarp();
         float sc[4][4];
 #pragma unroll
@@ -413,6 +418,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
                 }
             }
         }
+        __syncwarp();
+        stage(ks, kc, t + 4);
         const int kb = t * HB + 2 * qd;
         float tm0 = -INFINITY, tm1 = -INFINITY;
 #pragma unroll
@@ -459,6 +466,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
             o[i][2] = __fmul_rn(o[i][2], a1);
             o[i][3] = __fmul_rn(o[i][3], a1);
         }
+        wait_group<1>(); // tile t's V (the next K may still be in flight)
+        __syncwarp();
         uint32_t pa[2][4];
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
@@ -481,8 +490,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
             mma(o[i], pa[1], b[0], b[1]);
             mma(o[i + 1], pa[1], b[2], b[3]);
         }
-        __syncwarp(); // the next tile's copies overwrite this warp's slots
+        __syncwarp();
+        stage(vs, vc, t + 4);
     }
+    wait_group<0>();
     __syncthreads();
     float* os = reinterpret_cast<float*>(smem);   // [4 warps][16 heads][D]
     float* ms = os + 4 * 16 * D;                  // [4][16]
