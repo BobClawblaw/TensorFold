@@ -19,6 +19,7 @@ pub const norms_ref = @import("norms_ref.zig");
 pub const moe_ref = @import("moe_ref.zig");
 pub const dense_ref = @import("dense_ref.zig");
 pub const qk_ref = @import("qk_ref.zig");
+pub const act_ref = @import("act_ref.zig");
 pub const attention_ref = @import("attention_ref.zig");
 
 test {
@@ -40,5 +41,6 @@ test {
     _ = moe_ref;
     _ = dense_ref;
     _ = qk_ref;
+    _ = act_ref;
     _ = attention_ref;
 }

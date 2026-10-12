@@ -330,3 +330,147 @@ extern "C" __global__ void __launch_bounds__(VNT) tf_add_rms_rows_bf16(const __n
         }
     }
 }
+
+// Rows that hand on a bf16 residual and fp32 sums over each 64 outputs (the next affine matmul's group sums).
+namespace tf_norms {
+
+__device__ __forceinline__ void load8w(const float* p, float* f) { load8f(p, f); }
+__device__ __forceinline__ void load8w(const __nv_bfloat16* p, float* f) { unpack8(*reinterpret_cast<const uint4*>(p), f); }
+
+// A thread's 8 stored outputs summed in order, then the group's 8 lanes in a fixed tree (every lane of the warp calls).
+__device__ __forceinline__ float group_sum8(const uint4& packed, bool live) {
+    float f[8];
+    unpack8(packed, f);
+    float s = 0.f;
+    if (live)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) s = __fadd_rn(s, f[i]);
+    s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 4));
+    s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 2));
+    return __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 1));
+}
+
+// h = bf16(x + r) (r null: h = x), y = bf16(rms(h) * w), xs y's 64-value sums; width % 64, 16-byte loads.
+template <typename WT>
+__device__ __forceinline__ void add_rms_h(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ r,
+                                          const WT* __restrict__ w, __nv_bfloat16* __restrict__ h,
+                                          __nv_bfloat16* __restrict__ y, float* __restrict__ xs, int width, float eps) {
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * width;
+    const int chunks = width / 8;
+    float v[VEC_MOST][8], wv[VEC_MOST][8];
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j) {
+        const int c = threadIdx.x + j * VNT;
+        if (c < chunks) {
+            unpack8(reinterpret_cast<const uint4*>(x + at)[c], v[j]);
+            load8w(w + 8 * c, wv[j]);
+            if (r != nullptr) {
+                float rv[8];
+                unpack8(reinterpret_cast<const uint4*>(r + at)[c], rv);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) v[j][i] = __fadd_rn(v[j][i], rv[i]);
+                const uint4 hp = pack8(v[j]);
+                reinterpret_cast<uint4*>(h + at)[c] = hp;
+                unpack8(hp, v[j]); // the norm reads h as stored
+            }
+        }
+    }
+    float part = 0.f;
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j)
+        if (threadIdx.x + j * VNT < chunks)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) part = __fmaf_rn(v[j][i], v[j][i], part);
+    const float inv = inv_rms_v(part, width, eps);
+#pragma unroll
+    for (int j = 0; j < VEC_MOST; ++j) {
+        const int c = threadIdx.x + j * VNT;
+        const bool live = c < chunks;
+        float o[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[i] = __fmul_rn(__fmul_rn(v[j][i], inv), wv[j][i]);
+        const uint4 yp = pack8(o);
+        if (live) reinterpret_cast<uint4*>(y + at)[c] = yp;
+        if (xs != nullptr && j * VNT < chunks) { // whole warps of whole groups: width % 64 == 0
+            const float s = group_sum8(yp, live);
+            if (live && (c & 7) == 0) xs[static_cast<int64_t>(blockIdx.x) * (width / 64) + c / 8] = s;
+        }
+    }
+}
+
+}  // namespace tf_norms
+
+extern "C" __global__ void __launch_bounds__(VNT) tf_add_rms_rows_bf16h(const __nv_bfloat16* x, const __nv_bfloat16* r,
+                                                                         const __nv_bfloat16* w, __nv_bfloat16* h,
+                                                                         __nv_bfloat16* y, float* xs, int width, float eps) {
+    add_rms_h(x, r, w, h, y, xs, width, eps);
+}
+
+extern "C" __global__ void __launch_bounds__(VNT) tf_add_rms_rows_bf16h_f32w(const __nv_bfloat16* x,
+                                                                              const __nv_bfloat16* r, const float* w,
+                                                                              __nv_bfloat16* h, __nv_bfloat16* y,
+                                                                              float* xs, int width, float eps) {
+    add_rms_h(x, r, w, h, y, xs, width, eps);
+}
+
+// Per head of dv = 8 L: out = bf16(silu(z) * rms(y) * w), y and z rows at strides y_ld, z_ld; xs its 64-value sums.
+template <int L>
+__device__ __forceinline__ void gated_rms(const __nv_bfloat16* __restrict__ y, long long y_ld,
+                                          const __nv_bfloat16* __restrict__ z, long long z_ld,
+                                          const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
+                                          float* __restrict__ xs, int heads, float eps) {
+    constexpr int DV = 8 * L;
+    const int64_t r = blockIdx.x;
+    const int lane = threadIdx.x & 31, sub = lane % L;
+    const int hd = (blockIdx.y * blockDim.x + threadIdx.x) / L;
+    const bool live = hd < heads;
+    float yv[8], zv[8], wv[8];
+    if (live) {
+        unpack8(*reinterpret_cast<const uint4*>(y + r * y_ld + hd * DV + 8 * sub), yv);
+        unpack8(*reinterpret_cast<const uint4*>(z + r * z_ld + hd * DV + 8 * sub), zv);
+        unpack8(*reinterpret_cast<const uint4*>(w + 8 * sub), wv);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) yv[i] = zv[i] = wv[i] = 0.f;
+    }
+    float part = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) part = __fmaf_rn(yv[i], yv[i], part);
+#pragma unroll
+    for (int m = L / 2; m > 0; m >>= 1) part = __fadd_rn(part, __shfl_xor_sync(0xFFFFFFFFu, part, m));
+    const float inv = rsqrtf(__fadd_rn(__fdiv_rn(part, static_cast<float>(DV)), eps));
+    float o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float sg = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-zv[i])));
+        o[i] = __fmul_rn(__fmul_rn(zv[i], sg), __fmul_rn(__fmul_rn(yv[i], inv), wv[i]));
+    }
+    const uint4 op = pack8(o);
+    const int64_t at = (r * heads + hd) * DV + 8 * sub;
+    if (live) *reinterpret_cast<uint4*>(out + at) = op;
+    if (xs != nullptr) {
+        const float s = group_sum8(op, live);
+        if (live && (sub & 7) == 0) xs[at / 64] = s;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_gated_rms_rows_64(const __nv_bfloat16* y, long long y_ld,
+                                                                        const __nv_bfloat16* z, long long z_ld,
+                                                                        const __nv_bfloat16* w, __nv_bfloat16* out,
+                                                                        float* xs, int heads, float eps) {
+    gated_rms<8>(y, y_ld, z, z_ld, w, out, xs, heads, eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_gated_rms_rows_128(const __nv_bfloat16* y, long long y_ld,
+                                                                         const __nv_bfloat16* z, long long z_ld,
+                                                                         const __nv_bfloat16* w, __nv_bfloat16* out,
+                                                                         float* xs, int heads, float eps) {
+    gated_rms<16>(y, y_ld, z, z_ld, w, out, xs, heads, eps);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_gated_rms_rows_256(const __nv_bfloat16* y, long long y_ld,
+                                                                         const __nv_bfloat16* z, long long z_ld,
+                                                                         const __nv_bfloat16* w, __nv_bfloat16* out,
+                                                                         float* xs, int heads, float eps) {
+    gated_rms<32>(y, y_ld, z, z_ld, w, out, xs, heads, eps);
+}

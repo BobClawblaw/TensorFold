@@ -41,6 +41,28 @@ pub fn addRmsBounds(res0: []const f64, add: []const f64, w2: []const f64, y: []c
     }
 }
 
+/// y's sums over each 64 values.
+pub fn groupSums(y: []const f64, xs: []f64) void {
+    for (xs, 0..) |*o, j| {
+        var t: f64 = 0;
+        for (y[64 * j ..][0..64]) |v| t += v;
+        o.* = t;
+    }
+}
+
+/// A sum of 64 fp32 values' tolerance: 64 roundings of at most 2^-24 of the running |sum| <= sum |y|.
+pub fn groupSumTolerance(y: []const f64) f64 {
+    var t: f64 = 0;
+    for (y) |v| t += @abs(v);
+    return t * 64 * std.math.pow(f64, 2, -24) + 1e-30;
+}
+
+/// silu(z) * rms(y) * w for one head.
+pub fn gatedRms(y: []const f64, z: []const f64, w: []const f64, eps: f64, out: []f64) void {
+    rms(y, w, eps, out);
+    for (out, z) |*o, zz| o.* *= zz / (1 + @exp(-zz));
+}
+
 /// The element kinds the kernels read and write, numbered as they are (hip/ops/common.hpp: 0 fp32, 1 fp16, 2 bf16).
 pub const Kind = enum(u8) { f32 = 0, f16 = 1, bf16 = 2 };
 

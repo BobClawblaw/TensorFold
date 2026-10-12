@@ -31,12 +31,24 @@ pub const Norms = struct {
     add_rms_fn: Function,
     rms_bf16_fn: Function,
     add_rms_bf16_fn: Function,
+    add_rms_h_fn: Function,
+    add_rms_h_f32w_fn: Function,
+    gated_fns: [3]Function, // head dim 64, 128, 256
 
     pub fn load(d: *const Driver) !Norms {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var mod = try Module.load(d, kernels.norms);
         errdefer mod.unload();
-        return .{ .mod = mod, .rms_fn = try mod.function("tf_rms_rows"), .add_rms_fn = try mod.function("tf_add_rms_rows"), .rms_bf16_fn = try mod.function("tf_rms_rows_bf16"), .add_rms_bf16_fn = try mod.function("tf_add_rms_rows_bf16") };
+        return .{
+            .mod = mod,
+            .rms_fn = try mod.function("tf_rms_rows"),
+            .add_rms_fn = try mod.function("tf_add_rms_rows"),
+            .rms_bf16_fn = try mod.function("tf_rms_rows_bf16"),
+            .add_rms_bf16_fn = try mod.function("tf_add_rms_rows_bf16"),
+            .add_rms_h_fn = try mod.function("tf_add_rms_rows_bf16h"),
+            .add_rms_h_f32w_fn = try mod.function("tf_add_rms_rows_bf16h_f32w"),
+            .gated_fns = .{ try mod.function("tf_gated_rms_rows_64"), try mod.function("tf_gated_rms_rows_128"), try mod.function("tf_gated_rms_rows_256") },
+        };
     }
 
     pub fn unload(n: *Norms) void {
@@ -91,6 +103,41 @@ pub const Norms = struct {
         a.add(@as(i32, @intCast(width)));
         a.add(eps);
         try launch_.launch(n.add_rms_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = threads } }, s, &a);
+    }
+
+    /// bf16 residual: h = bf16(x + r) (r null: h = x), y = bf16(rms(h) * w); xs (or null): y's 64-value sums.
+    pub fn addRmsH(n: *const Norms, s: Stream, x: u64, r: ?u64, w: u64, w_kind: Kind, h: u64, y: u64, xs: ?u64, rows: usize, width: usize, eps: f32) !void {
+        if (width % 64 != 0 or !vectorOk(width, &.{ x, r orelse 0, w, h, y }) or w_kind == .f16) return error.RowShape;
+        if (rows == 0) return;
+        var a: launch_.Args = .{};
+        for ([_]u64{ x, r orelse 0, w, h, y, xs orelse 0 }) |v| a.add(v);
+        a.add(@as(i32, @intCast(width)));
+        a.add(eps);
+        const f = if (w_kind == .bf16) n.add_rms_h_fn else n.add_rms_h_f32w_fn;
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = vec_threads } }, s, &a);
+    }
+
+    /// Per head (dv 64/128/256): out = bf16(silu(z) * rms(y) * w), y/z rows at strides y_ld/z_ld; xs: 64-value sums.
+    pub fn gatedRms(n: *const Norms, s: Stream, y: u64, y_ld: usize, z: u64, z_ld: usize, w: u64, out: u64, xs: ?u64, rows: usize, heads: usize, dv: usize, eps: f32) !void {
+        const which: usize = switch (dv) {
+            64 => 0,
+            128 => 1,
+            256 => 2,
+            else => return error.RowShape,
+        };
+        if (y_ld % 8 != 0 or z_ld % 8 != 0 or !vectorOk(8, &.{ y, z, w, out })) return error.RowShape;
+        if (rows == 0 or heads == 0) return;
+        var a: launch_.Args = .{};
+        a.add(y);
+        a.add(@as(i64, @intCast(y_ld)));
+        a.add(z);
+        a.add(@as(i64, @intCast(z_ld)));
+        for ([_]u64{ w, out, xs orelse 0 }) |v| a.add(v);
+        a.add(@as(i32, @intCast(heads)));
+        a.add(eps);
+        const per_block = 256 / (dv / 8);
+        const grid: launch_.Dim3 = .{ .x = @intCast(rows), .y = @intCast((heads + per_block - 1) / per_block), .z = 1 };
+        try launch_.launch(n.gated_fns[which], .{ .grid = grid, .block = .{ .x = 256 } }, s, &a);
     }
 };
 
