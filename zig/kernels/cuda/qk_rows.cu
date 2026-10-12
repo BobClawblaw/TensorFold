@@ -9,12 +9,28 @@ namespace tf_qk {
 
 constexpr int MOST = 256; // head_dim at most
 
+// Where a row's heads come from: q, k and v (null: none) at row stride *_ld and head stride *_hs (elements).
+struct QkSrc {
+    const __nv_bfloat16* q;
+    long long q_ld, q_hs;
+    const __nv_bfloat16* k;
+    long long k_ld, k_hs;
+    const __nv_bfloat16* v;
+    long long v_ld, v_hs;
+};
+
+__device__ __forceinline__ const __nv_bfloat16* head_src(const QkSrc& s, int64_t r, int hd, int h, int hk) {
+    if (hd < h) return s.q + r * s.q_ld + hd * s.q_hs;
+    if (hd < h + hk) return s.k + r * s.k_ld + (hd - h) * s.k_hs;
+    return s.v + r * s.v_ld + (hd - h - hk) * s.v_hs;
+}
+
 }  // namespace tf_qk
 
 using namespace tf_qk;
 
-// Packed rows -> q, k, v (bf16); q, k normed by nw, rotate-half RoPE on `rot` dims; k, v also into kc/vc (or not).
-extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const __nv_bfloat16* qkv, const float* nw, const float* cosv,
+// Rows' heads (QkSrc) -> q, k, v (bf16); q, k normed by nw, rotate-half RoPE on `rot` dims; k, v also into kc/vc (or not).
+extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, const float* nw, const float* cosv,
                                                               const float* sinv, int rot, const int* pos,
                                                               const int* slot, __nv_bfloat16* q, __nv_bfloat16* ko,
                                                               __nv_bfloat16* vo, __nv_bfloat16* kc, __nv_bfloat16* vc,
@@ -24,7 +40,7 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const __nv_bfloat1
     const int dim = blockDim.x;
     const int64_t r = blockIdx.x;
     const int hd = blockIdx.y;
-    const __nv_bfloat16* src = qkv + (r * (h + 2 * hk) + hd) * dim;
+    const __nv_bfloat16* src = head_src(in, r, hd, h, hk);
     const float x = __bfloat162float(src[d]);
     const int p = pos[r];
     const int64_t pl = p < len ? p : p % len; // a 64-bit modulo only past the cache's end
@@ -70,7 +86,7 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const __nv_bfloat1
 
 // tf_qk_rows at head dim 128 with no or full rotation: a warp a head, lane l holding dims l + 32 j (the block form's
 // warps j), so the norm folds in the same order and a dim's rotation partner (j ^ 2) sits in the same lane.
-extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const __nv_bfloat16* qkv, const float* nw,
+extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const QkSrc in, const float* nw,
                                                                const float* cosv, const float* sinv, int rot,
                                                                const int* pos, const int* slot, __nv_bfloat16* q,
                                                                __nv_bfloat16* ko, __nv_bfloat16* vo,
@@ -80,8 +96,8 @@ extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const __nv_bfloat
     const int lane = threadIdx.x & 31;
     const int64_t r = blockIdx.x;
     const int hd = blockIdx.y * 4 + (threadIdx.x >> 5);
-    if (hd >= h + 2 * hk) return;
-    const __nv_bfloat16* src = qkv + (r * (h + 2 * hk) + hd) * D;
+    if (hd >= h + (in.v != nullptr ? 2 * hk : hk)) return;
+    const __nv_bfloat16* src = head_src(in, r, hd, h, hk);
     const int p = pos[r];
     __nv_bfloat16 raw[J];
 #pragma unroll

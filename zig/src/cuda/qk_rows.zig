@@ -13,6 +13,9 @@ const Stream = stream_.Stream;
 /// A packed row's heads: h query, hk key and hk value heads of `dim` (a multiple of 32, at most 256).
 pub const Heads = struct { h: usize, hk: usize, dim: usize };
 
+/// Where a row's heads come from: q, k and v (0: none) at row stride *_ld and head stride *_hs (elements).
+pub const Src = extern struct { q: u64, q_ld: i64, q_hs: i64, k: u64, k_ld: i64, k_hs: i64, v: u64 = 0, v_ld: i64 = 0, v_hs: i64 = 0 };
+
 /// What a call does to q and k: norms fp32 [2, dim] (q, k) or none; RoPE on `rot` dims from fp32 [positions, rot].
 pub const Shape = struct { norms: ?u64 = null, cos: ?u64 = null, sin: ?u64 = null, rot: usize = 0, eps: f32 = 1e-6 };
 
@@ -38,11 +41,20 @@ pub const QkRows = struct {
 
     /// n packed rows qkv [n, (h + 2 hk) dim] bf16 at positions pos (int32 [n]) in cache slots slot (int32 [n] or none).
     pub fn rows(g: *const QkRows, s: Stream, qkv: u64, hs: Heads, shape: Shape, pos: u64, slot: ?u64, out: Out, n: usize) !void {
+        const ld: i64 = @intCast((hs.h + 2 * hs.hk) * hs.dim);
+        const dim: i64 = @intCast(hs.dim);
+        const src: Src = .{ .q = qkv, .q_ld = ld, .q_hs = dim, .k = qkv + hs.h * hs.dim * 2, .k_ld = ld, .k_hs = dim, .v = qkv + (hs.h + hs.hk) * hs.dim * 2, .v_ld = ld, .v_hs = dim };
+        return g.rowsFrom(s, src, hs, shape, pos, slot, out, n);
+    }
+
+    /// As `rows`, the heads read from `src` (e.g. [q | gate] rows: q_hs = 2 dim); no v source: no v out or vc.
+    pub fn rowsFrom(g: *const QkRows, s: Stream, src: Src, hs: Heads, shape: Shape, pos: u64, slot: ?u64, out: Out, n: usize) !void {
         if (hs.dim % 32 != 0 or hs.dim > 256 or shape.rot % 2 != 0 or shape.rot > hs.dim) return error.HeadShape;
         if ((shape.cos == null) != (shape.sin == null) or (shape.cos != null and shape.rot == 0)) return error.HeadShape;
+        if (src.v == 0 and out.vc != null) return error.HeadShape;
         if (n == 0) return;
         var a: launch_.Args = .{};
-        a.add(qkv);
+        a.add(src);
         a.add(shape.norms orelse 0);
         a.add(shape.cos orelse 0);
         a.add(shape.sin orelse 0);
@@ -58,7 +70,7 @@ pub const QkRows = struct {
         a.add(@as(i32, @intCast(hs.h)));
         a.add(@as(i32, @intCast(hs.hk)));
         a.add(shape.eps);
-        const heads = hs.h + 2 * hs.hk;
+        const heads = hs.h + (if (src.v != 0) 2 * hs.hk else hs.hk);
         if (hs.dim == 128 and (shape.cos == null or shape.rot == 128)) {
             const grid: launch_.Dim3 = .{ .x = @intCast(n), .y = @intCast((heads + 3) / 4), .z = 1 };
             return launch_.launch(g.warp_fn, .{ .grid = grid, .block = .{ .x = 128 } }, s, &a);

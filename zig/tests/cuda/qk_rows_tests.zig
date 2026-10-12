@@ -128,6 +128,22 @@ fn run1(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const cuda.qk_
         }
     }
     worst.* = @max(worst.*, q_most);
+    // the same heads from [q | gate] rows and a padded k buffer, no v: the same q, k and k cache bits
+    const qg = try a.alloc(u16, most * c.h * 2 * c.dim);
+    const kb = try a.alloc(u16, most * (c.hk * c.dim + 64));
+    @memset(qg, 0x7fc0); // the gate halves: NaN, never read
+    @memset(kb, 0x7fc0);
+    for (0..most) |r| {
+        for (0..c.h) |hd| @memcpy(qg[(r * c.h + hd) * 2 * c.dim ..][0..c.dim], xs[r * width + hd * c.dim ..][0..c.dim]);
+        @memcpy(kb[r * (c.hk * c.dim + 64) ..][0 .. c.hk * c.dim], xs[r * width + c.h * c.dim ..][0 .. c.hk * c.dim]);
+    }
+    const src: cuda.qk_rows.Src = .{ .q = try up.f(gpu, &bufs, std.mem.sliceAsBytes(qg)), .q_ld = @intCast(c.h * 2 * c.dim), .q_hs = @intCast(2 * c.dim), .k = try up.f(gpu, &bufs, std.mem.sliceAsBytes(kb)), .k_ld = @intCast(c.hk * c.dim + 64), .k_hs = @intCast(c.dim) };
+    const o2: cuda.qk_rows.Out = .{ .q = try up.z(gpu, &bufs, s, most * c.h * c.dim * 2), .k = try up.z(gpu, &bufs, s, most * c.hk * c.dim * 2), .v = 0, .kc = try up.z(gpu, &bufs, s, cache_bytes), .len = len };
+    try g.rowsFrom(s, src, .{ .h = c.h, .hk = c.hk, .dim = c.dim }, shape, dp, dsl, o2, most);
+    try s.synchronize();
+    try check.sameBytes("qk rows from strided heads: q", std.mem.sliceAsBytes(try back.f(gpu, a, o2.q, most * c.h * c.dim)), std.mem.sliceAsBytes(gq));
+    try check.sameBytes("qk rows from strided heads: k", std.mem.sliceAsBytes(try back.f(gpu, a, o2.k, most * c.hk * c.dim)), std.mem.sliceAsBytes(gk));
+    try check.sameBytes("qk rows from strided heads: k cache", std.mem.sliceAsBytes(try back.f(gpu, a, o2.kc.?, cache_bytes / 2)), std.mem.sliceAsBytes(gkc));
     try check.expect(q_most <= 1, "qk rows {d}/{d}x{d}, rot {d}{s}: within float64 tolerance (worst {d:.3})", .{ c.h, c.hk, c.dim, c.rot, if (c.norm) ", normed" else "", q_most });
     for (counts[0 .. counts.len - 1], outs[0 .. counts.len - 1]) |m, oo| {
         try check.sameBytes("qk rows: q at a smaller row count", std.mem.sliceAsBytes(try back.f(gpu, a, oo.q, m * c.h * c.dim)), std.mem.sliceAsBytes(gq[0 .. m * c.h * c.dim]));
@@ -149,5 +165,6 @@ pub fn run(gpu: check.Gpu) !void {
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 48, .hk = 4, .dim = 128, .rot = 0, .norm = true }, &worst); // Kolibri, full
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 8, .hk = 2, .dim = 64, .rot = 32, .norm = false }, &worst); // partial rotary
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 16, .hk = 2, .dim = 128, .rot = 128, .norm = false }, &worst); // a warp a head, no norm
+    try run1(gpu, a, s, &g, prng.random(), .{ .h = 24, .hk = 4, .dim = 256, .rot = 64, .norm = true }, &worst); // Qwen3.8-27B
     check.pass("qk rows: q and k within float64 tolerance (worst {d:.3}), v and the caches exact, bits at any row count", .{worst});
 }
