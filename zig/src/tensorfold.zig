@@ -18,6 +18,7 @@ pub const flashnext_replay = @import("families/flashnext/replay.zig");
 pub const flashnext_engine = @import("families/flashnext/engine.zig");
 pub const flashnext_snapshot = @import("families/flashnext/snapshot.zig");
 pub const flashnext_learned = @import("families/flashnext/learned.zig");
+pub const flashnext_vision = @import("families/flashnext/vision.zig");
 pub const glm = @import("families/glm/glm.zig");
 pub const qwen35 = @import("families/qwen3_5/qwen3_5.zig");
 pub const flashnext_pack = @import("families/flashnext/pack.zig");
