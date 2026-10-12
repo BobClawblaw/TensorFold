@@ -144,6 +144,22 @@ fn run1(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const cuda.qk_
     try check.sameBytes("qk rows from strided heads: q", std.mem.sliceAsBytes(try back.f(gpu, a, o2.q, most * c.h * c.dim)), std.mem.sliceAsBytes(gq));
     try check.sameBytes("qk rows from strided heads: k", std.mem.sliceAsBytes(try back.f(gpu, a, o2.k, most * c.hk * c.dim)), std.mem.sliceAsBytes(gk));
     try check.sameBytes("qk rows from strided heads: k cache", std.mem.sliceAsBytes(try back.f(gpu, a, o2.kc.?, cache_bytes / 2)), std.mem.sliceAsBytes(gkc));
+    // head-major outputs [heads, rows, dim] (strides): the packed call's bits, rearranged
+    {
+        const o4: cuda.qk_rows.Out = .{ .q = try up.z(gpu, &bufs, s, most * c.h * c.dim * 2), .k = try up.z(gpu, &bufs, s, most * c.hk * c.dim * 2), .v = try up.z(gpu, &bufs, s, most * c.hk * c.dim * 2), .len = len, .q_ld = c.dim, .q_hs = most * c.dim, .kv_ld = c.dim, .kv_hs = most * c.dim };
+        try g.rows(s, dx, .{ .h = c.h, .hk = c.hk, .dim = c.dim }, shape, dp, dsl, o4, most);
+        try s.synchronize();
+        const hq = try back.f(gpu, a, o4.q, most * c.h * c.dim);
+        const hk_ = try back.f(gpu, a, o4.k, most * c.hk * c.dim);
+        const hv = try back.f(gpu, a, o4.v, most * c.hk * c.dim);
+        for (0..most) |r| {
+            for (0..c.h) |hd| try check.sameBytes("qk rows head-major: q", std.mem.sliceAsBytes(hq[(hd * most + r) * c.dim ..][0..c.dim]), std.mem.sliceAsBytes(gq[(r * c.h + hd) * c.dim ..][0..c.dim]));
+            for (0..c.hk) |hd| {
+                try check.sameBytes("qk rows head-major: k", std.mem.sliceAsBytes(hk_[(hd * most + r) * c.dim ..][0..c.dim]), std.mem.sliceAsBytes(gk[(r * c.hk + hd) * c.dim ..][0..c.dim]));
+                try check.sameBytes("qk rows head-major: v", std.mem.sliceAsBytes(hv[(hd * most + r) * c.dim ..][0..c.dim]), std.mem.sliceAsBytes(gv[(r * c.hk + hd) * c.dim ..][0..c.dim]));
+            }
+        }
+    }
     // bf16 norm weights at their own addresses and RoPE from inv (angle = pos * inv in fp32): float64 tolerance
     if (c.norm) {
         const wqb = try a.alloc(u16, c.dim);

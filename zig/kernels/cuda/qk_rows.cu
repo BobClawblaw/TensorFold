@@ -44,6 +44,16 @@ __device__ __forceinline__ void rope_at(const float* cosv, const float* sinv, co
     }
 }
 
+// Where a row's q, k and v (null: none) go, at row stride *_ld and head stride *_hs (elements).
+struct QkDst {
+    __nv_bfloat16* q;
+    long long q_ld, q_hs;
+    __nv_bfloat16* k;
+    long long k_ld, k_hs;
+    __nv_bfloat16* v;
+    long long v_ld, v_hs;
+};
+
 __device__ __forceinline__ const __nv_bfloat16* head_src(const QkSrc& s, int64_t r, int hd, int h, int hk) {
     if (hd < h) return s.q + r * s.q_ld + hd * s.q_hs;
     if (hd < h + hk) return s.k + r * s.k_ld + (hd - h) * s.k_hs;
@@ -57,8 +67,7 @@ using namespace tf_qk;
 // QkSrc's heads -> q, k, v (bf16); q, k normed by nw, rotate-half RoPE on `rot` dims; k, v also into kc/vc.
 extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, const QkW nw, const float* cosv,
                                                               const float* sinv, const float* inv, int rot, const int* pos,
-                                                              const int* slot, __nv_bfloat16* q, __nv_bfloat16* ko,
-                                                              __nv_bfloat16* vo, __nv_bfloat16* kc, __nv_bfloat16* vc,
+                                                              const int* slot, const QkDst dst, __nv_bfloat16* kc, __nv_bfloat16* vc,
                                                               long long len, int h, int hk, float eps) {
     __shared__ float warps[MOST / 32];
     const int d = threadIdx.x;
@@ -72,7 +81,7 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, co
     const int64_t at = slot != nullptr ? static_cast<int64_t>(slot[r]) * len + pl : pl;
     if (hd >= h + hk) { // v: as is
         const int k = hd - h - hk;
-        vo[(r * hk + k) * dim + d] = src[d];
+        if (dst.v != nullptr) dst.v[r * dst.v_ld + k * dst.v_hs + d] = src[d];
         if (vc != nullptr) vc[(at * hk + k) * dim + d] = src[d];
         return;
     }
@@ -100,10 +109,10 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, co
     }
     const __nv_bfloat16 out = __float2bfloat16_rn(y);
     if (hd < h) {
-        q[(r * h + hd) * dim + d] = out;
+        dst.q[r * dst.q_ld + hd * dst.q_hs + d] = out;
     } else {
         const int k = hd - h;
-        ko[(r * hk + k) * dim + d] = out;
+        dst.k[r * dst.k_ld + k * dst.k_hs + d] = out;
         if (kc != nullptr) kc[(at * hk + k) * dim + d] = out;
     }
 }
@@ -111,8 +120,7 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, co
 // tf_qk_rows at dim 128, no or full rotation: a warp a head, lane l dims l + 32 j (same fold order, partner j ^ 2).
 extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const QkSrc in, const QkW nw,
                                                                const float* cosv, const float* sinv, const float* inv, int rot,
-                                                               const int* pos, const int* slot, __nv_bfloat16* q,
-                                                               __nv_bfloat16* ko, __nv_bfloat16* vo,
+                                                               const int* pos, const int* slot, const QkDst dst,
                                                                __nv_bfloat16* kc, __nv_bfloat16* vc, long long len,
                                                                int h, int hk, float eps) {
     constexpr int D = 128, J = D / 32;
@@ -140,7 +148,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const QkSrc in, c
         const int k = hd - h - hk;
 #pragma unroll
         for (int j = 0; j < J; ++j) {
-            vo[(r * hk + k) * D + lane + 32 * j] = raw[j];
+            if (dst.v != nullptr) dst.v[r * dst.v_ld + k * dst.v_hs + lane + 32 * j] = raw[j];
             if (vc != nullptr) vc[(at * hk + k) * D + lane + 32 * j] = raw[j];
         }
         return;
@@ -176,10 +184,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const QkSrc in, c
     for (int j = 0; j < J; ++j) {
         const __nv_bfloat16 out = __float2bfloat16_rn(y[j]);
         if (hd < h) {
-            q[(r * h + hd) * D + lane + 32 * j] = out;
+            dst.q[r * dst.q_ld + hd * dst.q_hs + lane + 32 * j] = out;
         } else {
             const int k = hd - h;
-            ko[(r * hk + k) * D + lane + 32 * j] = out;
+            dst.k[r * dst.k_ld + k * dst.k_hs + lane + 32 * j] = out;
             if (kc != nullptr) kc[(at * hk + k) * D + lane + 32 * j] = out;
         }
     }

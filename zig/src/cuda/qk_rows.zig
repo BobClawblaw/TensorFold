@@ -23,7 +23,22 @@ pub const Shape = struct { norms: ?u64 = null, norm_k: ?u64 = null, norms_bf16: 
 const W = extern struct { q: u64, k: u64, bf16: i32 };
 
 /// Where the rows go: q [n, h, dim], k and v [n, hk, dim]; k and v also into kc/vc at (slot * len + pos % len).
-pub const Out = struct { q: u64, k: u64, v: u64, kc: ?u64 = null, vc: ?u64 = null, len: usize = 1 };
+pub const Out = struct {
+    q: u64,
+    k: u64,
+    v: u64,
+    kc: ?u64 = null,
+    vc: ?u64 = null,
+    len: usize = 1,
+    /// Row and head strides in elements (0: packed [n, heads, dim]); head-major [heads, n, dim]: ld dim, hs n dim.
+    q_ld: usize = 0,
+    q_hs: usize = 0,
+    kv_ld: usize = 0,
+    kv_hs: usize = 0,
+};
+
+/// qk_rows.cu's QkDst.
+const Dst = extern struct { q: u64, q_ld: i64, q_hs: i64, k: u64, k_ld: i64, k_hs: i64, v: u64, v_ld: i64, v_hs: i64 };
 
 pub const QkRows = struct {
     mod: Module,
@@ -69,9 +84,12 @@ pub const QkRows = struct {
         a.add(@as(i32, @intCast(if (roped) shape.rot else 0)));
         a.add(pos);
         a.add(slot orelse 0);
-        a.add(out.q);
-        a.add(out.k);
-        a.add(out.v);
+        const dim: i64 = @intCast(hs.dim);
+        const qld: i64 = if (out.q_ld != 0) @intCast(out.q_ld) else @as(i64, @intCast(hs.h)) * dim;
+        const qhs: i64 = if (out.q_hs != 0) @intCast(out.q_hs) else dim;
+        const kld: i64 = if (out.kv_ld != 0) @intCast(out.kv_ld) else @as(i64, @intCast(hs.hk)) * dim;
+        const khs: i64 = if (out.kv_hs != 0) @intCast(out.kv_hs) else dim;
+        a.add(Dst{ .q = out.q, .q_ld = qld, .q_hs = qhs, .k = out.k, .k_ld = kld, .k_hs = khs, .v = out.v, .v_ld = kld, .v_hs = khs });
         a.add(out.kc orelse 0);
         a.add(out.vc orelse 0);
         a.add(@as(i64, @intCast(out.len)));
