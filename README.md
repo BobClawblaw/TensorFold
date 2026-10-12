@@ -71,6 +71,7 @@ Nemotron's named checkpoint is `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B
 NVIDIA's NVFP4 checkpoint, `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, serves on CUDA as stored; its bf16 MTP head is quantized to 4-bit at load for drafts.
 The 2B checkpoint is `mlx-community/Qwen3.5-2B-MLX-4bit`, revision `93760be4f1f69842a46bc13dbdc0f19e291392a3`.
 Flash Next loads its checkpoint directly and builds its weight packs locally, without a recorded kernel directory.
+On Metal it samples a request with a temperature on the host, with the lane core's keyed sampler; speed-up mode decodes greedily.
 GLM's two-Mac setup uses one settings file per rank and a separate MCDMA runtime.
 The [1.0.0 release notes](RELEASE-NOTES-1.0.0.md) give qualification limits and credit the contributors.
 
