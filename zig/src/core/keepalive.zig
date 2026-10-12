@@ -27,6 +27,10 @@ pub const Keepalive = struct {
     pub fn start(gpa: std.mem.Allocator, io: std.Io, target: Target, window_ns: i64) !*Keepalive {
         const k = try gpa.create(Keepalive);
         k.* = .{ .gpa = gpa, .io = io, .target = target, .window_ns = window_ns, .idle_since = .init(now(io)) };
+        if (std.c.getenv("TF_KEEPALIVE_MS")) |v| { // a shorter tick for an engine whose idle unwiring a 400 ms tick misses
+            const ms = std.fmt.parseInt(i64, std.mem.span(v), 10) catch 400;
+            k.interval_ns = @max(20, ms) * std.time.ns_per_ms;
+        }
         if (std.Thread.spawn(.{}, loop, .{k})) |t| {
             k.thread = t;
         } else |e| {

@@ -21,11 +21,16 @@ pub const Vis = struct {
     video_markers: [3]u32 = video_markers,
     lim: api.VisionOpen,
 
+    /// One image's tokens at most while a request's images fit --vision-image-tokens together (the Python lane's
+    /// TOKENS_PER_IMAGE): the tower's scratch holds one such image.
+    pub const image_most: u32 = 4096;
+
     /// The server's image hook: this tower's offer, `ctx` this Vis.
     pub fn offer(v: *Vis) api.Vision {
         // a video: frames in pairs, each "<X.Y seconds>", <|vision_start|>, its <|video_pad|> rows, <|vision_end|>
         const video: api.VideoOffer = .{ .prepare = prepareVideo, .video_token = video_markers[1], .group_open = video_markers[0], .group_close = video_markers[2], .group_token = video_markers[1], .time_first = true, .markers = &v.video_markers, .video_tokens = v.lim.video_tokens, .max_videos = v.lim.max_videos, .max_frames = v.lim.max_frames };
-        return .{ .ctx = v, .prepare = prepare, .image_token = markers[1], .markers = &v.markers, .image_tokens = v.lim.image_tokens, .max_images = v.lim.max_images, .video = video };
+        // video only with libtfvideo beside the server: without it a video part is refused (400), not failed (500)
+        return .{ .ctx = v, .prepare = prepare, .image_token = markers[1], .markers = &v.markers, .image_tokens = v.lim.image_tokens, .max_images = v.lim.max_images, .image_most = image_most, .video = if (api.tfvideo.version() != null) video else null };
     }
 
     pub fn deinit(v: *Vis) void {
@@ -35,11 +40,12 @@ pub const Vis = struct {
 
     /// The request's images through the tower: the prompt pass's image rows and positions (freed by `release`).
     pub fn build(v: *Vis, eng: *fx.Engine, a: std.mem.Allocator, images: []const api.Image, prompt_len: usize) !*vp.VisPrompt {
-        return vp.build(v.tower, eng.r.device, eng.r.queue, a, images, prompt_len);
+        return vp.build(v.tower, eng.r.device, eng.r.queue, a, images, prompt_len, .{});
     }
 };
 
-/// The tower for `dir` with scratch for `lim.image_tokens` tokens at once; refused on a speed-up pair.
+/// The tower for `dir` with scratch for one image (Vis.image_most tokens, fewer under a smaller budget); refused on a
+/// speed-up pair.
 pub fn attach(gpa: std.mem.Allocator, eng: *fx.Engine, dir: []const u8, lim: api.VisionOpen) !*Vis {
     if (eng.r.tp != null) return error.VisionOnPair;
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -50,8 +56,9 @@ pub fn attach(gpa: std.mem.Allocator, eng: *fx.Engine, dir: []const u8, lim: api
     try fnv.check(f.bytes[0..f.size], arena.allocator());
     const v = try gpa.create(Vis);
     errdefer gpa.destroy(v);
-    v.* = .{ .gpa = gpa, .tower = try fnv.Vision.load(gpa, eng.r.device, dir, lim.image_tokens), .lim = lim };
-    std.log.info("flash next: image tower loaded ({d:.2} GiB with scratch for {d} image tokens a request)", .{ @as(f64, @floatFromInt(v.tower.bytes)) / (1 << 30), lim.image_tokens });
+    const one = @min(lim.image_tokens, Vis.image_most);
+    v.* = .{ .gpa = gpa, .tower = try fnv.Vision.load(gpa, eng.r.device, dir, one), .lim = lim };
+    std.log.info("flash next: image tower loaded ({d:.2} GiB with scratch for an image of {d} tokens; {d} image tokens a request)", .{ @as(f64, @floatFromInt(v.tower.bytes)) / (1 << 30), one, lim.image_tokens });
     return v;
 }
 

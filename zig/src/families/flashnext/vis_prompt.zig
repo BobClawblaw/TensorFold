@@ -1,9 +1,11 @@
 //! An image prompt in the replay engine: the tower's rows for its images, where they sit, and the positions its prompt
 //! pass rotates at. transformers' get_rope_index gives text one position on all three axes and an image's merged
 //! tokens (p, p + row, p + col), moving p on by max(rows, cols) past it: text after an image sits below its slot.
-//! Rotary scores read only differences of positions, so this engine shifts the whole frame by the images' total:
-//! text after the last image rotates at its own slot (decode, drafts and GPU-side rounds unchanged), and only prompt
-//! rows up to the last image's end (`frame_end`) take a table position.
+//! Rotary scores read only differences of positions, so the single-reply engine shifts the whole frame by the images'
+//! total: text after the last image rotates at its own slot (decode, drafts and GPU-side rounds unchanged), and only
+//! prompt rows up to the last image's end (`frame_end`) take a table position. The shared sessions take the standard
+//! frame instead (`Opts.standard`): a prefix's rows sit where every longer prompt puts them, so an image prompt keeps
+//! and resumes states as text does, and rows past the last image rotate at their slot plus `delta` (at most 0).
 const std = @import("std");
 const mtl = @import("metal");
 
@@ -15,13 +17,14 @@ pub const VisPrompt = struct {
     spans: []const Span,
     pos3: []const i32, // [frame_end * 3]: each slot's t, h, w below frame_end
     frame_end: u32,
+    delta: i32 = 0, // the standard frame: rows past the last image rotate at their slot plus this
     prep: mtl.Pipeline, // fnv_attn_prep_mrope
 
     /// Rows [pos, pos + n): the recorded kernels' position (t) and the multimodal kernel's three.
     pub fn positions(v: *const VisPrompt, pos: usize, n: usize, out_pos: []i32, out3: []i32) void {
         for (0..n) |i| {
             const slot = pos + i;
-            const p: [3]i32 = if (slot < v.frame_end) v.pos3[slot * 3 ..][0..3].* else @splat(@intCast(slot));
+            const p: [3]i32 = if (slot < v.frame_end) v.pos3[slot * 3 ..][0..3].* else @splat(@as(i32, @intCast(slot)) + v.delta);
             out_pos[i] = p[0];
             @memcpy(out3[i * 3 ..][0..3], &p);
         }
@@ -36,13 +39,21 @@ pub const VisPrompt = struct {
     }
 };
 
-/// Each slot's three positions below the last image's end, in the shifted frame (`spans` in prompt order).
-pub fn frame(gpa: std.mem.Allocator, spans: []const Span) ![]i32 {
+/// The total every image's tokens run past max(rows, cols): the shifted frame moves by it, the standard frame's rows
+/// past the last image sit that far below their slots.
+pub fn shiftOf(spans: []const Span) i64 {
+    var shift: i64 = 0;
+    for (spans) |s| shift += @as(i64, s.n) - @max(s.mh, s.mw);
+    return shift;
+}
+
+/// Each slot's three positions below the last image's end, in the shifted frame (`standard`: unshifted; `spans` in
+/// prompt order).
+pub fn frame(gpa: std.mem.Allocator, spans: []const Span, standard: bool) ![]i32 {
     if (spans.len == 0) return &.{};
     const last = spans[spans.len - 1];
     const end: usize = @as(usize, last.at) + last.n;
-    var shift: i64 = 0; // the total the frame moves by: every image's tokens past max(rows, cols)
-    for (spans) |s| shift += @as(i64, s.n) - @max(s.mh, s.mw);
+    const shift: i64 = if (standard) 0 else shiftOf(spans); // the total the frame moves by
     const out = try gpa.alloc(i32, end * 3);
     var cur: i64 = 0; // transformers' current_pos
     var slot: usize = 0;
@@ -67,12 +78,31 @@ pub fn frame(gpa: std.mem.Allocator, spans: []const Span) ![]i32 {
 test "the shifted frame: text after the last image at its slot, the image's tokens on its grid" {
     const a = std.testing.allocator;
     // 3 text tokens, a 2x3 image (6 tokens), then text: transformers gives the image (3, 3+r, 3+c) and the next text 6
-    const p = try frame(a, &.{.{ .at = 3, .n = 6, .mh = 2, .mw = 3, .row = 0 }});
+    const p = try frame(a, &.{.{ .at = 3, .n = 6, .mh = 2, .mw = 3, .row = 0 }}, false);
     defer a.free(p);
     try std.testing.expectEqual(@as(usize, 9 * 3), p.len);
     // shift 6 - 3 = 3: text 0, 1, 2 at 3, 4, 5; the image from t = 6; the next text (slot 9) at 6 + 3 = 9, its slot
     try std.testing.expectEqualSlices(i32, &.{ 3, 3, 3, 4, 4, 4, 5, 5, 5 }, p[0..9]);
     try std.testing.expectEqualSlices(i32, &.{ 6, 6, 6, 6, 6, 7, 6, 6, 8, 6, 7, 6, 6, 7, 7, 6, 7, 8 }, p[9..27]);
+}
+
+test "the standard frame: a prefix's positions whatever images follow, rows past the last image at slot plus delta" {
+    const a = std.testing.allocator;
+    const one = [_]Span{.{ .at = 3, .n = 6, .mh = 2, .mw = 3, .row = 0 }};
+    const two = [_]Span{ one[0], .{ .at = 12, .n = 4, .mh = 2, .mw = 2, .row = 6 } };
+    const p1 = try frame(a, &one, true);
+    defer a.free(p1);
+    const p2 = try frame(a, &two, true);
+    defer a.free(p2);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 0, 1, 1, 1, 2, 2, 2 }, p1[0..9]); // text from 0, unshifted
+    try std.testing.expectEqualSlices(i32, &.{ 3, 3, 3, 3, 3, 4 }, p1[9..15]); // the image from t = 3
+    try std.testing.expectEqualSlices(i32, p1, p2[0..p1.len]); // a later image moves nothing before it
+    try std.testing.expectEqual(@as(i64, 3), shiftOf(&one)); // the next text (slot 9) at 9 - 3 = 6
+    const v: VisPrompt = .{ .rows = undefined, .spans = &one, .pos3 = p1, .frame_end = 9, .delta = -3, .prep = undefined };
+    var t: [2]i32 = undefined;
+    var t3: [6]i32 = undefined;
+    v.positions(9, 2, &t, &t3);
+    try std.testing.expectEqualSlices(i32, &.{ 6, 7 }, &t);
 }
 
 test "the rows of a span a chunk holds" {
@@ -82,9 +112,13 @@ test "the rows of a span a chunk holds" {
     try std.testing.expectEqual(@as(?[3]usize, .{ 0, 12, 15 }), VisPrompt.overlap(s, 15, 100));
 }
 
+/// How a prompt's images are built: the frame, and the slot its pass resumes at (images ending at or before it are in
+/// the restored state: the tower skips them and their rows stay unread).
+pub const Opts = struct { standard: bool = false, from: usize = 0 };
+
 /// `images` (each with pixels, gh, gw, at, tokens: lanes' Image) through `tower` on `queue`: the image prompt for a
 /// prompt of `prompt_len` tokens, its rows on `device` (freed by the caller: `rows.deinit()`), the rest in `a`.
-pub fn build(tower: anytype, device: mtl.Device, queue: mtl.Queue, a: std.mem.Allocator, images: anytype, prompt_len: usize) !*VisPrompt {
+pub fn build(tower: anytype, device: mtl.Device, queue: mtl.Queue, a: std.mem.Allocator, images: anytype, prompt_len: usize, opts: Opts) !*VisPrompt {
     const fnv = @import("vision.zig");
     var total: usize = 0;
     var most: usize = 0;
@@ -105,7 +139,12 @@ pub fn build(tower: anytype, device: mtl.Device, queue: mtl.Queue, a: std.mem.Al
     defer out.deinit();
     const t0 = std.c.mach_absolute_time();
     var gpu: f64 = 0;
+    var encoded: usize = 0;
+    var encoded_tokens: usize = 0;
     for (images, spans) |img, s| { // one image a command buffer: the tower's host-written scratch is shared
+        if (@as(usize, s.at) + s.n <= opts.from) continue; // in the restored state
+        encoded += 1;
+        encoded_tokens += s.n;
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = queue.commandBuffer();
@@ -124,9 +163,9 @@ pub fn build(tower: anytype, device: mtl.Device, queue: mtl.Queue, a: std.mem.Al
         for (0..s.n) |k| for (0..4) |stream| @memcpy(dst[((s.row + k) * 4 + stream) * row ..][0..row], src[k * row ..][0..row]);
     }
     const ms = @as(f64, @floatFromInt(std.c.mach_absolute_time() - t0)) / 24e3; // 24 MHz ticks on Apple silicon
-    std.log.info("flash next vision: {d} images, {d} tokens through the tower in {d:.1} ms ({d:.1} ms on the GPU)", .{ images.len, total, ms, gpu * 1e3 });
+    if (encoded > 0) std.log.info("flash next vision: {d} images, {d} tokens through the tower in {d:.1} ms ({d:.1} ms on the GPU){s}", .{ encoded, encoded_tokens, ms, gpu * 1e3, if (encoded < images.len) " (the rest in the restored prefix)" else "" });
     const p = try a.create(VisPrompt);
     const last = spans[spans.len - 1];
-    p.* = .{ .rows = rows, .spans = spans, .pos3 = try frame(a, spans), .frame_end = last.at + last.n, .prep = tower.k.attn_prep };
+    p.* = .{ .rows = rows, .spans = spans, .pos3 = try frame(a, spans, opts.standard), .frame_end = last.at + last.n, .delta = if (opts.standard) @intCast(-shiftOf(spans)) else 0, .prep = tower.k.attn_prep };
     return p;
 }

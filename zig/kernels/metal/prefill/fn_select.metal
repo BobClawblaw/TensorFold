@@ -65,3 +65,45 @@ using namespace metal;
   }
   POOLED[size_t(b) * DI + d] = bfloat(out);
 }
+
+// q4_idx_pool's arithmetic at an image prompt's block positions (the standard frame): block START[0] + j's three
+// rotary positions BPOS[b * 3 ..] (its first row's: t, h, w; text runs on all three alike, so a text block keeps
+// q4_idx_pool's bits), frequency i taking Qwen's interleaved axis as fnv_attn_prep_mrope does (h when i % 3 == 1,
+// w when i % 3 == 2 and i < 30, else t). Writes block j at POOLED + j * DI, as q4_idx_pool from its bound offset.
+[[kernel]] void fz_idx_pool3(const device bfloat* RAW [[buffer(0)]], const constant int* START [[buffer(1)]],
+    const device float* Wn [[buffer(2)]], const constant float* eps [[buffer(3)]], const constant float* LOG2BASE [[buffer(4)]],
+    const device int* BPOS [[buffer(5)]], device bfloat* POOLED [[buffer(6)]], uint sgi [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint3 tpos [[thread_position_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+  constexpr int DI = 128;
+  constexpr int RD = 64;
+  const int j = int(tg.y);
+  const int d = int(tpos.x);
+  const int b = START[0] + j;
+  threadgroup float part[DI / 32];
+  threadgroup float normed[DI];
+  const device bfloat* src = RAW + size_t(4 * b) * DI + d;
+  float m = float(src[0]);
+  for (int k = 1; k < 4; k++) m += float(src[k * DI]);
+  const float x = float(bfloat(m * 0.25f));
+  float ss = simd_sum(x * x);
+  if (lane == 0) part[sgi] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (int k = 0; k < DI / 32; k++) total += part[k];
+  const float inv = metal::rsqrt(total / float(DI) + eps[0]);
+  normed[d] = float(bfloat((x * inv) * Wn[d]));
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float out = normed[d];
+  if (d < RD) {
+    const int hr = RD / 2;
+    const int i = d % hr;
+    const int axis = (i % 3 == 1 && i < 33) ? 1 : ((i % 3 == 2 && i < 30) ? 2 : 0);
+    // LOG2BASE[1] != 0: YaRN (the frequencies at [3, 35), cos and sin scaled by [2]); else the plain rotary
+    const float freq = LOG2BASE[1] != 0.0f ? LOG2BASE[3 + i] : metal::exp2(-(float(i) / float(hr)) * LOG2BASE[0]);
+    const float angle = float(BPOS[b * 3 + axis]) * freq;
+    const float ys = LOG2BASE[1] != 0.0f ? LOG2BASE[2] : 1.0f;
+    const float c = metal::fast::cos(angle) * ys, s = metal::fast::sin(angle) * ys;
+    out = d < hr ? normed[d] * c - normed[d + hr] * s : normed[d - hr] * s + normed[d] * c;
+  }
+  POOLED[size_t(j) * DI + d] = bfloat(out);
+}

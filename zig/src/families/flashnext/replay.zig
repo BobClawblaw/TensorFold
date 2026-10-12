@@ -912,6 +912,7 @@ pub const Run = struct {
     variants: std.StringHashMapUnmanaged(*Variant) = .empty,
     roles: std.StringHashMapUnmanaged(Site) = .empty,
     shapes: std.StringHashMapUnmanaged(mtl.Buffer) = .empty,
+    held: std.ArrayList(mtl.Buffer) = .empty, // what buffer, load and group made: a host's residency set holds them
     loaded: usize = 0,
     rows: usize = 1,
     fused_xsum: bool = false,
@@ -982,12 +983,14 @@ pub const Run = struct {
     gsel: ?GSelect = null, // the same in GPU-side rounds
     sel_meta_pipe: mtl.Pipeline = undefined,
     pool_abs_pipe: mtl.Pipeline = undefined,
+    pool3_pipe: mtl.Pipeline = undefined, // fz_idx_pool3: an image prompt's blocks at their three positions (standard frame)
     ngram: []const u8 = "shard_", // how the checkpoint spells its n-gram table shards (index.ngramSpelling)
 
     pub fn buffer(r: *Run, len: usize) !mtl.Buffer {
         const n = @max(len, 64);
         const b = try r.device.buffer(n, opts);
         @memset(b.contents()[0..n], 0);
+        try r.held.append(r.arena, b);
         return b;
     }
 
@@ -1024,6 +1027,7 @@ pub const Run = struct {
         errdefer b.deinit();
         try readAll(e.fd, b.contents()[0..e.len], e.at);
         r.loaded += e.len;
+        try r.held.append(r.arena, b);
         return .{ .b = b };
     }
 
@@ -1047,6 +1051,7 @@ pub const Run = struct {
             at += e.len;
         }
         r.loaded += total;
+        try r.held.append(r.arena, b);
         return .{ .b = b };
     }
 
@@ -1142,6 +1147,7 @@ pub const Run = struct {
         const slib = try mtl.Library.fromSource(r.device, ks.flashnext_select, mtl.CompileOptions.mlx());
         r.sel_meta_pipe = try mtl.Pipeline.init(r.device, slib, "fz_sel_meta", false);
         r.pool_abs_pipe = try mtl.Pipeline.init(r.device, slib, "fz_idx_pool_abs", false);
+        r.pool3_pipe = try mtl.Pipeline.init(r.device, slib, "fz_idx_pool3", false);
         r.sink = .{ .b = try r.buffer(64) };
     }
 
@@ -1580,30 +1586,38 @@ pub const Select = struct {
     pub fn catchUp(s: *Select, r: *Run, m: *Model, upto: usize) !void {
         var k: usize = 0;
         for (&m.layers) |*L| if (!L.linear) {
-            try s.catchLayer(r, L, m.t.eps, m.t.log2base, upto, k);
+            try s.catchLayer(r, L, m.t.eps, m.t.log2base, upto, k, m.bpos);
             k += 1;
         };
-        try s.catchLayer(r, &m.mtp, m.t.eps, m.t.log2base, upto, k);
+        try s.catchLayer(r, &m.mtp, m.t.eps, m.t.log2base, upto, k, null); // the head rotates at slots
     }
 
     /// One layer's catch-up, its first block in slot k (the GPU reads it when it runs the dispatch).
-    pub fn catchLayer(s: *Select, r: *Run, L: anytype, eps: Buf, log2base: Buf, upto: usize, k: usize) !void {
+    pub fn catchLayer(s: *Select, r: *Run, L: anytype, eps: Buf, log2base: Buf, upto: usize, k: usize, bpos: ?Buf) !void {
         if (upto <= L.pooled_n) return;
         const at = catchSlot(s.starts.b.slice(i32, CATCH * 64), k, L.pooled_n);
-        try r.bindV(s.pool, &.{ L.raw, .{ .b = s.starts.b, .off = at }, L.pool, eps, log2base }, &.{.{ .b = L.pooled.b, .off = L.pooled.off + L.pooled_n * 128 * 2 }});
-        r.enc.dispatchThreads(mtl.Size.of(128, upto - L.pooled_n, 1), mtl.Size.of(128, 1, 1));
-        if (!r.serial) r.enc.barrier();
+        try s.pool_(r, L, .{ .b = s.starts.b, .off = at }, eps, log2base, upto - L.pooled_n, bpos);
         L.pooled_n = upto;
     }
 
+    /// Blocks [L.pooled_n, + count) pooled: the recorded kernel at 4 b, or fz_idx_pool3 at an image prompt's block
+    /// positions (`bpos`, the standard frame); `start` holds the first block for the GPU.
+    fn pool_(s: *Select, r: *Run, L: anytype, start: Buf, eps: Buf, log2base: Buf, count: usize, bpos: ?Buf) !void {
+        const out: Buf = .{ .b = L.pooled.b, .off = L.pooled.off + L.pooled_n * 128 * 2 };
+        if (bpos) |bp| {
+            r.enc.setPipeline(r.pool3_pipe);
+            for ([_]Buf{ L.raw, start, L.pool, eps, log2base, bp, out }, 0..) |b, j| r.enc.setBuffer(b.b, b.off, j);
+        } else try r.bindV(s.pool, &.{ L.raw, start, L.pool, eps, log2base }, &.{out});
+        r.enc.dispatchThreads(mtl.Size.of(128, count, 1), mtl.Size.of(128, 1, 1));
+        if (!r.serial) r.enc.barrier();
+    }
+
     /// Pool the blocks the window completes, score every complete block for each row, select each row's keys.
-    pub fn encode(s: *Select, r: *Run, L: anytype, iq: Buf, eps: Buf, log2base: Buf, pos: usize, rows: usize) !void {
+    pub fn encode(s: *Select, r: *Run, L: anytype, iq: Buf, eps: Buf, log2base: Buf, pos: usize, rows: usize, bpos: ?Buf) !void {
         const last = (pos + rows) / 4;
         if (last > L.pooled_n) {
             s.start.b.slice(i32, 1)[0] = @intCast(L.pooled_n); // read at run time: one window a command buffer
-            try r.bindV(s.pool, &.{ L.raw, s.start, L.pool, eps, log2base }, &.{.{ .b = L.pooled.b, .off = L.pooled.off + L.pooled_n * 128 * 2 }});
-            r.enc.dispatchThreads(mtl.Size.of(128, last - L.pooled_n, 1), mtl.Size.of(128, 1, 1));
-            if (!r.serial) r.enc.barrier();
+            try s.pool_(r, L, s.start, eps, log2base, last - L.pooled_n, bpos);
             L.pooled_n = last;
         }
         const nb = L.pooled_n;
@@ -1920,6 +1934,8 @@ pub const Model = struct {
     rec_slot: usize = 0, // the record this window writes (the other holds the previous window's)
     marks: ?Marks = null, // DeltaNet states at marks inside a prompt chunk, as a chunk ending there would leave them
     vis: ?*const vis_prompt.VisPrompt = null, // an image prompt's rows and positions while its prompt pass runs
+    bpos: ?Buf = null, // a shared session's image prompt (standard frame): each block's three positions [cap / 4, 3]
+    delta: i32 = 0, // and its rows past the prompt rotate at their slot plus this
 
     pub fn reset(m: *Model) void {
         m.pos = 0;
@@ -2164,7 +2180,7 @@ pub const Model = struct {
                     try r.shapes.put(r.arena, "IDS_shape", dense_ids);
                 } else if (r.sel != null and !r.gpu_round and r.sel.?.meta(m.pos, rows)) {
                     var sl = &r.sel.?;
-                    try sl.encode(r, L, t.iq, t.eps, t.log2base, m.pos, rows);
+                    try sl.encode(r, L, t.iq, t.eps, t.log2base, m.pos, rows, m.bpos);
                     const dense_ids = r.shapes.get("IDS_shape").?;
                     try r.shapes.put(r.arena, "IDS_shape", sl.ids_shape);
                     try r.call("q4_attn_parts#[24, 256]", &.{ t.q, L.keys, L.vals, sl.keys, sl.counts, sl.sparse, t.scale }, &.{ t.po, t.pm });
@@ -2310,7 +2326,7 @@ pub const Model = struct {
             try r.shapes.put(r.arena, "IDS_shape", dense_ids);
         } else if (r.sel != null and !r.gpu_round and r.sel.?.meta(h.pos, rows)) { // one call a command buffer
             var ss = &r.sel.?;
-            try ss.encode(r, h, t.iq, t.eps, t.log2base, h.pos, rows);
+            try ss.encode(r, h, t.iq, t.eps, t.log2base, h.pos, rows, null); // the head rotates at slots
             const dense_ids = r.shapes.get("IDS_shape").?;
             try r.shapes.put(r.arena, "IDS_shape", ss.ids_shape);
             try r.call("mtp:q4_attn_parts#[24, 256]", &.{ t.q, h.keys, h.vals, ss.keys, ss.counts, ss.sparse, t.scale }, &.{ t.po, t.pm });
@@ -3083,7 +3099,7 @@ pub const Prompt = struct {
                 if (sparse) {
                     sl.nax_scores = p.scores_nax;
                     defer sl.nax_scores = null;
-                    try sl.encode(r, L, b.iq, t.eps, t.log2base, s.pos, rows);
+                    try sl.encode(r, L, b.iq, t.eps, t.log2base, s.pos, rows, m.bpos);
                 }
                 p.bind(p.sattn, &.{ b.q, L.keys, L.vals, sl.keys, sl.counts, sl.sparse, b.p, t.scale });
                 const cap: i32 = @intCast(m.cap);
@@ -3093,7 +3109,7 @@ pub const Prompt = struct {
                 p.barrier();
             } else if (sparse) {
                 var sl = &p.sel.?;
-                try sl.encode(r, L, b.iq, t.eps, t.log2base, s.pos, rows);
+                try sl.encode(r, L, b.iq, t.eps, t.log2base, s.pos, rows, m.bpos);
                 try p.partials();
                 const dense_ids = r.shapes.get("IDS_shape").?;
                 try r.shapes.put(r.arena, "IDS_shape", sl.ids_shape);

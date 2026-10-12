@@ -10,6 +10,7 @@ const snap = tf.flashnext_snapshot;
 const learned = tf.flashnext_learned;
 const pc = api.prompt_cache;
 const vh = @import("flashnext_vision_host.zig");
+const Resident = @import("resident.zig").Resident;
 const cache_fit = @import("cache_fit.zig");
 const Allocator = std.mem.Allocator;
 
@@ -51,6 +52,7 @@ pub const Host = struct {
     saved: std.ArrayList(u32) = .empty, // this request's marks the cache kept (speed-up: rank 1 drops the others)
     learned: ?api.prompt_imprint.Imprint = null, // --learn: shared states on disk, read back by later servers
     vision: ?*vh.Vis = null, // --vision: the image tower
+    resident: ?Resident = null, // the engine's and tower's buffers, kept wired between requests
 
     const Mark = struct { at: i96, tokens: u64 };
     const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -482,6 +484,9 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
     h.warm = .{ .queue = eng.r.queue };
     h.vision = vis;
     if (vis) |v| h.info_.vision = v.offer();
+    // macOS unwires GPU memory after 1-2 s idle and the next request re-wires it all: one set the idle keepalive uses
+    if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h) catch |err| std.log.warn("flash next: no residency set ({s}): the first request after an idle second re-wires the model", .{@errorName(err)});
+    errdefer if (h.resident) |*r| r.deinit();
     if (!eng.followsPeer() and budget > 0) h.cache = pc.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop, .charged = Snaps.charged, .spare = Snaps.spare, .trim = Snaps.trim, .reuses = Snaps.reuses, .write = Snaps.write, .read = Snaps.read, .forget = Snaps.forget } }, .{ .lookahead = 1 }, budget);
     h.info_.prompt_cache = h.cache != null;
     if (learn) |root| {
@@ -491,6 +496,16 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
     errdefer if (h.learned) |*m| m.deinit();
     try h.start();
     return h;
+}
+
+/// The engine's buffers and the tower's in one residency set; the idle keepalive's ticks use it.
+fn holdResident(h: *Host) !void {
+    var list: std.ArrayList(mtl.Buffer) = .empty;
+    defer list.deinit(h.gpa);
+    try list.appendSlice(h.gpa, h.eng.r.held.items);
+    if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
+    h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, list.items, true);
+    h.warm = (&h.resident.?).target();
 }
 
 fn follow(eng: *fx.Engine) void {
@@ -506,6 +521,7 @@ pub fn close(ctx: *anyopaque) void {
     }
     if (h.cache) |*store| store.deinit();
     if (h.learned) |*m| m.deinit();
+    if (h.resident) |*r| r.deinit();
     if (h.vision) |v| v.deinit();
     h.saved.deinit(h.gpa);
     h.eng.deinit();

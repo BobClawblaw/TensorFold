@@ -232,6 +232,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     var n_images: usize = 0;
     for (ps) |p| n_images += @intFromBool(!p.video);
     const n_videos = ps.len - n_images;
+    if (n_videos > 0 and v.video == null) return cx.refuse("this server reads images, not video (video input needs libtfvideo beside it)");
     const video_token: ?u32 = if (v.video) |o| o.video_token else null;
     var marks: usize = 0;
     var video_marks: usize = 0;
@@ -244,9 +245,13 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
     if (ps.len == 0) return null;
     if (n_images > v.max_images) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request may hold at most {d} images (--vision-max-images); it has {d}", .{ v.max_images, n_images }));
     if (n_videos > videos.max_videos) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request supports at most {d} videos", .{videos.max_videos}));
-    const budget: u32 = if (n_images > 0) v.image_tokens / @as(u32, @intCast(n_images)) else 0;
-    if (n_images > 0 and budget < 1) return cx.refuse("the image count exceeds the visual-token budget");
+    const share: u32 = if (n_images > 0) v.image_tokens / @as(u32, @intCast(n_images)) else 0;
+    if (n_images > 0 and share < 1) return cx.refuse("the image count exceeds the visual-token budget");
+    // each image at image_most while the request's images fit image_tokens together; past it (or without), the share
+    var budget: u32 = if (v.image_most > 0) @min(v.image_most, v.image_tokens) else share;
     const prepared = try cx.a.alloc(api.PreparedImage, n_images);
+    const sources = try cx.a.alloc([]const u8, n_images);
+    const lows = try cx.a.alloc(bool, n_images);
     const clips = try cx.a.alloc(api.PreparedVideo, n_videos);
     var bytes_total: usize = 0;
     // every URL's download inside one request's seconds (images.py total_timeout_seconds, videos.py's)
@@ -270,9 +275,21 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             .webp => return cx.refuse(try std.fmt.allocPrint(cx.a, "image {d} is WebP, which this server does not decode yet; send PNG or JPEG", .{i + 1})),
             .gif, .other => return cx.refuse(try std.fmt.allocPrint(cx.a, "image {d} is not PNG or JPEG; send one of those", .{i + 1})),
         }
+        sources[i] = bytes;
+        lows[i] = p.low;
         const cap = if (p.low) @min(budget, low_detail_tokens) else budget;
         prepared[i] = v.prepare(v.ctx, cx.a, bytes, cap) catch |e| return refusal(cx, i, e);
         if (prepared[i].tokens == 0 or prepared[i].tokens > cap) return cx.refuse("the image processor exceeded the per-image visual-token budget");
+    }
+    var tokens_total: usize = 0;
+    for (prepared) |img| tokens_total += img.tokens;
+    if (tokens_total > v.image_tokens) { // past the request's budget at image_most each: every image at the share
+        budget = @min(budget, share);
+        for (prepared, sources, lows, 0..) |*img, bytes, low, i| {
+            const cap = if (low) @min(budget, low_detail_tokens) else budget;
+            img.* = v.prepare(v.ctx, cx.a, bytes, cap) catch |e| return refusal(cx, i, e);
+            if (img.tokens == 0 or img.tokens > cap) return cx.refuse("the image processor exceeded the per-image visual-token budget");
+        }
     }
     var out_ids: std.ArrayList(u32) = .empty;
     var key: std.ArrayList(u32) = .empty;

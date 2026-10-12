@@ -15,6 +15,8 @@ const segments = @import("../../core/segments.zig");
 const vis_prompt = @import("vis_prompt.zig");
 const Vision = @import("vision.zig").Vision;
 const sample = @import("sample.zig");
+const batch_costs = @import("batch_costs.zig");
+const learned = @import("learned.zig");
 
 /// A stream's sampling when it samples (a temperature above 0); null: the GPU's argmax stands.
 fn sampling(stream: *const Stream) ?lanes.Sampling {
@@ -43,23 +45,43 @@ pub const Backend = struct {
     draft_seconds: f64 = 0,
     fill_until: f64 = 0, // a prompt pass beside decoding streams waits until their rounds have had its last step's time
     tower: ?*Vision = null, // --vision: a stream's images become its prompt pass's rows (vis_prompt.zig)
+    grow: usize = std.math.maxInt(usize), // reply tokens a session must hold at admission past the prompt (the rest: move)
+    paused: std.ArrayList(*Stream) = .empty, // streams that outgrew their session and wait for a larger one to free
+    moves: u64 = 0,
+    serial_drafts: bool = false, // FZ_BATCH_MTP_SERIAL=1: each stream's drafts in their own command buffers
+    costs: ?batch_costs.Costs = null, // timeCosts: the lane allocator's prices
+    lone_handoffs: u64 = 0, // lone streams the engine's rounds handed to the shared ones
 
-    pub fn init(gpa: std.mem.Allocator, e: *Engine, n: u32, capacity: usize) !Backend {
-        if (n < 2 or n > fz.MAXR or e.r.tp != null) return error.BadBatchSlots;
-        const sessions = try gpa.alloc(Session, n);
+    /// Sessions of the given capacities (the first, the engine's own, holds its whole window whatever is given).
+    pub fn init(gpa: std.mem.Allocator, e: *Engine, capacities: []const usize) !Backend {
+        if (capacities.len < 2 or capacities.len > fz.MAXR or e.r.tp != null) return error.BadBatchSlots;
+        const sessions = try gpa.alloc(Session, capacities.len);
         errdefer gpa.free(sessions);
         var made: usize = 0;
         errdefer for (sessions[0..made]) |*s| s.deinit(gpa);
-        for (sessions, 0..) |*s, i| {
+        for (sessions, capacities, 0..) |*s, capacity, i| {
             s.* = try Session.init(gpa, e, capacity, i == 0);
             made += 1;
         }
         const hidden = try e.r.device.buffer(fz.MAXR * fz.WIDE * 2, fz.opts);
-        return .{ .gpa = gpa, .e = e, .primary = e.m, .sessions = sessions, .hidden = .{ .b = hidden }, .chain_drafts = if (std.c.getenv("FZ_BATCH_MTP_CHAIN")) |v| v[0] == '1' else false };
+        const env = struct {
+            fn on(name: [*:0]const u8) bool {
+                return if (std.c.getenv(name)) |v| v[0] == '1' else false;
+            }
+        };
+        return .{ .gpa = gpa, .e = e, .primary = e.m, .sessions = sessions, .hidden = .{ .b = hidden }, .chain_drafts = env.on("FZ_BATCH_MTP_CHAIN"), .serial_drafts = env.on("FZ_BATCH_MTP_SERIAL") };
+    }
+
+    /// The lane allocator's prices, timed on the last session before any stream holds it.
+    pub fn timeCosts(b: *Backend) !void {
+        const c = try batch_costs.time(b, &b.sessions[b.sessions.len - 1]);
+        b.costs = c;
+        std.log.info("flash next: shared forwards {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} ms at 1, 2, 4, 8, 16 rows; a chained draft {d:.2} ms; a sampled row's draw {d:.2} ms", .{ c.shared[0].ms, c.shared[1].ms, c.shared[3].ms, c.shared[7].ms, c.shared[15].ms, c.step_ms, c.draw_ms });
     }
 
     pub fn deinit(b: *Backend) void {
         b.e.m = b.primary;
+        b.paused.deinit(b.gpa);
         b.by.deinit(b.gpa);
         for (b.sessions) |*s| s.deinit(b.gpa);
         b.gpa.free(b.sessions);
@@ -71,7 +93,10 @@ pub const Backend = struct {
     }
 
     pub fn facts(b: *Backend) lanes.Model {
-        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = false };
+        const c: ?*const batch_costs.Costs = if (b.costs) |*x| x else null;
+        // a lone stream's depth from the same timed forwards and chained step: it drafts as deep as its drafts land
+        const priced = std.c.getenv("FZ_LONE_UNPRICED") == null;
+        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (c != null and priced) &c.?.shared else &.{}, .mtp_step_ms = if (c != null and priced) c.?.step_ms else 0 };
     }
 
     fn self(ptr: *anyopaque) *Backend {
@@ -110,7 +135,7 @@ pub const Backend = struct {
         select: ?fz.Select,
         shape: @TypeOf(@as(fz.Select, undefined).q_shape),
         passed: @FieldType(Engine, "passed"),
-        fn restore(old: Binding, b: *Backend) void {
+        pub fn restore(old: Binding, b: *Backend) void {
             b.e.m = old.model;
             b.e.host = old.host;
             b.e.cins = old.cins;
@@ -120,7 +145,7 @@ pub const Backend = struct {
         }
     };
 
-    fn bind(b: *Backend, s: *Session) !Binding {
+    pub fn bind(b: *Backend, s: *Session) !Binding {
         const e = b.e;
         const old: Binding = .{ .model = e.m, .host = e.host, .cins = e.cins, .select = e.r.sel, .shape = e.r.shapes.get("Kc_shape").?, .passed = e.passed };
         try e.r.shapes.put(e.r.arena, "Kc_shape", s.shape);
@@ -133,17 +158,80 @@ pub const Backend = struct {
         return old;
     }
 
-    /// The free session with the smallest capacity that holds a stream (slot 0 holds the longest window: keep it for
-    /// those that need it); error.LaneMemory when only a busy one would (the stream waits), ContextFull when none would.
+    /// The free session with the smallest capacity that holds a stream's prompt and its reply's first `grow` tokens
+    /// (slot 0 holds the longest window: keep it for those that need it; a stream that outgrows its session moves:
+    /// makeRoom); error.LaneMemory when only a busy one would (the stream waits), ContextFull when none holds it whole.
     fn slotFor(b: *Backend, prompt: usize, max_new: usize) !usize {
-        const need = prompt + max_new + fz.MAXR + 1;
+        const need = prompt + @min(max_new, b.grow) + fz.MAXR + 1;
         var best: ?usize = null;
-        var any = false;
-        for (b.sessions, 0..) |s, j| if (s.m.cap >= need) {
-            any = true;
-            if (!s.used and (best == null or s.m.cap < b.sessions[best.?].m.cap)) best = j;
+        var most: usize = 0;
+        for (b.sessions, 0..) |s, j| {
+            most = @max(most, s.m.cap);
+            if (s.m.cap >= need and !s.used and (best == null or s.m.cap < b.sessions[best.?].m.cap)) best = j;
+        }
+        if (prompt + max_new + fz.MAXR + 1 > most) return error.ContextFull;
+        return best orelse error.LaneMemory;
+    }
+
+    /// Before a round: a stream left too little room for the next one moves to a free larger session; with none free
+    /// it pauses after this round (its window fits) until one frees (release).
+    fn makeRoom(b: *Backend, stream: *Stream, rows: usize) !void {
+        const i = b.by.get(stream) orelse return error.UnknownStream;
+        const s = &b.sessions[i];
+        if (s.m.pos + rows + 2 * (fz.MAXR + 1) <= s.m.cap) return;
+        b.move(stream, i) catch |err| switch (err) {
+            error.LaneMemory => {
+                if (s.m.pos + rows + fz.MAXR + 1 > s.m.cap) return error.ContextFull;
+                if (!stream.paused) {
+                    try b.paused.append(b.gpa, stream);
+                    std.log.info("flash next: a stream at {d} tokens waits for a session larger than {d} tokens to free", .{ s.m.pos, s.m.cap });
+                }
+                stream.paused = true;
+            },
+            else => return err,
         };
-        return best orelse if (any) error.LaneMemory else error.ContextFull;
+    }
+
+    /// The stream in session `i` into the smallest free larger session that holds its reply's next `grow` tokens (the
+    /// largest free one when none does); LaneMemory when no larger session is free.
+    fn move(b: *Backend, stream: *Stream, i: usize) !void {
+        const from = &b.sessions[i];
+        const left: usize = @intCast(@max(stream.budgetLeft(), 0));
+        const need = from.m.pos + @min(left, b.grow) + 2 * (fz.MAXR + 1);
+        var best: ?usize = null; // the smallest free larger session that holds `need`
+        var most: ?usize = null; // else the largest free larger one
+        for (b.sessions, 0..) |o, j| if (!o.used and o.m.cap > from.m.cap) {
+            if (o.m.cap >= need and (best == null or o.m.cap < b.sessions[best.?].m.cap)) best = j;
+            if (most == null or o.m.cap > b.sessions[most.?].m.cap) most = j;
+        };
+        const j = best orelse most orelse return error.LaneMemory;
+        try b.settle();
+        try from.moveTo(&b.sessions[j], b.e);
+        try b.by.put(b.gpa, stream, j);
+        from.used = false;
+        from.round = .{};
+        from.held_n = 0;
+        b.moves += 1;
+        std.log.info("flash next: a stream at {d} tokens moved from a {d}-token session to a {d}-token one ({d} moves)", .{ from.m.pos, from.m.cap, b.sessions[j].m.cap, b.moves });
+    }
+
+    /// Paused streams into sessions that freed, oldest first; each goes on once moved.
+    fn resumePaused(b: *Backend) void {
+        var k: usize = 0;
+        while (k < b.paused.items.len) {
+            const stream = b.paused.items[k];
+            const i = b.by.get(stream) orelse {
+                _ = b.paused.orderedRemove(k);
+                continue;
+            };
+            b.move(stream, i) catch |err| {
+                if (err != error.LaneMemory) std.log.err("flash next: a paused stream could not move: {s}", .{@errorName(err)});
+                k += 1;
+                continue;
+            };
+            stream.paused = false;
+            _ = b.paused.orderedRemove(k);
+        }
     }
 
     /// LaneHost's admission check: a free session holds the request now.
@@ -157,10 +245,15 @@ pub const Backend = struct {
 
     /// A stream's prompt pass begins: the smallest free session that holds it, a restored prefix, its images' rows.
     fn begin(b: *Backend, stream: *Stream) !*Session {
+        return b.beginIn(stream, null);
+    }
+
+    /// `begin` in session `slot` (free, holding the request) when given.
+    fn beginIn(b: *Backend, stream: *Stream, slot: ?usize) !*Session {
         const prompt = stream.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
         try b.settle();
-        const i = try b.slotFor(prompt.len, stream.max_new);
+        const i = slot orelse try b.slotFor(prompt.len, stream.max_new);
         const s = &b.sessions[i];
         try b.by.put(b.gpa, stream, i);
         errdefer {
@@ -177,16 +270,21 @@ pub const Backend = struct {
         const old = try b.bind(s);
         defer old.restore(b);
         s.m.reset();
+        s.m.bpos = null;
+        s.m.delta = 0;
         stream.cached = 0;
-        if (stream.images.len > 0) { // an image prompt is read whole and never kept: its frame depends on every image
-            s.vis_arena = .init(b.gpa);
-            s.m.vis = try vis_prompt.build(b.tower orelse return error.NoVision, b.e.r.device, b.e.r.queue, s.vis_arena.?.allocator(), stream.images, prompt.len);
-        } else if (stream.reuse.saved) |saved| {
+        if (stream.reuse.saved) |saved| {
             const state: *snap.State = @ptrCast(@alignCast(saved));
             if (state.at < prompt.len and state.at < s.m.cap) {
                 try snap.restore(b.e, state);
                 stream.cached = @intCast(state.at);
             } else stream.reuse_failed = true;
+        }
+        if (stream.images.len > 0) { // the standard frame: a prefix's rows sit where any longer prompt puts them
+            s.vis_arena = .init(b.gpa);
+            const v = try vis_prompt.build(b.tower orelse return error.NoVision, b.e.r.device, b.e.r.queue, s.vis_arena.?.allocator(), stream.images, prompt.len, .{ .standard = true, .from = stream.cached });
+            s.m.vis = v;
+            s.imageBlocks(v);
         }
         return s;
     }
@@ -203,7 +301,6 @@ pub const Backend = struct {
     /// One chunk of a stream's prompt pass from its session's position, at most `most` rows; true once the pass ends.
     fn chunk(b: *Backend, s: *Session, stream: *Stream, most: usize) !bool {
         const prompt = stream.prompt();
-        const images = s.m.vis != null;
         if (stream.isCancelled()) return error.Cancelled;
         try b.settle(); // other streams' rounds may have run since the last chunk
         const old = try b.bind(s);
@@ -214,7 +311,7 @@ pub const Backend = struct {
             end = @min(end, mark);
             break;
         };
-        for (stream.reuse.marks) |mark| if (!images and mark > at) {
+        for (stream.reuse.marks) |mark| if (mark > at) {
             end = @min(end, mark);
             break;
         };
@@ -223,12 +320,13 @@ pub const Backend = struct {
         end = at + call.rows;
         const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
         const t_chunk = std.c.mach_absolute_time();
+        const gpu0 = s.m.gpu_seconds;
         s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
         // the pass's last row's logits are in the model's head buffer until the next forward: a sampled first token now
         if (end == prompt.len) if (sampling(stream)) |p| {
             s.first = try drawRow(b.gpa, s.m.t.logits, 0, p, prompt.len);
         };
-        if (std.c.getenv("FZ_BATCH_LOG") != null) std.log.info("flash next prefill: rows [{d}, {d}) in {d} parts, {d:.1} ms", .{ at, end, call.parts, @as(f64, @floatFromInt(std.c.mach_absolute_time() - t_chunk)) / 24e3 });
+        if (std.c.getenv("FZ_BATCH_LOG") != null) std.log.info("flash next prefill: rows [{d}, {d}) in {d} parts, {d:.1} ms ({d:.1} ms on the GPU)", .{ at, end, call.parts, @as(f64, @floatFromInt(std.c.mach_absolute_time() - t_chunk)) / 24e3, (s.m.gpu_seconds - gpu0) * 1e3 });
         for (ps[0..call.parts], 0..) |p, k| {
             const start = at + segments.start(call.rows, call.parts, k);
             const rows = segments.rows(call.rows, call.parts, k);
@@ -237,13 +335,116 @@ pub const Backend = struct {
             if (start + rows == prompt.len) Session.copy(p.last.at((rows - 1) * fz.WIDE * 2), s.last, fz.WIDE * 2);
         }
         s.normalize();
-        if (!images and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null)
+        if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null)
             if (stream.reuse.hook) |hook| hook.at(hook.ptr, stream, @intCast(end));
         if (end < prompt.len) return false;
         s.m.mtp.pos = prompt.len - 1;
         s.m.mtp.drafted = 0;
         endFill(s);
         return true;
+    }
+
+    /// LaneHost's driver for a lone text stream: the shared sessions' own prompt pass into the engine's session (the
+    /// states it keeps are theirs), then the engine's GPU-side rounds, two deep when greedy, until the stream finishes
+    /// (false) or `hooks.yield` asks for it: its state then stands as a shared round leaves it, in the smallest free
+    /// session that holds it, and the lane core takes it on (true). `hooks`: LaneHost's LoneHooks.
+    pub fn lone(b: *Backend, stream: *Stream, hooks: anytype) !bool {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const prompt = stream.prompt();
+        if (b.sessions[0].used) return error.LaneMemory;
+        if (prompt.len + stream.max_new + @import("engine.zig").MARGIN > b.sessions[0].m.cap) return error.ContextFull;
+        const s = try b.beginIn(stream, 0); // the GPU-side rounds run on the engine's own buffers
+        var handed = false;
+        defer if (!handed) release(b, stream);
+        while (!try b.chunk(s, stream, std.math.maxInt(usize))) {}
+        _ = try stream.commit(b.gpa, &.{s.first}, &.{});
+        hooks.committed(hooks.ctx);
+        if (stream.finished) return false;
+        const Hooks = @TypeOf(hooks);
+        const Ctx = struct {
+            gpa: std.mem.Allocator,
+            stream: *Stream,
+            hooks: Hooks,
+            failed: ?anyerror = null,
+            fn prefilled(_: *anyopaque) void {}
+            fn tokens(p: *anyopaque, toks: []const u32) bool {
+                const c: *@This() = @ptrCast(@alignCast(p));
+                _ = c.stream.commit(c.gpa, toks, &.{}) catch |err| {
+                    c.failed = err;
+                    return true;
+                };
+                c.hooks.committed(c.hooks.ctx);
+                return c.stream.finished;
+            }
+            fn cancelled(p: *anyopaque) bool { // a request waits, or one is cancelled: the lane core takes over
+                const c: *@This() = @ptrCast(@alignCast(p));
+                return c.hooks.yield(c.hooks.ctx);
+            }
+        };
+        var c: Ctx = .{ .gpa = b.gpa, .stream = stream, .hooks = hooks };
+        var ho: Engine.Handoff = .{};
+        {
+            const old = try b.bind(s);
+            defer old.restore(b);
+            outputs(b, s, 0);
+            const res = try b.e.decode(prompt, s.first, s.last, stream.max_new, stream.eos, null, .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled, .sampling = sampling(stream) }, &ho);
+            if (c.failed) |err| return err;
+            stream.rounds += res.rounds;
+            stream.drafted += res.drafted;
+            stream.accepted += res.accepted;
+            if (res.rounds > 0) stream.min_rows = if (stream.min_rows == 0) res.min_rows else @min(stream.min_rows, res.min_rows);
+        }
+        if (!ho.yielded) {
+            if (!stream.finished) { // the rounds ended where the stream did not (eos or length by the engine's count)
+                stream.finished = true;
+                stream.reason = .stop;
+            }
+            return false;
+        }
+        const ctx = stream.context.items;
+        const at = ho.cache; // the cache's rows: every committed token but the last, the next window's first
+        if (at + 1 != ctx.len or at < 2) return error.HandoffOutOfStep;
+        s.m.pos = at;
+        s.m.state = 0;
+        s.m.state_row = 0;
+        s.m.ple.hist = .{ ctx[at - 2], ctx[at - 1] };
+        s.m.mtp.pos = at;
+        s.m.mtp.drafted = 0;
+        s.m.mtp.pooled_n = @min(s.m.mtp.pooled_n, at / 4); // blocks the rounds pooled are pooled again here
+        for (&s.m.layers) |*l| if (!l.linear) {
+            l.pooled_n = @min(l.pooled_n, at / 4);
+        };
+        s.held_n = 0;
+        s.round = .{};
+        stream.cache_len = at;
+        stream.pending = ctx[at];
+        stream.next = null;
+        handed = true;
+        b.lone_handoffs += 1;
+        b.shrink(stream) catch |err| std.log.warn("flash next: a handed-over stream stays in the engine's session ({s})", .{@errorName(err)});
+        std.log.info("flash next: a lone stream at {d} tokens handed to the shared rounds, in a {d}-token session ({d} handoffs)", .{ at, b.sessions[b.by.get(stream).?].m.cap, b.lone_handoffs });
+        return true;
+    }
+
+    /// A handed-over lone stream leaves the engine's session (the longest window: kept for the prompts that need it)
+    /// for the smallest free one that holds its reply's next `grow` tokens, when one does.
+    fn shrink(b: *Backend, stream: *Stream) !void {
+        const i = b.by.get(stream) orelse return error.UnknownStream;
+        const from = &b.sessions[i];
+        const left: usize = @intCast(@max(stream.budgetLeft(), 0));
+        const need = from.m.pos + @min(left, b.grow) + 2 * (fz.MAXR + 1);
+        var best: ?usize = null;
+        for (b.sessions, 0..) |o, j| if (!o.used and o.m.cap < from.m.cap and o.m.cap >= need) {
+            if (best == null or o.m.cap < b.sessions[best.?].m.cap) best = j;
+        };
+        const j = best orelse return;
+        try b.settle();
+        try from.moveTo(&b.sessions[j], b.e);
+        try b.by.put(b.gpa, stream, j);
+        from.used = false;
+        from.round = .{};
+        from.held_n = 0;
     }
 
     /// The whole prompt pass at once (a lone stream's driver).
@@ -292,7 +493,7 @@ pub const Backend = struct {
         return @intCast(handle);
     }
 
-    fn outputs(b: *Backend, s: *Session, row: usize) void {
+    pub fn outputs(b: *Backend, s: *Session, row: usize) void {
         var li: usize = 0;
         for (&s.m.layers) |*l| if (l.linear) {
             l.cs[1] = .{ .b = b.e.o_cs, .off = (li * fz.MAXR + row) * fz.CS_ROW };
@@ -307,6 +508,7 @@ pub const Backend = struct {
         const b = self(ptr);
         try b.settle();
         if (windows.len == 0 or windows.len > fz.MAXR or out.len != windows.len) return error.BadBatch;
+        for (windows) |w| try b.makeRoom(w.stream, w.rows());
         var desc: [fz.MAXR]meta.Window = undefined;
         var segs: [fz.MAXR]forward.Seg = undefined;
         for (windows, out, 0..) |w, o, i| {
@@ -338,7 +540,14 @@ pub const Backend = struct {
         }
         t.rows.b.slice(i32, 1)[0] = @intCast(plan.total);
         t.mdims.b.slice(i32, 2)[0] = @intCast(plan.total);
-        @memcpy(t.pos8.b.slice(u32, fz.MAXR)[0..plan.total], plan.positions[0..plan.total]);
+        const pos8 = t.pos8.b.slice(u32, fz.MAXR);
+        @memcpy(pos8[0..plan.total], plan.positions[0..plan.total]);
+        for (windows, 0..) |w, i| { // an image prompt's rows past it rotate at their slot plus its delta
+            const d = (try b.session(w.stream)).m.delta;
+            if (d != 0) for (pos8[plan.starts[i]..][0..w.rows()]) |*p| {
+                p.* = @intCast(@as(i64, p.*) + d);
+            };
+        }
         const cb = b.e.r.queue.commandBuffer();
         b.e.r.enc = cb.compute(.serial);
         try forward.encode(b.e, segs[0..windows.len], plan.total, t.ids8);
@@ -364,6 +573,7 @@ pub const Backend = struct {
 
     fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const b = self(ptr);
+        if (!b.serial_drafts) return b.draftTogether(requests);
         for (requests) |r| {
             const pool = mtl.objc.Pool.push();
             defer pool.pop();
@@ -402,13 +612,70 @@ pub const Backend = struct {
         }
     }
 
+    /// Every request's absorb and chained drafts in one command buffer, one wait for the round's drafts (a follow
+    /// past MAXR rows, the prompt's first, absorbs alone first).
+    fn draftTogether(b: *Backend, requests: []const be.DraftRequest) !void {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const start = mtl.clock.seconds();
+        var follows: [fz.MAXR][]const u32 = undefined;
+        var hiddens: [fz.MAXR]Buf = undefined;
+        var ones: [fz.MAXR][1]u32 = undefined;
+        if (requests.len > fz.MAXR) return error.DraftOutOfStep;
+        for (requests, 0..) |r, k| {
+            if (r.early or r.lanes != null or r.ranks or r.depth >= fz.MAXR) return error.DraftOutOfStep;
+            const s = try b.session(r.stream);
+            follows[k] = if (r.first) |f| blk: {
+                ones[k][0] = switch (f) {
+                    .value => |v| v,
+                    .handle => |h| @intCast(h),
+                };
+                break :blk ones[k][0..];
+            } else r.follow;
+            if (follows[k].len == 0) return error.DraftOutOfStep;
+            hiddens[k] = if (r.rows) |path| blk: {
+                try s.round.draft(r.start, path, follows[k].len);
+                break :blk b.hidden.at(s.row0 * fz.WIDE * 2);
+            } else s.last;
+            if (follows[k].len > fz.MAXR) { // all but the last MAXR rows absorbed first, on their own
+                const cut = follows[k].len - fz.MAXR;
+                const old = try b.bind(s);
+                defer old.restore(b);
+                _ = try s.m.mtpAbsorb(follows[k][0..cut], hiddens[k]);
+                hiddens[k] = hiddens[k].at(cut * fz.WIDE * 2);
+                follows[k] = follows[k][cut..];
+                b.draft_waits += (cut + fz.MAXR - 1) / fz.MAXR;
+            }
+        }
+        const cb = b.e.r.queue.commandBuffer();
+        b.e.r.enc = cb.compute(if (b.e.r.serial) .serial else .concurrent);
+        for (requests, 0..) |r, k| {
+            const s = try b.session(r.stream);
+            const old = try b.bind(s);
+            defer old.restore(b);
+            s.encodeDrafts(follows[k], hiddens[k], r.depth) catch |err| {
+                b.e.r.enc.end();
+                return err;
+            };
+        }
+        try b.primary.finish(cb);
+        for (requests) |r| (try b.session(r.stream)).heldDrafts(r.depth);
+        b.draft_waits += 1;
+        b.draft_calls += requests.len;
+        b.draft_seconds += mtl.clock.seconds() - start;
+    }
+
     fn release(ptr: *anyopaque, stream: *Stream) void {
         const b = self(ptr);
+        if (std.mem.indexOfScalar(*Stream, b.paused.items, stream)) |k| _ = b.paused.orderedRemove(k);
         const kv = b.by.fetchRemove(stream) orelse return;
         endFill(&b.sessions[kv.value]); // a stream that leaves mid-pass frees its image rows
+        b.sessions[kv.value].m.bpos = null;
+        b.sessions[kv.value].m.delta = 0;
         b.sessions[kv.value].used = false;
         b.sessions[kv.value].round = .{};
         b.sessions[kv.value].held_n = 0;
+        if (b.paused.items.len > 0) b.resumePaused();
     }
 
     pub fn snapBytes(ptr: *anyopaque, at: u32) u64 {
@@ -439,5 +706,21 @@ pub const Backend = struct {
     }
     pub fn snapDrop(ptr: *anyopaque, saved: *anyopaque) void {
         snap.drop(self(ptr).gpa, @ptrCast(@alignCast(saved)));
+    }
+    /// --learn: a kept state to its file under `dir` (a shared cut's, or an evicted one's: the store spills).
+    pub fn snapWrite(_: *anyopaque, saved: *anyopaque, dir: [:0]const u8, key: u64) anyerror!void {
+        var buf: [1100]u8 = undefined;
+        try learned.writeFile(@ptrCast(@alignCast(saved)), try learned.path(&buf, dir, key));
+    }
+    /// --learn: state `key` of `at` tokens read back into a pool buffer.
+    pub fn snapRead(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!*anyopaque {
+        const b = self(ptr);
+        var buf: [1100]u8 = undefined;
+        return try learned.readFile(b.e, b.gpa, at, try learned.path(&buf, dir, key));
+    }
+    /// --learn: state `key`'s file removed.
+    pub fn snapForget(_: *anyopaque, dir: [:0]const u8, key: u64) void {
+        var buf: [1100]u8 = undefined;
+        _ = std.c.unlink(learned.path(&buf, dir, key) catch return);
     }
 };

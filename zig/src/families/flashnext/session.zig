@@ -21,6 +21,7 @@ pub const Session = struct {
     vis_arena: ?std.heap.ArenaAllocator = null, // an image prompt's spans and positions while its pass runs
     tokens: [fz.MAXR]u32 = @splat(0),
     row0: usize = 0,
+    blocks: Buf = undefined, // an image prompt's block positions [cap / 4 + 1, 3] (int32), the standard frame's (m.bpos)
     round: @import("batch_meta.zig").Round = .{},
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine, capacity: usize, original: bool) !Session {
@@ -54,6 +55,7 @@ pub const Session = struct {
             sel.* = try s.selector(gpa, e);
         }
         s.draft_ids = try s.buffer(gpa, e, fz.MAXR * 4);
+        s.blocks = try s.buffer(gpa, e, (s.m.cap / 4 + 1) * 3 * 4);
         for (&s.draft_select) |*sel| sel.* = try s.selectorMeta(gpa, e, s.select[fz.CATCH - 1]);
         // Sessions draft serially, but every encoded step needs immutable host metadata.
         for (s.m.mtp.slots[0..fz.MAXR]) |*sl| sl.* = .{
@@ -142,6 +144,112 @@ pub const Session = struct {
         try m.finish(cb);
         h.drafted = depth - 1;
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
+    }
+
+    /// Encode the head's absorb of a kept window and `depth` chained drafts into the open encoder, unsubmitted (one
+    /// command buffer takes every stream's drafts: heldDrafts reads them once it is done); depth 0 absorbs only.
+    pub fn encodeDrafts(s: *Session, follow: []const u32, hidden: Buf, depth: usize) !void {
+        if (follow.len == 0 or follow.len > fz.MAXR or depth >= fz.MAXR) return error.DraftOutOfStep;
+        const m = &s.m;
+        const h = &m.mtp;
+        const r = m.r;
+        const old_select = r.sel;
+        defer r.sel = old_select;
+        h.pos -= h.drafted;
+        h.drafted = 0;
+        h.pooled_n = @min(h.pooled_n, h.pos / 4);
+        @memcpy(h.slots[0].ids8.b.slice(u32, follow.len), follow);
+        for (0..@max(depth, 1)) |i| {
+            r.sel = s.draft_select[i];
+            const rows = if (i == 0) follow.len else 1;
+            const input = if (i == 0) h.slots[0].ids8 else s.draft_ids.at((i - 1) * 4);
+            const streams = if (i == 0) hidden else h.h[1];
+            try m.mtpEncode(i, rows, input, streams, s.draft_ids.at(i * 4));
+            h.pos += rows;
+        }
+    }
+
+    /// An image prompt in the standard frame: each block's three rotary positions (its first row's: the frame table's
+    /// below the last image's end, else the slot plus `v.delta` on all three) into `blocks`, and the model reads them.
+    pub fn imageBlocks(s: *Session, v: anytype) void {
+        const out = s.blocks.b.slice(i32, (s.m.cap / 4 + 1) * 3);
+        for (0..s.m.cap / 4 + 1) |b| {
+            const f = 4 * b;
+            const p: [3]i32 = if (f < v.frame_end) v.pos3[f * 3 ..][0..3].* else @splat(@as(i32, @intCast(f)) + v.delta);
+            @memcpy(out[b * 3 ..][0..3], &p);
+        }
+        s.m.bpos = s.blocks;
+        s.m.delta = v.delta;
+    }
+
+    /// encodeDrafts' drafts once their command buffer is done: held, the head's chained rows trimmed at its next absorb.
+    pub fn heldDrafts(s: *Session, depth: usize) void {
+        s.m.mtp.drafted = depth -| 1;
+        @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
+        s.held_n = depth;
+    }
+
+    /// This session's stream into `dst`, a free session with more room: its cache rows, states, n-gram tail and head
+    /// copied on the GPU at a round's end (states settled), so the stream goes on there with the same bits.
+    pub fn moveTo(s: *Session, dst: *Session, e: *Engine) !void {
+        const m = &s.m;
+        const d = &dst.m;
+        if (m.state != 0 or m.state_row != 0 or s.round.pending) return error.StateNotSettled;
+        const rows = @min(m.cap, m.pos + 2 * fz.MAXR + 2); // the cache's rows and the head's chained ones past them
+        if (rows > d.cap) return error.ContextFull;
+        const cb = e.r.queue.commandBuffer();
+        const blit = cb.blit();
+        for (&m.layers, &d.layers) |*a, *b| if (a.linear) {
+            blit.copy(a.cs[0].b, a.cs[0].off, b.cs[0].b, b.cs[0].off, fz.CS_ROW);
+            blit.copy(a.so[0].b, a.so[0].off, b.so[0].b, b.so[0].off, fz.SO_ROW);
+        } else {
+            moveRows(blit, a, b, m.cap, d.cap, rows);
+        };
+        moveRows(blit, &m.mtp, &d.mtp, m.cap, d.cap, rows);
+        blit.copy(m.ple.cin.b, m.ple.cin.off, d.ple.cin.b, d.ple.cin.off, (fz.PLE_TAIL + fz.MAXR) * fz.WIDE * 2);
+        blit.copy(s.last.b, s.last.off, dst.last.b, dst.last.off, fz.WIDE * 2);
+        blit.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |message| {
+            std.log.err("session move failed: {s}", .{message});
+            return error.GpuFailed;
+        }
+        d.pos = m.pos;
+        d.state = 0;
+        d.state_row = 0;
+        d.ple.hist = m.ple.hist;
+        d.mtp.pos = m.mtp.pos;
+        d.mtp.drafted = m.mtp.drafted;
+        d.delta = m.delta;
+        d.bpos = null;
+        if (m.bpos != null) { // the block positions it has, then the rows past them at their slot plus delta
+            const have = (m.cap / 4 + 1) * 3;
+            const out = dst.blocks.b.slice(i32, (d.cap / 4 + 1) * 3);
+            @memcpy(out[0..have], s.blocks.b.slice(i32, have));
+            for (m.cap / 4 + 1..d.cap / 4 + 1) |b| @memcpy(out[b * 3 ..][0..3], &@as([3]i32, @splat(@as(i32, @intCast(4 * b)) + m.delta)));
+            d.bpos = dst.blocks;
+        }
+        dst.held = s.held;
+        dst.held_n = s.held_n;
+        dst.first = s.first;
+        dst.round = s.round;
+        dst.tokens = s.tokens;
+        dst.row0 = s.row0;
+        dst.used = true;
+        dst.filling = false;
+    }
+
+    /// A sparse-attention layer's first `rows` keys, values and indexer keys and its pooled blocks, head by head.
+    fn moveRows(blit: mtl.BlitEncoder, a: anytype, b: anytype, from: usize, to: usize, rows: usize) void {
+        const row = 256 * 2;
+        for (0..2) |hd| {
+            blit.copy(a.keys.b, a.keys.off + hd * from * row, b.keys.b, b.keys.off + hd * to * row, rows * row);
+            blit.copy(a.vals.b, a.vals.off + hd * from * row, b.vals.b, b.vals.off + hd * to * row, rows * row);
+        }
+        blit.copy(a.raw.b, a.raw.off, b.raw.b, b.raw.off, rows * 128 * 2);
+        if (a.pooled_n > 0) blit.copy(a.pooled.b, a.pooled.off, b.pooled.b, b.pooled.off, a.pooled_n * 128 * 2);
+        b.pooled_n = a.pooled_n;
     }
 
     pub fn deinit(s: *Session, gpa: std.mem.Allocator) void {

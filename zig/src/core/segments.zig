@@ -32,6 +32,7 @@ pub fn run(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: m
 pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usize, mode: mtl.DispatchType, fam: anytype, every: usize) !f64 {
     const n = queues.len;
     if (n == 0 or n > MAX) return error.Segments;
+    const t_begin = mtl.clock.seconds();
     var evs: [MAX - 1]mtl.Event = undefined;
     var n_evs: usize = 0;
     defer for (evs[0..n_evs]) |e| e.deinit();
@@ -109,8 +110,14 @@ pub fn runCommitting(device: mtl.Device, queues: []const mtl.Queue, layers: usiz
         return err;
     };
     for (lanes[0..n]) |l| l.enc.end();
+    const t_commit = mtl.clock.seconds();
     for (lanes[0..n]) |l| l.cb.commit();
     for (lanes[0..n]) |l| l.cb.wait(); // every segment ends before a failure returns and its buffers are reused
+    if (std.c.getenv("TF_SEG_LOG") != null) { // diagnostics: encoding, the wait before the GPU starts, the GPU, the rest
+        const c = lanes[0].cb;
+        const t_done = mtl.clock.seconds();
+        if (t_done - t_begin > 0.25) std.log.info("segments: encode {d:.1} ms, queued {d:.1} ms, gpu {d:.1} ms, after {d:.1} ms", .{ (t_commit - t_begin) * 1e3, (c.gpuStart() - t_commit) * 1e3, c.gpuSeconds() * 1e3, (t_done - c.gpuEnd()) * 1e3 });
+    }
     var gpu: f64 = 0;
     for (done[0..n_done]) |cb| {
         cb.wait();

@@ -7,6 +7,11 @@ pub const Cost = struct { width: u32, ms: f64 };
 
 /// Draft prefixes per stream with the most expected tokens a ms; fixed rows always run. Caller frees.
 pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64) ![]u32 {
+    return allocatePriced(gpa, fixed, probs, costs, overhead_ms, max_rows, 0);
+}
+
+/// allocate, each stream's nodes past its first costing `step_ms` more (a head step drafts each of them).
+pub fn allocatePriced(gpa: Allocator, fixed: []const u32, probs: []const []const f64, costs: *const Table, overhead_ms: f64, max_rows: u64, step_ms: f64) ![]u32 {
     const counts = try gpa.alloc(u32, probs.len);
     defer gpa.free(counts);
     const best_counts = try gpa.alloc(u32, probs.len);
@@ -14,6 +19,7 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, 
     @memset(best_counts, 0);
     var rows: u64 = 0;
     for (fixed) |f| rows += f;
+    var steps: f64 = 0;
     var expected: f64 = @floatFromInt(rows);
     const timed = !costs.empty();
     var best = rate(costs, timed, rows, expected, overhead_ms);
@@ -31,9 +37,10 @@ pub fn allocate(gpa: Allocator, fixed: []const u32, probs: []const []const f64, 
         }
         const s = pick orelse break;
         counts[s] += 1;
+        if (counts[s] > 1) steps += 1;
         rows += 1;
         expected += pick_p;
-        const now = rate(costs, timed, rows, expected, overhead_ms);
+        const now = rate(costs, timed, rows, expected, overhead_ms + step_ms * steps);
         if (now > best) {
             best = now;
             @memcpy(best_counts, counts);
@@ -112,6 +119,19 @@ test "allocate takes the widest round when no cost is timed" {
     const counts = try allocate(gpa, &.{ 1, 1 }, &probs, &empty, 0.0, 8);
     defer gpa.free(counts);
     try std.testing.expectEqualSlices(u32, &.{ 2, 1 }, counts);
+}
+
+test "a priced draft step keeps a stream's later drafts out when they land too seldom to pay" {
+    const gpa = std.testing.allocator;
+    var costs = try extendCosts(gpa, &.{ .{ .width = 1, .ms = 10.0 }, .{ .width = 8, .ms = 12.0 } }, 8);
+    defer costs.deinit(gpa);
+    const probs = [_][]const f64{ &.{ 0.6, 0.3, 0.15 }, &.{ 0.6, 0.3, 0.15 } };
+    const free = try allocate(gpa, &.{ 1, 1 }, &probs, &costs, 2.0, 8);
+    defer gpa.free(free);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 3 }, free);
+    const priced = try allocatePriced(gpa, &.{ 1, 1 }, &probs, &costs, 2.0, 8, 1.5);
+    defer gpa.free(priced);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1 }, priced);
 }
 
 test "extendCosts interpolates and extrapolates" {

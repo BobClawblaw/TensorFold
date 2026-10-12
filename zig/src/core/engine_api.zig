@@ -119,6 +119,10 @@ pub const Vision = struct {
     /// Image tokens one request may hold in all, and images.
     image_tokens: u32,
     max_images: u32,
+    /// Each image at most this many tokens while a request's images fit image_tokens together, past it an equal share
+    /// of image_tokens (the Python lane's Flash Next policy: an image's grid holds whatever images follow it); 0: always
+    /// an equal share.
+    image_most: u32 = 0,
     /// Video input, when the engine's family reads it.
     video: ?VideoOffer = null,
 };
@@ -455,6 +459,7 @@ pub const Engine = struct {
 pub const Lone = struct {
     ctx: *anyopaque,
     sampled: bool = false, // it drives sampled streams too
+    images: bool = true, // it drives requests with images too
     /// Prefills `s` and decodes it until it finishes (false) or `hooks.yield` hands it to the lane core (true).
     run: *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: LoneHooks) anyerror!bool,
 };

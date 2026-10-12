@@ -320,7 +320,7 @@ fn openFlashNext(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem:
             return null;
         }
         var why: []const u8 = "";
-        return @import("flashnext_batch_host.zig").open(gpa, io, o.dir, dump, if (window > 0) @min(window, cap - margin) else cap - margin, o.lanes, o.prompt_cache_gib, o.prompt_cache_over_cap, o.vision, a, &why) catch |err| {
+        return @import("flashnext_batch_host.zig").open(gpa, io, o.dir, dump, if (window > 0) @min(window, cap - margin) else cap - margin, o.lanes, o.prompt_cache_gib, o.prompt_cache_over_cap, o.learn, @intFromFloat(o.learn_gib * (1 << 30)), @intFromFloat(o.learn_min_free_gib * (1 << 30)), o.vision, a, &why) catch |err| {
             problem.* = if (err == error.CacheOverCap) why else if (err == error.BadLoadLimit) "FLASHNEXT_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0, or unset it for 70% of RAM" else if (err == error.OverMemoryLimit) "the native Flash Next batching engine cannot open (OverMemoryLimit): the sessions do not fit under 70% of RAM past the loaded model; fewer streams, a smaller --context, or FLASHNEXT_LOAD_LIMIT_GB past the share" else try std.fmt.allocPrint(a, "the native Flash Next batching engine cannot open ({s})", .{@errorName(err)});
             return null;
         };

@@ -104,6 +104,7 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+    starts: []u32 = &.{}, // the request's chunk starts at or below `at` (a spilled state's, for planned lookups)
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -128,6 +129,7 @@ pub const Store = struct {
     counts: Counts = .{},
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
+    spill: bool = false, // with an imprint, an evicted state its conversation has not moved past goes to disk too
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
 
     const SHARED_KEYS = 64;
@@ -145,6 +147,7 @@ pub const Store = struct {
 
     fn free(s: *Store, e: *Entry) void {
         s.family.vtable.drop(s.family.ptr, e.saved);
+        s.gpa.free(e.starts);
         s.gpa.free(e.tokens);
         s.gpa.free(e.decode_spans);
         s.gpa.free(e.last);
@@ -155,6 +158,22 @@ pub const Store = struct {
         const e = s.entries.orderedRemove(i);
         s.held -= e.bytes;
         s.free(e);
+    }
+
+    /// An eviction: with `spill`, a state neither this prompt nor a later kept state moves past goes to disk first
+    /// (as a learned state: a later lookup recalls it, after a restart too), then out of memory.
+    fn evict(s: *Store, i: usize, prompt: []const u32) void {
+        const e = s.entries.items[i];
+        if (s.spill and s.imprint != null and !s.movedPast(e, prompt)) learned.learn(s, e, e.starts);
+        s.remove(i);
+        s.counts.evicted += 1;
+    }
+
+    /// Whether `prompt` extends `e`, or a later kept state of its conversation does.
+    fn movedPast(s: *const Store, e: *const Entry, prompt: []const u32) bool {
+        if (prompt.len > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) return true;
+        for (s.entries.items) |o| if (o != e and o.born > e.born and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) return true;
+        return false;
     }
 
     /// The family's free storage kept for later saves.
@@ -265,8 +284,7 @@ pub const Store = struct {
         }
         while (s.held + need > s.budget) {
             const i = s.victimBut(from, prompt) orelse return;
-            s.remove(i);
-            s.counts.evicted += 1;
+            s.evict(i, prompt);
         }
     }
 
@@ -413,8 +431,7 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimBut(null, prompt).?); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            s.evict(s.victimBut(null, prompt).?, prompt); // its storage may come back spare and take this state
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
@@ -434,7 +451,15 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+        var below: usize = 0;
+        for (starts) |x| below += @intFromBool(x <= at);
+        const own_starts: []u32 = s.gpa.alloc(u32, below) catch @constCast(&[_]u32{}); // none: a spill reads at no planned cut
+        var k: usize = 0;
+        if (own_starts.len == below) for (starts) |x| if (x <= at) {
+            own_starts[k] = x;
+            k += 1;
+        };
+        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .starts = own_starts };
         owns_decoded = false;
         s.entries.append(s.gpa, e) catch {
             s.free(e);
@@ -451,20 +476,29 @@ pub const Store = struct {
     fn recall(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
+        if (std.c.getenv("TF_SPILL_LOG") != null) for (im.metas.items) |*x| { // diagnostics: why a learned state is passed over
+            const n = @min(x.tokens.len, prompt.len);
+            const agree = std.mem.indexOfDiff(u32, prompt[0..n], x.tokens[0..n]) orelse n;
+            std.log.info("prompt cache: learned {d} tokens: {d} of its tokens agree with the {d}-token prompt; its starts {any}, the prompt's {any}", .{ x.at, agree, prompt.len, x.starts[0..@min(x.starts.len, 8)], starts[0..@min(starts.len, 8)] });
+        };
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
-        const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
-            s.remove(s.victimBut(have, prompt) orelse return have);
-            s.counts.evicted += 1;
-        }
-        if (bytes > s.budget) return have;
-        const e = s.gpa.create(Entry) catch return have;
-        e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
-        e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
-        e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
+        // its fields now: an eviction below may spill (learn) a state, growing the imprint's list under `m`
         const key = m.key;
-        e.saved = read(s.family.ptr, im.dir, key, m.at) catch |err| {
+        const at = m.at;
+        const tokens = s.gpa.dupe(u32, m.tokens) catch return have;
+        var owns_tokens = true;
+        defer if (owns_tokens) s.gpa.free(tokens);
+        const bytes = s.family.vtable.bytes(s.family.ptr, at);
+        while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
+            s.evict(s.victimBut(have, prompt) orelse return have, prompt);
+        }
+        if (bytes > s.budget or !im.has(key)) return have; // a spill's room on disk may have taken it
+        const e = s.gpa.create(Entry) catch return have;
+        e.* = .{ .tokens = tokens, .at = at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
+        owns_tokens = false;
+        e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
+        e.saved = read(s.family.ptr, im.dir, key, at) catch |err| {
             note("reading the learned {d} tokens failed ({s}); forgotten, a later pass learns them again", .{ e.at, @errorName(err) });
             learned.unlearn(s, im, key);
             return s.drop(e, have, false);
@@ -472,7 +506,7 @@ pub const Store = struct {
         im.touch(key);
         s.entries.append(s.gpa, e) catch return s.drop(e, have, true);
         s.held += bytes;
-        if (!@import("builtin").is_test) std.log.info("prompt cache: read {d} learned tokens from disk", .{m.at});
+        if (!@import("builtin").is_test) std.log.info("prompt cache: read {d} learned tokens from disk", .{at});
         return e;
     }
 

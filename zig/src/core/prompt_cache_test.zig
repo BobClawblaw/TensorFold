@@ -323,6 +323,34 @@ test "a learned harness state outlives its store: a fresh session on a new one r
     }
 }
 
+test "a spilled state comes back from disk, even when its room spills more states and grows the imprint's list" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-spill-test-{d}", .{std.c.getpid()});
+    defer rmTree(root);
+    const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
+    var im = try imprint.Imprint.open(gpa, root, 3, 1 << 30);
+    defer im.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.learned(), rules, 250); // two states of 107 bytes
+    defer s.deinit();
+    s.imprint = &im;
+    s.spill = true;
+    var prompts: [10][8]u32 = undefined;
+    for (&prompts, 0..) |*p, i| {
+        p.* = .{ @intCast(10 + i), 7, 7, 7, 7, 7, 7, 9 }; // each conversation its own: a state at 7 reads its history
+        try std.testing.expectEqual(fresh(p), f.pass(&s, p, try s.begin(a, p, 7, &.{}, &.{}, null, &.{})));
+    }
+    try std.testing.expectEqual(@as(usize, 8), im.metas.items.len); // the first eight spilled as the store moved on
+    const next = prompts[0] ++ [_]u32{ 5, 9 }; // the first conversation's next turn (the state's lookahead token kept)
+    const plan = try s.begin(a, &next, 8, &.{}, &.{}, null, &.{}); // its room spills a ninth: the list grows under the lookup
+    try std.testing.expectEqual(@as(u32, 7), plan.from);
+    try std.testing.expectEqual(fresh(&next), f.pass(&s, &next, plan));
+}
+
 test "past the learned-state cap the least recently used state is forgotten, and a file that no longer reads is too" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);

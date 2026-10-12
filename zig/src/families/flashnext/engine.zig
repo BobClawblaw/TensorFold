@@ -637,12 +637,26 @@ pub const Engine = struct {
             dr.after(out, at, n_in);
         }
         out.prefilled(out.ctx);
-        var res: Result = .{ .reason = .length };
         const first_stop = out.tokens(out.ctx, &.{pick}) or isEos(eos, pick);
         try dr.flush(e, out); // after the first token: the slots, rows and tail stay put till the rounds
         if (e.call_log) calls.log(if (r.tp) |tp| tp.rank else 0);
         if (try e.agree(first_stop)) return .{ .reason = .stop };
-        if (max_tokens <= 1) return res;
+        if (max_tokens <= 1) return .{ .reason = .length };
+        return e.decode(prompt, pick, .{ .b = m.last.b, .off = m.last.off + (last_n - 1) * WIDE * 2 }, max_tokens, eos, depth, out, null);
+    }
+
+    /// Where `decode` left a stream it handed over (a cancel with a handoff): its state as a host round leaves it
+    /// (the DeltaNet states kept, the n-gram tail in the model's own buffer, the head absorbed through the last
+    /// cache row), `cache` rows in the cache.
+    pub const Handoff = struct { yielded: bool = false, cache: usize = 0 };
+
+    /// The GPU-side rounds after a prompt pass: `prompt` in the cache, `pick` its first token (out has it), `streams`
+    /// the last prompt row's (the head's first drafts). With `handoff`, a cancel hands the stream over (handOver).
+    pub fn decode(e: *Engine, prompt: []const u32, pick: u32, streams: Buf, max_tokens: usize, eos: []const u32, depth: ?usize, out: Out, handoff: ?*Handoff) !Result {
+        const r = e.r;
+        const m = e.m;
+        defer e.hostMode();
+        var res: Result = .{ .reason = .length };
         var emitted: usize = 1;
         const ar = r.ar.b.slice(i32, fz.AR_WORDS);
         if (m.state == 1) { // the state into the rounds' state buffers
@@ -664,7 +678,7 @@ pub const Engine = struct {
         w[0] = pick;
         if (depth0 > 0) { // the head: the last prompt row with the first token, then its chain
             m.mtp.pos = prompt.len - 1;
-            w[1] = try m.mtpRun(&.{pick}, .{ .b = m.last.b, .off = m.last.off + (last_n - 1) * WIDE * 2 });
+            w[1] = try m.mtpRun(&.{pick}, streams);
             for (2..depth0 + 1) |j| w[j] = try m.mtpChain(w[j - 1]);
         }
         const W0 = depth0 + 1;
@@ -829,7 +843,33 @@ pub const Engine = struct {
         };
         r.event_value = base + round + 1;
         if (failed) |err| return err;
+        if (handoff) |h| if (res.reason == .cancelled) try e.handOver(h, round, widths[(round - 1) % 4], out.sampling != null, kv_len);
         return res;
+    }
+
+    /// The rounds handed over at `cache` rows, `round` the next round's index: a greedy reply's round ahead started
+    /// as each round does (the last landed one's kept states, tail and head absorb; past it nothing a host round
+    /// reads); a sampled reply runs that start now (no round ran ahead), its window's `wp` rows absorbed. Then the
+    /// tail into the model's own buffer.
+    fn handOver(e: *Engine, h: *Handoff, round: usize, wp: usize, sampled: bool, cache: usize) !void {
+        const r = e.r;
+        const m = e.m;
+        if (r.gdn_kept != null) return error.HandoffUnsupported; // kept states replay their rows in the next window
+        var tail = (round - 1) % 2;
+        if (sampled) {
+            const cb = r.queue.commandBuffer();
+            r.enc = cb.compute(.serial);
+            e.statesCopy(true);
+            r.copyKept(e.cins[(round - 1) % 2], e.cins[round % 2], PLE_TAIL * WIDE / 2, WIDE / 2, 0, 0, 1, 0);
+            try m.mtpEncode(MAXR - 1 + wp, wp, m.t.picks, m.last, .{ .b = e.wids.b, .off = 4 });
+            try m.finish(cb);
+            tail = round % 2;
+        }
+        if (tail == 1) {
+            const n = PLE_TAIL * WIDE * 2;
+            @memcpy(e.cins[0].b.contents()[e.cins[0].off..][0..n], e.cins[1].b.contents()[e.cins[1].off..][0..n]);
+        }
+        h.* = .{ .yielded = true, .cache = cache };
     }
 
     /// A sampled round's forward run to its end, its `rows` picks redrawn from their logits at kv_len + j + 1, and a
