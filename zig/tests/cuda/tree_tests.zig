@@ -42,7 +42,7 @@ const Set = struct {
 };
 
 /// One call over `rows` (global window rows of the given streams, in order): their outputs.
-fn call(x: *Set, s: cuda.Stream, g: *const tree.TreeAttention, d: usize, rows: []const usize, row_stream_all: []const i32, parents_all: []const i32, qs: []const u16, kns: []const u16, vns: []const u16, h: usize, hk: usize, streams_dev: u64, offs: u64, origin: u64, ng: usize, scale: f32) ![]u16 {
+fn call(x: *Set, s: cuda.Stream, g: *const tree.TreeAttention, d: usize, rows: []const usize, row_stream_all: []const i32, parents_all: []const i32, qs: []const u16, kns: []const u16, vns: []const u16, h: usize, hk: usize, streams_all: []const i32, offs: u64, origin: u64, ng: usize, scale: f32) ![]u16 {
     const n = rows.len;
     var local: std.AutoHashMap(usize, i32) = .init(x.a);
     for (rows, 0..) |r, i| try local.put(r, @intCast(i));
@@ -58,6 +58,18 @@ fn call(x: *Set, s: cuda.Stream, g: *const tree.TreeAttention, d: usize, rows: [
         @memcpy(kn[i * hk * d ..][0 .. hk * d], kns[r * hk * d ..][0 .. hk * d]);
         @memcpy(vn[i * hk * d ..][0 .. hk * d], vns[r * hk * d ..][0 .. hk * d]);
     }
+    // the streams' table for these rows: each stream's first row and rows among them, its committed keys
+    const st = try x.a.dupe(i32, streams_all);
+    for (0..st.len / 4) |k| {
+        st[4 * k] = 0;
+        st[4 * k + 1] = 0;
+    }
+    for (rows, 0..) |r, i| {
+        const k: usize = @intCast(row_stream_all[r]);
+        if (st[4 * k + 1] == 0) st[4 * k] = @intCast(i);
+        st[4 * k + 1] += 1;
+    }
+    const streams_dev = try x.up(std.mem.sliceAsBytes(st));
     const paths = try x.zero(s, n * tree.max_depth * 4);
     const depths = try x.zero(s, n * 4);
     try g.paths(s, try x.up(std.mem.sliceAsBytes(par)), paths, depths, n);
@@ -119,14 +131,13 @@ fn case(gpu: check.Gpu, d: usize, h: usize, hk: usize, seed: u64, worst_all: *f6
     for (kns) |*v| v.* = bf16(rng.floatNorm(f32));
     for (vns) |*v| v.* = bf16(rng.floatNorm(f32));
     const origin = try x.up(std.mem.sliceAsBytes(kcache));
-    const streams_dev = try x.up(std.mem.sliceAsBytes(&streams));
     const offs_dev = try x.up(std.mem.sliceAsBytes(&offs));
     var ng: usize = 0;
     for (committed, widths) |p, w| ng = @max(ng, tree.TreeAttention.groups(p + w));
     const scale: f32 = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(d))));
     const all = try a.alloc(usize, total);
     for (all, 0..) |*r, i| r.* = i;
-    const got = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    const got = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
     // the reference: committed keys, then the path root first
     var worst: f64 = 0;
     const kd = try a.alloc(f64, (4200 + 128) * d);
@@ -171,14 +182,14 @@ fn case(gpu: check.Gpu, d: usize, h: usize, hk: usize, seed: u64, worst_all: *f6
     // stream 1's rows alone (re-indexed): the same bits
     const only = try a.alloc(usize, widths[1]);
     for (only, 0..) |*r, i| r.* = widths[0] + i;
-    const alone = try call(&x, s, &g, d, only, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    const alone = try call(&x, s, &g, d, only, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
     try check.sameBytes("tree attention: one stream's rows alone", std.mem.sliceAsBytes(alone), std.mem.sliceAsBytes(got[widths[0] * h * d ..][0 .. widths[1] * h * d]));
     // one block a (row, key head) striding over the groups, and a grid sized for a long context: the same bits
     g.group_slots = 1;
-    const strided = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    const strided = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
     try check.sameBytes("tree attention: one group slot", std.mem.sliceAsBytes(strided), std.mem.sliceAsBytes(got));
     g.group_slots = 16;
-    const wide = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, 129, scale);
+    const wide = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, 129, scale);
     try check.sameBytes("tree attention: groups for a 262k context", std.mem.sliceAsBytes(wide), std.mem.sliceAsBytes(got));
 }
 

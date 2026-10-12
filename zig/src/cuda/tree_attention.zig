@@ -24,8 +24,9 @@ pub const TreeAttention = struct {
     mod: Module,
     paths_fn: Function,
     part_fns: [2]Function, // head dim 128, 256
+    shared_fns: [2]Function,
     merge_fn: Function,
-    /// Blocks a (row, key head) at most; each takes every `group_slots`-th group (bits do not depend on it).
+    /// Blocks a (row or pair tile, key head) at most, each taking every `group_slots`-th group (same bits).
     group_slots: usize = 16,
 
     pub fn load(d: *const Driver) !TreeAttention {
@@ -34,7 +35,9 @@ pub const TreeAttention = struct {
         errdefer mod.unload();
         var parts: [2]Function = .{ try mod.function("tf_tree_part"), try mod.function("tf_tree_part_256") };
         for (&parts, part_smem) |*f, b| try f.allowDynamicShared(b);
-        return .{ .mod = mod, .paths_fn = try mod.function("tf_tree_paths"), .part_fns = parts, .merge_fn = try mod.function("tf_tree_merge") };
+        var shared: [2]Function = .{ try mod.function("tf_tree_shared"), try mod.function("tf_tree_shared_256") };
+        for (&shared, part_smem) |*f, b| try f.allowDynamicShared(b);
+        return .{ .mod = mod, .paths_fn = try mod.function("tf_tree_paths"), .part_fns = parts, .shared_fns = shared, .merge_fn = try mod.function("tf_tree_merge") };
     }
 
     pub fn unload(g: *TreeAttention) void {
@@ -76,7 +79,16 @@ pub const TreeAttention = struct {
         a.add(@as(i32, @intCast(hk)));
         a.add(scale);
         a.add(@as(i32, @intCast(ng)));
+        const tiles = (@min(n, max_depth) * (h / hk) + 15) / 16; // 16 (row, head) pairs a block, a stream's rows
         const slots = @max(1, @min(ng, g.group_slots));
+        var c: launch_.Args = .{};
+        for ([_]u64{ q, rows.origin, rows.offs, rows.row_stream, rows.streams, rows.paths, rows.depths, sc.o, sc.m, sc.l }) |v| c.add(v);
+        c.add(@as(i32, @intCast(h)));
+        c.add(@as(i32, @intCast(hk)));
+        c.add(scale);
+        c.add(@as(i32, @intCast(ng)));
+        c.add(@as(i32, @intCast(tiles)));
+        try launch_.launch(g.shared_fns[which], .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(slots * tiles) }, .block = .{ .x = 128 }, .shared = part_smem[which] }, s, &c);
         try launch_.launch(g.part_fns[which], .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(slots) }, .block = .{ .x = 128 }, .shared = part_smem[which] }, s, &a);
         var b: launch_.Args = .{};
         for ([_]u64{ sc.o, sc.m, sc.l, rows.row_stream, rows.streams, rows.depths, out }) |v| b.add(v);
