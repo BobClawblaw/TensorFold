@@ -39,14 +39,18 @@ pub const Backend = struct {
     draft_calls: u64 = 0,
     draft_waits: u64 = 0,
     draft_seconds: f64 = 0,
+    grow: usize = std.math.maxInt(usize), // reply tokens a session must hold at admission past the prompt (the rest: move)
+    paused: std.ArrayList(*Stream) = .empty, // streams that outgrew their session and wait for a larger one to free
+    moves: u64 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, e: *Engine, n: u32, capacity: usize) !Backend {
-        if (n < 2 or n > fz.MAXR or e.r.tp != null) return error.BadBatchSlots;
-        const sessions = try gpa.alloc(Session, n);
+    /// Sessions of the given capacities (the first, the engine's own, holds its whole window whatever is given).
+    pub fn init(gpa: std.mem.Allocator, e: *Engine, capacities: []const usize) !Backend {
+        if (capacities.len < 2 or capacities.len > fz.MAXR or e.r.tp != null) return error.BadBatchSlots;
+        const sessions = try gpa.alloc(Session, capacities.len);
         errdefer gpa.free(sessions);
         var made: usize = 0;
         errdefer for (sessions[0..made]) |*s| s.deinit(gpa);
-        for (sessions, 0..) |*s, i| {
+        for (sessions, capacities, 0..) |*s, capacity, i| {
             s.* = try Session.init(gpa, e, capacity, i == 0);
             made += 1;
         }
@@ -56,6 +60,7 @@ pub const Backend = struct {
 
     pub fn deinit(b: *Backend) void {
         b.e.m = b.primary;
+        b.paused.deinit(b.gpa);
         b.by.deinit(b.gpa);
         for (b.sessions) |*s| s.deinit(b.gpa);
         b.gpa.free(b.sessions);
@@ -129,6 +134,88 @@ pub const Backend = struct {
         return old;
     }
 
+    /// The free session with the smallest capacity that holds a stream's prompt and its reply's first `grow` tokens
+    /// (slot 0 holds the longest window: keep it for those that need it; a stream that outgrows its session moves:
+    /// makeRoom); error.LaneMemory when only a busy one would (the stream waits), ContextFull when none holds it whole.
+    fn slotFor(b: *Backend, prompt: usize, max_new: usize) !usize {
+        const need = prompt + @min(max_new, b.grow) + fz.MAXR + 1;
+        var best: ?usize = null;
+        var most: usize = 0;
+        for (b.sessions, 0..) |s, j| {
+            most = @max(most, s.m.cap);
+            if (s.m.cap >= need and !s.used and (best == null or s.m.cap < b.sessions[best.?].m.cap)) best = j;
+        }
+        if (prompt + max_new + fz.MAXR + 1 > most) return error.ContextFull;
+        return best orelse error.LaneMemory;
+    }
+
+    /// Before a round: a stream left too little room for the next one moves to a free larger session; with none free
+    /// it pauses after this round (its window fits) until one frees (release).
+    fn makeRoom(b: *Backend, stream: *Stream, rows: usize) !void {
+        const i = b.by.get(stream) orelse return error.UnknownStream;
+        const s = &b.sessions[i];
+        if (s.m.pos + rows + 2 * (fz.MAXR + 1) <= s.m.cap) return;
+        b.move(stream, i) catch |err| switch (err) {
+            error.LaneMemory => {
+                if (s.m.pos + rows + fz.MAXR + 1 > s.m.cap) return error.ContextFull;
+                if (!stream.paused) {
+                    try b.paused.append(b.gpa, stream);
+                    std.log.info("flash next: a stream at {d} tokens waits for a session larger than {d} tokens to free", .{ s.m.pos, s.m.cap });
+                }
+                stream.paused = true;
+            },
+            else => return err,
+        };
+    }
+
+    /// The stream in session `i` into the smallest free larger session that holds its reply's next `grow` tokens (the
+    /// largest free one when none does); LaneMemory when no larger session is free.
+    fn move(b: *Backend, stream: *Stream, i: usize) !void {
+        const from = &b.sessions[i];
+        const left: usize = @intCast(@max(stream.budgetLeft(), 0));
+        const need = from.m.pos + @min(left, b.grow) + 2 * (fz.MAXR + 1);
+        var best: ?usize = null; // the smallest free larger session that holds `need`
+        var most: ?usize = null; // else the largest free larger one
+        for (b.sessions, 0..) |o, j| if (!o.used and o.m.cap > from.m.cap) {
+            if (o.m.cap >= need and (best == null or o.m.cap < b.sessions[best.?].m.cap)) best = j;
+            if (most == null or o.m.cap > b.sessions[most.?].m.cap) most = j;
+        };
+        const j = best orelse most orelse return error.LaneMemory;
+        try b.settle();
+        try from.moveTo(&b.sessions[j], b.e);
+        try b.by.put(b.gpa, stream, j);
+        from.used = false;
+        from.round = .{};
+        from.held_n = 0;
+        b.moves += 1;
+        std.log.info("flash next: a stream at {d} tokens moved from a {d}-token session to a {d}-token one ({d} moves)", .{ from.m.pos, from.m.cap, b.sessions[j].m.cap, b.moves });
+    }
+
+    /// Paused streams into sessions that freed, oldest first; each goes on once moved.
+    fn resumePaused(b: *Backend) void {
+        var k: usize = 0;
+        while (k < b.paused.items.len) {
+            const stream = b.paused.items[k];
+            const i = b.by.get(stream) orelse {
+                _ = b.paused.orderedRemove(k);
+                continue;
+            };
+            b.move(stream, i) catch |err| {
+                if (err != error.LaneMemory) std.log.err("flash next: a paused stream could not move: {s}", .{@errorName(err)});
+                k += 1;
+                continue;
+            };
+            stream.paused = false;
+            _ = b.paused.orderedRemove(k);
+        }
+    }
+
+    /// LaneHost's admission check: a free session holds the request now.
+    pub fn fits(ptr: *anyopaque, prompt: u32, max_new: u32) bool {
+        _ = self(ptr).slotFor(prompt, max_new) catch return false;
+        return true;
+    }
+
     fn prefill(ptr: *anyopaque, stream: *Stream) anyerror!void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
@@ -136,12 +223,13 @@ pub const Backend = struct {
         const prompt = stream.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
         try b.settle();
-        const i = for (b.sessions, 0..) |s, j| {
-            if (!s.used) break j;
-        } else return error.NoFreeSlot;
+        const i = try b.slotFor(prompt.len, stream.max_new);
         const s = &b.sessions[i];
-        if (prompt.len + stream.max_new + fz.MAXR + 1 > s.m.cap) return error.ContextFull;
         try b.by.put(b.gpa, stream, i);
+        errdefer {
+            _ = b.by.remove(stream);
+            s.used = false;
+        }
         s.used = true;
         s.held_n = 0;
         s.round = .{};
@@ -221,6 +309,7 @@ pub const Backend = struct {
         const b = self(ptr);
         try b.settle();
         if (windows.len == 0 or windows.len > fz.MAXR or out.len != windows.len) return error.BadBatch;
+        for (windows) |w| try b.makeRoom(w.stream, w.rows());
         var desc: [fz.MAXR]meta.Window = undefined;
         var segs: [fz.MAXR]forward.Seg = undefined;
         for (windows, out, 0..) |w, o, i| {
@@ -318,10 +407,12 @@ pub const Backend = struct {
 
     fn release(ptr: *anyopaque, stream: *Stream) void {
         const b = self(ptr);
+        if (std.mem.indexOfScalar(*Stream, b.paused.items, stream)) |k| _ = b.paused.orderedRemove(k);
         const kv = b.by.fetchRemove(stream) orelse return;
         b.sessions[kv.value].used = false;
         b.sessions[kv.value].round = .{};
         b.sessions[kv.value].held_n = 0;
+        if (b.paused.items.len > 0) b.resumePaused();
     }
 
     pub fn snapBytes(ptr: *anyopaque, at: u32) u64 {

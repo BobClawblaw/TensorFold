@@ -34,6 +34,33 @@ fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
     return c.bytes;
 }
 
+/// The sessions past the engine's own from FLASHNEXT_SLOT_CONTEXTS: token counts, `CONTEXTxN` for N sessions of one
+/// size (as "131072,65536x2,16384x8"), each holding at most `capacity` rows; null when unset.
+fn slotContexts(gpa: std.mem.Allocator, capacity: usize) !?[]usize {
+    const text = std.mem.trim(u8, std.mem.span(std.c.getenv("FLASHNEXT_SLOT_CONTEXTS") orelse return null), " \t");
+    if (text.len == 0) return null;
+    var caps: std.ArrayList(usize) = .empty;
+    errdefer caps.deinit(gpa);
+    var it = std.mem.tokenizeScalar(u8, text, ',');
+    while (it.next()) |entry| {
+        const e = std.mem.trim(u8, entry, " \t");
+        const x = std.mem.indexOfScalar(u8, e, 'x');
+        const tokens = std.fmt.parseInt(usize, if (x) |i| e[0..i] else e, 10) catch return error.BadSlotContexts;
+        const n = if (x) |i| std.fmt.parseInt(usize, e[i + 1 ..], 10) catch return error.BadSlotContexts else 1;
+        if (tokens < 1024 or n == 0) return error.BadSlotContexts;
+        for (0..n) |_| try caps.append(gpa, @min(capacity, tokens + @as(usize, @intCast(fx.MARGIN))));
+    }
+    if (caps.items.len == 0 or caps.items.len + 1 > tf.flashnext_replay.MAXR) return error.BadSlotContexts;
+    return try caps.toOwnedSlice(gpa);
+}
+
+/// Reply tokens a stream's session must hold past its prompt at admission (FLASHNEXT_SLOT_GROW, default 8192): a
+/// stream that outgrows it moves to a free larger session at a round's end, or waits for one.
+fn slotGrow() usize {
+    const v = std.c.getenv("FLASHNEXT_SLOT_GROW") orelse return 8192;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8192;
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, streams: u32, cache_gib: ?f64, over: bool, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -51,13 +78,34 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     const available = cap -| ready -| fit.MARGIN -| reserved;
     if (available < fixed) return error.OverMemoryLimit;
     const room = available - fixed;
-    const slots = try tf.flashnext_batch_meta.fit(streams, true, room, Session.bytes(capacity));
+    const tiers = slotContexts(gpa, capacity) catch |err| {
+        std.log.err("flash next: FLASHNEXT_SLOT_CONTEXTS is not a list of sessions: token counts of 1024 or more, CONTEXTxN for N alike, at most {d} sessions past the engine's own", .{tf.flashnext_replay.MAXR - 1});
+        return err;
+    };
+    defer if (tiers) |t| gpa.free(t);
+    var caps: std.ArrayList(usize) = .empty;
+    defer caps.deinit(gpa);
+    try caps.append(gpa, capacity); // the engine's own session: the whole window
+    if (tiers) |t| {
+        var bytes: u64 = 0;
+        for (t) |c| bytes += Session.bytes(c);
+        if (bytes > room) {
+            std.log.err("flash next: the sessions FLASHNEXT_SLOT_CONTEXTS lists take {d:.1} GiB; {d:.1} GiB fits under the limit beside the prompt cache", .{ fit.gibs(bytes), fit.gibs(room) });
+            return error.OverMemoryLimit;
+        }
+        try caps.appendSlice(gpa, t);
+    } else {
+        const n = try tf.flashnext_batch_meta.fit(streams, true, room, Session.bytes(capacity));
+        for (1..n) |_| try caps.append(gpa, capacity);
+    }
+    const slots: u32 = @intCast(caps.items.len);
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.gpa = gpa;
     h.eng = eng;
-    h.back = try Backend.init(gpa, eng, slots, capacity);
+    h.back = try Backend.init(gpa, eng, caps.items);
     errdefer h.back.deinit();
+    if (tiers != null) h.back.grow = slotGrow();
     const allocated = fit.footprint() orelse return error.NoMemoryReading;
     if (allocated +| fit.MARGIN +| reserved > cap) return error.OverMemoryLimit;
     h.cfg = try lanes.Config.init(gpa, h.back.facts(), tf.flashnext_replay.MAXR, tf.flashnext_replay.MAXR - 1);
@@ -67,7 +115,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     errdefer h.core.deinit();
     const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .admit = .{ .ctx = &h.back, .fits = Backend.fits } });
     h.cache = null;
     if (plan.budget_bytes > 0) {
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = Backend.snapBytes, .save = Backend.snapSave, .restore = Backend.snapRestore, .drop = Backend.snapDrop, .charged = Backend.snapCharged, .spare = Backend.snapSpare, .trim = Backend.snapTrim, .reuses = Backend.snapReuses } }, .{ .lookahead = 1, .planned = true }, plan.budget_bytes);
@@ -79,7 +127,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     h.warm = .{ .queue = eng.r.queue };
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     try h.host.start();
-    std.log.info("Flash Next: {d} session slots, shared target forwards, serial MTP drafts", .{slots});
+    var listed: [tf.flashnext_replay.MAXR * 8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&listed);
+    for (caps.items, 0..) |c, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", c }) catch break;
+    std.log.info("Flash Next: {d} session slots ({s} tokens), shared target forwards, serial MTP drafts", .{ slots, w.buffered() });
     return .{ .engine = h.host.engine(), .close = close, .ctx = h };
 }
 

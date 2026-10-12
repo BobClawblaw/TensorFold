@@ -142,6 +142,59 @@ pub const Session = struct {
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
     }
 
+    /// This session's stream into `dst`, a free session with more room: its cache rows, states, n-gram tail and head
+    /// copied on the GPU at a round's end (states settled), so the stream goes on there with the same bits.
+    pub fn moveTo(s: *Session, dst: *Session, e: *Engine) !void {
+        const m = &s.m;
+        const d = &dst.m;
+        if (m.state != 0 or m.state_row != 0 or s.round.pending) return error.StateNotSettled;
+        const rows = @min(m.cap, m.pos + 2 * fz.MAXR + 2); // the cache's rows and the head's chained ones past them
+        if (rows > d.cap) return error.ContextFull;
+        const cb = e.r.queue.commandBuffer();
+        const blit = cb.blit();
+        for (&m.layers, &d.layers) |*a, *b| if (a.linear) {
+            blit.copy(a.cs[0].b, a.cs[0].off, b.cs[0].b, b.cs[0].off, fz.CS_ROW);
+            blit.copy(a.so[0].b, a.so[0].off, b.so[0].b, b.so[0].off, fz.SO_ROW);
+        } else {
+            moveRows(blit, a, b, m.cap, d.cap, rows);
+        };
+        moveRows(blit, &m.mtp, &d.mtp, m.cap, d.cap, rows);
+        blit.copy(m.ple.cin.b, m.ple.cin.off, d.ple.cin.b, d.ple.cin.off, (fz.PLE_TAIL + fz.MAXR) * fz.WIDE * 2);
+        blit.copy(s.last.b, s.last.off, dst.last.b, dst.last.off, fz.WIDE * 2);
+        blit.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |message| {
+            std.log.err("session move failed: {s}", .{message});
+            return error.GpuFailed;
+        }
+        d.pos = m.pos;
+        d.state = 0;
+        d.state_row = 0;
+        d.ple.hist = m.ple.hist;
+        d.mtp.pos = m.mtp.pos;
+        d.mtp.drafted = m.mtp.drafted;
+        dst.held = s.held;
+        dst.held_n = s.held_n;
+        dst.first = s.first;
+        dst.round = s.round;
+        dst.tokens = s.tokens;
+        dst.row0 = s.row0;
+        dst.used = true;
+    }
+
+    /// A sparse-attention layer's first `rows` keys, values and indexer keys and its pooled blocks, head by head.
+    fn moveRows(blit: mtl.BlitEncoder, a: anytype, b: anytype, from: usize, to: usize, rows: usize) void {
+        const row = 256 * 2;
+        for (0..2) |hd| {
+            blit.copy(a.keys.b, a.keys.off + hd * from * row, b.keys.b, b.keys.off + hd * to * row, rows * row);
+            blit.copy(a.vals.b, a.vals.off + hd * from * row, b.vals.b, b.vals.off + hd * to * row, rows * row);
+        }
+        blit.copy(a.raw.b, a.raw.off, b.raw.b, b.raw.off, rows * 128 * 2);
+        if (a.pooled_n > 0) blit.copy(a.pooled.b, a.pooled.off, b.pooled.b, b.pooled.off, a.pooled_n * 128 * 2);
+        b.pooled_n = a.pooled_n;
+    }
+
     pub fn deinit(s: *Session, gpa: std.mem.Allocator) void {
         for (s.owned.items) |b| b.deinit();
         s.owned.deinit(gpa);
