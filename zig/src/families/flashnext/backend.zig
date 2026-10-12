@@ -24,8 +24,7 @@ fn sampling(stream: *const Stream) ?lanes.Sampling {
 
 /// Row `row` of a [rows, VOCAB] bf16 logits buffer, drawn with `p` keyed at `position`.
 fn drawRow(gpa: std.mem.Allocator, logits: Buf, row: usize, p: lanes.Sampling, position: u64) !u32 {
-    const bytes = logits.b.contents()[logits.off + row * fz.VOCAB * 2 ..][0 .. fz.VOCAB * 2];
-    return sample.draw(gpa, @as([*]const u16, @ptrCast(@alignCast(bytes.ptr)))[0..fz.VOCAB], p, position);
+    return sample.draw(gpa, sample.row(logits.b.contents() + logits.off, fz.VOCAB, row), p, position);
 }
 
 pub const Backend = struct {

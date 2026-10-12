@@ -1,5 +1,6 @@
 //! Flash Next behind the native server: one reply at a time on the replay engine (prompt chunks, then GPU-side
-//! rounds), greedy only; the engine's thread owns the GPU, requests wait in arrival order (foreground first).
+//! rounds), sampled on the host when a request asks (speed-up mode greedy only); the engine's thread owns the GPU,
+//! requests wait in arrival order (foreground first).
 const std = @import("std");
 const mtl = @import("metal");
 const api = @import("engine_api");
@@ -299,18 +300,14 @@ pub const Host = struct {
         defer h.finish(job, fin.reason, fin.stats, fin.message); // after every defer below: they read the job and its request
         const r = job.request;
         job.began = h.now();
-        if (r.sampling) |s| if (s.temperature > 0) {
-            emit(job, .{ .prefilled = 0 });
-            fin.message = "the native Flash Next engine decodes greedily only: send temperature 0";
-            return;
-        };
         if (h.eng.followsPeer()) {
             emit(job, .{ .prefilled = 0 });
             fin.message = "speed-up mode: this Mac runs rank 0's requests; send requests to rank 0";
             return;
         }
         var c: Ctx = .{ .h = h, .job = job };
-        const out: fx.Out = .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled, .marked = Ctx.marked };
+        const sampled: ?api.Sampling = if (r.sampling) |s| (if (s.temperature > 0) s else null) else null;
+        const out: fx.Out = .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled, .marked = Ctx.marked, .sampling = sampled };
         const depth: ?usize = if (r.drafts) null else 0;
         var arena: std.heap.ArenaAllocator = .init(h.gpa);
         defer arena.deinit();
@@ -481,7 +478,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     const limit: i64 = @as(i64, @intCast(tf.flashnext_replay.CAP)) - fx.MARGIN;
-    h.* = .{ .gpa = gpa, .io = io, .eng = eng, .follower = follower, .info_ = .{ .name = "flashnext-zig", .prompt_cache_plan = cache_plan, .lanes = 1, .greedy_only = true, .context_window = @intCast(if (window > 0) @min(window, limit) else limit) } };
+    h.* = .{ .gpa = gpa, .io = io, .eng = eng, .follower = follower, .info_ = .{ .name = "flashnext-zig", .prompt_cache_plan = cache_plan, .lanes = 1, .greedy_only = eng.r.tp != null, .context_window = @intCast(if (window > 0) @min(window, limit) else limit) } };
     h.warm = .{ .queue = eng.r.queue };
     h.vision = vis;
     if (vis) |v| h.info_.vision = v.offer();

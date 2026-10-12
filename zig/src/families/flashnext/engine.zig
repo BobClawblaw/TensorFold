@@ -2,6 +2,8 @@
 //! keys for every prompt row), then GPU-side rounds whose drafts the depth rule sets; tokens leave as rounds are read.
 const std = @import("std");
 const mtl = @import("metal");
+const lanes = @import("lanes");
+const sample = @import("sample.zig");
 const fz = @import("replay.zig");
 const config = @import("config.zig");
 const segments = @import("../../core/segments.zig");
@@ -86,6 +88,8 @@ pub const Out = struct {
     cancelled: *const fn (ctx: *anyopaque) bool,
     /// The prompt pass stands at one of generateFrom's marks (a chunk end): the prompt cache keeps its state here.
     marked: ?*const fn (ctx: *anyopaque, at: usize) void = null,
+    /// A sampled reply (a temperature above 0): each token drawn on the host from the head's logits; null: greedy.
+    sampling: ?lanes.Sampling = null,
 };
 
 pub const Engine = struct {
@@ -527,6 +531,7 @@ pub const Engine = struct {
         if (prompt.len == 0) return error.EmptyPrompt;
         if (prompt.len + max_tokens + MARGIN > fz.CAP) return error.ContextFull;
         if (from >= prompt.len or (from > 0 and m.pos != from)) return error.NotResumed;
+        if (out.sampling != null and r.tp != null) return error.SpeedUpGreedyOnly; // each Mac holds half the logits
         for (marks, 0..) |mk, i| if (mk <= from or mk >= prompt.len or (i > 0 and mk <= marks[i - 1])) return error.Marks;
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
@@ -613,6 +618,9 @@ pub const Engine = struct {
             }
             const hist0 = m.ple.hist; // the two tokens before the call: the n-gram history at a passed mark follows from them
             pick = try Prompt.chunkMarked(ps[0..c.parts], m, e.gpa, prompt[at .. at + c.rows], inside[0..n_in]);
+            if (at + c.rows == prompt.len) if (out.sampling) |p| { // the last row's logits, before the head's keys
+                pick = try sample.draw(e.gpa, sample.row(m.t.logits.b.contents() + m.t.logits.off, fz.VOCAB, 0), p, prompt.len);
+            };
             for (ps[0..c.parts], 0..) |p, k| { // the MTP head's keys for each segment's rows, from its streams
                 const s = at + segments.start(c.rows, c.parts, k);
                 const n = segments.rows(c.rows, c.parts, k);
@@ -703,9 +711,10 @@ pub const Engine = struct {
         res.min_rows = @intCast(W0);
         const rg = e.ring.slice(u32, fz.RING_WORDS * RING);
         var failed: ?anyerror = null;
+        var kv_len: usize = m.pos; // the cache before the next round read: a sampled row j draws at kv_len + j + 1
         while (true) {
             const wr = widths[round % 4];
-            const cb = r.queue.commandBuffer();
+            var cb = r.queue.commandBuffer();
             if (round > 0) cb.waitFor(r.event, base + round);
             r.enc = cb.compute(.serial);
             m.t.rows = e.rows_w[wr];
@@ -737,6 +746,9 @@ pub const Engine = struct {
             if (r.gsel) |*g| g.nb_ub = ub;
             if (m.mtp.gsel) |*g| g.nb_ub = ub;
             try m.windowEncode(wr, e.wids);
+            if (out.sampling) |p| { // the window's picks drawn on the host before the accept kernel reads them
+                cb = try sampledPicks(e, cb, wr, kv_len, p);
+            }
             // the widest windows while copies land whole; otherwise the head's rule
             const copying = e.copy and copy_rate + 0.05 >= head_rate and copy_rate > 0.9;
             const wn = (if (fixed) |d| d else if (copying) MAXR - 1 else next_depth) + 1;
@@ -752,7 +764,7 @@ pub const Engine = struct {
             cb.commit();
             cbs[round % 4] = cb;
             round += 1;
-            if (round < 2) continue;
+            if (round < 2 and out.sampling == null) continue; // greedy rounds run two deep; sampled ones one at a time
             const prev = cbs[done % 4].?;
             prev.wait();
             cbs[done % 4] = null;
@@ -786,6 +798,7 @@ pub const Engine = struct {
             res.accepted += keep - 1;
             res.min_rows = @min(res.min_rows, @as(u32, @intCast(wd)));
             done += 1;
+            kv_len += keep;
             const got = rg[slot + 3 .. slot + 3 + keep];
             var take: usize = 0;
             var stop = false;
@@ -817,6 +830,26 @@ pub const Engine = struct {
         r.event_value = base + round + 1;
         if (failed) |err| return err;
         return res;
+    }
+
+    /// A sampled round's forward run to its end, its `rows` picks redrawn from their logits at kv_len + j + 1, and a
+    /// new command buffer for the accept kernel (which waits on nothing: the forward's buffer has finished).
+    fn sampledPicks(e: *Engine, cb: mtl.CommandBuffer, rows: usize, kv_len: usize, p: lanes.Sampling) !mtl.CommandBuffer {
+        const r = e.r;
+        const m = e.m;
+        r.enc.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.err("command buffer failed: {s}", .{msg});
+            return error.GpuFailed;
+        }
+        const picks = m.t.picks.b.slice(u32, MAXR);
+        const base = m.t.logits.b.contents() + m.t.logits.off;
+        for (0..rows) |j| picks[j] = try sample.draw(e.gpa, sample.row(base, fz.VOCAB, j), p, kv_len + j + 1);
+        const next = r.queue.commandBuffer();
+        r.enc = next.compute(.serial);
+        return next;
     }
 
     /// Speed-up mode: whether to stop at a step both ranks take (rank 0 decides, rank 1 follows); alone, `quit`.
