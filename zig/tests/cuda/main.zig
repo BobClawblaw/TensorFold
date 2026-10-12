@@ -15,6 +15,7 @@ const qk_rows_tests = @import("qk_rows_tests.zig");
 const window_tests = @import("window_tests.zig");
 const tree_tests = @import("tree_tests.zig");
 const act_rows_tests = @import("act_rows_tests.zig");
+const gdn_prep_tests = @import("gdn_prep_tests.zig");
 const glue_tests = @import("glue_tests.zig");
 const window_profile = @import("window_profile.zig");
 const tree_accept = @import("tree_accept.zig");
@@ -60,6 +61,7 @@ const usage =
     \\  qk-rows                   QK norm, RoPE and the cache write against float64 references (synthetic)
     \\  window                    sliding-window attention against float64 references (synthetic)
     \\  tree                      tree attention (committed keys and paths) against float64 references (synthetic)
+    \\  gdn-prep                  Gated DeltaNet conv, norms, g and beta against float64 (synthetic)
     \\  act-rows                  bf16-residual and gated norms, SwiGLU, output gates, group sums against float64 (synthetic)
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
@@ -126,6 +128,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "act-rows")) return act_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "gdn-prep")) return gdn_prep_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);

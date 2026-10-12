@@ -39,6 +39,7 @@ pub const qk_rows = @import("qk_rows.zig");
 pub const window_attention = @import("window_attention.zig");
 pub const tree_attention = @import("tree_attention.zig");
 pub const act_rows = @import("act_rows.zig");
+pub const gdn_prep = @import("gdn_prep.zig");
 
 test {
     _ = @import("memory.zig");
@@ -61,4 +62,5 @@ test {
     _ = @import("window_attention.zig");
     _ = @import("tree_attention.zig");
     _ = @import("act_rows.zig");
+    _ = @import("gdn_prep.zig");
 }
