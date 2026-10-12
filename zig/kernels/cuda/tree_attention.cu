@@ -64,12 +64,12 @@ __device__ __forceinline__ void tree_group(
     const __nv_bfloat16* __restrict__ origin, const long long* __restrict__ offs, const int* __restrict__ row_stream,
     const int* __restrict__ streams, const int* __restrict__ paths, const int* __restrict__ depths,
     float* __restrict__ po, float* __restrict__ pm, float* __restrict__ pl, int h, int hk, float scale, int gi, int ng,
-    int64_t rq, int pf, int npairs) {
+    int64_t rq, int pf, int npairs, int64_t row) {
     constexpr int C = D / 8, K16 = D / 16, NB = D / 8, NT8 = HB / 8, PK = HB / 16;
     constexpr bool QREG = D <= 128;
     extern __shared__ uint4 smem[];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g8 = lane / 4, qd = lane % 4, mt = lane / 8;
-    const int64_t r = blockIdx.x;
+    const int64_t r = row; // the row whose stream and depth set the keys
     const int kh = blockIdx.y, G = h / hk;
     const int s = row_stream[r];
     const int p = streams[4 * s + 2], depth = depths[r];
@@ -259,16 +259,18 @@ __device__ __forceinline__ void tree_shared(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ origin, const long long* __restrict__ offs,
     const int* __restrict__ row_stream, const int* __restrict__ streams, const int* __restrict__ paths,
     const int* __restrict__ depths, float* __restrict__ po, float* __restrict__ pm, float* __restrict__ pl, int h, int hk,
-    float scale, int ng, int tiles) {
-    const int64_t r = blockIdx.x;
-    const int st = row_stream[r];
-    if (streams[4 * st] != r) return; // the stream's first row's blocks do its rows
-    const int G = h / hk, pairs = streams[4 * st + 1] * G, p = streams[4 * st + 2];
-    const int tile = blockIdx.z % tiles, slots = gridDim.z / tiles;
-    if (tile * 16 >= pairs) return;
-    for (int gi = blockIdx.z / tiles; (gi + 1) * SPAN <= p; gi += slots) {
-        tree_group<D, HB>(q, q, q, origin, offs, row_stream, streams, paths, depths, po, pm, pl, h, hk, scale, gi, ng, r,
-                          tile * 16, pairs);
+    float scale, int ng, int n) {
+    const int G = h / hk;
+    for (int item = blockIdx.x; item < n * ng; item += gridDim.x) { // (row, group): a fixed grid, no empty blocks
+        const int64_t r = item / ng;
+        const int gi = item % ng;
+        const int st = row_stream[r];
+        const int64_t r0 = streams[4 * st];
+        const int pairs = streams[4 * st + 1] * G, p = streams[4 * st + 2];
+        const int tile = static_cast<int>(r - r0); // a stream's j-th row hosts its j-th pair tile (tiles <= rows)
+        if (tile * 16 >= pairs || (gi + 1) * SPAN > p) continue;
+        tree_group<D, HB>(q, q, q, origin, offs, row_stream, streams, paths, depths, po, pm, pl, h, hk, scale, gi, ng, r0,
+                          tile * 16, pairs, r);
         __syncthreads();
     }
 }
@@ -278,8 +280,8 @@ __device__ __forceinline__ void tree_shared(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ origin,                                \
         const long long* __restrict__ offs, const int* __restrict__ row_stream, const int* __restrict__ streams,      \
         const int* __restrict__ paths, const int* __restrict__ depths, float* __restrict__ po,                        \
-        float* __restrict__ pm, float* __restrict__ pl, int h, int hk, float scale, int ng, int tiles) {              \
-        tree_shared<D, HB>(q, origin, offs, row_stream, streams, paths, depths, po, pm, pl, h, hk, scale, ng, tiles); \
+        float* __restrict__ pm, float* __restrict__ pl, int h, int hk, float scale, int ng, int n) {                  \
+        tree_shared<D, HB>(q, origin, offs, row_stream, streams, paths, depths, po, pm, pl, h, hk, scale, ng, n);     \
     }
 
 TF_TREE_SHARED(tf_tree_shared, 128, 32)
@@ -296,7 +298,7 @@ __device__ __forceinline__ void tree_part(
     const int p = streams[4 * row_stream[r] + 2], total = p + depths[r];
     for (int gi = blockIdx.z + p / SPAN; gi < ng && gi * SPAN < total; gi += gridDim.z) { // full committed: shared
         tree_group<D, HB>(q, kn, vn, origin, offs, row_stream, streams, paths, depths, po, pm, pl, h, hk, scale, gi, ng,
-                          r, 0, h / hk);
+                          r, 0, h / hk, r);
         __syncthreads(); // the next group's tiles reuse the partials' shared memory
     }
 }

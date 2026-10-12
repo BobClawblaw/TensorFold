@@ -26,8 +26,8 @@ pub const TreeAttention = struct {
     part_fns: [2]Function, // head dim 128, 256
     shared_fns: [2]Function,
     merge_fn: Function,
-    /// Blocks a (row or pair tile, key head) at most, each taking every `group_slots`-th group (same bits).
-    group_slots: usize = 16,
+    /// The shared kernel's blocks a key head: a fixed grid walking every (row, group) (bits do not depend on it).
+    shared_blocks: usize = 96,
 
     pub fn load(d: *const Driver) !TreeAttention {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -79,17 +79,16 @@ pub const TreeAttention = struct {
         a.add(@as(i32, @intCast(hk)));
         a.add(scale);
         a.add(@as(i32, @intCast(ng)));
-        const tiles = (@min(n, max_depth) * (h / hk) + 15) / 16; // 16 (row, head) pairs a block, a stream's rows
-        const slots = @max(1, @min(ng, g.group_slots));
         var c: launch_.Args = .{};
         for ([_]u64{ q, rows.origin, rows.offs, rows.row_stream, rows.streams, rows.paths, rows.depths, sc.o, sc.m, sc.l }) |v| c.add(v);
         c.add(@as(i32, @intCast(h)));
         c.add(@as(i32, @intCast(hk)));
         c.add(scale);
         c.add(@as(i32, @intCast(ng)));
-        c.add(@as(i32, @intCast(tiles)));
-        try launch_.launch(g.shared_fns[which], .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(slots * tiles) }, .block = .{ .x = 128 }, .shared = part_smem[which] }, s, &c);
-        try launch_.launch(g.part_fns[which], .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(slots) }, .block = .{ .x = 128 }, .shared = part_smem[which] }, s, &a);
+        c.add(@as(i32, @intCast(n)));
+        try launch_.launch(g.shared_fns[which], .{ .grid = .{ .x = @intCast(@min(n * ng, g.shared_blocks)), .y = @intCast(hk), .z = 1 }, .block = .{ .x = 128 }, .shared = part_smem[which] }, s, &c);
+        // a row's own block: its boundary group and at most the next (a path is at most 128 keys)
+        try launch_.launch(g.part_fns[which], .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(@min(ng, 2)) }, .block = .{ .x = 128 }, .shared = part_smem[which] }, s, &a);
         var b: launch_.Args = .{};
         for ([_]u64{ sc.o, sc.m, sc.l, rows.row_stream, rows.streams, rows.depths, out }) |v| b.add(v);
         b.add(@as(i32, @intCast(h)));

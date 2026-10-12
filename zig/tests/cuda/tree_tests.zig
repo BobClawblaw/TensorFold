@@ -184,11 +184,11 @@ fn case(gpu: check.Gpu, d: usize, h: usize, hk: usize, seed: u64, worst_all: *f6
     for (only, 0..) |*r, i| r.* = widths[0] + i;
     const alone = try call(&x, s, &g, d, only, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
     try check.sameBytes("tree attention: one stream's rows alone", std.mem.sliceAsBytes(alone), std.mem.sliceAsBytes(got[widths[0] * h * d ..][0 .. widths[1] * h * d]));
-    // one block a (row, key head) striding over the groups, and a grid sized for a long context: the same bits
-    g.group_slots = 1;
+    // one shared block walking every (row, group), and a grid sized for a long context: the same bits
+    g.shared_blocks = 1;
     const strided = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, ng, scale);
-    try check.sameBytes("tree attention: one group slot", std.mem.sliceAsBytes(strided), std.mem.sliceAsBytes(got));
-    g.group_slots = 16;
+    try check.sameBytes("tree attention: one shared block", std.mem.sliceAsBytes(strided), std.mem.sliceAsBytes(got));
+    g.shared_blocks = 96;
     const wide = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, &streams, offs_dev, origin, 129, scale);
     try check.sameBytes("tree attention: groups for a 262k context", std.mem.sliceAsBytes(wide), std.mem.sliceAsBytes(got));
 }
