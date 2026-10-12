@@ -1,5 +1,6 @@
 //! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images redacted, for replays.
 const std = @import("std");
+const platform = @import("sys");
 const json = @import("json.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
@@ -33,8 +34,9 @@ pub fn append(a: Allocator, path: []const u8, body: Value) void {
     if (body.strField("priority")) |p| if (std.mem.eql(u8, p, "background")) return;
     const line = json.stringify(a, redact(a, body) catch return, .{}) catch return;
     const pathz = a.dupeSentinel(u8, path, 0) catch return;
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, pathz, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o644) catch return;
-    defer _ = std.posix.system.close(fd);
+    const fd = platform.c.open(pathz, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, @as(platform.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = platform.c.close(fd);
     const framed = std.mem.concat(a, u8, &.{ line, "\n" }) catch return;
-    _ = std.posix.system.write(fd, framed.ptr, framed.len);
+    _ = platform.c.write(fd, framed.ptr, framed.len);
 }
