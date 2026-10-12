@@ -47,6 +47,8 @@ pub const Vis = struct {
         errdefer rows.deinit();
         const out = try device.buffer(most * row, mtl.ResourceOptions.shared);
         defer out.deinit();
+        const t0 = std.c.mach_absolute_time();
+        var gpu: f64 = 0;
         for (images, spans) |img, s| { // one image a command buffer: the tower's host-written scratch is shared
             const pool = mtl.objc.Pool.push();
             defer pool.pop();
@@ -60,10 +62,13 @@ pub const Vis = struct {
                 std.log.err("flash next vision: the tower's command buffer failed: {s}", .{msg});
                 return error.GpuFailed;
             }
+            gpu += cb.gpuSeconds();
             const src = out.contents();
             const dst = rows.contents();
             for (0..s.n) |k| for (0..4) |stream| @memcpy(dst[((s.row + k) * 4 + stream) * row ..][0..row], src[k * row ..][0..row]);
         }
+        const ms = @as(f64, @floatFromInt(std.c.mach_absolute_time() - t0)) / 24e3; // 24 MHz ticks on Apple silicon
+        std.log.info("flash next vision: {d} images, {d} tokens through the tower in {d:.1} ms ({d:.1} ms on the GPU)", .{ images.len, total, ms, gpu * 1e3 });
         const pos3 = try vp.frame(a, spans);
         const last = spans[spans.len - 1];
         const p = try a.create(vp.VisPrompt);
