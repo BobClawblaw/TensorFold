@@ -46,8 +46,11 @@ pub const Seq = struct {
     arena: Arena,
     rec: []u64, // by layer: (hv, dv, dk) fp32, 0 for attention layers
     conv: []u64, // by layer: (3, conv dim) bf16
-    keys: []u64, // by layer: (capacity, kv heads, head dim) bf16
+    keys: []u64, // by layer: (capacity, kv heads, head dim) bf16, or e4m3 under kv8
     values: []u64,
+    kscale: []u64, // kv8: by layer, (capacity, kv heads) fp32, each key row's scale (0 for DeltaNet layers)
+    vscale: []u64,
+    kv8: bool, // --kv-cache fp8: keys and values as e4m3 rows with a scale each
     head_in: u64, // the last prompt row normed, (hidden) bf16, and its group sums: the first draw's input
     head_xs: u64,
     capacity: usize,
@@ -57,16 +60,16 @@ pub const Seq = struct {
     gpa: std.mem.Allocator,
 
     /// Device bytes a stream of `capacity` positions takes.
-    pub fn bytes(g: c.Geometry, capacity: usize) usize {
+    pub fn bytes(g: c.Geometry, capacity: usize, kv8: bool) usize {
         var n: usize = std.mem.alignForward(usize, g.hidden * 2, 256) + std.mem.alignForward(usize, g.hidden / 64 * 4, 256);
         const a = std.mem.alignForward;
-        for (0..g.layers) |i| n += if (c.linear(i)) a(usize, g.deltaBytes(), 256) + a(usize, g.convBytes(), 256) else 2 * a(usize, capacity * g.kvInner() * 2, 256);
+        for (0..g.layers) |i| n += if (c.linear(i)) a(usize, g.deltaBytes(), 256) + a(usize, g.convBytes(), 256) else if (kv8) 2 * (a(usize, capacity * g.kvInner(), 256) + a(usize, capacity * g.kv_heads * 4, 256)) else 2 * a(usize, capacity * g.kvInner() * 2, 256);
         return n;
     }
 
     /// A fresh stream: zero recurrences and conv windows, caches for `capacity` positions.
-    pub fn init(gpa: std.mem.Allocator, ops: kern.Ops, g: c.Geometry, capacity: usize) !Seq {
-        var s: Seq = .{ .gpa = gpa, .arena = try Arena.init(ops.k.d, bytes(g, capacity)), .rec = &.{}, .conv = &.{}, .keys = &.{}, .values = &.{}, .head_in = 0, .head_xs = 0, .capacity = capacity };
+    pub fn init(gpa: std.mem.Allocator, ops: kern.Ops, g: c.Geometry, capacity: usize, kv8: bool) !Seq {
+        var s: Seq = .{ .gpa = gpa, .arena = try Arena.init(ops.k.d, bytes(g, capacity, kv8)), .rec = &.{}, .conv = &.{}, .keys = &.{}, .values = &.{}, .kscale = &.{}, .vscale = &.{}, .kv8 = kv8, .head_in = 0, .head_xs = 0, .capacity = capacity };
         errdefer s.arena.deinit();
         s.rec = try gpa.alloc(u64, g.layers);
         errdefer gpa.free(s.rec);
@@ -76,7 +79,11 @@ pub const Seq = struct {
         errdefer gpa.free(s.keys);
         s.values = try gpa.alloc(u64, g.layers);
         errdefer gpa.free(s.values);
-        const bf = 2;
+        s.kscale = try gpa.alloc(u64, g.layers);
+        errdefer gpa.free(s.kscale);
+        s.vscale = try gpa.alloc(u64, g.layers);
+        errdefer gpa.free(s.vscale);
+        const bf: usize = if (kv8) 1 else 2;
         s.head_in = try s.arena.take(g.hidden * 2);
         s.head_xs = try s.arena.take(g.hidden / 64 * 4);
         for (0..g.layers) |i| {
@@ -84,6 +91,8 @@ pub const Seq = struct {
             s.conv[i] = 0;
             s.keys[i] = 0;
             s.values[i] = 0;
+            s.kscale[i] = 0;
+            s.vscale[i] = 0;
             const A = &s.arena;
             if (c.linear(i)) {
                 s.rec[i] = try A.take(g.deltaBytes());
@@ -91,6 +100,10 @@ pub const Seq = struct {
             } else {
                 s.keys[i] = try A.take(capacity * g.kvInner() * bf);
                 s.values[i] = try A.take(capacity * g.kvInner() * bf);
+                if (kv8) {
+                    s.kscale[i] = try A.take(capacity * g.kv_heads * 4);
+                    s.vscale[i] = try A.take(capacity * g.kv_heads * 4);
+                }
             }
         }
         try s.reset(ops, g);
@@ -103,6 +116,8 @@ pub const Seq = struct {
         s.gpa.free(s.conv);
         s.gpa.free(s.keys);
         s.gpa.free(s.values);
+        s.gpa.free(s.kscale);
+        s.gpa.free(s.vscale);
         s.* = undefined;
     }
 
@@ -179,10 +194,12 @@ pub const Scratch = struct {
     paths: u64,
     depths: u64,
     offs: u64,
-    part_o: u64,
+    part_o: u64, // attention's partials, (slots, rows, heads, dim) fp32 and (slots, rows, heads) m and l, in `parts`
     part_m: u64,
     part_l: u64,
-    part_chunks: usize,
+    part_rows: usize, // the slot-rows `parts` holds: a round's most slots times its rows fit under this
+    parts: ?cuda.DeviceBuffer = null,
+    quant_items: u64, // --kv-cache fp8: a commit's or a prompt's kv_quant table (kern.Quant)
     origin: u64, // the bf16 origin cache offsets count from
     conv_tmp: u64,
     conv_old: u64, // a round's streams' conv rows that survive its commit, by stream and DeltaNet layer
@@ -210,19 +227,49 @@ pub const Scratch = struct {
         s.arena = try Arena.init(d, s.arena.used);
         errdefer s.arena.deinit();
         try s.layout(g, prompt_rows, capacity);
+        s.parts = null;
+        try s.fitPartials(d, g, initial_part_rows);
         return s;
+    }
+
+    /// Partials for calibration's short windows until `fit` sizes them for the admitted streams.
+    pub const initial_part_rows = 4 * round_rows;
+
+    /// Device bytes partials of `slot_rows` take.
+    pub fn partialBytes(g: c.Geometry, slot_rows: usize) usize {
+        const a = std.mem.alignForward;
+        return a(usize, slot_rows * g.query_heads * c.head_dim * 4, 256) + 2 * a(usize, slot_rows * g.query_heads * 4, 256);
+    }
+
+    /// The slot-rows a stream of `capacity` positions may add to a round: its most slots (attention.slots of any
+    /// keys and window it can hold) times its widest window.
+    pub fn streamPartRows(capacity: usize) usize {
+        return ((capacity + max_rows + tri.chunk - 1) / tri.chunk + 1) * max_rows;
+    }
+
+    /// Partials of `slot_rows` (at least the initial), replacing any held.
+    pub fn fitPartials(s: *Scratch, d: *const cuda.Driver, g: c.Geometry, slot_rows: usize) !void {
+        const rows = @max(slot_rows, initial_part_rows);
+        if (s.parts) |*b| b.free();
+        s.parts = null;
+        var b = try cuda.DeviceBuffer.alloc(d, partialBytes(g, rows));
+        errdefer b.free();
+        var A: Arena = .{ .buf = b };
+        s.part_o = try A.take(rows * g.query_heads * c.head_dim * 4);
+        s.part_m = try A.take(rows * g.query_heads * 4);
+        s.part_l = try A.take(rows * g.query_heads * 4);
+        s.part_rows = rows;
+        s.parts = b;
     }
 
     fn layout(s: *Scratch, g: c.Geometry, prompt_rows: usize, capacity: usize) !void {
         const R = @max(prompt_rows, round_rows);
         const W = round_rows;
         const bf = 2;
-        const chunks = (capacity + W + tri.chunk - 1) / tri.chunk;
         // attention.plan_host: a query tile's items per committed chunk and folded group
         const codes = capacity / tri.chunk + capacity / (tri.chunk * tri.group_chunks);
         const items = codes * ((W * (g.query_heads / g.kv_heads) + 15) / 16);
         s.rows = R;
-        s.part_chunks = chunks;
         s.arena.used = 0;
         const A = &s.arena;
         s.origin = try A.take(128);
@@ -271,13 +318,11 @@ pub const Scratch = struct {
         s.attn_plan = try A.take((W + 4 + 3 * items + W + 12) * 4); // + each segment's 16-byte padding
         s.paths = try A.take(W * tri.max_nodes * 4);
         s.depths = try A.take(W * 4);
-        s.offs = try A.take(g.layers * max_streams * 2 * 8);
-        s.part_o = try A.take(chunks * W * g.query_heads * c.head_dim * 4);
-        s.part_m = try A.take(chunks * W * g.query_heads * 4);
-        s.part_l = try A.take(chunks * W * g.query_heads * 4);
+        s.offs = try A.take(g.layers * max_streams * 4 * 8);
         s.conv_tmp = try A.take((c.conv_taps - 1 + R) * g.convDim() * bf);
         s.conv_old = try A.take(max_streams * g.layers * (c.conv_taps - 1) * g.convDim() * bf);
         s.copy_items = try A.take(2 * copy_items * @sizeOf(kern.Copy));
+        s.quant_items = try A.take(copy_items * @sizeOf(kern.Quant));
         s.taps = try A.take(R * 5 * g.hidden * bf);
         s.replay_table = try A.take(g.layers * (4 + max_streams) * 8);
         s.replay_rows = try A.take(max_streams * (W + 1) * 4);
@@ -301,6 +346,7 @@ pub const Scratch = struct {
     }
 
     pub fn deinit(s: *Scratch) void {
+        if (s.parts) |*b| b.free();
         s.arena.deinit();
         s.gpa.free(s.records);
         s.gpa.free(s.attn_records);

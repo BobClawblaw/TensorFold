@@ -27,7 +27,8 @@ pub const Round = struct {
     most: usize, // the most rows a stream's window holds
     tables: u64, // multi: (DeltaNet layers, streams) state pointers, a layer's row at its DeltaNet index
     attn: tri.Tri.Plan,
-    offs: u64, // (attention layers, streams, 2) int64 cache offsets; single: indexed by layer
+    offs: u64, // (attention layers, streams, 2) int64 cache offsets (4 under kv8: scales too); single: by layer
+    kv8: bool, // the streams' caches are e4m3 with scales (attention8)
     starts_host: [st.max_streams + 1]usize,
 
     /// The conv rows gdn_pre reads for layer `i` (its DeltaNet index `j`): the stream's own, or the stacked copy.
@@ -38,7 +39,8 @@ pub const Round = struct {
 
     /// Layer `i`'s attention cache offsets: tree_forward's (one stream, by layer) or the packed (layer, streams) rows.
     pub fn offsets(r: *const Round, i: usize, a: usize) u64 {
-        return if (r.multi) r.offs + a * r.streams * 16 else r.offs + i * 16;
+        const each: usize = if (r.kv8) 32 else 16;
+        return if (r.multi) r.offs + a * r.streams * each else r.offs + i * each;
     }
 
     /// The DeltaNet state table of DeltaNet layer `j` (multi only).
@@ -106,6 +108,18 @@ fn offsetOf(s: *const st.Scratch, ptr: u64) i64 {
     return @divExact(@as(i64, @bitCast(ptr -% s.origin)), bf);
 }
 
+/// Layer `i`'s cache offsets for a stream: bf16 elements of keys and values, or under kv8 e4m3 bytes of keys and
+/// values and fp32 elements of their scales.
+fn cacheOffsets(s: *const st.Scratch, seq: *const st.Seq, i: usize, out: *std.ArrayList(i64), gpa: std.mem.Allocator) !void {
+    if (!seq.kv8) return out.appendSlice(gpa, &.{ offsetOf(s, seq.keys[i]), offsetOf(s, seq.values[i]) });
+    const d = struct {
+        fn at(sc: *const st.Scratch, ptr: u64, size: i64) i64 {
+            return @divExact(@as(i64, @bitCast(ptr -% sc.origin)), size);
+        }
+    };
+    try out.appendSlice(gpa, &.{ d.at(s, seq.keys[i], 1), d.at(s, seq.values[i], 1), d.at(s, seq.kscale[i], 4), d.at(s, seq.vscale[i], 4) });
+}
+
 /// Every stream's host plans: positions (pos + depth), the GDN schedule (nodes offset by its start), conv windows.
 const Host = struct { pos: std.ArrayList(i32) = .empty, entries: std.ArrayList(i32) = .empty, windows: std.ArrayList(i32) = .empty, slots: usize = 0, most: usize = 0 };
 
@@ -144,6 +158,14 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
         r.starts_host[k + 1] = W;
     }
     if (W > st.round_rows) return error.WindowTooWide;
+    // attention's partials: the most slots any stream takes, for every row of the round
+    var most_slots: usize = 0;
+    for (parts) |p| {
+        most_slots = @max(most_slots, tri.slots(p.seq.pos, p.tokens.len));
+        if (p.seq.kv8 != parts[0].seq.kv8) return error.InvalidQwenWindows;
+    }
+    if (most_slots * W > s.part_rows) return error.WindowTooWide;
+    r.kv8 = parts[0].seq.kv8;
     r.rows = W;
     r.streams = parts.len;
     r.multi = parts.len > 1;
@@ -179,7 +201,7 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
         const ap = try attnPlan(gpa, &host, parts, group);
         try ops.upload(s.attn_plan, std.mem.sliceAsBytes(host.items));
         try ops.s.synchronize();
-        for (0..g.layers) |i| try offs.appendSlice(gpa, if (c.linear(i)) &.{ 0, 0 } else &.{ offsetOf(s, p.seq.keys[i]), offsetOf(s, p.seq.values[i]) });
+        for (0..g.layers) |i| if (c.linear(i)) try offs.appendNTimes(gpa, 0, if (r.kv8) 4 else 2) else try cacheOffsets(s, p.seq, i, &offs, gpa);
         try ops.upload(s.offs, std.mem.sliceAsBytes(offs.items));
         try ops.s.synchronize();
         r.ids = s.ids;
@@ -224,7 +246,7 @@ pub fn stage(gpa: std.mem.Allocator, ops: kern.Ops, t: tri.Tri, s: *st.Scratch, 
     var j: usize = 0;
     for (0..g.layers) |i| {
         if (!c.linear(i)) {
-            for (parts) |p| try offs.appendSlice(gpa, &.{ offsetOf(s, p.seq.keys[i]), offsetOf(s, p.seq.values[i]) });
+            for (parts) |p| try cacheOffsets(s, p.seq, i, &offs, gpa);
             continue;
         }
         const cat = s.conv_cat + j * st.max_streams * keep * g.convDim() * bf;

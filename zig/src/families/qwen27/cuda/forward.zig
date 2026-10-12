@@ -121,7 +121,8 @@ pub const Forward = struct {
                     try f.ops.dense(s.y, s.xs, a.k, s.key, W);
                     try f.ops.dense(s.y, s.xs, a.v, rec.v, W);
                     try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, rec.k, W, f.attnShape(), c.eps);
-                    try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, .{ .o = s.part_o, .m = s.part_m, .l = s.part_l }, s.attn, f.attnShape());
+                    const part: tri.Tri.Partials = .{ .o = s.part_o, .m = s.part_m, .l = s.part_l };
+                    if (r.kv8) try f.t.attention8(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, part, s.attn, f.attnShape()) else try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, part, s.attn, f.attnShape());
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.dense(s.gated, s.gated_xs, a.o, s.r, W);
                     att += 1;
@@ -183,6 +184,9 @@ pub const Forward = struct {
         defer save.deinit(f.gpa);
         var write: std.ArrayList(kern.Copy) = .empty;
         defer write.deinit(f.gpa);
+        var quant: std.ArrayList(kern.Quant) = .empty; // kv8: the accepted keys and values, quantized into the caches
+        defer quant.deinit(f.gpa);
+        const hk = g_.kv_heads;
         base = 0;
         for (parts, paths, 0..) |p, path, k| {
             const n = path.len;
@@ -199,7 +203,13 @@ pub const Forward = struct {
                     lin += 1;
                 } else {
                     for (path, 0..) |acc, j| {
-                        const at = (p.seq.pos + j) * kv;
+                        const pos = p.seq.pos + j;
+                        if (p.seq.kv8) {
+                            try quant.append(f.gpa, .{ .src = s.attn_records[i].k + (base + acc) * kv, .dst = p.seq.keys[i] + pos * kv / bf, .scale = p.seq.kscale[i] + pos * hk * 4, .rows = hk });
+                            try quant.append(f.gpa, .{ .src = s.attn_records[i].v + (base + acc) * kv, .dst = p.seq.values[i] + pos * kv / bf, .scale = p.seq.vscale[i] + pos * hk * 4, .rows = hk });
+                            continue;
+                        }
+                        const at = pos * kv;
                         try write.append(f.gpa, .{ .dst = p.seq.keys[i] + at, .src = s.attn_records[i].k + (base + acc) * kv, .bytes = kv });
                         try write.append(f.gpa, .{ .dst = p.seq.values[i] + at, .src = s.attn_records[i].v + (base + acc) * kv, .bytes = kv });
                     }
@@ -213,6 +223,9 @@ pub const Forward = struct {
         try f.ops.upload(second, std.mem.sliceAsBytes(write.items));
         try f.ops.copies(s.copy_items, save.items.len);
         try f.ops.copies(second, write.items.len);
+        if (quant.items.len > st.copy_items) return error.InvalidQwenCommit;
+        try f.ops.upload(s.quant_items, std.mem.sliceAsBytes(quant.items));
+        try f.ops.quant(s.quant_items, quant.items.len, hk);
         try f.ops.s.synchronize(); // the tables' host copies go when this returns
     }
 
@@ -279,13 +292,25 @@ pub const Forward = struct {
                 .attention => |a| {
                     try f.ops.prefillDense(s.y, a.q, s.qg, W);
                     try f.ops.prefillDense(s.y, a.k, s.key, W);
-                    try f.ops.prefillDense(s.y, a.v, seq.values[i] + p0 * kv, W);
+                    // kv8: the chunk's rotated keys and values go through the prompt buffers, quantized into the caches
+                    const kdst = if (seq.kv8) s.prompt_keys else seq.keys[i] + p0 * kv;
+                    const vdst = if (seq.kv8) s.prompt_values else seq.values[i] + p0 * kv;
+                    try f.ops.prefillDense(s.y, a.v, vdst, W);
                     if (media) |m| {
                         const sh = f.attnShape();
-                        try m.tower.attnPrep(f.gpu(), s.qg, s.key, a.q_norm, a.k_norm, m.dev.ptr + W * 4, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, .{ .heads = sh.heads, .kv_heads = sh.kv_heads, .dim = sh.dim, .half = sh.half }, c.eps);
-                    } else try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, f.attnShape(), c.eps);
+                        try m.tower.attnPrep(f.gpu(), s.qg, s.key, a.q_norm, a.k_norm, m.dev.ptr + W * 4, w.inv_freq, s.q_rot, kdst, W, .{ .heads = sh.heads, .kv_heads = sh.kv_heads, .dim = sh.dim, .half = sh.half }, c.eps);
+                    } else try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, kdst, W, f.attnShape(), c.eps);
                     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
-                    try f.ops.prefillAttention(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
+                    if (seq.kv8) {
+                        const hk = g_.kv_heads;
+                        const q = [_]kern.Quant{
+                            .{ .src = s.prompt_keys, .dst = seq.keys[i] + p0 * kv / bf, .scale = seq.kscale[i] + p0 * hk * 4, .rows = W * hk },
+                            .{ .src = s.prompt_values, .dst = seq.values[i] + p0 * kv / bf, .scale = seq.vscale[i] + p0 * hk * 4, .rows = W * hk },
+                        };
+                        try f.ops.upload(s.quant_items, std.mem.sliceAsBytes(&q));
+                        try f.ops.quant(s.quant_items, q.len, W * hk);
+                        try f.ops.prefillAttention8(s.q_rot, seq.keys[i], seq.values[i], seq.kscale[i], seq.vscale[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
+                    } else try f.ops.prefillAttention(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.prefillDense(s.gated, a.o, s.r, W);
                 },
@@ -355,6 +380,10 @@ pub const Forward = struct {
         };
         const staged = items.items.len;
         var at_layer: [256]usize = undefined; // each layer's first write, then the end
+        var quant: std.ArrayList(kern.Quant) = .empty; // kv8: each attention layer's prompt rows to quantize
+        defer quant.deinit(f.gpa);
+        var quant_at: [256]usize = @splat(0);
+        var quant_rows: usize = 0;
         lin_n = 0;
         for (0..g_.layers) |i| {
             at_layer[i] = items.items.len;
@@ -373,15 +402,26 @@ pub const Forward = struct {
                 }
                 lin_n += 1;
             } else {
+                quant_at[i] = quant.items.len;
                 for (pieces, 0..) |p, k| {
                     const o = starts[k];
                     const n = p.ids.len;
+                    if (p.seq.kv8) {
+                        const hk = g_.kv_heads;
+                        try quant.append(f.gpa, .{ .src = s.prompt_keys + o * kv, .dst = p.seq.keys[i] + p.seq.pos * kv / bf, .scale = p.seq.kscale[i] + p.seq.pos * hk * 4, .rows = n * hk });
+                        try quant.append(f.gpa, .{ .src = s.prompt_values + o * kv, .dst = p.seq.values[i] + p.seq.pos * kv / bf, .scale = p.seq.vscale[i] + p.seq.pos * hk * 4, .rows = n * hk });
+                        quant_rows = @max(quant_rows, n * hk);
+                        continue;
+                    }
                     try items.append(f.gpa, .{ .dst = p.seq.keys[i] + p.seq.pos * kv, .src = s.prompt_keys + o * kv, .bytes = n * kv });
                     try items.append(f.gpa, .{ .dst = p.seq.values[i] + p.seq.pos * kv, .src = s.prompt_values + o * kv, .bytes = n * kv });
                 }
             }
         }
+        quant_at[g_.layers] = quant.items.len;
         at_layer[g_.layers] = items.items.len;
+        if (quant.items.len > st.copy_items) return error.InvalidQwenWindows;
+        try f.ops.upload(s.quant_items, std.mem.sliceAsBytes(quant.items));
         if (items.items.len > 2 * st.copy_items) return error.InvalidQwenWindows;
         try f.ops.upload(s.copy_items, std.mem.sliceAsBytes(items.items));
         try f.ops.copies(s.copy_items, staged);
@@ -416,9 +456,13 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, a.v, s.prompt_values, W);
                     try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, s.prompt_keys, W, f.attnShape(), c.eps);
                     try f.ops.copies(s.copy_items + at_layer[i] * item, at_layer[i + 1] - at_layer[i]);
+                    try f.ops.quant(s.quant_items + quant_at[i] * @sizeOf(kern.Quant), quant_at[i + 1] - quant_at[i], quant_rows);
                     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
                     const qrow = g_.query_heads * c.head_dim * bf;
-                    for (pieces, 0..) |p, k| try f.ops.prefillAttention(s.q_rot + starts[k] * qrow, p.seq.keys[i], p.seq.values[i], s.attn + starts[k] * qrow, p.seq.pos, p.ids.len, g_.query_heads, g_.kv_heads, scale);
+                    for (pieces, 0..) |p, k| if (p.seq.kv8)
+                        try f.ops.prefillAttention8(s.q_rot + starts[k] * qrow, p.seq.keys[i], p.seq.values[i], p.seq.kscale[i], p.seq.vscale[i], s.attn + starts[k] * qrow, p.seq.pos, p.ids.len, g_.query_heads, g_.kv_heads, scale)
+                    else
+                        try f.ops.prefillAttention(s.q_rot + starts[k] * qrow, p.seq.keys[i], p.seq.values[i], s.attn + starts[k] * qrow, p.seq.pos, p.ids.len, g_.query_heads, g_.kv_heads, scale);
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.prefillDense(s.gated, a.o, s.r, W);
                 },

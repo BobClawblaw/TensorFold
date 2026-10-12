@@ -15,6 +15,7 @@ const sym = struct {
     const gemv = "_ZN12tf_lane_gemv11gemv_kernelILi64ELi64ELi8EEEvPK13__nv_bfloat16PKfNS_4PartEiii";
     const prefill_mm = "_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi2ELi2ELb0EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii";
     const pattn = "_ZN20tf_prefill_attention12pattn_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiif";
+    const pattn8 = "_ZN20tf_prefill_attention13pattn8_kernelILi256ELi8ELi2ELi2EEEvPK13__nv_bfloat16PKhS5_PKfS7_PS1_iiiiif";
     const chain128 = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16Li128ELi32EEEvPKT_S4_PKS1_PKfS8_S8_PfPS1_iii";
     const chain64 = "_ZN14tf_gdn_prefill12chain_kernelI13__nv_bfloat16Li64ELi32EEEvPKT_S4_PKS1_PKfS8_S8_PfPS1_iii";
     const argmax = "tf_argmax_rows_i32_kernel";
@@ -44,6 +45,10 @@ pub const pattn_smem: u32 = 98304; // two 32-key slots of 256 dims beside eight 
 /// One item of a batched copy: 16-byte aligned pointers, a multiple of 16 bytes.
 pub const Copy = extern struct { dst: u64, src: u64, bytes: u64 };
 
+/// One item of qwen_ops.cu's kv_quant (--kv-cache fp8): `rows` bf16 rows of 256 from src, as e4m3 rows at dst and
+/// one fp32 scale a row at scale.
+pub const Quant = extern struct { src: u64, dst: u64, scale: u64, rows: u64 };
+
 /// A tiled 4-bit projection: packed words, (kg, npad) scales and biases, n outputs from k inputs.
 pub const QLinear = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: usize };
 
@@ -56,6 +61,8 @@ pub const Kernels = struct {
     gemv: cuda.Function,
     prefill_mm: cuda.Function,
     pattn: cuda.Function,
+    pattn8: cuda.Function,
+    kv_quant: cuda.Function,
     trees: [cuda.kernels.gdn_variants.len]cuda.Function, // tree_kernel by gdn_variants: [0] the chain one
     chip: [3]c_int, // major, minor, SMs: what dispatch_tree reads
     replay: cuda.Function,
@@ -95,6 +102,7 @@ pub const Kernels = struct {
         k.prefill_mm = try k.mods[1].function(sym.prefill_mm);
         k.gemv = try k.mods[2].function(sym.gemv);
         k.pattn = try k.mods[3].function(sym.pattn);
+        k.pattn8 = try k.mods[3].function(sym.pattn8);
         for (&k.trees, cuda.kernels.gdn_variants) |*f, v| f.* = try k.mods[4].function(v.symbol);
         k.replay = try k.mods[4].function(cuda.kernels.gdn_symbols.replay_bf16);
         k.pack_dense = try k.mods[6].function(cuda.qlinear.symbols.pack_words);
@@ -102,6 +110,7 @@ pub const Kernels = struct {
         k.argmax = try k.mods[7].function(sym.argmax);
         k.torch = try torch_ops.Functions.resolve(k.mods[7..13]);
         k.copy_batch = try k.mods[13].function("tf_copy_batch");
+        k.kv_quant = try k.mods[13].function("tf_kv_quant");
         k.tap = try k.mods[13].function("tf_tap");
         k.rms_norm = try k.mods[13].function("tf_rms_norm");
         k.inv_freq = try k.mods[13].function("tf_inv_freq");
@@ -118,6 +127,7 @@ pub const Kernels = struct {
         try k.gemv.allowDynamicShared(group_smem);
         try k.prefill_mm.allowDynamicShared(prefill_mm_smem);
         try k.pattn.allowDynamicShared(pattn_smem);
+        try k.pattn8.allowDynamicShared(pattn_smem);
         k.gemv_blocks = @max(1, try k.gemv.occupancy(128, group_smem)) * sms;
         const major = try ctx.attribute(.compute_capability_major);
         const minor = try ctx.attribute(.compute_capability_minor);
@@ -307,6 +317,26 @@ pub const Ops = struct {
         a.add(scale);
         const block_rows = 16 * (8 / hpc);
         try o.go(o.k.pattn, .{ (rows + block_rows - 1) / block_rows, kv_heads * (g / hpc), 1 }, 256, pattn_smem, &a);
+    }
+
+    /// prefill_attention over an fp8 cache: e4m3 keys and values with a scale a (position, key head) row.
+    pub fn prefillAttention8(o: Ops, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, out: u64, p0: usize, rows: usize, heads: usize, kv_heads: usize, scale: f32) !void {
+        const g = heads / kv_heads;
+        const hpc = 2;
+        var a: cuda.Args = .{};
+        for ([_]u64{ q, kc, vc, ks, vs, out }) |v| a.add(v);
+        for ([_]usize{ p0, rows, heads, kv_heads, g }) |v| a.add(int(v));
+        a.add(scale);
+        const block_rows = 16 * (8 / hpc);
+        try o.go(o.k.pattn8, .{ (rows + block_rows - 1) / block_rows, kv_heads * (g / hpc), 1 }, 256, pattn_smem, &a);
+    }
+
+    /// qwen_ops.cu's tf_kv_quant: `count` items from the device table `items`, none over `most` rows.
+    pub fn quant(o: Ops, items: u64, count: usize, most: usize) !void {
+        if (count == 0) return;
+        var a: cuda.Args = .{};
+        a.add(items);
+        try o.go(o.k.kv_quant, .{ (most + 7) / 8, count, 1 }, 256, 0, &a);
     }
 
     /// torch.argmax(rows of bf16 logits) as int32: the first maximum, a NaN first.

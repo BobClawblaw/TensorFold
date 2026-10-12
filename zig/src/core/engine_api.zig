@@ -255,6 +255,8 @@ pub const Open = struct {
     policy: []const u8 = "",
     /// --vision: load the checkpoint's image tower (null: text only; an engine without one refuses).
     vision: ?VisionOpen = null,
+    /// --kv-cache fp8: attention caches as e4m3 with a scale a row (the CUDA Qwen3.8-27B engine only).
+    kv8: bool = false,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.

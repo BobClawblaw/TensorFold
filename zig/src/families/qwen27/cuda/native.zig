@@ -17,7 +17,7 @@ pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = engine.prompt_rows;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, vision: ?Vision = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, vision: ?Vision = null, kv8: bool = false };
 
 /// --vision's limits: the visual tokens a request's images share, and its images.
 pub const Vision = struct { image_tokens: u32, max_images: u32 };
@@ -83,7 +83,7 @@ const most_streams = 32;
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     // the 27B's glue runs the Python engine's Triton kernels, captured on this chip (no own glue kernels yet)
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse return error.QwenNeedsCapturedKernels, .{ .context = o.context });
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels orelse return error.QwenNeedsCapturedKernels, .{ .context = o.context, .kv8 = o.kv8 });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -110,11 +110,18 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = st.max_rows,
-        .stream_bytes = st.Seq.bytes(e.w.g, o.context) + if (own.draft != null) dr.Context.bytes() else 0,
+        // each stream's caches, its drafter context, and its share of a round's attention partials (`fit`)
+        .stream_bytes = st.Seq.bytes(e.w.g, o.context, o.kv8) + st.Scratch.partialBytes(e.w.g, st.Scratch.streamPartRows(o.context)) + if (own.draft != null) dr.Context.bytes() else 0,
         .vision_bytes = vision_bytes,
         .ctx = own,
         .deinit = release,
     };
+}
+
+/// After admission: attention's partials sized for the `streams` the budget admitted.
+pub fn fit(p: *anyopaque, streams: u32) !void {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    try own.e.fit(@min(streams, st.max_streams));
 }
 
 /// A request this engine refuses, in words; null: none of its own.

@@ -16,6 +16,8 @@ const usage =
     \\  Greedy shared rounds of one row a stream over every prompt, timed.
     \\       tf-qwen27-cuda multi MODEL --kernels DIR --drafter DIR --prompts multi.json
     \\  capture_multi.py's drafted shared rounds: each round's windows and every reply against the capture's.
+    \\       tf-qwen27-cuda kvcompare MODEL --kernels DIR --prompts prompts.json [--max-tokens N]
+    \\  --kv-cache fp8 against bf16, teacher-forced on bf16's greedy reply: top-1 agreement and KL a token.
     \\       tf-qwen27-cuda vision MODEL --fixtures DIR
     \\  The image tower on qwen_vision_fixtures.py's patches: each image's rows against 0.6.6's (cosine, max error).
     \\
@@ -32,6 +34,7 @@ const Options = struct {
     dump: ?[]const u8 = null, // windows: a case's per-norm rows into this folder
     cases: ?[]const u8 = null, // windows: only these cases, comma separated
     drafter: ?[]const u8 = null, // draft: the DFlash2 checkpoint
+    kv8: bool = false, // --kv-cache fp8: e4m3 attention caches
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -42,9 +45,10 @@ pub fn main(init: std.process.Init) !u8 {
     const rounds = args.len >= 2 and std.mem.eql(u8, args[1], "rounds");
     const drafting = args.len >= 2 and std.mem.eql(u8, args[1], "draft");
     const multi = args.len >= 2 and std.mem.eql(u8, args[1], "multi");
+    const kvcompare = args.len >= 2 and std.mem.eql(u8, args[1], "kvcompare");
     if (args.len >= 5 and std.mem.eql(u8, args[1], "vision") and std.mem.eql(u8, args[3], "--fixtures"))
         return checkVision(gpa, arena, init.io, args[2], args[4]);
-    if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi)) {
+    if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi or kvcompare)) {
         std.debug.print("{s}", .{usage});
         return 2;
     }
@@ -53,7 +57,7 @@ pub fn main(init: std.process.Init) !u8 {
     while (i + 1 < args.len) : (i += 2) {
         const k = args[i];
         const v = args[i + 1];
-        if (std.mem.eql(u8, k, "--kernels")) o.kernels = v else if (std.mem.eql(u8, k, "--prompts")) o.prompts = v else if (std.mem.eql(u8, k, "--expect")) o.expect = v else if (std.mem.eql(u8, k, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--context")) o.context = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--device")) o.device = try std.fmt.parseInt(c_int, v, 10) else if (std.mem.eql(u8, k, "--dump")) o.dump = v else if (std.mem.eql(u8, k, "--cases")) o.cases = v else if (std.mem.eql(u8, k, "--drafter")) o.drafter = v else {
+        if (std.mem.eql(u8, k, "--kernels")) o.kernels = v else if (std.mem.eql(u8, k, "--prompts")) o.prompts = v else if (std.mem.eql(u8, k, "--expect")) o.expect = v else if (std.mem.eql(u8, k, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--context")) o.context = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, k, "--device")) o.device = try std.fmt.parseInt(c_int, v, 10) else if (std.mem.eql(u8, k, "--dump")) o.dump = v else if (std.mem.eql(u8, k, "--cases")) o.cases = v else if (std.mem.eql(u8, k, "--drafter")) o.drafter = v else if (std.mem.eql(u8, k, "--kv-cache")) o.kv8 = std.mem.eql(u8, v, "fp8") else {
             std.debug.print("unknown option {s}\n{s}", .{ k, usage });
             return 2;
         }
@@ -70,13 +74,15 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     const clock = std.Io.Clock.awake;
     var t0 = clock.now(init.io).toNanoseconds();
-    const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, o.kernels, .{ .context = o.context });
+    const e = try qwen.Engine.init(gpa, init.io, &ctx, o.model, o.kernels, .{ .context = o.context, .kv8 = o.kv8 });
     defer e.deinit();
+    try e.fit(16); // the shared rounds' partials: up to 16 streams of the context (windows' are 4096)
     std.debug.print("loaded in {d:.1}s, weights {d:.2} GiB\n", .{ @as(f64, @floatFromInt(clock.now(init.io).toNanoseconds() - t0)) / 1e9, @as(f64, @floatFromInt(e.w.bytes())) / (1 << 30) });
     if (windows) return checkWindows(gpa, arena, init.io, e, prompts, o.dump, o.cases);
     if (rounds) return benchRounds(gpa, arena, init.io, e, prompts, o.max_tokens);
     if (drafting) return runDrafted(gpa, arena, init.io, e, o, prompts, expect);
     if (multi) return runMulti(gpa, arena, init.io, e, o, prompts);
+    if (kvcompare) return compareKv(arena, e, prompts, o.max_tokens);
     var seq = try e.sequence(o.context);
     defer seq.deinit();
     var mismatches: usize = 0;
@@ -103,6 +109,85 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}: prompt {d}, {d} tokens sha {s} in {d:.2}s{s}\n", .{ name, ids.len, out.items.len, sha, seconds, verdict });
     }
     return if (mismatches == 0) 0 else 1;
+}
+
+/// The scratch's first logits row as fp64 log-probabilities.
+fn logProbs(f: *qwen.Forward, bits: []u16, out: []f64) !void {
+    try f.ops.download(std.mem.sliceAsBytes(bits), f.s.logits);
+    try f.ops.s.synchronize();
+    var most: f64 = -std.math.inf(f64);
+    for (bits, out) |b, *x| {
+        x.* = @floatCast(@as(f32, @bitCast(@as(u32, b) << 16)));
+        most = @max(most, x.*);
+    }
+    var total: f64 = 0;
+    for (out) |x| total += @exp(x - most);
+    const log_total = most + @log(total);
+    for (out) |*x| x.* -= log_total;
+}
+
+fn argmaxOf(x: []const f64) u32 {
+    var best: usize = 0;
+    for (x, 0..) |v, i| if (v > x[best]) {
+        best = i;
+    };
+    return @intCast(best);
+}
+
+/// kvcompare: a bf16 stream and an fp8 one on each prompt, both fed bf16's greedy tokens; each step's top-1
+/// agreement, KL(bf16 || fp8) and how much less log-probability fp8 gives bf16's pick.
+fn compareKv(arena: std.mem.Allocator, e: *qwen.Engine, prompts: std.json.Value, steps: usize) !u8 {
+    const vocab = qwen.config.vocab;
+    const bits = try arena.alloc(u16, vocab);
+    const pa = try arena.alloc(f64, vocab);
+    const pb = try arena.alloc(f64, vocab);
+    var f = e.forward();
+    var it = prompts.object.iterator();
+    var all_agree: usize = 0;
+    var all_n: usize = 0;
+    while (it.next()) |entry| {
+        const ids = try tokenList(arena, entry.value_ptr.*);
+        const cap = ids.len + steps + 16;
+        e.kv8 = false;
+        var a = try e.sequence(cap);
+        defer a.deinit();
+        e.kv8 = true;
+        var b = try e.sequence(cap);
+        defer b.deinit();
+        e.kv8 = false;
+        var agree: usize = 0;
+        var kl_sum: f64 = 0;
+        var kl_most: f64 = 0;
+        var lp_sum: f64 = 0;
+        var tok: u32 = 0;
+        for (0..steps) |step| {
+            for ([_]*qwen.state.Seq{ &a, &b }, [_][]f64{ pa, pb }) |seq, out| {
+                if (step == 0) {
+                    try e.prefill(seq, ids);
+                    try f.head(seq);
+                } else {
+                    const part = [_]qwen.Part{.{ .seq = seq, .tokens = &.{tok} }};
+                    try f.round(&part);
+                    try f.commit(&part, &.{&.{0}});
+                }
+                try logProbs(&f, bits, out);
+            }
+            const top_a = argmaxOf(pa);
+            if (top_a == argmaxOf(pb)) agree += 1;
+            var kl: f64 = 0;
+            for (pa, pb) |x, y| kl += @exp(x) * (x - y);
+            kl_sum += kl;
+            kl_most = @max(kl_most, kl);
+            lp_sum += pa[top_a] - pb[top_a];
+            tok = top_a;
+        }
+        const n: f64 = @floatFromInt(steps);
+        std.debug.print("{s}: prompt {d}, {d} steps: top-1 agree {d}/{d}, KL mean {d:.5} max {d:.5} nats, pick logprob gap {d:.5}\n", .{ entry.key_ptr.*, ids.len, steps, agree, steps, kl_sum / n, kl_most, lp_sum / n });
+        all_agree += agree;
+        all_n += steps;
+    }
+    std.debug.print("overall top-1 agree {d}/{d}\n", .{ all_agree, all_n });
+    return 0;
 }
 
 fn readJson(a: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Value {

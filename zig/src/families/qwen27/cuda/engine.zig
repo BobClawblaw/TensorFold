@@ -20,7 +20,7 @@ pub fn chunkBounds(start: usize, end: usize, size: usize, j: usize) [2]usize {
     return .{ start + (end - start) * j / n, start + (end - start) * (j + 1) / n };
 }
 
-pub const Options = struct { context: usize };
+pub const Options = struct { context: usize, kv8: bool = false };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -30,6 +30,7 @@ pub const Engine = struct {
     w: wts.Weights,
     scratch: st.Scratch,
     context: usize,
+    kv8: bool, // --kv-cache fp8: every stream's attention caches e4m3 with a scale a row
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         const cfg = try c.Config.read(gpa, io, dir);
@@ -39,6 +40,7 @@ pub const Engine = struct {
         e.gpa = gpa;
         e.ctx = ctx;
         e.context = o.context;
+        e.kv8 = o.kv8;
         e.s = try cuda.Stream.init(ctx.d, true);
         errdefer e.s.deinit();
         e.k = try kern.Kernels.load(gpa, io, ctx, kernels, g.linear_v_heads);
@@ -69,7 +71,13 @@ pub const Engine = struct {
 
     /// A stream's state for `capacity` positions (its caches, recurrences and conv windows), empty.
     pub fn sequence(e: *Engine, capacity: usize) !st.Seq {
-        return st.Seq.init(e.gpa, e.ops(), e.w.g, capacity);
+        return st.Seq.init(e.gpa, e.ops(), e.w.g, capacity, e.kv8);
+    }
+
+    /// Attention's partials for `streams` streams of the engine's context in one round.
+    pub fn fit(e: *Engine, streams: usize) !void {
+        try e.s.synchronize();
+        try e.scratch.fitPartials(e.ctx.d, e.w.g, streams * st.Scratch.streamPartRows(e.context));
     }
 
     /// prefill_state from an empty state: the prompt in even chunks of at most `prompt_rows`, its last row normed.
