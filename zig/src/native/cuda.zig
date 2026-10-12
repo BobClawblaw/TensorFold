@@ -1,5 +1,6 @@
 //! CUDA family registration, device setup, memory admission and the native lane host.
 const std = @import("std");
+const platform = @import("sys");
 const cuda = @import("cuda");
 const api = @import("engine_api");
 const lanes = @import("lanes");
@@ -44,7 +45,7 @@ fn chipClass(a: Allocator, capability: u32) ?[]const u8 {
 }
 
 fn getenv(name: [:0]const u8) ?[]const u8 {
-    return std.mem.span(std.c.getenv(name) orelse return null);
+    return std.mem.span(platform.c.getenv(name) orelse return null);
 }
 
 /// A variable's whole number: null when unset or empty, an error for anything else that is not one.
