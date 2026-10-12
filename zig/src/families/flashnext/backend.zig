@@ -190,7 +190,9 @@ pub const Backend = struct {
             const call = if (b.e.segments) segments.next(end - at, step, @import("engine.zig").SEG_MIN) else segments.Call{ .rows = @min(end - at, step), .parts = 1 };
             end = at + call.rows;
             const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
+            const t_chunk = std.c.mach_absolute_time();
             s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
+            if (std.c.getenv("FZ_BATCH_LOG") != null) std.log.info("flash next prefill: rows [{d}, {d}) in {d} parts, {d:.1} ms", .{ at, end, call.parts, @as(f64, @floatFromInt(std.c.mach_absolute_time() - t_chunk)) / 24e3 });
             for (ps[0..call.parts], 0..) |p, k| {
                 const start = at + segments.start(call.rows, call.parts, k);
                 const rows = segments.rows(call.rows, call.parts, k);
