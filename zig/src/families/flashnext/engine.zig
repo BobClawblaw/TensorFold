@@ -123,6 +123,7 @@ pub const Engine = struct {
     peer_kept: std.AutoHashMapUnmanaged(u64, *snapshot.State) = .empty, // speed-up rank 1: its halves of rank 0's kept states
     peer_budget: u64 = 0, // speed-up rank 1: the budget its kept states' buffers and free ones stay inside
     peer_held: u64 = 0, // speed-up rank 1: its kept states' buffers
+    drawn: mtl.SharedEvent, // a sampled round's accept kernel waits here for the host's draws
     identity_hash: u64 = 0, // the checkpoint's identity text (pack_io.zig) hashed: --learn keys learned states by it
     // while copies land worse than the head's drafts, only 8-token matches the head agrees with are copied
     wids: Buf,
@@ -173,6 +174,7 @@ pub const Engine = struct {
         r.dense = true;
         r.hc_up = true;
         r.event = try device.sharedEvent();
+        e.drawn = try device.sharedEvent();
         if (dump_dir) |d| try r.compile(d) else try r.compileChecked();
         r.sel = try Select.init(r, MAXR);
         r.lane_new = std.c.getenv("FZ_LANE") != null; // core lane and fz_gdn on the target (the recorded bits)
@@ -712,6 +714,8 @@ pub const Engine = struct {
         const rg = e.ring.slice(u32, fz.RING_WORDS * RING);
         var failed: ?anyerror = null;
         var kv_len: usize = m.pos; // the cache before the next round read: a sampled row j draws at kv_len + j + 1
+        var fwds: [4]?mtl.CommandBuffer = .{ null, null, null, null }; // sampled rounds' forwards, committed apart
+        const hbase = e.drawn.value();
         while (true) {
             const wr = widths[round % 4];
             var cb = r.queue.commandBuffer();
@@ -746,8 +750,13 @@ pub const Engine = struct {
             if (r.gsel) |*g| g.nb_ub = ub;
             if (m.mtp.gsel) |*g| g.nb_ub = ub;
             try m.windowEncode(wr, e.wids);
-            if (out.sampling) |p| { // the window's picks drawn on the host before the accept kernel reads them
-                cb = try sampledPicks(e, cb, wr, kv_len, p);
+            if (out.sampling != null) { // the forward commits alone; the accept kernel waits for the host's draws
+                r.enc.end();
+                cb.commit();
+                fwds[round % 4] = cb;
+                cb = r.queue.commandBuffer();
+                cb.waitFor(e.drawn, hbase + round + 1);
+                r.enc = cb.compute(.serial);
             }
             // the widest windows while copies land whole; otherwise the head's rule
             const copying = e.copy and copy_rate + 0.05 >= head_rate and copy_rate > 0.9;
@@ -764,7 +773,15 @@ pub const Engine = struct {
             cb.commit();
             cbs[round % 4] = cb;
             round += 1;
-            if (round < 2 and out.sampling == null) continue; // greedy rounds run two deep; sampled ones one at a time
+            if (round < 2) continue;
+            if (out.sampling) |p| {
+                const fwd = fwds[done % 4].?;
+                fwds[done % 4] = null;
+                drawRound(e, fwd, widths[done % 4], kv_len, p, hbase + done + 1) catch |err| {
+                    failed = err;
+                    break;
+                };
+            }
             const prev = cbs[done % 4].?;
             prev.wait();
             cbs[done % 4] = null;
@@ -823,33 +840,28 @@ pub const Engine = struct {
                 break;
             }
         }
-        for (&cbs) |*c| if (c.*) |cb| {
+        if (out.sampling != null) e.drawn.set(hbase + round); // the rounds past the reply run on undrawn picks
+        for (&cbs, &fwds) |*c, *f| for ([_]*?mtl.CommandBuffer{ f, c }) |x| if (x.*) |cb| {
             cb.wait();
-            c.* = null;
+            x.* = null;
         };
         r.event_value = base + round + 1;
         if (failed) |err| return err;
         return res;
     }
 
-    /// A sampled round's forward run to its end, its `rows` picks redrawn from their logits at kv_len + j + 1, and a
-    /// new command buffer for the accept kernel (which waits on nothing: the forward's buffer has finished).
-    fn sampledPicks(e: *Engine, cb: mtl.CommandBuffer, rows: usize, kv_len: usize, p: lanes.Sampling) !mtl.CommandBuffer {
-        const r = e.r;
-        const m = e.m;
-        r.enc.end();
-        cb.commit();
-        cb.wait();
-        if (cb.failure()) |msg| {
+    /// A sampled round's forward waited for, its `rows` picks redrawn from their logits at kv_len + j + 1, then the
+    /// accept kernel released by setting `drawn` to `value`.
+    fn drawRound(e: *Engine, fwd: mtl.CommandBuffer, rows: usize, kv_len: usize, p: lanes.Sampling, value: u64) !void {
+        fwd.wait();
+        if (fwd.failure()) |msg| {
             std.log.err("command buffer failed: {s}", .{msg});
             return error.GpuFailed;
         }
-        const picks = m.t.picks.b.slice(u32, MAXR);
-        const base = m.t.logits.b.contents() + m.t.logits.off;
+        const picks = e.m.t.picks.b.slice(u32, MAXR);
+        const base = e.m.t.logits.b.contents() + e.m.t.logits.off;
         for (0..rows) |j| picks[j] = try sample.draw(e.gpa, sample.row(base, fz.VOCAB, j), p, kv_len + j + 1);
-        const next = r.queue.commandBuffer();
-        r.enc = next.compute(.serial);
-        return next;
+        e.drawn.set(value);
     }
 
     /// Speed-up mode: whether to stop at a step both ranks take (rank 0 decides, rank 1 follows); alone, `quit`.
