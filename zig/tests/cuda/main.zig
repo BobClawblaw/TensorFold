@@ -8,6 +8,15 @@ const bench = @import("bench.zig");
 const oracle_tests = @import("oracle_tests.zig");
 const libs_tests = @import("libs_tests.zig");
 const sample_tests = @import("sample_tests.zig");
+const norms_tests = @import("norms_tests.zig");
+const moe_glue_tests = @import("moe_glue_tests.zig");
+const dense_rows_tests = @import("dense_rows_tests.zig");
+const qk_rows_tests = @import("qk_rows_tests.zig");
+const window_tests = @import("window_tests.zig");
+const tree_tests = @import("tree_tests.zig");
+const act_rows_tests = @import("act_rows_tests.zig");
+const gdn_prep_tests = @import("gdn_prep_tests.zig");
+const block_tests = @import("block_tests.zig");
 const glue_tests = @import("glue_tests.zig");
 const window_profile = @import("window_profile.zig");
 const tree_accept = @import("tree_accept.zig");
@@ -52,6 +61,15 @@ const usage =
     \\  fp8-experts <dir>         grouped block-FP8 experts against recorded fixture bytes
     \\  nvfp4-experts <dir>       grouped NVFP4 experts against recorded fixture bytes
     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
+    \\  norms                     RMS norm and the residual step against float64 references (synthetic)
+    \\  moe-glue                  sigmoid top-k routing and the weighted combine against float64 references (synthetic)
+    \\  dense-rows                bf16 rows times weight rows (routers, heads) against float64 references (synthetic)
+    \\  qk-rows                   QK norm, RoPE and the cache write against float64 references (synthetic)
+    \\  window                    sliding-window attention against float64 references (synthetic)
+    \\  tree                      tree attention (committed keys and paths) against float64 references (synthetic)
+    \\  block                     DFlash block attention over windowed contexts against float64 (synthetic)
+    \\  gdn-prep                  Gated DeltaNet conv, norms, g and beta against float64 (synthetic)
+    \\  act-rows                  bf16-residual and gated norms, SwiGLU, output gates, group sums against float64 (synthetic)
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
     \\  modelopt                  ModelOpt repack, FP8 and BF16 lane rows and relu^2 NVFP4 experts against fp64
@@ -113,6 +131,15 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "nvfp4")) return nvfp4_tests.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "nvfp4-experts")) return nvfp4_experts_tests.experts(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "norms")) return norms_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "moe-glue")) return moe_glue_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "qk-rows")) return qk_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "act-rows")) return act_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "gdn-prep")) return gdn_prep_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "exlr8")) return exlr8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "exlr8-dense")) return exlr8_dense_tests.run(gpu, if (rest.len > 0) rest[0] else null);

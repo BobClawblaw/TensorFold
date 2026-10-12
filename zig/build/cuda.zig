@@ -40,6 +40,16 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_attention", .flags = glue },
     .{ .name = "nemotron_keyed", .flags = glue },
     .{ .name = "qmmf", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's device code (FP8G, FP4), tensorfold_nvfp4_v3
+    .{ .name = "norms", .flags = &.{"-O3"} }, // ours: RMS norm rows for every family (cuda/norms.zig)
+    .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k and the weighted combine (cuda/moe_glue.zig)
+    .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig)
+    .{ .name = "qk_rows", .flags = &.{"-O3"} }, // ours: QK norm, RoPE and the cache write (cuda/qk_rows.zig)
+    .{ .name = "window_attention", .flags = &.{"-O3"} }, // ours: sliding-window attention (cuda/window_attention.zig)
+    .{ .name = "tree_attention", .flags = &.{"-O3"} }, // ours: committed keys and paths (cuda/tree_attention.zig)
+    .{ .name = "act_rows", .flags = &.{"-O3"} }, // ours: SwiGLU, output gates, group sums (cuda/act_rows.zig)
+    .{ .name = "gdn_prep", .flags = &.{"-O3"} }, // ours: Gated DeltaNet conv, norms, g and beta (cuda/gdn_prep.zig)
+    .{ .name = "embed_rows", .flags = &.{"-O3"} }, // ours: 4-bit affine and bf16 token rows (cuda/embed_rows.zig)
+    .{ .name = "block_attention", .flags = &.{"-O3"} }, // ours: a drafter's block over its context (cuda/block_attention.zig)
     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
@@ -138,6 +148,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     runner.addImport("cuda", cuda);
+    runner.addImport("core", mods.core);
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
     const exlr8 = exlr8_build.coreAlias(b, target, optimize, mods.core);
