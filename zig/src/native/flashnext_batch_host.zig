@@ -21,8 +21,8 @@ const Host = struct {
     warm: mtl.keepalive.Target,
 };
 
-/// What the sessions may take the server to: 70% of RAM, or FLASHNEXT_LOAD_LIMIT_GB (GB, as GLM_LOAD_LIMIT_GB) up to the
-/// GPU's recommended working set; past the default the log names the risk, as GLM's loader does.
+/// What the server may hold in all, sessions and prompt cache: 70% of RAM, or FLASHNEXT_LOAD_LIMIT_GB (GB, as
+/// GLM_LOAD_LIMIT_GB) up to the GPU's recommended working set; past the default the log names the risk, as GLM's does.
 fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
     const text: ?[]const u8 = if (std.c.getenv("FLASHNEXT_LOAD_LIMIT_GB")) |v| std.mem.span(v) else null;
     const c = fit.ceiling(total, working_set, text) catch |err| {
@@ -30,7 +30,7 @@ fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
         return err;
     };
     if (c.capped) std.log.info("flash next: FLASHNEXT_LOAD_LIMIT_GB={s} passes this GPU's recommended working set; the limit is {d:.1} GB", .{ text.?, fit.gibs(c.bytes) * 1.073741824 });
-    if (c.bytes > c.default) std.log.warn("flash next: FLASHNEXT_LOAD_LIMIT_GB lets the sessions take this Mac to {d:.1} GiB, past the default {d:.1} GiB (70% of RAM): a load that wires most of the RAM can stall macOS until its watchdog kills the server", .{ fit.gibs(c.bytes), fit.gibs(c.default) });
+    if (c.bytes > c.default) std.log.warn("flash next: FLASHNEXT_LOAD_LIMIT_GB lets the server (sessions and prompt cache) take this Mac to {d:.1} GiB, past the default {d:.1} GiB (70% of RAM): a load that wires most of the RAM can stall macOS until its watchdog kills the server", .{ fit.gibs(c.bytes), fit.gibs(c.default) });
     return c.bytes;
 }
 
@@ -65,7 +65,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    const plan = try fit.budget(cache_gib, over, 0, a, why, "");
+    const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .greedy_only = true, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan });
     h.cache = null;
