@@ -81,3 +81,51 @@ test "the rows of a span a chunk holds" {
     try std.testing.expectEqual(@as(?[3]usize, .{ 5, 7, 5 }), VisPrompt.overlap(s, 5, 10));
     try std.testing.expectEqual(@as(?[3]usize, .{ 0, 12, 15 }), VisPrompt.overlap(s, 15, 100));
 }
+
+/// `images` (each with pixels, gh, gw, at, tokens: lanes' Image) through `tower` on `queue`: the image prompt for a
+/// prompt of `prompt_len` tokens, its rows on `device` (freed by the caller: `rows.deinit()`), the rest in `a`.
+pub fn build(tower: anytype, device: mtl.Device, queue: mtl.Queue, a: std.mem.Allocator, images: anytype, prompt_len: usize) !*VisPrompt {
+    const fnv = @import("vision.zig");
+    var total: usize = 0;
+    var most: usize = 0;
+    const spans = try a.alloc(Span, images.len);
+    for (images, spans, 0..) |img, *s, i| {
+        if (img.gh % fnv.merge != 0 or img.gw % fnv.merge != 0 or img.tokens * fnv.patches_per_token != img.gh * img.gw) return error.ImageGrid;
+        if (@as(usize, img.at) + img.tokens > prompt_len or (i > 0 and img.at < spans[i - 1].at + spans[i - 1].n)) return error.ImageOutOfPrompt;
+        s.* = .{ .at = img.at, .n = img.tokens, .mh = img.gh / fnv.merge, .mw = img.gw / fnv.merge, .row = @intCast(total) };
+        total += img.tokens;
+        most = @max(most, img.tokens);
+    }
+    if (total * fnv.patches_per_token > tower.max_patches) return error.TooManyImageTokens;
+    const row = fnv.out_hidden * 2;
+    const rows = try device.buffer(total * 4 * row, mtl.ResourceOptions.shared);
+    errdefer rows.deinit();
+    const out = try device.buffer(most * row, mtl.ResourceOptions.shared);
+    defer out.deinit();
+    const t0 = std.c.mach_absolute_time();
+    var gpu: f64 = 0;
+    for (images, spans) |img, s| { // one image a command buffer: the tower's host-written scratch is shared
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const cb = queue.commandBuffer();
+        const enc = cb.compute(.serial);
+        try tower.encode(enc, img.pixels, img.gh, img.gw, .{ .buf = out }, null);
+        enc.end();
+        cb.commit();
+        cb.wait();
+        if (cb.failure()) |msg| {
+            std.log.err("flash next vision: the tower's command buffer failed: {s}", .{msg});
+            return error.GpuFailed;
+        }
+        gpu += cb.gpuSeconds();
+        const src = out.contents();
+        const dst = rows.contents();
+        for (0..s.n) |k| for (0..4) |stream| @memcpy(dst[((s.row + k) * 4 + stream) * row ..][0..row], src[k * row ..][0..row]);
+    }
+    const ms = @as(f64, @floatFromInt(std.c.mach_absolute_time() - t0)) / 24e3; // 24 MHz ticks on Apple silicon
+    std.log.info("flash next vision: {d} images, {d} tokens through the tower in {d:.1} ms ({d:.1} ms on the GPU)", .{ images.len, total, ms, gpu * 1e3 });
+    const p = try a.create(VisPrompt);
+    const last = spans[spans.len - 1];
+    p.* = .{ .rows = rows, .spans = spans, .pos3 = try frame(a, spans), .frame_end = last.at + last.n, .prep = tower.k.attn_prep };
+    return p;
+}

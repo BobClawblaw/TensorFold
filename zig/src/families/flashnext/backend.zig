@@ -12,6 +12,8 @@ const Stream = lanes.Stream;
 const Buf = fz.Buf;
 const mtl = @import("metal");
 const segments = @import("../../core/segments.zig");
+const vis_prompt = @import("vis_prompt.zig");
+const Vision = @import("vision.zig").Vision;
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -26,6 +28,7 @@ pub const Backend = struct {
     draft_calls: u64 = 0,
     draft_waits: u64 = 0,
     draft_seconds: f64 = 0,
+    tower: ?*Vision = null, // --vision: a stream's images become its prompt pass's rows (vis_prompt.zig)
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine, n: u32, capacity: usize) !Backend {
         if (n < 2 or n > fz.MAXR or e.r.tp != null) return error.BadBatchSlots;
@@ -139,13 +142,22 @@ pub const Backend = struct {
         defer old.restore(b);
         s.m.reset();
         stream.cached = 0;
-        if (stream.reuse.saved) |saved| {
+        // an image prompt is read whole and never kept: its frame depends on every image in it
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const images = stream.images.len > 0;
+        if (images) s.m.vis = try vis_prompt.build(b.tower orelse return error.NoVision, b.e.r.device, b.e.r.queue, arena.allocator(), stream.images, prompt.len);
+        defer if (s.m.vis) |v| {
+            v.rows.deinit();
+            s.m.vis = null;
+        };
+        if (stream.reuse.saved) |saved| if (!images) {
             const state: *snap.State = @ptrCast(@alignCast(saved));
             if (state.at < prompt.len and state.at < s.m.cap) {
                 try snap.restore(b.e, state);
                 stream.cached = @intCast(state.at);
             } else stream.reuse_failed = true;
-        }
+        };
         var at: usize = s.m.pos;
         while (at < prompt.len) {
             if (stream.isCancelled()) return error.Cancelled;
@@ -154,7 +166,7 @@ pub const Backend = struct {
                 end = @min(end, mark);
                 break;
             };
-            for (stream.reuse.marks) |mark| if (mark > at) {
+            for (stream.reuse.marks) |mark| if (!images and mark > at) {
                 end = @min(end, mark);
                 break;
             };
@@ -171,7 +183,7 @@ pub const Backend = struct {
             }
             s.normalize();
             at = end;
-            if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(at)) != null)
+            if (!images and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(at)) != null)
                 if (stream.reuse.hook) |hook| hook.at(hook.ptr, stream, @intCast(at));
         }
         s.m.mtp.pos = prompt.len - 1;
