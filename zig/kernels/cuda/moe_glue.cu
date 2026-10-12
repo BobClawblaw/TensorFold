@@ -83,6 +83,12 @@ extern "C" __global__ void __launch_bounds__(NT) tf_moe_topk_sigmoid(const float
     }
 }
 
+// A float's order as an unsigned (-0 as +0, so equal values stay equal).
+__device__ __forceinline__ unsigned ordered(float v) {
+    const unsigned u = __float_as_uint(__fadd_rn(v, 0.f));
+    return u & 0x80000000u ? ~u : u | 0x80000000u;
+}
+
 // tf_moe_topk_sigmoid with a warp a row (up to 32 * PER experts): values in registers, no block barrier.
 constexpr int PER = 16;
 
@@ -94,15 +100,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_topk_sigmoid_warp(const
     const int64_t r = static_cast<int64_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
     if (r >= rows) return;
     const float* lg = logits + r * ne;
-    float v[PER];
+    float v[PER], x[PER];
 #pragma unroll
     for (int j = 0; j < PER; ++j) {
         const int e = lane + 32 * j;
-        v[j] = e < ne ? __fadd_rn(lg[e], bias != nullptr ? bias[e] : 0.f) : -INFINITY;
+        x[j] = e < ne ? lg[e] : 0.f;
+        v[j] = e < ne ? __fadd_rn(x[j], bias != nullptr ? bias[e] : 0.f) : -INFINITY;
     }
     const int slots = topk + (shared ? 1 : 0);
-    float sum = 0.f;
-    float wk = 0.f; // lane k's weight
+    float xk = 0.f; // lane k's pick's logit
     int pk = 0;     // lane k's pick
     for (int k = 0; k < topk; ++k) {
         float bv = -INFINITY;
@@ -112,18 +118,22 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_topk_sigmoid_warp(const
             const int e = lane + 32 * j;
             if (e < ne && beats(v[j], e, bv, bi)) bv = v[j], bi = e;
         }
-        for (int m = 16; m > 0; m >>= 1) {
-            const float ov = __shfl_xor_sync(0xFFFFFFFFu, bv, m);
-            const int oi = __shfl_xor_sync(0xFFFFFFFFu, bi, m);
-            if (beats(ov, oi, bv, bi)) bv = ov, bi = oi;
+        { // the warp's best: the largest value (redux on an order-keeping key), then the lowest id among equals
+            const unsigned key = ordered(bv);
+            const unsigned top = __reduce_max_sync(0xFFFFFFFFu, key);
+            bi = static_cast<int>(__reduce_min_sync(0xFFFFFFFFu, key == top ? static_cast<unsigned>(bi) : 0xFFFFFFFFu));
         }
+        float xb = 0.f;
 #pragma unroll
         for (int j = 0; j < PER; ++j)
-            if (lane + 32 * j == bi) v[j] = -INFINITY;
-        const float w = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-lg[bi])));
-        sum = __fadd_rn(sum, w);
-        if (lane == k) wk = w, pk = bi;
+            if (lane + 32 * j == bi) v[j] = -INFINITY, xb = x[j];
+        xb = __shfl_sync(0xFFFFFFFFu, xb, bi & 31);
+        if (lane == k) xk = xb, pk = bi;
     }
+    // the weights after the picks, each in its lane; the sum in pick order
+    const float wk = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-xk)));
+    float sum = 0.f;
+    for (int k = 0; k < topk; ++k) sum = __fadd_rn(sum, __shfl_sync(0xFFFFFFFFu, wk, k));
     if (lane < topk) {
         pick[r * slots + lane] = pk;
         wts[r * slots + lane] = __fmul_rn(normalize ? __fdiv_rn(wk, sum) : wk, scale);
@@ -132,12 +142,25 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_topk_sigmoid_warp(const
 }
 
 // out[r, d] = sum over the row's slots, in slot order, of w[r, k] * y[r, k, d] (fp32 fma), rounded once to out's kind.
+template <int YK, int OK>
+__device__ __forceinline__ void combine_row(const void* y, const float* w, void* out, int slots, int dims, int64_t r, int d) {
+    float acc = 0.f;
+    for (int k = 0; k < slots; ++k) acc = __fmaf_rn(w[r * slots + k], load(y, YK, (r * slots + k) * dims + d), acc);
+    store(out, OK, r * dims + d, acc);
+}
+
 extern "C" __global__ void __launch_bounds__(NT) tf_moe_combine(const void* y, int y_kind, const float* w, void* out,
                                                                 int out_kind, int slots, int dims) {
     const int64_t r = blockIdx.x;
     const int d = blockIdx.y * NT + threadIdx.x;
     if (d >= dims) return;
-    float acc = 0.f;
-    for (int k = 0; k < slots; ++k) acc = __fmaf_rn(w[r * slots + k], load(y, y_kind, (r * slots + k) * dims + d), acc);
-    store(out, out_kind, r * dims + d, acc);
+    // the kinds picked once a thread (a branch an element costs instruction fetch on small calls)
+    if (y_kind == 0 && out_kind == 2) combine_row<0, 2>(y, w, out, slots, dims, r, d);
+    else if (y_kind == 2 && out_kind == 2) combine_row<2, 2>(y, w, out, slots, dims, r, d);
+    else if (y_kind == 0 && out_kind == 0) combine_row<0, 0>(y, w, out, slots, dims, r, d);
+    else {
+        float acc = 0.f;
+        for (int k = 0; k < slots; ++k) acc = __fmaf_rn(w[r * slots + k], load(y, y_kind, (r * slots + k) * dims + d), acc);
+        store(out, out_kind, r * dims + d, acc);
+    }
 }

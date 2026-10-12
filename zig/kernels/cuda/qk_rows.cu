@@ -27,7 +27,8 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const __nv_bfloat1
     const __nv_bfloat16* src = qkv + (r * (h + 2 * hk) + hd) * dim;
     const float x = __bfloat162float(src[d]);
     const int p = pos[r];
-    const int64_t at = slot != nullptr ? (static_cast<int64_t>(slot[r]) * len + p % len) : p % len;
+    const int64_t pl = p < len ? p : p % len; // a 64-bit modulo only past the cache's end
+    const int64_t at = slot != nullptr ? static_cast<int64_t>(slot[r]) * len + pl : pl;
     if (hd >= h + hk) { // v: as is
         const int k = hd - h - hk;
         vo[(r * hk + k) * dim + d] = src[d];
