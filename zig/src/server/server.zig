@@ -153,7 +153,8 @@ pub const Server = struct {
         if (srv.info.greedy_only) return cx.refuse(if ((if (defaults) |d| number(d.get("temperature")) else null) orelse 0 > 0)
             "this engine decodes greedily only and this server samples by default: send temperature 0, or serve with --temperature 0"
         else
-            "this engine decodes greedily only: send temperature 0 or leave it out");
+            // "not supported" and the field's name: OpenAI clients' retry-without-the-parameter matchers look for both
+            "temperature above 0 is not supported: this engine decodes greedily only; send temperature 0 or leave it out");
         const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
         return .{
             .seed = seed,
