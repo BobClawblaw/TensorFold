@@ -8,7 +8,6 @@ const qwen27 = @import("qwen27");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
-const Pool = budget.Pool;
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{ nemotron.native, qwen27.native };
@@ -98,20 +97,11 @@ fn weightBytes(io: std.Io, dir: []const u8) u64 {
     return total;
 }
 
-/// A /proc file's text, streamed: procfs reports size 0, and a positional read (readFileAlloc) stops there.
-fn procText(a: Allocator, io: std.Io, path: []const u8) ?[]u8 {
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var r = file.readerStreaming(io, &buf);
-    return r.interface.allocRemaining(a, .limited(1 << 20)) catch null;
-}
-
 /// The pool now, read on the thread whose context is current; `problem` names a bad variable.
-fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?Pool {
+fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?budget.Pool {
     const unified = (try ctx.attribute(.integrated)) != 0;
     const card = try ctx.memInfo();
-    const text = if (unified) procText(a, io, "/proc/meminfo") else null;
+    const text = if (unified) budget.procText(a, io, "/proc/meminfo") else null;
     const available = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
         problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
         return null;
@@ -334,6 +324,7 @@ const Host = struct {
                     return x.inner.vtable.held.?(x.inner.ptr, s, out);
                 }
             }.f else null,
+            .prompt_rows = v.prompt_rows,
             .release = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream) void {
                     const x = bind(p);
@@ -345,8 +336,17 @@ const Host = struct {
     }
 };
 
-/// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
+/// What the backend refuses before any device work, whatever the family; null when `o` may open.
+fn refusal(o: api.Open) ?[]const u8 {
+    return if (o.learn != null) "--learn learns prompt prefixes on Macs only: serve without --learn, --learn-dir or --learn-gib on CUDA" else null;
+}
+
+/// The engine for `o.dir`, or null with `problem` set when `refusal` names a flag or no CUDA family reads it.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    if (refusal(o)) |why| {
+        problem.* = why;
+        return null;
+    }
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     }
@@ -476,9 +476,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (@hasDecl(F, "snap_bytes") and cache > 0) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
-        // states kept and resumed on the family's grid, where a cache-off pass cuts; the head reads one token on
-        // Nemotron's head reads one token on (lookahead 1); the 27B's states end where its prompt pass stands
-        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &Snaps(F).vtable }, .{ .lookahead = if (@hasDecl(F, "snap_lookahead")) F.snap_lookahead else 1, .planned = true, .grid = F.prompt_rows }, cache);
+        // Nemotron: a row's bits ignore the cuts and a kept row costs no call, so states keep at any row; its head reads
+        // one token on. The 27B: states on its zero-anchored grid, where a cache-off pass cuts, ending where the pass stands.
+        const rules: pc.Rules = if (@hasDecl(F, "snap_host")) .{ .lookahead = F.snap_lookahead, .planned = true, .grid = F.prompt_rows } else .{ .lookahead = 1, .min_prompt = 0 };
+        const ready: u64 = if (@hasDecl(F, "snap_ready")) try F.snap_ready(loaded.target, cache) else 0;
+        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &Snaps(F).vtable }, rules, cache - ready);
         h.store = store;
         if (@hasDecl(F, "useCache")) F.useCache(loaded.ctx);
     }
@@ -519,7 +521,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .image_tokens = v.image_tokens,
         .max_images = v.max_images,
     } else null) else null;
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null, .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null, .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
@@ -527,7 +529,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
 /// A host-memory prompt cache: --prompt-cache-gib, else 8 GiB, at most half the host's available memory.
 fn hostCacheBytes(a: Allocator, io: std.Io, asked: ?f64) u64 {
     const want: u64 = if (asked) |g| (if (g > 0) std.math.lossyCast(u64, g * gib) else 0) else 8 << 30;
-    const text = procText(a, io, "/proc/meminfo") orelse return 0;
+    const text = budget.procText(a, io, "/proc/meminfo") orelse return 0;
     const m = budget.meminfo(text) orelse return 0;
     return @min(want, m.available / 2);
 }
@@ -536,12 +538,13 @@ fn toGib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / gib;
 }
 
-test "this host's /proc/meminfo reads whole and parses (Linux)" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const text = procText(a, std.testing.io, "/proc/meminfo") orelse return error.Unreadable;
-    defer a.free(text);
-    try std.testing.expect(budget.meminfo(text) != null);
+test {
+    _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
+}
+
+test "--learn is refused whatever the family, and --slide or a learned-disk size alone is not" {
+    try std.testing.expectStringStartsWith(refusal(.{ .dir = "d", .model_type = "nemotron_h", .learn = "/x" }) orelse "", "--learn learns prompt prefixes on Macs only");
+    try std.testing.expect(refusal(.{ .dir = "d", .model_type = "nemotron_h", .slide = true, .learn_gib = 8, .learn_min_free_gib = 2 }) == null);
 }
 
 test "chip classes name the compute capability as gate entries do" {

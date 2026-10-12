@@ -122,7 +122,9 @@ pub const Spec = struct {
     shared_prefixes: []const u32 = &.{}, // then shared system blocks
     reuse: Reuse = .{},
     decide: ?u32 = null, // the prompt row where living lessons decide whether they act on the reply
+    untaught: bool = false, // no learned neuron acts on its rows: the model as shipped (Request.untaught)
     logprobs: ?u8 = null, // the target's log probabilities for each committed token, with this many best tokens
+    prompt_logprobs: ?u8 = null, // and for each prompt token after the first, with ranks (the prompt pass starts at 0)
     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
@@ -152,10 +154,13 @@ pub const Stream = struct {
     grammar: ?*grammar.Constraint = null, // follows each committed token; its masks keep the draws inside it
     problem: []const u8 = "", // why a stream finished with `error` (static text)
     rows: std.ArrayList(Row) = .empty, // with `logprobs`: one a token of emitted(), in order
+    prompt_logprobs: ?u8 = null,
+    prompt_rows: std.ArrayList(Row) = .empty, // with `prompt_logprobs`: one a prompt token after the first, in order
     reuse: Reuse = .{},
     decode_spans: []const [2]u32 = &.{},
     decide: ?u32 = null,
     images: []const Image = &.{},
+    untaught: bool = false,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
@@ -212,7 +217,9 @@ pub const Stream = struct {
             .shared_prefixes = spec.shared_prefixes,
             .reuse = spec.reuse,
             .decide = spec.decide,
+            .untaught = spec.untaught,
             .logprobs = spec.logprobs,
+            .prompt_logprobs = spec.prompt_logprobs,
             .grammar = spec.grammar,
             .decode_spans = spec.decode_spans,
             .images = spec.images,
@@ -228,6 +235,7 @@ pub const Stream = struct {
     pub fn deinit(s: *Stream, gpa: Allocator) void {
         s.context.deinit(gpa);
         s.rows.deinit(gpa);
+        s.prompt_rows.deinit(gpa);
         s.force.deinit(gpa);
         s.dropRoundState(gpa);
     }

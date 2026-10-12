@@ -106,7 +106,8 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up: 
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     if (eng.vision) |v| h.markers = .{ v.c.image_start, v.c.image_token, v.c.image_end };
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "glm-zig", .lanes = n, .context_window = window, .prefill_step = eng.chunk_rows, .greedy_only = true, .admit = if (h.slots.pool != null) .{ .ctx = &h.back, .fits = glm.backend.Backend.fits } else null, .vision = if (eng.vision) |v| .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &h.markers, .image_tokens = eng.vision_limits.image_tokens, .max_images = eng.vision_limits.max_images } else null });
+    const serves = @min(window, glm.pool.capacity(&h.slots) -| (glm.state.max_rows + 1)); // prompt + reply a stream's caches hold beside its last window (a pool keeps whole blocks)
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "glm-zig", .lanes = n, .context_window = serves, .prefill_step = eng.chunk_rows, .greedy_only = true, .admit = if (h.slots.pool != null) .{ .ctx = &h.back, .fits = glm.backend.Backend.fits } else null, .vision = if (eng.vision) |v| .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &h.markers, .image_tokens = eng.vision_limits.image_tokens, .max_images = eng.vision_limits.max_images } else null });
     h.cache = null;
     const budget = cacheBudget(eng, cache_gib);
     if (!eng.followsPeer() and budget > 0) {
@@ -114,6 +115,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up: 
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = B.snapBytes, .save = B.snapSave, .restore = B.snapRestore, .drop = B.snapDrop, .write = B.snapWrite, .read = B.snapRead, .forget = B.snapForget, .forget_checked = B.snapForgetChecked, .reclaim = B.snapReclaim, .peer_other_used = B.peerOtherUsed, .peer_other_next = B.peerOtherNext, .peer_other_bytes = B.peerOtherBytes, .peer_other_remove = B.peerOtherRemove, .peer_need = B.peerNeed, .peer_reclaim = B.peerReclaim, .peer_reserve = B.peerReserve, .peer_finish = B.peerFinish } }, cache_rules, budget);
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
+        h.slots.grow = .{ .ctx = h, .f = growSnap }; // a resident state made whole before its slot writes below it
     }
     errdefer if (h.cache) |*store| store.deinit();
     if (learn) |root| {
@@ -141,6 +143,12 @@ fn prepareImage(ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u3
     const h: *Host = @ptrCast(@alignCast(ctx));
     const p = try glm.image.prepare(a, bytes, h.eng.vision.?.c, max_tokens);
     return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+}
+
+/// Slots.grow: the prompt cache charges a kept state's prefixes when its budget has room (the host thread's store).
+fn growSnap(ctx: *anyopaque, saved: *anyopaque, extra: u64) bool {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    return if (h.cache) |*store| store.grow(saved, extra) else false;
 }
 
 fn follow(h: *Host) void {

@@ -18,6 +18,7 @@ pub const Config = server.Config;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("json.zig");
+    _ = @import("std_options.zig");
     _ = @import("fields.zig");
     _ = @import("reply_text.zig");
     _ = @import("tool_parse.zig");
@@ -41,10 +42,12 @@ test {
     _ = @import("images.zig");
     _ = @import("media_fetch.zig");
     _ = @import("stream_preflight_test.zig");
+    _ = @import("stream_dsml_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("completion_prompt_test.zig");
+    _ = @import("server_init_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
     _ = @import("slide.zig");
@@ -52,6 +55,9 @@ test {
     _ = @import("slide_model.zig");
     _ = @import("slide_lesson.zig");
     _ = @import("slide_words.zig");
+    _ = @import("slide_found.zig");
+    _ = @import("slide_untold.zig");
+    _ = @import("slide_replace.zig");
     _ = @import("slide_whom.zig");
     _ = @import("slide_subject.zig");
     _ = @import("slide_side.zig");
