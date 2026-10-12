@@ -14,6 +14,19 @@ const mtl = @import("metal");
 const segments = @import("../../core/segments.zig");
 const vis_prompt = @import("vis_prompt.zig");
 const Vision = @import("vision.zig").Vision;
+const sample = @import("sample.zig");
+
+/// A stream's sampling when it samples (a temperature above 0); null: the GPU's argmax stands.
+fn sampling(stream: *const Stream) ?lanes.Sampling {
+    const p = stream.sampling orelse return null;
+    return if (p.temperature > 0) p else null;
+}
+
+/// Row `row` of a [rows, VOCAB] bf16 logits buffer, drawn with `p` keyed at `position`.
+fn drawRow(gpa: std.mem.Allocator, logits: Buf, row: usize, p: lanes.Sampling, position: u64) !u32 {
+    const bytes = logits.b.contents()[logits.off + row * fz.VOCAB * 2 ..][0 .. fz.VOCAB * 2];
+    return sample.draw(gpa, @as([*]const u16, @ptrCast(@alignCast(bytes.ptr)))[0..fz.VOCAB], p, position);
+}
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -144,7 +157,6 @@ pub const Backend = struct {
 
     /// A stream's prompt pass begins: the smallest free session that holds it, a restored prefix, its images' rows.
     fn begin(b: *Backend, stream: *Stream) !*Session {
-        if (stream.sampling) |p| if (p.temperature > 0) return error.GreedyOnly;
         const prompt = stream.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
         try b.settle();
@@ -212,6 +224,10 @@ pub const Backend = struct {
         const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
         const t_chunk = std.c.mach_absolute_time();
         s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
+        // the pass's last row's logits are in the model's head buffer until the next forward: a sampled first token now
+        if (end == prompt.len) if (sampling(stream)) |p| {
+            s.first = try drawRow(b.gpa, s.m.t.logits, 0, p, prompt.len);
+        };
         if (std.c.getenv("FZ_BATCH_LOG") != null) std.log.info("flash next prefill: rows [{d}, {d}) in {d} parts, {d:.1} ms", .{ at, end, call.parts, @as(f64, @floatFromInt(std.c.mach_absolute_time() - t_chunk)) / 24e3 });
         for (ps[0..call.parts], 0..) |p, k| {
             const start = at + segments.start(call.rows, call.parts, k);
@@ -329,6 +345,9 @@ pub const Backend = struct {
         try b.primary.finish(cb);
         Session.copy(b.primary.last, b.hidden, plan.total * fz.WIDE * 2);
         for (out, 0..) |o, i| @memcpy(o.sampled, t.picks.b.slice(u32, plan.total)[plan.starts[i]..][0..o.sampled.len]);
+        for (windows, out, 0..) |w, o, i| if (sampling(w.stream)) |p| {
+            for (o.sampled, w.positions, 0..) |*tok, pos, j| tok.* = try drawRow(b.gpa, t.logits, plan.starts[i] + j, p, pos);
+        };
         b.window_count += 1;
         if (windows.len > 1) b.shared_count += 1;
         if (std.c.getenv("FZ_BATCH_LOG") != null)

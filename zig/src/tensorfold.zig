@@ -21,6 +21,7 @@ pub const flashnext_learned = @import("families/flashnext/learned.zig");
 pub const flashnext_vision = @import("families/flashnext/vision.zig");
 pub const flashnext_image = @import("families/flashnext/image.zig");
 pub const flashnext_video = @import("families/flashnext/video.zig");
+pub const flashnext_sample = @import("families/flashnext/sample.zig");
 pub const flashnext_session = @import("families/flashnext/session.zig");
 pub const flashnext_batch_forward = @import("families/flashnext/batch_forward.zig");
 pub const flashnext_backend = @import("families/flashnext/backend.zig");
