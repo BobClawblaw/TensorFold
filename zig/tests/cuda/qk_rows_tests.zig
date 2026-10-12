@@ -144,6 +144,46 @@ fn run1(gpu: check.Gpu, a: std.mem.Allocator, s: cuda.Stream, g: *const cuda.qk_
     try check.sameBytes("qk rows from strided heads: q", std.mem.sliceAsBytes(try back.f(gpu, a, o2.q, most * c.h * c.dim)), std.mem.sliceAsBytes(gq));
     try check.sameBytes("qk rows from strided heads: k", std.mem.sliceAsBytes(try back.f(gpu, a, o2.k, most * c.hk * c.dim)), std.mem.sliceAsBytes(gk));
     try check.sameBytes("qk rows from strided heads: k cache", std.mem.sliceAsBytes(try back.f(gpu, a, o2.kc.?, cache_bytes / 2)), std.mem.sliceAsBytes(gkc));
+    // bf16 norm weights at their own addresses and RoPE from inv (angle = pos * inv in fp32): float64 tolerance
+    if (c.norm) {
+        const wqb = try a.alloc(u16, c.dim);
+        const wkb = try a.alloc(u16, c.dim);
+        for (wqb, wkb, 0..) |*p, *q, i| {
+            p.* = bf16(nw[i]);
+            q.* = bf16(nw[c.dim + i]);
+        }
+        const half = @max(c.rot / 2, 1);
+        const inv = try a.alloc(f32, half);
+        for (inv, 0..) |*v, j| v.* = @floatCast(1 / std.math.pow(f64, 10000, @as(f64, @floatFromInt(2 * j)) / @as(f64, @floatFromInt(@max(c.rot, 1)))));
+        const sh3: cuda.qk_rows.Shape = .{ .norms = try up.f(gpu, &bufs, std.mem.sliceAsBytes(wqb)), .norm_k = try up.f(gpu, &bufs, std.mem.sliceAsBytes(wkb)), .norms_bf16 = true, .inv = if (c.rot > 0) try up.f(gpu, &bufs, std.mem.sliceAsBytes(inv)) else null, .rot = c.rot };
+        const o3: cuda.qk_rows.Out = .{ .q = try up.z(gpu, &bufs, s, most * c.h * c.dim * 2), .k = try up.z(gpu, &bufs, s, most * c.hk * c.dim * 2), .v = try up.z(gpu, &bufs, s, most * c.hk * c.dim * 2), .len = len };
+        try g.rows(s, dx, .{ .h = c.h, .hk = c.hk, .dim = c.dim }, sh3, dp, dsl, o3, most);
+        try s.synchronize();
+        const q3 = try back.f(gpu, a, o3.q, most * c.h * c.dim);
+        const k3 = try back.f(gpu, a, o3.k, most * c.hk * c.dim);
+        for (wq, wk, 0..) |*p, *q, i| {
+            p.* = bf(wqb[i]);
+            q.* = bf(wkb[i]);
+        }
+        for (0..most) |r| {
+            const p: usize = @intCast(pos[r]);
+            for (0..c.rot) |i| {
+                const ang: f64 = @as(f32, @floatFromInt(p)) * inv[i % half];
+                cv[i] = @cos(ang);
+                sv[i] = @sin(ang);
+            }
+            for (0..c.h + c.hk) |hd| {
+                for (xv, 0..) |*v, i| v.* = bf(xs[r * width + hd * c.dim + i]);
+                const is_q = hd < c.h;
+                core.qk_ref.head(xv, if (is_q) wq else wk, 1e-6, if (c.rot > 0) cv else null, if (c.rot > 0) sv else null, c.rot, y);
+                for (y, 0..) |want, i| {
+                    const got = if (is_q) bf(q3[(r * c.h + hd) * c.dim + i]) else bf(k3[(r * c.hk + hd - c.h) * c.dim + i]);
+                    q_most = @max(q_most, @abs(got - want) / ((@abs(want) + 2 * @abs(xv[i]) + 1e-3) * std.math.pow(f64, 2, -8)));
+                }
+            }
+        }
+        worst.* = @max(worst.*, q_most);
+    }
     try check.expect(q_most <= 1, "qk rows {d}/{d}x{d}, rot {d}{s}: within float64 tolerance (worst {d:.3})", .{ c.h, c.hk, c.dim, c.rot, if (c.norm) ", normed" else "", q_most });
     for (counts[0 .. counts.len - 1], outs[0 .. counts.len - 1]) |m, oo| {
         try check.sameBytes("qk rows: q at a smaller row count", std.mem.sliceAsBytes(try back.f(gpu, a, oo.q, m * c.h * c.dim)), std.mem.sliceAsBytes(gq[0 .. m * c.h * c.dim]));
