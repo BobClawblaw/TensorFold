@@ -57,9 +57,7 @@ extern "C" __global__ void tf_tree_paths(const int* __restrict__ parents, int* _
     for (int slot = depth - 1; slot >= 0; --slot, cur = parents[cur]) paths[node * MAXD + slot] = cur;
 }
 
-// Block (row, key head, group): keys k0 .. k1 of committed (cache) then path (kn, vn) keys; heads one mma tile.
-// One absolute 2,048-key group gi of row r, key head kh: its fp32 partial at (r * hk + kh) * ng + gi.
-// D 128: queries in registers, 32 keys a stage; D 256: queries in shared memory, 16 keys a stage.
+// Group gi of (row, key head): committed then path keys, heads one mma tile; D 256 keeps q in shared memory.
 template <int D, int HB>
 __device__ __forceinline__ void tree_group(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kn, const __nv_bfloat16* __restrict__ vn,

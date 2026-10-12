@@ -10,8 +10,7 @@ const Module = module.Module;
 const Function = module.Function;
 const Stream = stream_.Stream;
 
-/// Keys a group (one partial), a path's most rows, and the part kernels' shared memory: four warps' K and V slots
-/// (32 keys at dim 128; 16 at dim 256, plus the row's queries), reused for the partials.
+/// Keys a group, a path's most rows, the part kernels' shared memory (four warps' K/V slots; at 256 also the queries).
 pub const span = 2048;
 pub const max_depth = 128;
 const part_smem = [2]u32{ 4 * 2 * 32 * 16 * 16, 4 * 2 * 16 * 32 * 16 + 16 * 32 * 16 };
