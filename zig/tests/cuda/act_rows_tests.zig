@@ -232,6 +232,35 @@ fn groupSums(r: *Rig, g: *const cuda.act_rows.ActRows, k: usize) !void {
     try r.sums("group sums", dense, xs, most, k);
 }
 
+fn embed(r: *Rig, d: usize) !void {
+    var e = try cuda.embed_rows.EmbedRows.load(r.gpu.d);
+    defer e.unload();
+    const vocab = 300;
+    const w = try r.a.alloc(u32, vocab * d / 8);
+    for (w) |*x| x.* = r.rng.int(u32);
+    const sc = r.bfs(vocab * d / 64, 0.1);
+    const bi = r.bfs(vocab * d / 64, 0.5);
+    const tab = r.bfs(vocab * d, 1);
+    const ids = try r.a.alloc(i32, most);
+    for (ids) |*x| x.* = @intCast(r.rng.uintLessThan(usize, vocab));
+    const did = try r.dev(std.mem.sliceAsBytes(ids));
+    const o4 = try r.out(most * d * 2);
+    const o16 = try r.out(most * d * 2);
+    try e.affine4(r.s, did, try r.dev(std.mem.sliceAsBytes(w)), try r.dev(std.mem.sliceAsBytes(sc)), try r.dev(std.mem.sliceAsBytes(bi)), o4, most, d);
+    try e.bf16(r.s, did, try r.dev(std.mem.sliceAsBytes(tab)), o16, most, d);
+    const g4 = try r.back(u16, o4, most * d);
+    const g16 = try r.back(u16, o16, most * d);
+    for (0..most) |row| {
+        const t: usize = @intCast(ids[row]);
+        for (0..d) |i| {
+            const q: u4 = @truncate(w[t * d / 8 + i / 8] >> @intCast(4 * (i % 8)));
+            const want = aref.affine4(q, bf(sc[t * d / 64 + i / 64]), bf(bi[t * d / 64 + i / 64]));
+            try r.within("embed affine4", bf(g4[row * d + i]), want, nref.tolerance(want, .bf16));
+        }
+        try check.sameBytes("embed bf16", std.mem.sliceAsBytes(g16[row * d ..][0..d]), std.mem.sliceAsBytes(tab[t * d ..][0..d]));
+    }
+}
+
 pub fn run(gpu: check.Gpu) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
     defer arena.deinit();
@@ -257,5 +286,7 @@ pub fn run(gpu: check.Gpu) !void {
     try outputGate(&r, &g, 24, 256); // the 27B's attention output gate
     try outputGate(&r, &g, 3, 64);
     try groupSums(&r, &g, 5120);
-    check.pass("act rows: add_rms_h, gated rms, swiglu, output gate within float64 tolerance (worst {d:.3}), group sums of the stored outputs, every row count's bits equal", .{r.worst});
+    try embed(&r, 5120); // the 27B's hidden
+    try embed(&r, 192);
+    check.pass("act rows: add_rms_h, gated rms, swiglu, output gate, embed rows within float64 tolerance (worst {d:.3}), group sums of the stored outputs, every row count's bits equal", .{r.worst});
 }

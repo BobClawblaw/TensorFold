@@ -10,6 +10,11 @@ pub fn swiglu(gate: f64, up: f64) f64 {
     return gate * sigmoid(gate) * up;
 }
 
+/// A 4-bit affine table's value: q * scale + bias.
+pub fn affine4(q: u4, scale: f64, bias: f64) f64 {
+    return @as(f64, @floatFromInt(q)) * scale + bias;
+}
+
 /// A bf16 output of fp32 arithmetic through expf: half a bf16 ulp plus 2^-18 of |want|.
 pub fn tolerance(want: f64) f64 {
     return @abs(want) * (std.math.pow(f64, 2, -8) + std.math.pow(f64, 2, -18)) + 1e-30;

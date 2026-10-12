@@ -40,6 +40,7 @@ pub const window_attention = @import("window_attention.zig");
 pub const tree_attention = @import("tree_attention.zig");
 pub const act_rows = @import("act_rows.zig");
 pub const gdn_prep = @import("gdn_prep.zig");
+pub const embed_rows = @import("embed_rows.zig");
 
 test {
     _ = @import("memory.zig");
@@ -63,4 +64,5 @@ test {
     _ = @import("tree_attention.zig");
     _ = @import("act_rows.zig");
     _ = @import("gdn_prep.zig");
+    _ = @import("embed_rows.zig");
 }
