@@ -8,6 +8,7 @@ const fx = tf.flashnext_engine;
 const snap = tf.flashnext_snapshot;
 const learned = tf.flashnext_learned;
 const pc = api.prompt_cache;
+const vh = @import("flashnext_vision_host.zig");
 const cache_fit = @import("cache_fit.zig");
 const Allocator = std.mem.Allocator;
 
@@ -48,6 +49,7 @@ pub const Host = struct {
     prompt: []const u32 = &.{}, // the request in the engine (speed-up mode names kept states by its tokens)
     saved: std.ArrayList(u32) = .empty, // this request's marks the cache kept (speed-up: rank 1 drops the others)
     learned: ?api.prompt_imprint.Imprint = null, // --learn: shared states on disk, read back by later servers
+    vision: ?*vh.Vis = null, // --vision: the image tower
 
     const Mark = struct { at: i96, tokens: u64 };
     const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -313,10 +315,23 @@ pub const Host = struct {
         var arena: std.heap.ArenaAllocator = .init(h.gpa);
         defer arena.deinit();
         var plan: pc.Plan = .{};
+        // an image prompt: the tower's rows and positions for the prompt pass, read whole and never kept (its frame
+        // depends on every image in it, so no prefix state stands for another prompt)
+        const vis: ?*tf.flashnext_replay.vis_prompt.VisPrompt = if (r.images.len == 0) null else if (h.vision) |v| v.build(h.eng, arena.allocator(), r.images, r.prompt.len) catch |e| {
+            emit(job, .{ .prefilled = 0 });
+            fin.message = @errorName(e);
+            return;
+        } else {
+            emit(job, .{ .prefilled = 0 });
+            fin.message = "this server reads no images: start it with --vision";
+            return;
+        };
+        h.eng.m.vis = vis;
+        defer vh.release(h.eng, vis);
         const kept0 = if (h.cache) |*store| store.counts.kept else 0;
         const t_begin = h.now();
         h.prompt = r.prompt; // a learned state read back in `begin` is named by these tokens
-        if (h.cache) |*store| if (r.prompt.len + r.max_tokens + fx.MARGIN <= tf.flashnext_replay.CAP) {
+        if (h.cache) |*store| if (vis == null and r.prompt.len + r.max_tokens + fx.MARGIN <= tf.flashnext_replay.CAP) {
             plan = store.beginRewind(arena.allocator(), r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, &.{}, null, &.{}) catch .{};
         };
         job.restore_ns = h.now() - t_begin;
@@ -445,7 +460,7 @@ fn learnedStates(gpa: Allocator, eng: *fx.Engine, root: []const u8, cap: u64) !a
 }
 
 /// The engine for a Flash Next checkpoint: the replay engine on the kernels and packs in `dump`, warmed, served; `speed_up` names this Mac's speed-up mode settings (tp.zig); `cache_gib` the prompt cache's budget (null: what 70% of RAM leaves; `over_cap` lets a larger one through); on error.CacheOverCap `why` (in `a`) says why.
-pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, speed_up: ?[]const u8, cache_gib: ?f64, over_cap: bool, learn: ?[]const u8, learn_cap: u64, a: Allocator, why: *[]const u8) !*Host {
+pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, speed_up: ?[]const u8, cache_gib: ?f64, over_cap: bool, learn: ?[]const u8, learn_cap: u64, vision: ?api.VisionOpen, a: Allocator, why: *[]const u8) !*Host {
     const eng = try fx.Engine.loadWith(gpa, io, dir, dump, speed_up);
     errdefer eng.deinit();
     if (learn != null and eng.r.tp != null) {
@@ -456,6 +471,8 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
         std.log.err("flash next: warm-up failed: {s}", .{@errorName(err)});
         return err;
     };
+    const vis: ?*vh.Vis = if (vision) |lim| try vh.attach(gpa, eng, dir, lim) else null; // before the cache's budget reads memory
+    errdefer if (vis) |v| v.deinit();
     const cache_plan = try cacheBudget(eng, cache_gib, over_cap, a, why);
     const budget = cache_plan.budget_bytes;
     eng.peer_budget = budget; // rank 1: its kept states and free buffers stay inside the same budget
@@ -466,6 +483,8 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
     const limit: i64 = tf.flashnext_replay.CAP - fx.MARGIN;
     h.* = .{ .gpa = gpa, .io = io, .eng = eng, .follower = follower, .info_ = .{ .name = "flashnext-zig", .prompt_cache_plan = cache_plan, .lanes = 1, .greedy_only = true, .context_window = @intCast(if (window > 0) @min(window, limit) else limit) } };
     h.warm = .{ .queue = eng.r.queue };
+    h.vision = vis;
+    if (vis) |v| h.info_.vision = v.offer();
     if (!eng.followsPeer() and budget > 0) h.cache = pc.Store.init(gpa, .{ .ptr = h, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop, .charged = Snaps.charged, .spare = Snaps.spare, .trim = Snaps.trim, .reuses = Snaps.reuses, .write = Snaps.write, .read = Snaps.read, .forget = Snaps.forget } }, .{ .lookahead = 1 }, budget);
     h.info_.prompt_cache = h.cache != null;
     if (learn) |root| {
@@ -490,6 +509,7 @@ pub fn close(ctx: *anyopaque) void {
     }
     if (h.cache) |*store| store.deinit();
     if (h.learned) |*m| m.deinit();
+    if (h.vision) |v| v.deinit();
     h.saved.deinit(h.gpa);
     h.eng.deinit();
     h.gpa.destroy(h);

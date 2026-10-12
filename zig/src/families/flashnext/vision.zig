@@ -62,6 +62,7 @@ const Kernels = struct {
     heads_: mtl.Pipeline,
     gelu_tanh: mtl.Pipeline,
     gelu: mtl.Pipeline,
+    attn_prep: mtl.Pipeline, // the language model's attention prep with three positions a row (vis_prompt.zig)
 
     fn load(gpa: std.mem.Allocator, device: mtl.Device) !Kernels {
         const src = try frags.source(device, gpa, sources.flashnext_vision);
@@ -75,7 +76,7 @@ const Kernels = struct {
             const full = try std.fmt.bufPrint(&name, "fnv_gemm_{s}_{d}{d}", .{ kind, m, n });
             k.gemm[ki][m][n] = try mtl.Pipeline.init(device, lib, full, false);
         };
-        inline for (.{ .{ "bias", "fnv_bias" }, .{ "add", "fnv_add" }, .{ "layer_norm", "fnv_layer_norm" }, .{ "pos", "fnv_pos" }, .{ "qkv", "fnv_qkv" }, .{ "softmax", "fnv_softmax" }, .{ "heads_", "fnv_heads" }, .{ "gelu_tanh", "fnv_gelu_tanh" }, .{ "gelu", "fnv_gelu" } }) |kv| {
+        inline for (.{ .{ "bias", "fnv_bias" }, .{ "add", "fnv_add" }, .{ "layer_norm", "fnv_layer_norm" }, .{ "pos", "fnv_pos" }, .{ "qkv", "fnv_qkv" }, .{ "softmax", "fnv_softmax" }, .{ "heads_", "fnv_heads" }, .{ "gelu_tanh", "fnv_gelu_tanh" }, .{ "gelu", "fnv_gelu" }, .{ "attn_prep", "fnv_attn_prep_mrope" } }) |kv| {
             @field(k, kv[0]) = try mtl.Pipeline.init(device, lib, kv[1], false);
         }
         return k;
@@ -83,7 +84,7 @@ const Kernels = struct {
 
     fn deinit(k: *Kernels) void {
         for (&k.gemm) |*a| for (a) |*b| for (b) |p| p.deinit();
-        inline for (.{ "bias", "add", "layer_norm", "pos", "qkv", "softmax", "heads_", "gelu_tanh", "gelu" }) |f| @field(k, f).deinit();
+        inline for (.{ "bias", "add", "layer_norm", "pos", "qkv", "softmax", "heads_", "gelu_tanh", "gelu", "attn_prep" }) |f| @field(k, f).deinit();
         k.lib.deinit();
     }
 };
