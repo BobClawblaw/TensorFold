@@ -500,6 +500,13 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
 
 /// The engine's buffers and the tower's in one residency set; the idle keepalive's ticks use it.
 fn holdResident(h: *Host) !void {
+    if (mtl.registry.active()) { // FLASHNEXT_RESIDENCY=all: every live buffer now, every later one as it is made
+        h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, &.{}, true);
+        h.warm = (&h.resident.?).target();
+        const n = mtl.registry.hold(h.resident.?.set);
+        std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident, and each later one as it is made", .{ n, @as(f64, @floatFromInt(h.resident.?.set.allocatedSize())) / (1 << 30) });
+        return;
+    }
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
     const weights = @import("resident.zig").weightsOnly(); // FLASHNEXT_RESIDENCY=weights: the tensors alone

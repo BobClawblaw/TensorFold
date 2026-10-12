@@ -11,6 +11,7 @@ pub const DispatchType = types.DispatchType;
 pub const Device = @import("device.zig").Device;
 pub const Buffer = @import("device.zig").Buffer;
 pub const MappedFile = @import("device.zig").MappedFile;
+pub const registry = @import("device.zig").registry;
 pub const Library = @import("library.zig").Library;
 pub const CompileOptions = @import("library.zig").CompileOptions;
 pub const Pipeline = @import("library.zig").Pipeline;

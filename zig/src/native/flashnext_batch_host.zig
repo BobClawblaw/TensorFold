@@ -44,6 +44,13 @@ fn learnedStates(gpa: std.mem.Allocator, eng: *fx.Engine, root: []const u8, cap:
 /// macOS unwires GPU memory after 1-2 s idle and the next request re-wires it all (2 s before its first token): the
 /// engine's buffers, every session's and the tower's join one residency set the idle keepalive uses.
 fn holdResident(h: *Host) !void {
+    if (mtl.registry.active()) { // FLASHNEXT_RESIDENCY=all: every live buffer now, every later one as it is made
+        h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, &.{}, true);
+        h.warm = (&h.resident.?).target();
+        const n = mtl.registry.hold(h.resident.?.set);
+        std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident, and each later one as it is made", .{ n, @as(f64, @floatFromInt(h.resident.?.set.allocatedSize())) / (1 << 30) });
+        return;
+    }
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
     if (resident.weightsOnly()) { // FLASHNEXT_RESIDENCY=weights: the checkpoint's tensors alone, the working buffers left to macOS

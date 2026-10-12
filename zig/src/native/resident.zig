@@ -42,6 +42,7 @@ pub const Resident = struct {
     }
 
     pub fn deinit(r: *Resident) void {
+        _ = mtl.registry.hold(null);
         r.work.removeResidencySet(r.set);
         r.set.deinit();
         if (r.scratch) |b| b.deinit();

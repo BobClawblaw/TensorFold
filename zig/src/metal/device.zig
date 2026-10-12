@@ -33,7 +33,69 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: Buffer) void {
+        registry.leave(self);
         objc.release(self.id);
+    }
+};
+
+/// FLASHNEXT_RESIDENCY=all: every live buffer, from the first, so a host's residency set can hold the whole footprint
+/// and each later buffer joins it as made (rounds that touched both held and unheld memory ran up to 3x slower).
+pub const registry = struct {
+    var lock: std.atomic.Value(bool) = .init(false);
+    var on: ?bool = null;
+    var live: std.AutoArrayHashMapUnmanaged(Id, void) = .empty;
+    var set: ?residency.ResidencySet = null;
+
+    fn enabled() bool {
+        if (on == null) on = if (std.c.getenv("FLASHNEXT_RESIDENCY")) |v| std.mem.eql(u8, std.mem.span(v), "all") else false;
+        return on.?;
+    }
+
+    fn acquire() void {
+        while (lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn release() void {
+        lock.store(false, .release);
+    }
+
+    fn join(b: Buffer) void {
+        if (!enabled()) return;
+        acquire();
+        defer release();
+        live.put(std.heap.c_allocator, b.id, {}) catch {}; // a miss only leaves this buffer to macOS
+        if (set) |s| { // no requestResidency: it walks the whole set (a 5 tok/s reply while the prompt cache allocated)
+            s.add(b);
+            s.commit();
+        }
+    }
+
+    fn leave(b: Buffer) void {
+        if (!enabled()) return;
+        acquire();
+        defer release();
+        if (!live.swapRemove(b.id)) return;
+        if (set) |s| {
+            s.remove(b);
+            s.commit();
+        }
+    }
+
+    /// Whether FLASHNEXT_RESIDENCY=all asks for the registry.
+    pub fn active() bool {
+        return enabled();
+    }
+
+    /// Every live buffer joins `s` (committed and requested resident), and each later one as it is made; null stops.
+    pub fn hold(s: ?residency.ResidencySet) usize {
+        acquire();
+        defer release();
+        set = s;
+        const r = s orelse return 0;
+        for (live.keys()) |id| r.add(.{ .id = id });
+        r.commit();
+        r.requestResidency();
+        return live.count();
     }
 };
 
@@ -84,13 +146,17 @@ pub const Device = struct {
     /// A new buffer of `len` bytes; `options` from types.ResourceOptions (shared storage by default).
     pub fn buffer(self: Device, len: usize, options: usize) Error!Buffer {
         const id = objc.msg(?Id, self.id, "newBufferWithLength:options:", .{ len, options });
-        return .{ .id = id orelse return error.NoBuffer };
+        const b: Buffer = .{ .id = id orelse return error.NoBuffer };
+        registry.join(b);
+        return b;
     }
 
     /// A buffer over caller memory with no copy: `ptr` page-aligned, `len` a whole number of pages.
     pub fn bufferNoCopy(self: Device, ptr: *anyopaque, len: usize, options: usize) Error!Buffer {
         const id = objc.msg(?Id, self.id, "newBufferWithBytesNoCopy:length:options:deallocator:", .{ ptr, len, options, @as(?*anyopaque, null) });
-        return .{ .id = id orelse return error.NoBuffer };
+        const b: Buffer = .{ .id = id orelse return error.NoBuffer };
+        registry.join(b);
+        return b;
     }
 
     pub fn sharedEvent(self: Device) Error!sync.SharedEvent {
