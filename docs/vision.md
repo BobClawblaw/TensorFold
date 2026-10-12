@@ -135,8 +135,16 @@ For Qwen, each image request carries its own multimodal rotary positions and con
 4,096) for engines that read images; GLM-5.3-Flash on one Mac reads them so far, and other native engines refuse the
 flag at startup.
 
-- Images arrive as `image_url` data URLs in user messages and tool results. Remote URLs are refused, since
-  `--vision-urls` isn't on the native server yet.
+- Images arrive as `image_url` data URLs in user messages and tool results. With `--vision-urls` (it needs
+  `--vision`), a part may name a public HTTPS URL instead, fetched as 0.6.6 fetched it: port 443 without credentials
+  or a fragment; every address the host resolves to public (no private, loopback, link-local, carrier-grade NAT,
+  documentation, multicast or metadata address, and for IPv6 global unicast only, without 6to4 or Teredo); TLS
+  verified for the host against the system's certificates, on the address that was checked; up to 3 redirects,
+  each checked again; a declared `image/jpeg`, `image/png` or `image/webp`, uncompressed; 10 MB an image and 20 MB
+  a request across data URLs and downloads; 10 s a download and 30 s a request's downloads. The refusals are
+  0.6.6's words; a TLS failure, like any other failed connection, is "image download failed or timed out". Host
+  names that aren't ASCII and IPv6 address literals are refused. Without the flag, an HTTPS URL is refused with the
+  flag's name.
 - PNG and JPEG are decoded by the platform's decoder (ImageIO on macOS). WebP is refused by name until a decoder
   exists; other formats are refused.
 - The limits and the processing are 0.6.6's: EXIF orientation, alpha composited over white, the GLM5-Next processor's
@@ -148,6 +156,35 @@ flag at startup.
   template's own markers, one wrapper for each image part, become image tokens.
 - The prompt cache keys each image's placeholder rows by the image's content, so a kept state resumes the same image
   and never another one under the same placeholders. Image conversations reuse their history like text ones.
+
+### Video on the native server
+
+With `--vision`, GLM-5.3-Flash also reads `video_url` parts in user messages, as transformers 5.19's
+`Glm5NextProcessor` prepares them:
+- **Sampling:** 2 frames a second, deduplicated and padded to an even count, at most 256 frames.
+- **Frame pairs:** each pair of frames is one image to the tower.
+- **Prompt:** the template's `<|begin_of_video|><|video|><|end_of_video|>` holds one
+  `<|begin_of_image|>…<|end_of_image|>T.T seconds` block a pair.
+- **Budget:** a request's videos share `--vision-video-tokens` visual tokens (default 16,384; the processor's
+  `max_image_tokens`). The frames are sized under it and resized with torch's antialiased uint8 bicubic.
+
+Video needs `libtfvideo`, an optional library over FFmpeg 9.0.2 (the release PyAV 19.0.1 ships). The server loads it
+when the first video arrives and refuses videos by name without it:
+
+```sh
+tools/zig/build_ffmpeg.sh ~/ffmpeg-9.0.2        # static FFmpeg: H.264, HEVC, VP8, VP9, MPEG-4; MP4/MOV, MKV/WebM
+zig build video -Dffmpeg=$HOME/ffmpeg-9.0.2     # zig-out/native/lib/libtfvideo.dylib, beside the server
+```
+
+- **Limits (0.6.6's):** 2 videos a request, 16 MB each and 20 MB together, an hour of footage, 8192 pixels a side.
+  Data URLs work, and with `--vision-urls` public HTTPS URLs too (MP4, WebM, QuickTime or Matroska; 20 s a download,
+  120 s a request).
+- **Too short:** a clip too short for one sampled frame (under half a second) is refused, as the processor samples
+  nothing.
+- **Frame counts:** a container without one (Matroska, WebM) is counted by its video packets. transformers' PyAV loader
+  can't read these at all.
+- **Checks:** `tools/zig/glm_video_fixtures.py` checks the patches bit for bit against the processor on frames PyAV
+  decodes, over 13 clips. `tools/zig/video_served.py` checks a served model's prompt ids against the processor's.
 
 ## Verification
 
