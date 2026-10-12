@@ -5,7 +5,6 @@ const core = @import("core");
 const check = @import("check.zig");
 
 const tree = cuda.tree_attention;
-const D = 128;
 
 fn bf16(x: f32) u16 {
     const u: u32 = @bitCast(x);
@@ -43,34 +42,34 @@ const Set = struct {
 };
 
 /// One call over `rows` (global window rows of the given streams, in order): their outputs.
-fn call(x: *Set, s: cuda.Stream, g: *const tree.TreeAttention, rows: []const usize, row_stream_all: []const i32, parents_all: []const i32, qs: []const u16, kns: []const u16, vns: []const u16, h: usize, hk: usize, streams_dev: u64, offs: u64, origin: u64, ng: usize, scale: f32) ![]u16 {
+fn call(x: *Set, s: cuda.Stream, g: *const tree.TreeAttention, d: usize, rows: []const usize, row_stream_all: []const i32, parents_all: []const i32, qs: []const u16, kns: []const u16, vns: []const u16, h: usize, hk: usize, streams_dev: u64, offs: u64, origin: u64, ng: usize, scale: f32) ![]u16 {
     const n = rows.len;
     var local: std.AutoHashMap(usize, i32) = .init(x.a);
     for (rows, 0..) |r, i| try local.put(r, @intCast(i));
     const rs = try x.a.alloc(i32, n);
     const par = try x.a.alloc(i32, n);
-    const q = try x.a.alloc(u16, n * h * D);
-    const kn = try x.a.alloc(u16, n * hk * D);
-    const vn = try x.a.alloc(u16, n * hk * D);
+    const q = try x.a.alloc(u16, n * h * d);
+    const kn = try x.a.alloc(u16, n * hk * d);
+    const vn = try x.a.alloc(u16, n * hk * d);
     for (rows, 0..) |r, i| {
         rs[i] = row_stream_all[r];
         par[i] = if (parents_all[r] < 0) -1 else local.get(@intCast(parents_all[r])).?;
-        @memcpy(q[i * h * D ..][0 .. h * D], qs[r * h * D ..][0 .. h * D]);
-        @memcpy(kn[i * hk * D ..][0 .. hk * D], kns[r * hk * D ..][0 .. hk * D]);
-        @memcpy(vn[i * hk * D ..][0 .. hk * D], vns[r * hk * D ..][0 .. hk * D]);
+        @memcpy(q[i * h * d ..][0 .. h * d], qs[r * h * d ..][0 .. h * d]);
+        @memcpy(kn[i * hk * d ..][0 .. hk * d], kns[r * hk * d ..][0 .. hk * d]);
+        @memcpy(vn[i * hk * d ..][0 .. hk * d], vns[r * hk * d ..][0 .. hk * d]);
     }
     const paths = try x.zero(s, n * tree.max_depth * 4);
     const depths = try x.zero(s, n * 4);
     try g.paths(s, try x.up(std.mem.sliceAsBytes(par)), paths, depths, n);
-    const sc_base = try x.zero(s, tree.TreeAttention.scratchBytes(n, hk, ng));
-    const out = try x.zero(s, n * h * D * 2);
+    const sc_base = try x.zero(s, tree.TreeAttention.scratchBytes(n, hk, ng, d));
+    const out = try x.zero(s, n * h * d * 2);
     const rws: tree.Rows = .{ .row_stream = try x.up(std.mem.sliceAsBytes(rs)), .streams = streams_dev, .offs = offs, .origin = origin, .paths = paths, .depths = depths };
-    try g.run(s, try x.up(std.mem.sliceAsBytes(q)), try x.up(std.mem.sliceAsBytes(kn)), try x.up(std.mem.sliceAsBytes(vn)), rws, tree.TreeAttention.scratch(sc_base, n, hk, ng), out, n, h, hk, ng, scale);
+    try g.run(s, try x.up(std.mem.sliceAsBytes(q)), try x.up(std.mem.sliceAsBytes(kn)), try x.up(std.mem.sliceAsBytes(vn)), rws, tree.TreeAttention.scratch(sc_base, n, hk, ng, d), out, n, h, hk, d, ng, scale);
     try s.synchronize();
-    return x.down(u16, out, n * h * D);
+    return x.down(u16, out, n * h * d);
 }
 
-pub fn run(gpu: check.Gpu) !void {
+fn case(gpu: check.Gpu, d: usize, h: usize, hk: usize, seed: u64, worst_all: *f64) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -83,22 +82,20 @@ pub fn run(gpu: check.Gpu) !void {
         for (x.bufs.items) |*b| b.free();
         x.bufs.deinit(gpu.gpa);
     }
-    var prng = std.Random.DefaultPrng.init(41);
+    var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
-    const h = 48;
-    const hk = 4;
     const committed = [_]usize{ 5, 1500, 4200 };
     const widths = [_]usize{ 9, 33, 17 };
     // the caches: stream s's rows at element offset cache_at[s] of one buffer (keys, then values)
     var cache_rows: usize = 0;
     for (committed) |p| cache_rows += p;
-    const kcache = try a.alloc(u16, 2 * cache_rows * hk * D);
+    const kcache = try a.alloc(u16, 2 * cache_rows * hk * d);
     for (kcache) |*v| v.* = bf16(rng.floatNorm(f32));
     var offs: [2 * committed.len]i64 = undefined;
     var at: usize = 0;
     for (committed, 0..) |p, si| {
-        offs[2 * si] = @intCast(at * hk * D);
-        offs[2 * si + 1] = @intCast((cache_rows + at) * hk * D);
+        offs[2 * si] = @intCast(at * hk * d);
+        offs[2 * si + 1] = @intCast((cache_rows + at) * hk * d);
         at += p;
     }
     var total: usize = 0;
@@ -115,9 +112,9 @@ pub fn run(gpu: check.Gpu) !void {
         for ([_]usize{ start, w, p, 0 }, 0..) |v, k| streams[4 * si + k] = @intCast(v);
         start += w;
     }
-    const qs = try a.alloc(u16, total * h * D);
-    const kns = try a.alloc(u16, total * hk * D);
-    const vns = try a.alloc(u16, total * hk * D);
+    const qs = try a.alloc(u16, total * h * d);
+    const kns = try a.alloc(u16, total * hk * d);
+    const vns = try a.alloc(u16, total * hk * d);
     for (qs) |*v| v.* = bf16(rng.floatNorm(f32));
     for (kns) |*v| v.* = bf16(rng.floatNorm(f32));
     for (vns) |*v| v.* = bf16(rng.floatNorm(f32));
@@ -126,18 +123,18 @@ pub fn run(gpu: check.Gpu) !void {
     const offs_dev = try x.up(std.mem.sliceAsBytes(&offs));
     var ng: usize = 0;
     for (committed, widths) |p, w| ng = @max(ng, tree.TreeAttention.groups(p + w));
-    const scale: f32 = @floatCast(1 / @sqrt(@as(f64, D)));
+    const scale: f32 = @floatCast(1 / @sqrt(@as(f64, @floatFromInt(d))));
     const all = try a.alloc(usize, total);
     for (all, 0..) |*r, i| r.* = i;
-    const got = try call(&x, s, &g, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    const got = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
     // the reference: committed keys, then the path root first
     var worst: f64 = 0;
-    const kd = try a.alloc(f64, (4200 + 128) * D);
+    const kd = try a.alloc(f64, (4200 + 128) * d);
     const vd = try a.alloc(f64, kd.len);
     const keys = try a.alloc(usize, 4200 + 128);
-    const q = try a.alloc(f64, D);
-    const want = try a.alloc(f64, D);
-    const tol = try a.alloc(f64, D);
+    const q = try a.alloc(f64, d);
+    const want = try a.alloc(f64, d);
+    const tol = try a.alloc(f64, d);
     var path: [tree.max_depth]usize = undefined;
     for (0..total) |r| {
         const si: usize = @intCast(row_stream[r]);
@@ -150,37 +147,44 @@ pub fn run(gpu: check.Gpu) !void {
         }
         std.mem.reverse(usize, path[0..depth]);
         for (0..hk) |kh| {
-            for (0..p) |j| for (0..D) |e| {
+            for (0..p) |j| for (0..d) |e| {
                 const ko: usize = @intCast(offs[2 * si]);
                 const vo: usize = @intCast(offs[2 * si + 1]);
-                kd[j * D + e] = bf(kcache[ko + (j * hk + kh) * D + e]);
-                vd[j * D + e] = bf(kcache[vo + (j * hk + kh) * D + e]);
+                kd[j * d + e] = bf(kcache[ko + (j * hk + kh) * d + e]);
+                vd[j * d + e] = bf(kcache[vo + (j * hk + kh) * d + e]);
             };
-            for (0..depth) |j| for (0..D) |e| {
-                kd[(p + j) * D + e] = bf(kns[(path[j] * hk + kh) * D + e]);
-                vd[(p + j) * D + e] = bf(vns[(path[j] * hk + kh) * D + e]);
+            for (0..depth) |j| for (0..d) |e| {
+                kd[(p + j) * d + e] = bf(kns[(path[j] * hk + kh) * d + e]);
+                vd[(p + j) * d + e] = bf(vns[(path[j] * hk + kh) * d + e]);
             };
             for (0..p + depth) |j| keys[j] = j;
             for (0..h / hk) |hh| {
                 const hd = kh * (h / hk) + hh;
-                for (q, 0..) |*v, e| v.* = bf(qs[(r * h + hd) * D + e]);
-                core.attention_ref.head(q, kd, vd, keys[0 .. p + depth], D, scale, want, tol);
-                for (want, tol, 0..) |w, t, e| worst = @max(worst, @abs(bf(got[(r * h + hd) * D + e]) - w) / t);
+                for (q, 0..) |*v, e| v.* = bf(qs[(r * h + hd) * d + e]);
+                core.attention_ref.head(q, kd, vd, keys[0 .. p + depth], d, scale, want, tol);
+                for (want, tol, 0..) |w, t, e| worst = @max(worst, @abs(bf(got[(r * h + hd) * d + e]) - w) / t);
             }
         }
     }
-    try check.expect(worst <= 1, "tree attention: within float64 tolerance (worst {d:.3})", .{worst});
+    try check.expect(worst <= 1, "tree attention dim {d}: within float64 tolerance (worst {d:.3})", .{ d, worst });
+    worst_all.* = @max(worst_all.*, worst);
     // stream 1's rows alone (re-indexed): the same bits
     const only = try a.alloc(usize, widths[1]);
     for (only, 0..) |*r, i| r.* = widths[0] + i;
-    const alone = try call(&x, s, &g, only, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
-    try check.sameBytes("tree attention: one stream's rows alone", std.mem.sliceAsBytes(alone), std.mem.sliceAsBytes(got[widths[0] * h * D ..][0 .. widths[1] * h * D]));
+    const alone = try call(&x, s, &g, d, only, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    try check.sameBytes("tree attention: one stream's rows alone", std.mem.sliceAsBytes(alone), std.mem.sliceAsBytes(got[widths[0] * h * d ..][0 .. widths[1] * h * d]));
     // one block a (row, key head) striding over the groups, and a grid sized for a long context: the same bits
     g.group_slots = 1;
-    const strided = try call(&x, s, &g, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    const strided = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
     try check.sameBytes("tree attention: one group slot", std.mem.sliceAsBytes(strided), std.mem.sliceAsBytes(got));
     g.group_slots = 16;
-    const wide = try call(&x, s, &g, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, 129, scale);
+    const wide = try call(&x, s, &g, d, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, 129, scale);
     try check.sameBytes("tree attention: groups for a 262k context", std.mem.sliceAsBytes(wide), std.mem.sliceAsBytes(got));
-    check.pass("tree attention: committed keys and paths within float64 tolerance (worst {d:.3}), a stream's bits alone, any group slots", .{worst});
+}
+
+pub fn run(gpu: check.Gpu) !void {
+    var worst: f64 = 0;
+    try case(gpu, 128, 48, 4, 41, &worst); // Kolibri
+    try case(gpu, 256, 24, 4, 42, &worst); // Qwen3.8-27B
+    check.pass("tree attention: dim 128 and 256, committed keys and paths within float64 tolerance (worst {d:.3}), a stream's bits alone, any group slots", .{worst});
 }
