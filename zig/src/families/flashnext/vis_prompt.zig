@@ -96,7 +96,8 @@ pub fn build(tower: anytype, device: mtl.Device, queue: mtl.Queue, a: std.mem.Al
         total += img.tokens;
         most = @max(most, img.tokens);
     }
-    if (total * fnv.patches_per_token > tower.max_patches) return error.TooManyImageTokens;
+    // the tower runs one image (a video's group) at a time
+    if (most * fnv.patches_per_token > tower.max_patches) return error.ImageTooLarge;
     const row = fnv.out_hidden * 2;
     const rows = try device.buffer(total * 4 * row, mtl.ResourceOptions.shared);
     errdefer rows.deinit();
