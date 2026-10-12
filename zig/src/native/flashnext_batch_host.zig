@@ -46,7 +46,9 @@ fn holdResident(h: *Host) !void {
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
     try list.appendSlice(h.gpa, h.eng.r.held.items);
-    for (h.back.sessions) |s| try list.appendSlice(h.gpa, s.owned.items);
+    // FLASHNEXT_RESIDENCY_SESSIONS=0: the extra sessions' caches stay out (a 196 GiB set slowed the GPU-side rounds 3x)
+    const sessions = if (std.c.getenv("FLASHNEXT_RESIDENCY_SESSIONS")) |v| v[0] != '0' else true;
+    if (sessions) for (h.back.sessions) |s| try list.appendSlice(h.gpa, s.owned.items);
     try list.append(h.gpa, h.back.hidden.b);
     if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
     h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, list.items, true);
