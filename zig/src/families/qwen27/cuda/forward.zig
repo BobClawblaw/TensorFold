@@ -121,7 +121,7 @@ pub const Forward = struct {
                     try f.ops.dense(s.y, s.xs, a.k, s.key, W);
                     try f.ops.dense(s.y, s.xs, a.v, rec.v, W);
                     try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, r.pos, w.inv_freq, s.q_rot, rec.k, W, f.attnShape(), c.eps);
-                    const part: tri.Tri.Partials = .{ .o = s.part_o, .m = s.part_m, .l = s.part_l };
+                    const part: tri.Tri.Partials = .{ .o = s.part_o, .m = s.part_m, .l = s.part_l, .bytes = st.Scratch.partialBytes(g_, s.part_rows) };
                     if (r.kv8) try f.t.attention8(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, part, s.attn, f.attnShape()) else try f.t.attention(s.q_rot, rec.k, rec.v, s.origin, r.offsets(i, att), r.attn, part, s.attn, f.attnShape());
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);
                     try f.ops.dense(s.gated, s.gated_xs, a.o, s.r, W);

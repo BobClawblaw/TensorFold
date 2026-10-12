@@ -3,6 +3,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const aot = cuda.aot;
+const glue_ = @import("glue.zig");
+const use = glue_.uses;
 
 const p = aot.ptr;
 
@@ -41,6 +43,7 @@ pub const Attn = struct { heads: usize, kv_heads: usize, dim: usize, half: usize
 pub const Tri = struct {
     set: *const aot.Set,
     s: cuda.Stream,
+    g: ?*const glue_.Glue = null, // native kernels in place of some (TF_QWEN27_GLUE)
 
     fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
         try t.set.run(t.s, name, grid, args, consts);
@@ -48,16 +51,37 @@ pub const Tri = struct {
 
     /// glue.embed: a 4-bit table row dequantized, one program a row and 64-group.
     pub fn embed(t: Tri, ids: u64, w: u64, s: u64, b: u64, out: u64, rows: usize, d: usize) !void {
+        if (use(t.g, .embed)) |g| return g.embed.affine4(t.s, ids, w, s, b, out, rows, d);
         try t.run("_embed", .{ u(rows), u(d / 64), 1 }, &.{ p("IDS", "*i32", ids), p("Wt", "*i32", w), p("S", "*bf16", s), p("B", "*bf16", b), p("OUT", "*bf16", out) }, &.{ci("D", d)});
     }
 
     /// glue.add_rmsnorm: h = x + r (or x itself without r), y = rmsnorm(h) * w, xs = y's 64-group sums.
     pub fn addRmsnorm(t: Tri, x: u64, r: ?u64, w: u64, h: u64, y: u64, xs: u64, rows: usize, d: usize, eps: f32) !void {
+        if (use(t.g, .add_rmsnorm)) |g| return g.norms.addRmsH(t.s, x, r, w, .bf16, if (r != null) h else x, y, xs, rows, d, eps);
         try t.run("_add_rmsnorm", .{ u(rows), 1, 1 }, &.{ p("X", "*bf16", x), p("R", "*bf16", r orelse x), p("W", "*bf16", w), p("H", "*bf16", if (r != null) h else x), p("Y", "*bf16", y), p("XS", "*fp32", xs), aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", pow2(d)), ci("HAS_R", @intFromBool(r != null)) });
     }
 
     /// glue.gdn_pre: conv over each row's window of [state; qkv], q/k norms, g and beta; `sid`: several streams.
     pub fn gdnPre(t: Tri, qkv: u64, cs: u64, cw: u64, win: u64, sid: ?u64, a: u64, b: u64, alog: u64, dtb: u64, q: u64, k: u64, v: u64, g: u64, beta: u64, rows: usize, m: Gdn) !void {
+        if (use(t.g, .gdn_pre)) |x| return x.gdn.run(t.s, .{
+            .qkv = qkv,
+            .qkv_ld = @intCast(m.c),
+            .state = cs,
+            .conv = cw,
+            .win = win,
+            .sid = sid orelse 0,
+            .a = a,
+            .a_ld = @intCast(m.vh),
+            .b = b,
+            .b_ld = @intCast(m.vh),
+            .a_log = alog,
+            .dt_bias = dtb,
+            .q = q,
+            .k = k,
+            .v = v,
+            .g = g,
+            .beta = beta,
+        }, rows, .{ .kh = m.kh, .vh = m.vh, .dk = m.dk, .keep = m.keep });
         try t.run("_gdn_pre", .{ u(rows), u(2 * m.kh + m.vh), 1 }, &.{
             p("QKV", "*bf16", qkv), p("CS", "*bf16", cs), p("CW", "*bf16", cw), p("WIN", "*i32", win), p("A", "*bf16", a), p("B", "*bf16", b),       p("ALOG", "*fp32", alog),
             p("DTB", "*fp32", dtb), p("Q", "*bf16", q),   p("K", "*bf16", k),   p("V", "*bf16", v),    p("G", "*fp32", g), p("BETA", "*fp32", beta), p("SID", "*i32", sid orelse win),
@@ -66,16 +90,23 @@ pub const Tri = struct {
 
     /// glue.gated_norm: silu(z) * rmsnorm(y) * w per value head, and its group sums.
     pub fn gatedNorm(t: Tri, y: u64, z: u64, w: u64, out: u64, xs: u64, rows: usize, vh: usize, dv: usize, eps: f32) !void {
+        if (use(t.g, .gated_norm)) |g| return g.norms.gatedRms(t.s, y, vh * dv, z, vh * dv, w, out, xs, rows, vh, dv, eps);
         try t.run("_gated_norm", .{ u(rows), u(vh), 1 }, &.{ p("Yr", "*bf16", y), p("Z", "*bf16", z), p("W", "*bf16", w), p("OUT", "*bf16", out), p("XS", "*fp32", xs), aot.float("eps", eps) }, &.{ ci("VH", vh), ci("DV", dv) });
     }
 
     /// glue.swiglu: silu(gate) * up in 1024-column blocks, and its group sums.
     pub fn swiglu(t: Tri, gate: u64, up: u64, out: u64, xs: u64, rows: usize, n: usize) !void {
+        if (use(t.g, .swiglu)) |g| return g.act.swiglu(t.s, gate, n, up, n, out, xs, rows, n);
         try t.run("_swiglu", .{ u(rows), cdiv(n, 1024), 1 }, &.{ p("GATE", "*bf16", gate), p("UP", "*bf16", up), p("OUT", "*bf16", out), p("XS", "*fp32", xs) }, &.{ ci("N", n), ci("BLOCK", 1024) });
     }
 
     /// glue.attn_prep: q (from the [q | gate] rows) and k normed, then rotated at each row's position.
     pub fn attnPrep(t: Tri, qg: u64, kv: u64, qn: u64, kn: u64, pos: u64, inv: u64, qout: u64, kout: u64, rows: usize, a: Attn, eps: f32) !void {
+        if (use(t.g, .attn_prep)) |g| {
+            const D: i64 = @intCast(a.dim);
+            const src: cuda.qk_rows.Src = .{ .q = qg, .q_ld = @as(i64, @intCast(a.heads)) * 2 * D, .q_hs = 2 * D, .k = kv, .k_ld = @as(i64, @intCast(a.kv_heads)) * D, .k_hs = D };
+            return g.qk.rowsFrom(t.s, src, .{ .h = a.heads, .hk = a.kv_heads, .dim = a.dim }, .{ .norms = qn, .norm_k = kn, .norms_bf16 = true, .inv = inv, .rot = 2 * a.half, .eps = eps }, pos, null, .{ .q = qout, .k = kout, .v = 0 }, rows);
+        }
         try t.run("_attn_prep", .{ u(rows), u(a.heads + a.kv_heads), 1 }, &.{ p("QG", "*bf16", qg), p("KV", "*bf16", kv), p("QN", "*bf16", qn), p("KN", "*bf16", kn), p("POS", "*i32", pos), p("INV", "*fp32", inv), p("QOUT", "*bf16", qout), p("KOUT", "*bf16", kout), aot.float("eps", eps) }, &.{
             ci("H", a.heads), ci("HKV", a.kv_heads), ci("D", a.dim), ci("HALF", a.half), ci("MROPE", 0), ci("ROWS", 0), ci("HSEC", 11), ci("WSEC", 10),
         });
@@ -83,28 +114,39 @@ pub const Tri = struct {
 
     /// glue.gate_mul: the attention output times sigmoid(gate) from the [q | gate] rows, and its group sums.
     pub fn gateMul(t: Tri, o: u64, qg: u64, out: u64, xs: u64, rows: usize, heads: usize, dim: usize) !void {
+        if (use(t.g, .gate_mul)) |g| return g.act.outputGate(t.s, o, qg + dim * 2, heads * 2 * dim, 2 * dim, out, xs, rows, heads, dim);
         try t.run("_gate_mul", .{ u(rows), u(heads), 1 }, &.{ p("O", "*bf16", o), p("QG", "*bf16", qg), p("OUT", "*bf16", out), p("XS", "*fp32", xs) }, &.{ ci("H", heads), ci("D", dim) });
     }
 
     /// qmm.group_sums: each row's 64-group input sums in fp32 (rows may be strided by `ld`).
     pub fn groupSums(t: Tri, x: u64, xs: u64, ld: usize, rows: usize, k: usize) !void {
+        if (use(t.g, .group_sums)) |g| return g.act.groupSums(t.s, x, ld, xs, rows, k);
         try t.run("_group_sums", .{ u(rows), cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("ldx", ld) }, &.{ ci("KG", k / 64), ci("GS", 64), ci("GB", 16) });
     }
 
     /// attention.from_packed's _paths: each row's root-to-row window rows and its depth.
     pub fn paths(t: Tri, parents: u64, out: u64, depths: u64, rows: usize) !void {
+        if (use(t.g, .paths)) |g| return g.tree.paths(t.s, parents, out, depths, rows);
         try t.run("_paths", .{ u(rows), 1, 1 }, &.{ p("PARENTS", "*i32", parents), p("PATHS", "*i32", out), p("DEPTHS", "*i32", depths) }, &.{ci("MAXD", max_nodes)});
     }
 
     /// The layout attention.attention reads: the plan's tables and the partial buffers it writes.
     pub const Plan = struct { streams: u64, items: u64, n_items: usize, rows: u64, paths: u64, depths: u64, width: usize };
-    pub const Partials = struct { o: u64, m: u64, l: u64 };
+    pub const Partials = struct { o: u64, m: u64, l: u64, bytes: usize = 0 };
 
     /// attention.attention: committed keys in 512-key chunks, the row's own path in its tail, merged in order.
     pub fn attention(t: Tri, q: u64, kn: u64, vn: u64, base: u64, offs: u64, plan: Plan, part: Partials, out: u64, a: Attn) !void {
         const g = a.heads / a.kv_heads;
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(a.dim), -0.5));
         const w = plan.width;
+        if (use(t.g, .attention)) |x| {
+            // tree_attention reads the plan's rows, stream table, offsets and paths as they are; its partials take
+            // the start of the partial buffers (sized for attention.slots, which is more)
+            const T = cuda.tree_attention.TreeAttention;
+            if (T.scratchBytes(w, a.kv_heads, x.ng, a.dim) > part.bytes) return error.TreeScratch;
+            const rows: cuda.tree_attention.Rows = .{ .row_stream = plan.rows, .streams = plan.streams, .offs = offs, .origin = base, .paths = plan.paths, .depths = plan.depths };
+            return x.tree.run(t.s, q, kn, vn, rows, T.scratch(part.o, w, a.kv_heads, x.ng, a.dim), out, w, a.heads, a.kv_heads, a.dim, x.ng, scale);
+        }
         if (plan.n_items > 0) try t.run("_shared", .{ u(plan.n_items * a.kv_heads), 1, 1 }, &.{
             p("Q", "*bf16", q),             p("KC", "*bf16", base),   p("VC", "*bf16", base),   p("OFF", "*i64", offs),   p("STREAM", "*i32", plan.streams),
             p("ITEMS", "*i32", plan.items), p("PO", "*fp32", part.o), p("PM", "*fp32", part.m), p("PL", "*fp32", part.l), int("W", w),

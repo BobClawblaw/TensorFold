@@ -7,6 +7,7 @@ const aot = cuda.aot;
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
+const glue_ = @import("glue.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const dl = @import("draft_load.zig");
@@ -241,6 +242,11 @@ pub const DFlash2 = struct {
         const l = x.w.layers[layer];
         const h: usize = if (with_q) dl.heads else 0;
         const stride = (h + 2 * dl.kv_heads) * D;
+        if (glue_.uses(x.t.g, .prep)) |g| {
+            // the angles from the positions rotary() uploaded (its cos/sin tables are [rows, D / 2], qk_rows' [pos, D])
+            const out: cuda.qk_rows.Out = .{ .q = if (with_q) q else 0, .k = k, .v = v, .q_ld = D, .q_hs = rows * D, .kv_ld = D, .kv_hs = rows * D };
+            return g.qk.rows(x.t.s, qkv, .{ .h = h, .hk = dl.kv_heads, .dim = D }, .{ .norms = l.q_norm, .norm_k = l.k_norm, .norms_bf16 = true, .inv = x.inv_freq, .rot = D, .eps = 1e-6 }, x.pos, null, out, rows);
+        }
         const p = aot.ptr;
         try x.t.set.run(x.t.s, "_prep_kernel", .{ @intCast(rows), @intCast(h + 2 * dl.kv_heads), 1 }, &.{
             p("QKV", "*bf16", qkv),                   p("QN", "*bf16", l.q_norm), p("KN", "*bf16", l.k_norm), p("COS", "*fp32", x.cos),     p("SIN", "*fp32", x.sin),
@@ -251,6 +257,7 @@ pub const DFlash2 = struct {
 
     /// dflash2._dconv: the two-tap dynamic conv of each `seg`-row block, plus a residual.
     fn dconv(x: *DFlash2, in: u64, dyn: u64, base: u64, branch: usize, res: ?u64, out: u64, rows: usize, seg: usize) !void {
+        if (glue_.uses(x.t.g, .dconv)) |g| return g.act.dconv(x.t.s, in, dyn, base, res, out, rows, H, dl.conv_group, branch, seg);
         const p = aot.ptr;
         try x.t.set.run(x.t.s, "_dconv_kernel", .{ @intCast(rows), (H + 1023) / 1024, 1 }, &.{
             p("X", "*bf16", in), p("DYN", "*bf16", dyn), p("BASE", "*bf16", base), p("RES", "*bf16", res orelse in), p("OUT", "*bf16", out), aot.int("SEG", @intCast(seg)),
@@ -352,7 +359,9 @@ pub const DFlash2 = struct {
             try x.prep(x.qkv, i, rows, true, x.q, x.k, x.v);
             const tb = x.table + i * per;
             const p = aot.ptr;
-            try x.t.set.run(x.t.s, "_block_attention", .{ @intCast(S), dl.kv_heads, 1 }, &.{
+            if (glue_.uses(x.t.g, .block_attention)) |g| {
+                try g.block.run(x.t.s, x.q, x.k, x.v, tb, tb + S * 16, x.attn, .{ .h = dl.heads, .hk = dl.kv_heads, .rows = rows, .block = L, .window = dl.window, .scale = scale });
+            } else try x.t.set.run(x.t.s, "_block_attention", .{ @intCast(S), dl.kv_heads, 1 }, &.{
                 p("Q", "*bf16", x.q),      p("KB", "*bf16", x.k),        p("VB", "*bf16", x.v),        p("TABLE", "*i64", tb), p("LENS", "*i32", tb + S * 16), p("O", "*bf16", x.attn),
                 aot.float("scale", scale), aot.int("window", dl.window), aot.int("R", @intCast(rows)),
             }, &.{ aot.ci("G", dl.heads / dl.kv_heads), aot.ci("HKV", dl.kv_heads), aot.ci("L", @intCast(L)), aot.ci("LP", @intCast(@max(16, std.math.ceilPowerOfTwo(usize, L) catch unreachable))), aot.ci("D", D), aot.ci("BN", 64), aot.ci("CAUSAL", 0) });

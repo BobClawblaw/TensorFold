@@ -84,6 +84,7 @@ pub const Engine = struct {
         e.s = try cuda.Stream.init(ctx.d, true);
         errdefer e.s.deinit();
         e.k = try kern.Kernels.load(gpa, io, ctx, kernels, g.linear_v_heads);
+        if (e.k.glue) |*x| x.ng = cuda.tree_attention.TreeAttention.groups(o.context + st.max_rows);
         errdefer e.k.deinit();
         e.w = try wts.load(gpa, io, e.ops(), dir, cfg);
         errdefer e.w.deinit();
@@ -106,7 +107,7 @@ pub const Engine = struct {
     }
 
     pub fn forward(e: *Engine) Forward {
-        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .set = &e.k.triton, .s = e.s }, .s = &e.scratch };
+        return .{ .gpa = e.gpa, .w = &e.w, .ops = e.ops(), .t = .{ .set = &e.k.triton, .s = e.s, .g = if (e.k.glue) |*g| g else null }, .s = &e.scratch };
     }
 
     /// A stream's state for `capacity` positions (its caches, recurrences and conv windows), empty.

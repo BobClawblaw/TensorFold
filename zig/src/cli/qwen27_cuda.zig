@@ -18,6 +18,8 @@ const usage =
     \\  capture_multi.py's drafted shared rounds: each round's windows and every reply against the capture's.
     \\       tf-qwen27-cuda kvcompare MODEL --kernels DIR --prompts prompts.json [--max-tokens N]
     \\  --kv-cache fp8 against bf16, teacher-forced on bf16's greedy reply: top-1 agreement and KL a token.
+    \\       tf-qwen27-cuda glue-diff --kernels DIR [--rows N]
+    \\  Each native glue kernel against the captured Triton kernel it replaces, on the same random rows.
     \\       tf-qwen27-cuda vision MODEL --fixtures DIR
     \\  The image tower on recorded 0.6.6 fixtures' patches: each image's rows against 0.6.6's (cosine, max error).
     \\
@@ -46,6 +48,8 @@ pub fn main(init: std.process.Init) !u8 {
     const drafting = args.len >= 2 and std.mem.eql(u8, args[1], "draft");
     const multi = args.len >= 2 and std.mem.eql(u8, args[1], "multi");
     const kvcompare = args.len >= 2 and std.mem.eql(u8, args[1], "kvcompare");
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "glue-diff") and std.mem.eql(u8, args[2], "--kernels"))
+        return @import("qwen27_glue_diff.zig").run(gpa, init.io, args[3], if (args.len >= 6 and std.mem.eql(u8, args[4], "--rows")) try std.fmt.parseInt(usize, args[5], 10) else 64);
     if (args.len >= 5 and std.mem.eql(u8, args[1], "vision") and std.mem.eql(u8, args[3], "--fixtures"))
         return checkVision(gpa, arena, init.io, args[2], args[4]);
     if (args.len < 3 or !(std.mem.eql(u8, args[1], "run") or windows or rounds or drafting or multi or kvcompare)) {
