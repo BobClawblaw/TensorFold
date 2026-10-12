@@ -58,15 +58,16 @@ extern "C" __global__ void tf_tree_paths(const int* __restrict__ parents, int* _
 }
 
 // Block (row, key head, group): keys k0 .. k1 of committed (cache) then path (kn, vn) keys; heads one mma tile.
-extern "C" __global__ void __launch_bounds__(128) tf_tree_part(
+// One absolute 2,048-key group gi of row r, key head kh: its fp32 partial at (r * hk + kh) * ng + gi.
+__device__ __forceinline__ void tree_group(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kn, const __nv_bfloat16* __restrict__ vn,
     const __nv_bfloat16* __restrict__ origin, const long long* __restrict__ offs, const int* __restrict__ row_stream,
     const int* __restrict__ streams, const int* __restrict__ paths, const int* __restrict__ depths,
-    float* __restrict__ po, float* __restrict__ pm, float* __restrict__ pl, int h, int hk, float scale) {
+    float* __restrict__ po, float* __restrict__ pm, float* __restrict__ pl, int h, int hk, float scale, int gi, int ng) {
     extern __shared__ uint4 smem[];
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, g8 = lane / 4, qd = lane % 4, mt = lane / 8;
     const int64_t r = blockIdx.x;
-    const int kh = blockIdx.y, gi = blockIdx.z, ng = gridDim.z, G = h / hk;
+    const int kh = blockIdx.y, G = h / hk;
     const int s = row_stream[r];
     const int p = streams[4 * s + 2], depth = depths[r];
     const int total = p + depth, k0 = gi * SPAN, k1 = min(total, k0 + SPAN);
@@ -231,6 +232,20 @@ extern "C" __global__ void __launch_bounds__(128) tf_tree_part(
         }
         po[(part * 16 + hd) * D + e] = acc;
         if (e == 0) pm[part * 16 + hd] = mm, pl[part * 16 + hd] = l;
+    }
+}
+
+// Block (row, key head, group slot): the row's groups slot, slot + slots, ... (a grid that never grows with context).
+extern "C" __global__ void __launch_bounds__(128) tf_tree_part(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kn, const __nv_bfloat16* __restrict__ vn,
+    const __nv_bfloat16* __restrict__ origin, const long long* __restrict__ offs, const int* __restrict__ row_stream,
+    const int* __restrict__ streams, const int* __restrict__ paths, const int* __restrict__ depths,
+    float* __restrict__ po, float* __restrict__ pm, float* __restrict__ pl, int h, int hk, float scale, int ng) {
+    const int64_t r = blockIdx.x;
+    const int total = streams[4 * row_stream[r] + 2] + depths[r];
+    for (int gi = blockIdx.z; gi < ng && gi * SPAN < total; gi += gridDim.z) {
+        tree_group(q, kn, vn, origin, offs, row_stream, streams, paths, depths, po, pm, pl, h, hk, scale, gi, ng);
+        __syncthreads(); // the next group's tiles reuse the partials' shared memory
     }
 }
 

@@ -175,5 +175,12 @@ pub fn run(gpu: check.Gpu) !void {
     for (only, 0..) |*r, i| r.* = widths[0] + i;
     const alone = try call(&x, s, &g, only, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
     try check.sameBytes("tree attention: one stream's rows alone", std.mem.sliceAsBytes(alone), std.mem.sliceAsBytes(got[widths[0] * h * D ..][0 .. widths[1] * h * D]));
-    check.pass("tree attention: committed keys and paths within float64 tolerance (worst {d:.3}), a stream's bits alone", .{worst});
+    // one block a (row, key head) striding over the groups, and a grid sized for a long context: the same bits
+    g.group_slots = 1;
+    const strided = try call(&x, s, &g, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, ng, scale);
+    try check.sameBytes("tree attention: one group slot", std.mem.sliceAsBytes(strided), std.mem.sliceAsBytes(got));
+    g.group_slots = 16;
+    const wide = try call(&x, s, &g, all, row_stream, parents, qs, kns, vns, h, hk, streams_dev, offs_dev, origin, 129, scale);
+    try check.sameBytes("tree attention: groups for a 262k context", std.mem.sliceAsBytes(wide), std.mem.sliceAsBytes(got));
+    check.pass("tree attention: committed keys and paths within float64 tolerance (worst {d:.3}), a stream's bits alone, any group slots", .{worst});
 }

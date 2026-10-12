@@ -25,6 +25,8 @@ pub const TreeAttention = struct {
     paths_fn: Function,
     part_fn: Function,
     merge_fn: Function,
+    /// Blocks a (row, key head) at most; each takes every `group_slots`-th group (bits do not depend on it).
+    group_slots: usize = 16,
 
     pub fn load(d: *const Driver) !TreeAttention {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -72,7 +74,9 @@ pub const TreeAttention = struct {
         a.add(@as(i32, @intCast(h)));
         a.add(@as(i32, @intCast(hk)));
         a.add(scale);
-        try launch_.launch(g.part_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(ng) }, .block = .{ .x = 128 }, .shared = part_smem }, s, &a);
+        a.add(@as(i32, @intCast(ng)));
+        const slots = @max(1, @min(ng, g.group_slots));
+        try launch_.launch(g.part_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(hk), .z = @intCast(slots) }, .block = .{ .x = 128 }, .shared = part_smem }, s, &a);
         var b: launch_.Args = .{};
         for ([_]u64{ sc.o, sc.m, sc.l, rows.row_stream, rows.streams, rows.depths, out }) |v| b.add(v);
         b.add(@as(i32, @intCast(h)));
