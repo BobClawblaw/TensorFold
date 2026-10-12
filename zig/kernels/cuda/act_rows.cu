@@ -27,7 +27,7 @@ __device__ __forceinline__ uint4 pack8(const float* f) {
     return u;
 }
 
-__device__ __forceinline__ float sigmoid(float x) { return __fdiv_rn(1.f, __fadd_rn(1.f, expf(-x))); }
+__device__ __forceinline__ float sigmoid(float x) { return __fdividef(1.f, __fadd_rn(1.f, __expf(-x))); }
 
 // A thread's 8 stored values in order, then the group's 8 lanes in a fixed tree (every lane of the warp calls).
 __device__ __forceinline__ float group_sum8(const uint4& packed, bool live) {
@@ -40,6 +40,26 @@ __device__ __forceinline__ float group_sum8(const uint4& packed, bool live) {
     s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 4));
     s = __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 2));
     return __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 1));
+}
+
+// Triton's order where a thread of its holds 4 values (gate_mul, gated_norm): each half's 4 in order, then the 16
+// half-lanes from the widest offset (lane xor 4, 2, 1 for both halves, then the two halves).
+__device__ __forceinline__ float group_sum4x2(const uint4& packed, bool live) {
+    float f[8];
+    unpack8(packed, f);
+    float a = 0.f, b = 0.f;
+    if (live) {
+        a = f[0];
+        b = f[4];
+#pragma unroll
+        for (int i = 1; i < 4; ++i) a = __fadd_rn(a, f[i]), b = __fadd_rn(b, f[4 + i]);
+    }
+#pragma unroll
+    for (int m = 4; m > 0; m >>= 1) {
+        a = __fadd_rn(a, __shfl_xor_sync(0xFFFFFFFFu, a, m));
+        b = __fadd_rn(b, __shfl_xor_sync(0xFFFFFFFFu, b, m));
+    }
+    return __fadd_rn(a, b);
 }
 
 }  // namespace tf_act
@@ -89,7 +109,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_gate_rows(const __nv_bfloat1
     const uint4 yp = pack8(y);
     if (live) *reinterpret_cast<uint4*>(out + r * n + 8 * c) = yp;
     if (xs != nullptr) {
-        const float s = group_sum8(yp, live);
+        const float s = group_sum4x2(yp, live);
         if (live && (c & 7) == 0) xs[r * (n / 64) + c / 8] = s;
     }
 }

@@ -350,6 +350,26 @@ __device__ __forceinline__ float group_sum8(const uint4& packed, bool live) {
     return __fadd_rn(s, __shfl_xor_sync(0xFFFFFFFFu, s, 1));
 }
 
+// Triton's order where a thread of its holds 4 values (gate_mul, gated_norm): each half's 4 in order, then the 16
+// half-lanes from the widest offset (lane xor 4, 2, 1 for both halves, then the two halves).
+__device__ __forceinline__ float group_sum4x2(const uint4& packed, bool live) {
+    float f[8];
+    unpack8(packed, f);
+    float a = 0.f, b = 0.f;
+    if (live) {
+        a = f[0];
+        b = f[4];
+#pragma unroll
+        for (int i = 1; i < 4; ++i) a = __fadd_rn(a, f[i]), b = __fadd_rn(b, f[4 + i]);
+    }
+#pragma unroll
+    for (int m = 4; m > 0; m >>= 1) {
+        a = __fadd_rn(a, __shfl_xor_sync(0xFFFFFFFFu, a, m));
+        b = __fadd_rn(b, __shfl_xor_sync(0xFFFFFFFFu, b, m));
+    }
+    return __fadd_rn(a, b);
+}
+
 // h = bf16(x + r) (r null: h = x), y = bf16(rms(h) * w), xs y's 64-value sums; width % 64, 16-byte loads.
 template <typename WT>
 __device__ __forceinline__ void add_rms_h(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ r,
@@ -442,14 +462,14 @@ __device__ __forceinline__ void gated_rms(const __nv_bfloat16* __restrict__ y, l
     float o[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const float sg = __fdiv_rn(1.f, __fadd_rn(1.f, expf(-zv[i])));
+        const float sg = __fdividef(1.f, __fadd_rn(1.f, __expf(-zv[i])));
         o[i] = __fmul_rn(__fmul_rn(zv[i], sg), __fmul_rn(__fmul_rn(yv[i], inv), wv[i]));
     }
     const uint4 op = pack8(o);
     const int64_t at = (r * heads + hd) * DV + 8 * sub;
     if (live) *reinterpret_cast<uint4*>(out + at) = op;
     if (xs != nullptr) {
-        const float s = group_sum8(op, live);
+        const float s = group_sum4x2(op, live);
         if (live && (sub & 7) == 0) xs[at / 64] = s;
     }
 }

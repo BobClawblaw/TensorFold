@@ -30,7 +30,7 @@ struct Io {
     float* beta;                // [rows, vh]
 };
 
-__device__ __forceinline__ float sigmoid(float x) { return __fdiv_rn(1.f, __fadd_rn(1.f, expf(-x))); }
+__device__ __forceinline__ float sigmoid(float x) { return __fdividef(1.f, __fadd_rn(1.f, __expf(-x))); }
 
 template <int J>
 __device__ __forceinline__ void prep(const Io& io, int c, int kh, int vh, int keep, float eps) {
@@ -76,8 +76,8 @@ __device__ __forceinline__ void prep(const Io& io, int c, int kh, int vh, int ke
     for (int i = 0; i < J; ++i) io.v[(r * vh + hv) * DK + J * lane + i] = __float2bfloat16_rn(cv[i]);
     if (lane == 0) {
         const float x = __fadd_rn(__bfloat162float(io.a[r * io.a_ld + hv]), io.dt_bias[hv]);
-        const float sp = x > 20.f ? x : log1pf(expf(x));
-        io.g[r * vh + hv] = expf(-__fmul_rn(expf(io.a_log[hv]), sp));
+        const float sp = x > 20.f ? x : logf(__fadd_rn(1.f, __expf(x)));
+        io.g[r * vh + hv] = __expf(__fmul_rn(-__expf(io.a_log[hv]), sp));
         io.beta[r * vh + hv] = sigmoid(__bfloat162float(io.b[r * io.b_ld + hv]));
     }
 }
