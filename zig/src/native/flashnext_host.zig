@@ -502,10 +502,12 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
 fn holdResident(h: *Host) !void {
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
-    try list.appendSlice(h.gpa, h.eng.r.held.items);
-    if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
+    const weights = @import("resident.zig").weightsOnly(); // FLASHNEXT_RESIDENCY=weights: the tensors alone
+    try list.appendSlice(h.gpa, if (weights) h.eng.r.weights.items else h.eng.r.held.items);
+    if (!weights) if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
     h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, list.items, true);
     h.warm = (&h.resident.?).target();
+    std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident between requests", .{ list.items.len, @as(f64, @floatFromInt(h.resident.?.set.allocatedSize())) / (1 << 30) });
 }
 
 fn follow(eng: *fx.Engine) void {

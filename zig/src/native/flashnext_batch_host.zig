@@ -9,7 +9,8 @@ const Session = tf.flashnext_session.Session;
 const fx = tf.flashnext_engine;
 const fit = @import("cache_fit.zig");
 const vh = @import("flashnext_vision_host.zig");
-const Resident = @import("resident.zig").Resident;
+const resident = @import("resident.zig");
+const Resident = resident.Resident;
 
 const Host = struct {
     gpa: std.mem.Allocator,
@@ -45,15 +46,23 @@ fn learnedStates(gpa: std.mem.Allocator, eng: *fx.Engine, root: []const u8, cap:
 fn holdResident(h: *Host) !void {
     var list: std.ArrayList(mtl.Buffer) = .empty;
     defer list.deinit(h.gpa);
+    if (resident.weightsOnly()) { // FLASHNEXT_RESIDENCY=weights: the checkpoint's tensors alone, the working buffers left to macOS
+        try list.appendSlice(h.gpa, h.eng.r.weights.items);
+        return holdList(h, list.items);
+    }
     try list.appendSlice(h.gpa, h.eng.r.held.items);
     // FLASHNEXT_RESIDENCY_SESSIONS=0: the extra sessions' caches stay out (a 196 GiB set slowed the GPU-side rounds 3x)
     const sessions = if (std.c.getenv("FLASHNEXT_RESIDENCY_SESSIONS")) |v| v[0] != '0' else true;
     if (sessions) for (h.back.sessions) |s| try list.appendSlice(h.gpa, s.owned.items);
     try list.append(h.gpa, h.back.hidden.b);
     if (h.vision) |v| try list.appendSlice(h.gpa, &v.tower.buffers());
-    h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, list.items, true);
+    return holdList(h, list.items);
+}
+
+fn holdList(h: *Host, buffers: []const mtl.Buffer) !void {
+    h.resident = try Resident.initTicked(h.eng.r.device, h.eng.r.queue, buffers, true);
     h.warm = (&h.resident.?).target();
-    std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident between requests", .{ list.items.len, fit.gibs(h.resident.?.set.allocatedSize()) });
+    std.log.info("flash next: {d} buffers ({d:.1} GiB) held resident between requests", .{ buffers.len, fit.gibs(h.resident.?.set.allocatedSize()) });
 }
 
 /// What the sessions may take the server to: 70% of RAM, or FLASHNEXT_LOAD_LIMIT_GB (GB, as GLM_LOAD_LIMIT_GB) up to the

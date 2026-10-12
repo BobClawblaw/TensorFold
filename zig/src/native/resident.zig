@@ -47,3 +47,9 @@ pub const Resident = struct {
         if (r.scratch) |b| b.deinit();
     }
 };
+
+/// FLASHNEXT_RESIDENCY=weights: a Flash Next host's set holds the checkpoint's tensors only, not its working buffers.
+pub fn weightsOnly() bool {
+    const v = std.c.getenv("FLASHNEXT_RESIDENCY") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "weights");
+}
