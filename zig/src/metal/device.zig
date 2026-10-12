@@ -38,13 +38,15 @@ pub const Buffer = struct {
     }
 };
 
-/// FLASHNEXT_RESIDENCY=all: every live buffer, from the first, so a host's residency set can hold the whole footprint
-/// and each later buffer joins it as made (rounds that touched both held and unheld memory ran up to 3x slower).
+/// FLASHNEXT_RESIDENCY=all: every live buffer, from the first, so a host's residency set holds the whole footprint.
+/// Later buffers join and freed ones leave the set staged; `flush` commits them while no request runs (a commit per
+/// buffer mid-request stalled a reply at 5 tok/s; a set that misses buffers made some rounds up to 3x slower).
 pub const registry = struct {
     var lock: std.atomic.Value(bool) = .init(false);
     var on: ?bool = null;
     var live: std.AutoArrayHashMapUnmanaged(Id, void) = .empty;
     var set: ?residency.ResidencySet = null;
+    var dirty = false; // staged adds and removes the set has not committed
 
     fn enabled() bool {
         if (on == null) on = if (std.c.getenv("FLASHNEXT_RESIDENCY")) |v| std.mem.eql(u8, std.mem.span(v), "all") else false;
@@ -64,9 +66,9 @@ pub const registry = struct {
         acquire();
         defer release();
         live.put(std.heap.c_allocator, b.id, {}) catch {}; // a miss only leaves this buffer to macOS
-        if (set) |s| { // no requestResidency: it walks the whole set (a 5 tok/s reply while the prompt cache allocated)
+        if (set) |s| {
             s.add(b);
-            s.commit();
+            dirty = true;
         }
     }
 
@@ -77,8 +79,19 @@ pub const registry = struct {
         if (!live.swapRemove(b.id)) return;
         if (set) |s| {
             s.remove(b);
-            s.commit();
+            dirty = true;
         }
+    }
+
+    /// Commit the adds and removes staged since the last flush; the idle keepalive calls it between requests.
+    pub fn flush() void {
+        if (!enabled()) return;
+        acquire();
+        defer release();
+        const s = set orelse return;
+        if (!dirty) return;
+        s.commit();
+        dirty = false;
     }
 
     /// Whether FLASHNEXT_RESIDENCY=all asks for the registry.

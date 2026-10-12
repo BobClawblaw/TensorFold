@@ -13,6 +13,7 @@ pub const Target = struct {
     /// The core ticker's tick: one command buffer that touches every set and commits.
     pub fn tick(ctx: *anyopaque) void {
         const t: *Target = @ptrCast(@alignCast(ctx));
+        @import("device.zig").registry.flush(); // buffers made or freed by the last request: the set again whole
         const pool = @import("objc.zig").Pool.push();
         defer pool.pop();
         const cmd = t.queue.commandBuffer();
