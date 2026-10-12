@@ -261,6 +261,41 @@ fn embed(r: *Rig, d: usize) !void {
     }
 }
 
+fn dconv(r: *Rig, g: *const cuda.act_rows.ActRows, d: usize, gs: usize, seg: usize, branch: usize, residual: bool) !void {
+    const x = r.bfs(most * d, 1);
+    const dyn = r.bfs(most * 4 * (d / gs), 0.3);
+    const base = r.bfs(4 * d, 0.7);
+    const res = r.bfs(most * d, 1);
+    const dx = try r.dev(std.mem.sliceAsBytes(x));
+    const ddyn = try r.dev(std.mem.sliceAsBytes(dyn));
+    const dbase = try r.dev(std.mem.sliceAsBytes(base));
+    const dres = try r.dev(std.mem.sliceAsBytes(res));
+    var os: [counts.len]u64 = undefined;
+    for (counts, 0..) |m, c| {
+        os[c] = try r.out(m * d * 2);
+        try g.dconv(r.s, dx, ddyn, dbase, if (residual) dres else null, os[c], m, d, gs, branch, seg);
+    }
+    var name: [64]u8 = undefined;
+    const label = try std.fmt.bufPrint(&name, "dconv d {d} gs {d} seg {d} branch {d}{s}", .{ d, gs, seg, branch, if (residual) " +res" else "" });
+    const got = try r.back(u16, os[counts.len - 1], most * d);
+    const half = std.math.pow(f64, 2, -8);
+    for (0..most) |row| for (0..d) |i| {
+        const grp = i / gs;
+        const k0 = bf(bf16(@as(f32, @floatCast(bf(base[(branch * 2) * d + i]))) + @as(f32, @floatCast(bf(dyn[((row * 2 + branch) * 2) * (d / gs) + grp])))));
+        const k1 = bf(bf16(@as(f32, @floatCast(bf(base[(branch * 2 + 1) * d + i]))) + @as(f32, @floatCast(bf(dyn[((row * 2 + branch) * 2 + 1) * (d / gs) + grp])))));
+        const xv = bf(x[row * d + i]);
+        const pv = if (row % seg > 0) bf(x[(row - 1) * d + i]) else 0;
+        const y = aref.dconv(xv, pv, k0, k1);
+        const yt = (@abs(xv * k0) + @abs(pv * k1)) * std.math.pow(f64, 2, -22);
+        if (residual) {
+            const rv = bf(res[row * d + i]);
+            try r.within(label, bf(got[row * d + i]), rv + y, @abs(rv + y) * half + @abs(y) * half + yt + 1e-30);
+        } else try r.within(label, bf(got[row * d + i]), y, @abs(y) * half + yt + 1e-30);
+    };
+    for (counts[0 .. counts.len - 1], 0..) |m, c|
+        try check.sameBytes(label, std.mem.sliceAsBytes(try r.back(u16, os[c], m * d)), std.mem.sliceAsBytes(got[0 .. m * d]));
+}
+
 pub fn run(gpu: check.Gpu) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
     defer arena.deinit();
@@ -288,5 +323,8 @@ pub fn run(gpu: check.Gpu) !void {
     try groupSums(&r, &g, 5120);
     try embed(&r, 5120); // the 27B's hidden
     try embed(&r, 192);
-    check.pass("act rows: add_rms_h, gated rms, swiglu, output gate, embed rows within float64 tolerance (worst {d:.3}), group sums of the stored outputs, every row count's bits equal", .{r.worst});
+    try dconv(&r, &g, 5120, 16, 16, 0, false); // DFlash2's block conv (groups of 16)
+    try dconv(&r, &g, 5120, 16, 16, 1, true);
+    try dconv(&r, &g, 256, 64, 7, 0, true);
+    check.pass("act rows: add_rms_h, gated rms, swiglu, output gate, embed rows, dconv within float64 tolerance (worst {d:.3}), group sums of the stored outputs, every row count's bits equal", .{r.worst});
 }

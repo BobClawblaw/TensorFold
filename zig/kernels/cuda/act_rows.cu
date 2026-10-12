@@ -104,3 +104,39 @@ extern "C" __global__ void __launch_bounds__(NT) tf_group_sums_rows(const __nv_b
     const float s = group_sum8(v, live);
     if (live && (c & 7) == 0) xs[r * (k / 64) + c / 8] = s;
 }
+
+// DFlash2's two-tap conv: out = bf16(x k0 + x[r - 1] k1) [+ res], no r - 1 at a seg block's start, k = bf16(b + dyn).
+extern "C" __global__ void __launch_bounds__(NT) tf_dconv_rows(const __nv_bfloat16* __restrict__ x,
+                                                               const __nv_bfloat16* __restrict__ dyn,
+                                                               const __nv_bfloat16* __restrict__ base,
+                                                               const __nv_bfloat16* __restrict__ res,
+                                                               __nv_bfloat16* __restrict__ out, int d, int gs, int branch,
+                                                               int seg) {
+    const int64_t r = blockIdx.x;
+    const int c = blockIdx.y * NT + threadIdx.x;
+    if (8 * c >= d) return;
+    const int g = d / gs, grp = 8 * c / gs;
+    float xv[8], pv[8], b0[8], b1[8], y[8];
+    unpack8(*reinterpret_cast<const uint4*>(x + r * d + 8 * c), xv);
+    if (r % seg > 0) unpack8(*reinterpret_cast<const uint4*>(x + (r - 1) * d + 8 * c), pv);
+    else
+#pragma unroll
+        for (int i = 0; i < 8; ++i) pv[i] = 0.f;
+    unpack8(*reinterpret_cast<const uint4*>(base + (int64_t)(branch * 2) * d + 8 * c), b0);
+    unpack8(*reinterpret_cast<const uint4*>(base + (int64_t)(branch * 2 + 1) * d + 8 * c), b1);
+    const float d0 = __bfloat162float(dyn[((r * 2 + branch) * 2) * g + grp]);
+    const float d1 = __bfloat162float(dyn[((r * 2 + branch) * 2 + 1) * g + grp]);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float k0 = __bfloat162float(__float2bfloat16_rn(__fadd_rn(b0[i], d0)));
+        const float k1 = __bfloat162float(__float2bfloat16_rn(__fadd_rn(b1[i], d1)));
+        y[i] = __fmaf_rn(pv[i], k1, __fmul_rn(xv[i], k0));
+    }
+    if (res != nullptr) {
+        float rv[8];
+        unpack8(*reinterpret_cast<const uint4*>(res + r * d + 8 * c), rv);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) y[i] = __fadd_rn(rv[i], __bfloat162float(__float2bfloat16_rn(y[i])));
+    }
+    *reinterpret_cast<uint4*>(out + r * d + 8 * c) = pack8(y);
+}

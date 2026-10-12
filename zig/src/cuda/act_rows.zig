@@ -27,12 +27,13 @@ pub const ActRows = struct {
     swiglu_fn: Function,
     gate_fn: Function,
     sums_fn: Function,
+    dconv_fn: Function,
 
     pub fn load(d: *const Driver) !ActRows {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var mod = try Module.load(d, kernels.act_rows);
         errdefer mod.unload();
-        return .{ .mod = mod, .swiglu_fn = try mod.function("tf_swiglu_rows"), .gate_fn = try mod.function("tf_gate_rows"), .sums_fn = try mod.function("tf_group_sums_rows") };
+        return .{ .mod = mod, .swiglu_fn = try mod.function("tf_swiglu_rows"), .gate_fn = try mod.function("tf_gate_rows"), .sums_fn = try mod.function("tf_group_sums_rows"), .dconv_fn = try mod.function("tf_dconv_rows") };
     }
 
     pub fn unload(g: *ActRows) void {
@@ -80,5 +81,15 @@ pub const ActRows = struct {
         a.add(xs);
         a.add(@as(i32, @intCast(k)));
         try launch_.launch(g.sums_fn, .{ .grid = grid(rows, k), .block = .{ .x = threads } }, s, &a);
+    }
+
+    /// DFlash2's two-tap conv over [rows, d] bf16: dyn [rows, 2, 2, d / gs], base [2, 2, d]; res (or null) added.
+    pub fn dconv(g: *const ActRows, s: Stream, x: u64, dyn: u64, base: u64, res: ?u64, out: u64, rows: usize, d: usize, gs: usize, branch: usize, seg: usize) !void {
+        if (d % 8 != 0 or gs % 8 != 0 or d % gs != 0 or branch > 1 or seg == 0 or !aligned(&.{ x, base, res orelse 0, out }, &.{})) return error.RowShape;
+        if (rows == 0) return;
+        var a: launch_.Args = .{};
+        for ([_]u64{ x, dyn, base, res orelse 0, out }) |v| a.add(v);
+        for ([_]usize{ d, gs, branch, seg }) |v| a.add(@as(i32, @intCast(v)));
+        try launch_.launch(g.dconv_fn, .{ .grid = grid(rows, d), .block = .{ .x = threads } }, s, &a);
     }
 };
