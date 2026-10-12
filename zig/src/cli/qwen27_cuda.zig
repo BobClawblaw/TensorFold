@@ -19,7 +19,7 @@ const usage =
     \\       tf-qwen27-cuda kvcompare MODEL --kernels DIR --prompts prompts.json [--max-tokens N]
     \\  --kv-cache fp8 against bf16, teacher-forced on bf16's greedy reply: top-1 agreement and KL a token.
     \\       tf-qwen27-cuda vision MODEL --fixtures DIR
-    \\  The image tower on qwen_vision_fixtures.py's patches: each image's rows against 0.6.6's (cosine, max error).
+    \\  The image tower on recorded 0.6.6 fixtures' patches: each image's rows against 0.6.6's (cosine, max error).
     \\
 ;
 
@@ -547,7 +547,8 @@ fn runMulti(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, e: *qwen.E
     return if (bad == 0 and round == want_rounds.len) 0 else 1;
 }
 
-/// The tower against qwen_vision_fixtures.py's manifest: per image, the features' row cosines and largest error.
+/// The tower against a manifest recorded from 0.6.6 outside the tree (qwen_vision_fixtures.py): per image, the
+/// features' row cosines and largest error.
 fn checkVision(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, model: []const u8, dir: []const u8) !u8 {
     const V = qwen.vision;
     const manifest = try readJson(arena, io, try std.fs.path.join(arena, &.{ dir, "manifest.json" }));
