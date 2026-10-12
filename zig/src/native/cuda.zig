@@ -13,13 +13,12 @@ const Pool = budget.Pool;
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{ nemotron.native, qwen27.native };
 
-/// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
-const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
-    .bytes = nemotron.native.snap_bytes,
-    .save = nemotron.native.snap_save,
-    .restore = nemotron.native.snap_restore,
-    .drop = nemotron.native.snap_drop,
-};
+/// A family's prompt-cache copies. A comptime value per family, so the store's pointer stays valid for the process.
+fn Snaps(comptime F: type) type {
+    return struct {
+        const vtable: api.prompt_cache.Snapshots.VTable = .{ .bytes = F.snap_bytes, .save = F.snap_save, .restore = F.snap_restore, .drop = F.snap_drop };
+    };
+}
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
@@ -466,19 +465,22 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
-    // prompt-cache snapshots are Nemotron's (cuda_reuse.zig); a family without them serves without a cache
-    const cache = if (@hasDecl(F, "snap_bytes")) budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free)) else 0;
+    // a family with prompt-cache snapshots keeps them in device room (Nemotron) or in pinned host memory (the 27B, whose
+    // long window leaves the device none); a family without them serves without a cache
+    const cache = if (!@hasDecl(F, "snap_bytes")) 0 else if (@hasDecl(F, "snap_host")) hostCacheBytes(a, io, o.prompt_cache_gib) else budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window{s}, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
-        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else if (vision_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for the image tower's calls", .{toGib(vision_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, if (o.kv8) " (fp8 caches)" else "", toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
-        if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+        capability,                                                                                                                                                                      device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else if (vision_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for the image tower's calls", .{toGib(vision_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, if (o.kv8) " (fp8 caches)" else "", toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+        if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache{s}", .{ toGib(cache), if (@hasDecl(F, "snap_host")) " in host memory" else "" }) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
     if (@hasDecl(F, "snap_bytes") and cache > 0) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
         // states kept and resumed on the family's grid, where a cache-off pass cuts; the head reads one token on
-        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{ .lookahead = 1, .planned = true, .grid = F.prompt_rows }, cache);
+        // Nemotron's head reads one token on (lookahead 1); the 27B's states end where its prompt pass stands
+        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &Snaps(F).vtable }, .{ .lookahead = if (@hasDecl(F, "snap_lookahead")) F.snap_lookahead else 1, .planned = true, .grid = F.prompt_rows }, cache);
         h.store = store;
+        if (@hasDecl(F, "useCache")) F.useCache(loaded.ctx);
     }
     errdefer if (h.store) |store| {
         store.deinit();
@@ -520,6 +522,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null, .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// A host-memory prompt cache: --prompt-cache-gib, else 8 GiB, at most half the host's available memory.
+fn hostCacheBytes(a: Allocator, io: std.Io, asked: ?f64) u64 {
+    const want: u64 = if (asked) |g| (if (g > 0) std.math.lossyCast(u64, g * gib) else 0) else 8 << 30;
+    const text = procText(a, io, "/proc/meminfo") orelse return 0;
+    const m = budget.meminfo(text) orelse return 0;
+    return @min(want, m.available / 2);
 }
 
 fn toGib(bytes: u64) f64 {

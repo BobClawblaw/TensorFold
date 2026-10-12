@@ -8,7 +8,8 @@ const tree = @import("tree.zig");
 const kern = @import("kernels.zig");
 const dr = @import("draft.zig");
 const dl = @import("draft_load.zig");
-const Engine = @import("engine.zig").Engine;
+const eng = @import("engine.zig");
+const Engine = eng.Engine;
 const Forward = @import("forward.zig").Forward;
 const Part = @import("forward.zig").Part;
 const Lanes = @import("lanes.zig").Cuda;
@@ -77,7 +78,14 @@ pub fn prefill(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, promp
 
 /// prefill with an image prompt's rows and positions (null: text); its decode offset stays on the stream.
 pub fn prefillMedia(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32, media: ?*const @import("vision.zig").Media) !void {
-    try seq.reset(e.ops(), e.w.g);
+    return prefillFrom(e, seq, ctx, d, prompt, 0, media, null);
+}
+
+/// prefillMedia from `from` (0, or the grid point a kept state was restored at), keeping states at `keep`'s marks. A
+/// resumed pass's context holds only the rows it read: drafts change no token, so a reply is the same either way.
+pub fn prefillFrom(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32, from: usize, media: ?*const @import("vision.zig").Media, keep: ?eng.Keep) !void {
+    if (prompt.len >= seq.capacity) return error.PromptTooLong;
+    if (from == 0) try seq.reset(e.ops(), e.w.g) else if (from != seq.pos or !eng.resumable(from, prompt.len)) return error.BadReuse;
     seq.media = media;
     defer seq.media = null;
     defer if (media) |m| {
@@ -85,15 +93,14 @@ pub fn prefillMedia(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, 
     };
     ctx.len = 0;
     ctx.end = 0;
-    const tap_from = prompt.len -| dl.window;
+    const tap_from = @max(from, prompt.len -| dl.window);
     ctx.skip(tap_from);
     var f = e.forward();
     f.taps = e.scratch.taps;
-    const rows = @import("engine.zig").prompt_rows;
-    const chunks = (prompt.len + rows - 1) / rows;
-    for (0..chunks) |j| {
-        const b = @import("engine.zig").chunkBounds(0, prompt.len, rows, j);
-        try f.chunk(prompt[b[0]..b[1]], seq, j == chunks - 1);
+    var it = eng.Chunks.init(prompt.len, from, e.grid);
+    while (it.next()) |b| {
+        try f.chunk(prompt[b[0]..b[1]], seq, b[1] == prompt.len);
+        eng.Keep.after(keep, b[1]);
         if (b[1] <= tap_from) continue;
         const skip = tap_from -| b[0];
         try d.absorb(ctx, e.scratch.taps + skip * taps_width * bf, b[1] - b[0] - skip);

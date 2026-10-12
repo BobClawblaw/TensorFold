@@ -126,13 +126,13 @@ pub const Tri = struct {
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(a.dim), -0.5));
         const w = plan.width;
         if (plan.n_items > 0) try t.run("_shared8", .{ u(plan.n_items * a.kv_heads), 1, 1 }, &.{
-            p("Q", "*bf16", q),            p("KC", "*fp8e4nv", base),      p("VC", "*fp8e4nv", base), p("KS", "*fp32", base),   p("VS", "*fp32", base),   p("OFF", "*i64", offs),
+            p("Q", "*bf16", q),                p("KC", "*fp8e4nv", base),      p("VC", "*fp8e4nv", base), p("KS", "*fp32", base),   p("VS", "*fp32", base),   p("OFF", "*i64", offs),
             p("STREAM", "*i32", plan.streams), p("ITEMS", "*i32", plan.items), p("PO", "*fp32", part.o),  p("PM", "*fp32", part.m), p("PL", "*fp32", part.l), int("W", w),
         }, &.{ ci("H", a.heads), ci("HK", a.kv_heads), ci("D", a.dim), ci("G", g), ci("CH", chunk), aot.cf("SCALE", scale), ci("GR", group_chunks) });
         const tails = 1 + (max_nodes + chunk - 1) / chunk;
         try t.run("_tail8", .{ u(w), u(a.kv_heads), u(tails) }, &.{
-            p("Q", "*bf16", q),           p("KN", "*bf16", kn),           p("VN", "*bf16", vn),             p("KC", "*fp8e4nv", base), p("VC", "*fp8e4nv", base), p("KS", "*fp32", base), p("VS", "*fp32", base), p("OFF", "*i64", offs),
-            p("STREAM", "*i32", plan.streams), p("ROWS", "*i32", plan.rows), p("PATHS", "*i32", plan.paths), p("DEPTHS", "*i32", plan.depths), p("PO", "*fp32", part.o), p("PM", "*fp32", part.m), p("PL", "*fp32", part.l), int("W", w),
+            p("Q", "*bf16", q),                p("KN", "*bf16", kn),         p("VN", "*bf16", vn),           p("KC", "*fp8e4nv", base),        p("VC", "*fp8e4nv", base), p("KS", "*fp32", base),   p("VS", "*fp32", base),   p("OFF", "*i64", offs),
+            p("STREAM", "*i32", plan.streams), p("ROWS", "*i32", plan.rows), p("PATHS", "*i32", plan.paths), p("DEPTHS", "*i32", plan.depths), p("PO", "*fp32", part.o),  p("PM", "*fp32", part.m), p("PL", "*fp32", part.l), int("W", w),
         }, &.{ ci("H", a.heads), ci("HK", a.kv_heads), ci("D", a.dim), ci("G", g), ci("CH", chunk), ci("MAXD", max_nodes), aot.cf("SCALE", scale), ci("GR", group_chunks) });
         try t.run("_merge", .{ u(w), u(a.kv_heads), u(a.dim / merge_columns) }, &.{
             p("PO", "*fp32", part.o), p("PM", "*fp32", part.m), p("PL", "*fp32", part.l), p("OUT", "*bf16", out), p("STREAM", "*i32", plan.streams), p("ROWS", "*i32", plan.rows), int("W", w),

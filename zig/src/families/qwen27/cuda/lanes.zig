@@ -7,7 +7,9 @@ const st = @import("state.zig");
 const Engine = @import("engine.zig").Engine;
 const Part = @import("forward.zig").Part;
 const Forward = @import("forward.zig").Forward;
-const prompt_rows = @import("engine.zig").prompt_rows;
+const eng = @import("engine.zig");
+const prompt_rows = eng.prompt_rows;
+const reuse = @import("reuse.zig");
 const dl = @import("draft_load.zig");
 const dr = @import("draft.zig");
 const drafts = @import("drafts.zig");
@@ -228,7 +230,8 @@ pub const Cuda = struct {
         try x.prefillOpened(s, seq);
     }
 
-    /// prefill_state into an opened stream: the prompt in chunks, a drafting stream's last window of taps absorbed.
+    /// prefill_state into an opened stream: the prompt in chunks, a drafting stream's last window of taps absorbed. A
+    /// kept state the lane host found is restored first, and the pass stops at its marks for the cache to copy.
     fn prefillOpened(x: *Cuda, s: *lanes.Stream, seq: *st.Seq) !void {
         // an image prompt: the tower's rows and the prompt's three positions for its pass (EncodedVision)
         const media: ?*vision.Media = if (s.images.len == 0) null else blk: {
@@ -237,11 +240,36 @@ pub const Cuda = struct {
             break :blk try vision.Media.init(x.gpa, tower, gpu, s.prompt(), s.images, prompt_rows);
         };
         defer if (media) |m| m.deinit();
+        const from = x.restoreKept(s, seq, media != null);
+        // an image prompt keeps nothing: its rows' positions are the tower's, not the tokens'
+        const marks: ?eng.Keep = if (s.reuse.marks.len == 0 or media != null) null else .{ .at = s.reuse.marks, .ctx = s, .call = keptAt };
         if (x.drafter) |d| if (s.drafts) {
             const ds = try x.draftingOf(s);
-            return lone.prefillMedia(x.e, seq, &ds.ctx, d, s.prompt(), media);
+            return lone.prefillFrom(x.e, seq, &ds.ctx, d, s.prompt(), from, media, marks);
         };
-        try x.e.prefillMedia(seq, s.prompt(), media);
+        try x.e.prefillFrom(seq, s.prompt(), from, media, marks);
+    }
+
+    /// The stream's kept state restored on its sequence: where its prompt pass starts (0: none, off the grid, failed).
+    fn restoreKept(x: *Cuda, s: *lanes.Stream, seq: *st.Seq, image: bool) usize {
+        s.cached = 0;
+        const saved = s.reuse.saved orelse return 0;
+        if (image or !x.e.grid or !eng.resumable(s.reuse.at, s.prompt().len)) {
+            s.reuse_failed = true;
+            return 0;
+        }
+        reuse.restoreSeq(x.e, seq, saved) catch {
+            s.reuse_failed = true;
+            return 0;
+        };
+        s.cached = s.reuse.at;
+        return s.reuse.at;
+    }
+
+    /// The prompt pass stands at a mark: the lane host copies the stream's state there.
+    fn keptAt(ctx: *anyopaque, at: u32) void {
+        const s: *lanes.Stream = @ptrCast(@alignCast(ctx));
+        if (s.reuse.hook) |k| k.at(k.ptr, s, at);
     }
 
     /// prefill_batch: prompts in shared passes of at most a chunk's rows (a longer one alone, in its chunks).

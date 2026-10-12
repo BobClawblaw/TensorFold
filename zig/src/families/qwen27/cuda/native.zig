@@ -10,12 +10,27 @@ const Lanes = @import("lanes.zig").Cuda;
 const dr = @import("draft.zig");
 const vision = @import("vision.zig");
 const image = @import("image.zig");
+const reuse = @import("reuse.zig");
 
 pub const model_type = "qwen3_5";
 pub const formats: []const []const u8 = &.{"mlx-q4g64"};
 pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = engine.prompt_rows;
+
+/// Prompt-cache copies (reuse.zig), kept in pinned host memory; a state ends where its prompt pass stands.
+pub const snap_bytes = reuse.bytes;
+pub const snap_save = reuse.save;
+pub const snap_restore = reuse.restore;
+pub const snap_drop = reuse.drop;
+pub const snap_host = true;
+pub const snap_lookahead: u32 = 0;
+
+/// The server keeps prompt states: prompts cut the zero-anchored grid, where kept states resume.
+pub fn useCache(p: *anyopaque) void {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    own.e.grid = true;
+}
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, vision: ?Vision = null, kv8: bool = false };
 
@@ -50,9 +65,10 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
+    target: *reuse.Target, // what the prompt cache copies (reuse.zig)
 };
 
-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: Lanes, draft: ?*dr.DFlash2 = null, tower: ?*vision.Tower = null };
+const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: Lanes, target: reuse.Target = undefined, draft: ?*dr.DFlash2 = null, tower: ?*vision.Tower = null };
 
 /// The drafter the Python engine pairs with the 27B once pulled (z-lab/Qwen3.8-27B-DFlash2).
 const drafter_repo = "models--z-lab--Qwen3.8-27B-DFlash2";
@@ -89,6 +105,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .lanes = try Lanes.init(gpa, e, most_streams) };
     errdefer own.lanes.deinit();
+    own.target = .{ .e = e, .seqs = &own.lanes.seqs };
     if (o.drafts) if (try drafterDir(gpa, io, o.drafter)) |draft_dir| {
         defer gpa.free(draft_dir);
         const f = e.forward();
@@ -115,6 +132,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .vision_bytes = vision_bytes,
         .ctx = own,
         .deinit = release,
+        .target = &own.target,
     };
 }
 
