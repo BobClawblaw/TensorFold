@@ -148,5 +148,6 @@ pub fn run(gpu: check.Gpu) !void {
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 48, .hk = 4, .dim = 128, .rot = 128, .norm = true }, &worst); // Kolibri, sliding
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 48, .hk = 4, .dim = 128, .rot = 0, .norm = true }, &worst); // Kolibri, full
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 8, .hk = 2, .dim = 64, .rot = 32, .norm = false }, &worst); // partial rotary
+    try run1(gpu, a, s, &g, prng.random(), .{ .h = 16, .hk = 2, .dim = 128, .rot = 128, .norm = false }, &worst); // a warp a head, no norm
     check.pass("qk rows: q and k within float64 tolerance (worst {d:.3}), v and the caches exact, bits at any row count", .{worst});
 }

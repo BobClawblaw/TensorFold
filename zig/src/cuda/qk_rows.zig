@@ -22,12 +22,14 @@ pub const Out = struct { q: u64, k: u64, v: u64, kc: ?u64 = null, vc: ?u64 = nul
 pub const QkRows = struct {
     mod: Module,
     fn_: Function,
+    /// tf_qk_rows_w: dim 128 with no or full rotation, a warp a head.
+    warp_fn: Function,
 
     pub fn load(d: *const Driver) !QkRows {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var mod = try Module.load(d, kernels.qk_rows);
         errdefer mod.unload();
-        return .{ .mod = mod, .fn_ = try mod.function("tf_qk_rows") };
+        return .{ .mod = mod, .fn_ = try mod.function("tf_qk_rows"), .warp_fn = try mod.function("tf_qk_rows_w") };
     }
 
     pub fn unload(g: *QkRows) void {
@@ -56,7 +58,12 @@ pub const QkRows = struct {
         a.add(@as(i32, @intCast(hs.h)));
         a.add(@as(i32, @intCast(hs.hk)));
         a.add(shape.eps);
-        const grid: launch_.Dim3 = .{ .x = @intCast(n), .y = @intCast(hs.h + 2 * hs.hk), .z = 1 };
+        const heads = hs.h + 2 * hs.hk;
+        if (hs.dim == 128 and (shape.cos == null or shape.rot == 128)) {
+            const grid: launch_.Dim3 = .{ .x = @intCast(n), .y = @intCast((heads + 3) / 4), .z = 1 };
+            return launch_.launch(g.warp_fn, .{ .grid = grid, .block = .{ .x = 128 } }, s, &a);
+        }
+        const grid: launch_.Dim3 = .{ .x = @intCast(n), .y = @intCast(heads), .z = 1 };
         try launch_.launch(g.fn_, .{ .grid = grid, .block = .{ .x = @intCast(hs.dim) } }, s, &a);
     }
 };

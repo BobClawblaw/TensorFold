@@ -145,7 +145,25 @@ extern "C" __global__ void __launch_bounds__(256) tf_moe_topk_sigmoid_warp(const
 template <int YK, int OK>
 __device__ __forceinline__ void combine_row(const void* y, const float* w, void* out, int slots, int dims, int64_t r, int d) {
     float acc = 0.f;
-    for (int k = 0; k < slots; ++k) acc = __fmaf_rn(w[r * slots + k], load(y, YK, (r * slots + k) * dims + d), acc);
+    int k = 0;
+    for (; k + 8 <= slots; k += 8) { // eight slots' loads in flight, then folded in order
+        float v[8], wk[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = load(y, YK, (r * slots + k + i) * dims + d), wk[i] = w[r * slots + k + i];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc = __fmaf_rn(wk[i], v[i], acc);
+    }
+    if (k < slots) {
+        float v[8], wk[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[i] = k + i < slots ? load(y, YK, (r * slots + k + i) * dims + d) : 0.f;
+            wk[i] = k + i < slots ? w[r * slots + k + i] : 0.f;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            if (k + i < slots) acc = __fmaf_rn(wk[i], v[i], acc);
+    }
     store(out, OK, r * dims + d, acc);
 }
 

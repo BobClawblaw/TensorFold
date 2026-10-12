@@ -67,3 +67,82 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const __nv_bfloat1
         if (kc != nullptr) kc[(at * hk + k) * dim + d] = out;
     }
 }
+
+// tf_qk_rows at head dim 128 with no or full rotation: a warp a head, lane l holding dims l + 32 j (the block form's
+// warps j), so the norm folds in the same order and a dim's rotation partner (j ^ 2) sits in the same lane.
+extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const __nv_bfloat16* qkv, const float* nw,
+                                                               const float* cosv, const float* sinv, int rot,
+                                                               const int* pos, const int* slot, __nv_bfloat16* q,
+                                                               __nv_bfloat16* ko, __nv_bfloat16* vo,
+                                                               __nv_bfloat16* kc, __nv_bfloat16* vc, long long len,
+                                                               int h, int hk, float eps) {
+    constexpr int D = 128, J = D / 32;
+    const int lane = threadIdx.x & 31;
+    const int64_t r = blockIdx.x;
+    const int hd = blockIdx.y * 4 + (threadIdx.x >> 5);
+    if (hd >= h + 2 * hk) return;
+    const __nv_bfloat16* src = qkv + (r * (h + 2 * hk) + hd) * D;
+    const int p = pos[r];
+    __nv_bfloat16 raw[J];
+#pragma unroll
+    for (int j = 0; j < J; ++j) raw[j] = src[lane + 32 * j];
+    // every load up front (the rotation's row waits on pos, then on memory)
+    float c[J], sn[J], w[J];
+    const bool qk = hd < h + hk;
+    const float* wrow = nw + (hd >= h ? D : 0);
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        c[j] = qk && cosv != nullptr ? cosv[static_cast<int64_t>(p) * D + lane + 32 * j] : 0.f;
+        sn[j] = qk && cosv != nullptr ? sinv[static_cast<int64_t>(p) * D + lane + 32 * j] : 0.f;
+        w[j] = qk && nw != nullptr ? wrow[lane + 32 * j] : 0.f;
+    }
+    const int64_t pl = p < len ? p : p % len;
+    const int64_t at = slot != nullptr ? static_cast<int64_t>(slot[r]) * len + pl : pl;
+    if (hd >= h + hk) { // v: as is
+        const int k = hd - h - hk;
+#pragma unroll
+        for (int j = 0; j < J; ++j) {
+            vo[(r * hk + k) * D + lane + 32 * j] = raw[j];
+            if (vc != nullptr) vc[(at * hk + k) * D + lane + 32 * j] = raw[j];
+        }
+        return;
+    }
+    float x[J], y[J], yp[J];
+#pragma unroll
+    for (int j = 0; j < J; ++j) x[j] = __bfloat162float(raw[j]), y[j] = x[j], yp[j] = 0.f;
+    if (nw != nullptr) {
+        float part[J];
+#pragma unroll
+        for (int j = 0; j < J; ++j) part[j] = __fmul_rn(x[j], x[j]);
+        for (int m = 16; m > 0; m >>= 1)
+#pragma unroll
+            for (int j = 0; j < J; ++j) part[j] = __fadd_rn(part[j], __shfl_xor_sync(0xFFFFFFFFu, part[j], m));
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < J; ++j) s = __fadd_rn(s, part[j]);
+        const float rstd = rsqrtf(__fadd_rn(__fdiv_rn(s, static_cast<float>(D)), eps));
+#pragma unroll
+        for (int j = 0; j < J; ++j) {
+            y[j] = __fmul_rn(__fmul_rn(x[j], rstd), w[j]);
+            if (rot != 0) yp[j] = __fmul_rn(__fmul_rn(x[j ^ 2], rstd), w[j ^ 2]);
+        }
+    } else if (rot != 0) {
+#pragma unroll
+        for (int j = 0; j < J; ++j) yp[j] = x[j ^ 2];
+    }
+    if (cosv != nullptr) {
+#pragma unroll
+        for (int j = 0; j < J; ++j) y[j] = __fadd_rn(__fmul_rn(y[j], c[j]), __fmul_rn(j < 2 ? -yp[j] : yp[j], sn[j]));
+    }
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        const __nv_bfloat16 out = __float2bfloat16_rn(y[j]);
+        if (hd < h) {
+            q[(r * h + hd) * D + lane + 32 * j] = out;
+        } else {
+            const int k = hd - h;
+            ko[(r * hk + k) * D + lane + 32 * j] = out;
+            if (kc != nullptr) kc[(at * hk + k) * D + lane + 32 * j] = out;
+        }
+    }
+}
