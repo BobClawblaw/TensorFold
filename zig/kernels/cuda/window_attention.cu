@@ -366,6 +366,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
     const int p = pos[r];
     const int64_t base = (slot != nullptr ? static_cast<int64_t>(slot[r]) : 0) * ring;
     const int lo = win > 0 ? max(p - win + 1, 0) : 0;
+    const int lor = static_cast<int>(lo % ring);
     uint32_t qa[K16][4];
     {
         const int h0 = g8, h1 = g8 + 8;
@@ -385,13 +386,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.0f, l1 = 0.0f;
     // K of tile t loads while tile t - 4's values fold in, V of tile t while its scores run: one commit group each
     auto stage = [&](uint4* dst, const __nv_bfloat16* src, int t) {
-        if (t <= p / HB)
+        if (t <= p / HB) {
+            const int r0 = static_cast<int>((t * HB) % ring);
+#pragma unroll 4
             for (int i = lane; i < HB * C; i += 32) {
-                const int key = t * HB + i / C;
+                const int j = i / C, key = t * HB + j;
                 const bool in = key >= lo && key <= p;
-                const int64_t row = base + (in ? key : lo) % ring;
-                cp16z(dst + sw<D>(i / C, i % C), src + (row * hk + kh) * D + (i % C) * 8, in);
+                int row = r0 + j;
+                if (row >= ring) row -= static_cast<int>(ring);
+                cp16z(dst + sw<D>(j, i % C), src + ((base + (in ? row : lor)) * hk + kh) * D + (i % C) * 8, in);
             }
+        }
         commit();
     };
     stage(ks, kc, lo / HB + warp);
@@ -491,6 +496,22 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
         stage(vs, vc, t + 4);
     }
     wait_group<0>();
+    const int na = min(4, p / HB - lo / HB + 1); // warps that saw keys
+    if (na == 1) { // one warp's fold is the result (the merge below would scale it by exp(0) = 1)
+        if (warp == 0) {
+#pragma unroll
+            for (int i = 0; i < NB; ++i) {
+                const int d = 8 * i + 2 * qd;
+                if (g8 < G)
+                    *reinterpret_cast<uint32_t*>(out + ((int64_t)r * h + kh * G + g8) * D + d) =
+                        pack(tdiv(o[i][0], l0), tdiv(o[i][1], l0));
+                if (g8 + 8 < G)
+                    *reinterpret_cast<uint32_t*>(out + ((int64_t)r * h + kh * G + g8 + 8) * D + d) =
+                        pack(tdiv(o[i][2], l1), tdiv(o[i][3], l1));
+            }
+        }
+        return;
+    }
     __syncthreads();
     float* os = reinterpret_cast<float*>(smem);   // [4 warps][16 heads][D]
     float* ms = os + 4 * 16 * D;                  // [4][16]
@@ -508,19 +529,35 @@ extern "C" __global__ void __launch_bounds__(128) tf_window_decode_tc(
         ms[warp * 16 + g8 + 8] = m1, ls[warp * 16 + g8 + 8] = l1;
     }
     __syncthreads();
-    for (int idx = threadIdx.x; idx < G * D; idx += 128) {
-        const int hd = idx / D, e = idx % D;
+    float* as = ls + 4 * 16; // [4][16]: warp w's factor for head hd
+    float* il = as + 4 * 16;  // [16]: the folded l
+    if (threadIdx.x < 16) {
+        const int hd = threadIdx.x;
         float mm = -INFINITY;
         for (int w = 0; w < 4; ++w) mm = fmaxf(mm, ms[w * 16 + hd]);
-        float acc = 0.0f, l = 0.0f;
+        float l = 0.0f;
         for (int w = 0; w < 4; ++w) {
             const float mw = ms[w * 16 + hd];
-            if (mw == -INFINITY) continue;
-            const float a = texp(__fsub_rn(mw, mm));
-            acc = __fmaf_rn(a, os[(w * 16 + hd) * D + e], acc);
-            l = __fmaf_rn(a, ls[w * 16 + hd], l);
+            const float a = mw == -INFINITY ? 0.0f : texp(__fsub_rn(mw, mm));
+            as[w * 16 + hd] = a;
+            if (mw != -INFINITY) l = __fmaf_rn(a, ls[w * 16 + hd], l);
         }
-        out[((int64_t)r * h + kh * G + hd) * D + e] = __float2bfloat16_rn(tdiv(acc, l));
+        il[hd] = l;
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < G * D / 2; idx += 128) {
+        const int hd = idx / (D / 2), e = 2 * (idx % (D / 2));
+        float acc0 = 0.0f, acc1 = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            if (ms[w * 16 + hd] == -INFINITY) continue;
+            const float a = as[w * 16 + hd];
+            const float2 v = *reinterpret_cast<const float2*>(os + (w * 16 + hd) * D + e);
+            acc0 = __fmaf_rn(a, v.x, acc0);
+            acc1 = __fmaf_rn(a, v.y, acc1);
+        }
+        const float l = il[hd];
+        *reinterpret_cast<uint32_t*>(out + ((int64_t)r * h + kh * G + hd) * D + e) = pack(tdiv(acc0, l), tdiv(acc1, l));
     }
 }
 

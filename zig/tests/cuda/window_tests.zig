@@ -207,6 +207,7 @@ pub fn run(gpu: check.Gpu) !void {
     var worst: f64 = 0;
     const a = arena.allocator();
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 48, .hk = 4, .d = 128, .win = 513, .ring = 640, .streams = 2, .top = 3000 }, &worst); // Kolibri
+    try run1(gpu, a, s, &g, prng.random(), .{ .h = 48, .hk = 4, .d = 128, .win = 513, .ring = 600, .streams = 2, .top = 3000 }, &worst); // the ring's end inside a key tile
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 8, .hk = 2, .d = 64, .win = 100, .ring = 128, .streams = 3, .top = 1000 }, &worst);
     try run1(gpu, a, s, &g, prng.random(), .{ .h = 16, .hk = 1, .d = 128, .win = 0, .ring = 300, .streams = 1, .top = 300 }, &worst); // no window
     try prompt1(gpu, a, s, &g, prng.random(), .{ .h = 48, .hk = 4, .win = 513, .ring = 2624, .p0 = 0, .n = 600 }, &worst); // Kolibri, first chunk
