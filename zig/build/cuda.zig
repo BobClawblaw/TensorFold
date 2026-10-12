@@ -43,6 +43,7 @@ const kernels = [_]Kernel{
     .{ .name = "act_rows", .flags = &.{"-O3"} }, // ours: SwiGLU, output gates, group sums (cuda/act_rows.zig)
     .{ .name = "gdn_prep", .flags = &.{"-O3"} }, // ours: Gated DeltaNet conv, norms, g and beta (cuda/gdn_prep.zig)
     .{ .name = "embed_rows", .flags = &.{"-O3"} }, // ours: 4-bit affine and bf16 token rows (cuda/embed_rows.zig)
+    .{ .name = "block_attention", .flags = &.{"-O3"} }, // ours: a drafter's block over its context (cuda/block_attention.zig)
     .{ .name = "prompt16", .flags = &.{"-O3"} }, // nvfp4/prompt.cu's FP4 and FP8 tile 4, tensorfold_nvfp4_prompt_v1
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
