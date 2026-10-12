@@ -29,7 +29,7 @@ __device__ __forceinline__ const __nv_bfloat16* head_src(const QkSrc& s, int64_t
 
 using namespace tf_qk;
 
-// Rows' heads (QkSrc) -> q, k, v (bf16); q, k normed by nw, rotate-half RoPE on `rot` dims; k, v also into kc/vc (or not).
+// QkSrc's heads -> q, k, v (bf16); q, k normed by nw, rotate-half RoPE on `rot` dims; k, v also into kc/vc.
 extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, const float* nw, const float* cosv,
                                                               const float* sinv, int rot, const int* pos,
                                                               const int* slot, __nv_bfloat16* q, __nv_bfloat16* ko,
@@ -84,8 +84,7 @@ extern "C" __global__ void __launch_bounds__(MOST) tf_qk_rows(const QkSrc in, co
     }
 }
 
-// tf_qk_rows at head dim 128 with no or full rotation: a warp a head, lane l holding dims l + 32 j (the block form's
-// warps j), so the norm folds in the same order and a dim's rotation partner (j ^ 2) sits in the same lane.
+// tf_qk_rows at dim 128, no or full rotation: a warp a head, lane l dims l + 32 j (same fold order, partner j ^ 2).
 extern "C" __global__ void __launch_bounds__(128) tf_qk_rows_w(const QkSrc in, const float* nw,
                                                                const float* cosv, const float* sinv, int rot,
                                                                const int* pos, const int* slot, __nv_bfloat16* q,
