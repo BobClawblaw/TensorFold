@@ -15,6 +15,7 @@ pub const draft = @import("cuda/draft.zig");
 pub const lone = @import("cuda/lone.zig");
 pub const drafts = @import("cuda/drafts.zig");
 pub const vision = @import("cuda/vision.zig");
+pub const image = @import("cuda/image.zig");
 
 test {
     _ = config;
@@ -32,4 +33,5 @@ test {
     _ = lone;
     _ = native;
     _ = vision;
+    _ = image;
 }

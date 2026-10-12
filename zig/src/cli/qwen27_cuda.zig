@@ -487,6 +487,23 @@ fn checkVision(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io, mod
         const want_bytes = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ dir, img.object.get("features").?.string }), arena, .limited(1 << 30));
         const px = try arena.alloc(f32, px_bytes.len / 4);
         @memcpy(std.mem.sliceAsBytes(px), px_bytes[0 .. px.len * 4]);
+        { // our decode and patches from the image's file, against 0.6.6's
+            const file = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ dir, img.object.get("file").?.string }), arena, .limited(1 << 30));
+            const want_rgb = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ dir, img.object.get("rgb").?.string }), arena, .limited(1 << 30));
+            const rgb = try qwen.image.decode(gpa, file);
+            defer rgb.deinit(gpa);
+            var px_diff: usize = 0;
+            if (rgb.px.len == want_rgb.len) {
+                for (rgb.px, want_rgb) |a, b| px_diff += @intFromBool(a != b);
+            } else px_diff = std.math.maxInt(usize);
+            const prep = try qwen.image.prepare(gpa, file, 4096);
+            defer gpa.free(prep.pixels);
+            var patch_diff: usize = 0;
+            if (prep.gh == g.h and prep.gw == g.w and prep.pixels.len == px.len) {
+                for (prep.pixels, px) |a, b| patch_diff += @intFromBool(@as(u32, @bitCast(a)) != @as(u32, @bitCast(b)));
+            } else patch_diff = std.math.maxInt(usize);
+            std.debug.print("{s}: decode {d}x{d}, {d} of {d} bytes differ from PIL's; patches grid {d}x{d}, {d} of {d} values differ\n", .{ name, rgb.w, rgb.h, px_diff, want_rgb.len, prep.gh, prep.gw, patch_diff, px.len });
+        }
         const rows = @as(usize, g.h) * g.w / 4;
         var out = try cuda.DeviceBuffer.alloc(&driver, rows * V.out_hidden * 2);
         defer out.free();

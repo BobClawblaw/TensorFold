@@ -94,6 +94,9 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     qwen27.addImport("core", core);
     qwen27.addImport("lanes", lanes);
     qwen27.addImport("nemotron", nemotron); // the checkpoint Source and torch ops the CUDA families share
+    // images' PNG and JPEG decoding on Linux (stb_image, vendored)
+    qwen27.addCSourceFile(.{ .file = b.path("zig/vendor/stb/stb_image.c"), .flags = &.{ "-O2", "-fno-sanitize=undefined" } });
+    qwen27.addIncludePath(b.path("zig/vendor/stb"));
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .qwen27 = qwen27, .tokenizer = tokenizer, .heat = heat };
 }
 
