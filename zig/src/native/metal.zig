@@ -298,17 +298,29 @@ fn openFlashNext(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem:
     const dump: ?[]const u8 = if (std.c.getenv("TF_FLASHNEXT_DUMP")) |d| std.mem.span(d) else null;
     const native = modelContext(a, io, o.dir);
     const window: i64 = o.context orelse native;
-    if (window < 0 or (native > 0 and window > native)) {
-        problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ window, native });
+    const fz = tf.flashnext_replay;
+    const margin: i64 = tf.flashnext_engine.MARGIN;
+    // past the trained window (up to four times it) the engine rotates with static YaRN x4, every prompt alike
+    if (window < 0 or (native > 0 and window > 4 * native)) {
+        problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window and its YaRN x4 reach ({d})", .{ window, native, 4 * native });
         return null;
     }
+    if (window > native) {
+        if (o.speed_up != null) {
+            problem.* = "--context past the trained window is served on one Mac; the --speed-up pair reads up to it";
+            return null;
+        }
+        try fz.setCap(@intCast(window + margin));
+        std.log.info("flash next: a {d}-token window, past the trained {d}: static YaRN x4 for every prompt", .{ window, native });
+    }
+    const cap: i64 = @intCast(fz.CAP);
     if (o.lanes_fixed and o.lanes > 1) {
         if (o.speed_up != null or std.c.getenv("TF_FLASHNEXT_TP") != null) {
             problem.* = "Flash Next shared sessions are single-Mac only; use --parallel 1 with --speed-up";
             return null;
         }
         var why: []const u8 = "";
-        return @import("flashnext_batch_host.zig").open(gpa, io, o.dir, dump, if (window > 0) @min(window, tf.flashnext_replay.CAP - tf.flashnext_engine.MARGIN) else tf.flashnext_replay.CAP - tf.flashnext_engine.MARGIN, o.lanes, o.prompt_cache_gib, o.prompt_cache_over_cap, o.vision, a, &why) catch |err| {
+        return @import("flashnext_batch_host.zig").open(gpa, io, o.dir, dump, if (window > 0) @min(window, cap - margin) else cap - margin, o.lanes, o.prompt_cache_gib, o.prompt_cache_over_cap, o.vision, a, &why) catch |err| {
             problem.* = if (err == error.CacheOverCap) why else if (err == error.BadLoadLimit) "FLASHNEXT_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0, or unset it for 70% of RAM" else if (err == error.OverMemoryLimit) "the native Flash Next batching engine cannot open (OverMemoryLimit): the sessions do not fit under 70% of RAM past the loaded model; fewer streams, a smaller --context, or FLASHNEXT_LOAD_LIMIT_GB past the share" else try std.fmt.allocPrint(a, "the native Flash Next batching engine cannot open ({s})", .{@errorName(err)});
             return null;
         };

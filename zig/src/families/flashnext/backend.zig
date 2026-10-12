@@ -119,6 +119,25 @@ pub const Backend = struct {
         return old;
     }
 
+    /// The free session with the smallest capacity that holds a stream (slot 0 holds the longest window: keep it for
+    /// those that need it); error.LaneMemory when only a busy one would (the stream waits), ContextFull when none would.
+    fn slotFor(b: *Backend, prompt: usize, max_new: usize) !usize {
+        const need = prompt + max_new + fz.MAXR + 1;
+        var best: ?usize = null;
+        var any = false;
+        for (b.sessions, 0..) |s, j| if (s.m.cap >= need) {
+            any = true;
+            if (!s.used and (best == null or s.m.cap < b.sessions[best.?].m.cap)) best = j;
+        };
+        return best orelse if (any) error.LaneMemory else error.ContextFull;
+    }
+
+    /// LaneHost's admission check: a free session holds the request now.
+    pub fn fits(ptr: *anyopaque, prompt: u32, max_new: u32) bool {
+        _ = self(ptr).slotFor(prompt, max_new) catch return false;
+        return true;
+    }
+
     fn prefill(ptr: *anyopaque, stream: *Stream) anyerror!void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
@@ -127,11 +146,8 @@ pub const Backend = struct {
         const prompt = stream.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
         try b.settle();
-        const i = for (b.sessions, 0..) |s, j| {
-            if (!s.used) break j;
-        } else return error.NoFreeSlot;
+        const i = try b.slotFor(prompt.len, stream.max_new);
         const s = &b.sessions[i];
-        if (prompt.len + stream.max_new + fz.MAXR + 1 > s.m.cap) return error.ContextFull;
         try b.by.put(b.gpa, stream, i);
         s.used = true;
         s.held_n = 0;
@@ -170,7 +186,8 @@ pub const Backend = struct {
                 end = @min(end, mark);
                 break;
             };
-            const call = if (b.e.segments) segments.next(end - at, b.e.pr.step, @import("engine.zig").SEG_MIN) else segments.Call{ .rows = @min(end - at, b.e.pr.step), .parts = 1 };
+            const step = fz.chunkRows(at, b.e.pr.step); // past the trained window a chunk scores more blocks a row
+            const call = if (b.e.segments) segments.next(end - at, step, @import("engine.zig").SEG_MIN) else segments.Call{ .rows = @min(end - at, step), .parts = 1 };
             end = at + call.rows;
             const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
             s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
@@ -228,7 +245,7 @@ pub const Backend = struct {
             for (w.positions, 0..) |p, j| if (p != s.m.pos + j + 1) return error.PositionMismatch;
             desc[i] = .{ .slot = @intCast(b.by.get(w.stream).?), .pos = @intCast(s.m.pos), .rows = @intCast(w.rows()) };
         }
-        const plan = try meta.Plan.init(desc[0..windows.len], fz.CAP);
+        const plan = try meta.Plan.init(desc[0..windows.len], @intCast(fz.CAP));
         const t = &b.primary.t;
         for (windows, out, 0..) |w, o, i| {
             const s = try b.session(w.stream);

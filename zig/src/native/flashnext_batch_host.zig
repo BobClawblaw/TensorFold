@@ -39,7 +39,8 @@ fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
 pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, streams: u32, cache_gib: ?f64, over: bool, vision: ?api.VisionOpen, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
-    const capacity: usize = @intCast(@min(tf.flashnext_replay.CAP, window + fx.MARGIN));
+    // slot 0 holds the engine's own window (past the trained one with YaRN); the others the trained window at most
+    const capacity: usize = @intCast(@min(@as(i64, @intCast(tf.flashnext_replay.TRAINED)), window + fx.MARGIN));
     const eng = try fx.Engine.load(gpa, io, dir, dump);
     errdefer eng.deinit();
     if (eng.r.tp != null) return error.BatchSpeedUpUnsupported;
@@ -73,7 +74,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     errdefer h.core.deinit();
     const plan = try fit.budget(cache_gib, over, 0, a, why, "");
     eng.snap_pool.max = plan.budget_bytes;
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .greedy_only = true, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .vision = if (vis) |v| v.offer() else null });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .greedy_only = true, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .vision = if (vis) |v| v.offer() else null, .admit = .{ .ctx = &h.back, .fits = Backend.fits } });
     h.cache = null;
     if (plan.budget_bytes > 0) {
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = Backend.snapBytes, .save = Backend.snapSave, .restore = Backend.snapRestore, .drop = Backend.snapDrop, .charged = Backend.snapCharged, .spare = Backend.snapSpare, .trim = Backend.snapTrim, .reuses = Backend.snapReuses } }, .{ .lookahead = 1, .planned = true }, plan.budget_bytes);
