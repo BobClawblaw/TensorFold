@@ -3,7 +3,8 @@
 //! alpha composited over white with PIL's integer blend), then transformers' Qwen2VLImageProcessorPil at the caps
 //! 0.6.6 passes it: smart_resize to multiples of 32 within [32^2, tokens * 32^2] pixels, PIL's 8-bit bicubic
 //! resampler, x / 255 in float64 rounded to float32, (x - 0.5) / 0.5, and 16x16 patches in 2x2 merge order with each
-//! patch's frame given twice. PNG patches equal 0.6.6's bit for bit; JPEG decoders may differ by a level.
+//! patch's frame given twice. JPEGs go through libjpeg-turbo (PIL's decoder) when libturbojpeg.so.0 loads, else
+//! stb_image, whose IDCT may differ from PIL's by a level.
 const std = @import("std");
 const vision = @import("vision.zig");
 
@@ -108,12 +109,71 @@ pub fn patchify(gpa: std.mem.Allocator, img: Rgb) Error![]f32 {
 
 // ---- decoding (stb_image), EXIF orientation and alpha, as PIL gives images.py its RGB ----
 
+/// TurboJPEG's decompression API (libturbojpeg.so.0), opened on first use; null when the library is absent.
+const Turbo = struct {
+    init: *const fn () callconv(.c) ?*anyopaque,
+    header: *const fn (?*anyopaque, [*]const u8, c_ulong, *c_int, *c_int, *c_int, *c_int) callconv(.c) c_int,
+    decompress: *const fn (?*anyopaque, [*]const u8, c_ulong, [*]u8, c_int, c_int, c_int, c_int, c_int) callconv(.c) c_int,
+    destroy: *const fn (?*anyopaque) callconv(.c) c_int,
+
+    var state = std.atomic.Value(u8).init(0); // 0: not opened, 1: opening, 2: done (api set or not)
+    var api: ?Turbo = null;
+    var lib: ?std.DynLib = null;
+
+    fn load() void {
+        var l = std.DynLib.open("libturbojpeg.so.0") catch return;
+        api = .{
+            .init = l.lookup(@FieldType(Turbo, "init"), "tjInitDecompress") orelse return l.close(),
+            .header = l.lookup(@FieldType(Turbo, "header"), "tjDecompressHeader3") orelse return l.close(),
+            .decompress = l.lookup(@FieldType(Turbo, "decompress"), "tjDecompress2") orelse return l.close(),
+            .destroy = l.lookup(@FieldType(Turbo, "destroy"), "tjDestroy") orelse return l.close(),
+        };
+        lib = l;
+    }
+
+    fn get() ?Turbo {
+        if (state.cmpxchgStrong(0, 1, .acquire, .acquire) == null) {
+            load();
+            state.store(2, .release);
+        }
+        while (state.load(.acquire) != 2) std.atomic.spinLoopHint();
+        return api;
+    }
+};
+
+const tjpf_rgb = 0;
+const tjcs_cmyk = 3;
+const tjcs_ycck = 4;
+
+/// A JPEG through libjpeg-turbo as PIL decodes it (accurate integer IDCT, fancy upsampling) into RGB rows; null
+/// when TurboJPEG is absent or the image is CMYK (PIL converts those itself).
+fn turboJpeg(gpa: std.mem.Allocator, bytes: []const u8) Error!?Rgb {
+    const t = Turbo.get() orelse return null;
+    const h = t.init() orelse return null;
+    defer _ = t.destroy(h);
+    var w: c_int = 0;
+    var ht: c_int = 0;
+    var sub: c_int = 0;
+    var cs: c_int = 0;
+    if (t.header(h, bytes.ptr, bytes.len, &w, &ht, &sub, &cs) != 0) return error.BadImage;
+    if (cs == tjcs_cmyk or cs == tjcs_ycck) return null;
+    if (w <= 0 or ht <= 0) return error.BadImage;
+    if (w > max_side or ht > max_side or @as(u64, @intCast(w)) * @as(u64, @intCast(ht)) > max_pixels) return error.ImageTooLarge;
+    const W: usize = @intCast(w);
+    const H: usize = @intCast(ht);
+    const out = try gpa.alloc(u8, W * H * 3);
+    errdefer gpa.free(out);
+    if (t.decompress(h, bytes.ptr, bytes.len, out.ptr, w, w * 3, ht, tjpf_rgb, 0) != 0) return error.BadImage;
+    return .{ .w = @intCast(W), .h = @intCast(H), .px = out };
+}
+
 /// A single-frame PNG or JPEG as 8-bit RGB: upright by its EXIF orientation, alpha composited over white, 16-bit
 /// gray clipped to 255 and other 16-bit layouts cut to their high byte (what PIL's convert("RGB") gives).
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Rgb {
     if (bytes.len < 8 or bytes.len > std.math.maxInt(c_int)) return error.BadImage;
     const n: c_int = @intCast(bytes.len);
     if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n") and pngAnimated(bytes)) return error.Animated;
+    if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) if (try turboJpeg(gpa, bytes)) |img| return upright(gpa, img, bytes);
     var w: c_int = 0;
     var h: c_int = 0;
     var comp: c_int = 0;
@@ -146,7 +206,11 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Rgb {
             }
         }
     }
-    const img: Rgb = .{ .w = @intCast(W), .h = @intCast(H), .px = out };
+    return upright(gpa, .{ .w = @intCast(W), .h = @intCast(H), .px = out }, bytes);
+}
+
+/// The decoded image turned upright by the EXIF orientation its bytes carry (it takes `img`).
+fn upright(gpa: std.mem.Allocator, img: Rgb, bytes: []const u8) Error!Rgb {
     const o = orientation(bytes);
     if (o < 2 or o > 8) return img;
     defer img.deinit(gpa);

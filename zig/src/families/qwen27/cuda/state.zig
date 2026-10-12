@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
+const vision = @import("vision.zig");
 const torch_ops = kern.torch_ops;
 
 /// The most rows a stream's verify window takes (the multi-stream GDN tree kernel's limit).
@@ -51,6 +52,8 @@ pub const Seq = struct {
     head_xs: u64,
     capacity: usize,
     pos: usize = 0,
+    rope_delta: i32 = 0, // an image prompt's rotary shift past its rows (decode positions are pos + rope_delta)
+    media: ?*const vision.Media = null, // during an image prompt's pass: its rows and positions
     gpa: std.mem.Allocator,
 
     /// Device bytes a stream of `capacity` positions takes.
@@ -110,6 +113,8 @@ pub const Seq = struct {
             try ops.fill32(s.conv[i], 0, g.convBytes() / 4);
         };
         s.pos = 0;
+        s.rope_delta = 0;
+        s.media = null;
     }
 };
 
@@ -263,7 +268,7 @@ pub const Scratch = struct {
         s.prompt_values = try A.take(R * g.kvInner() * bf);
         s.windows = try A.take(R * c.conv_taps * 4);
         s.plan = try A.take(R * 3 * 4);
-        s.attn_plan = try A.take((W + 4 + 3 * items + W) * 4);
+        s.attn_plan = try A.take((W + 4 + 3 * items + W + 12) * 4); // + each segment's 16-byte padding
         s.paths = try A.take(W * tri.max_nodes * 4);
         s.depths = try A.take(W * 4);
         s.offs = try A.take(g.layers * max_streams * 2 * 8);
@@ -276,7 +281,7 @@ pub const Scratch = struct {
         s.taps = try A.take(R * 5 * g.hidden * bf);
         s.replay_table = try A.take(g.layers * (4 + max_streams) * 8);
         s.replay_rows = try A.take(max_streams * (W + 1) * 4);
-        s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + W + 4 * max_streams + 3 * items * max_streams + W) * 4);
+        s.round = try A.take((6 * W + max_streams + 1 + W * c.conv_taps + 4 + W + 4 * max_streams + 3 * items * max_streams + W + 12) * 4);
         s.tables = try A.take(g.layers * max_streams * 8);
         s.conv_cat = try A.take(g.layers * max_streams * (c.conv_taps - 1) * g.convDim() * bf);
         for (0..g.layers) |i| {

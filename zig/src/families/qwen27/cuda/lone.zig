@@ -72,7 +72,17 @@ pub const Stats = struct { rounds: usize = 0, drafted: usize = 0, accepted: usiz
 
 /// prefill_state with a drafter: the prompt in even chunks, its last `window` rows' taps into the context.
 pub fn prefill(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32) !void {
+    return prefillMedia(e, seq, ctx, d, prompt, null);
+}
+
+/// prefill with an image prompt's rows and positions (null: text); its decode offset stays on the stream.
+pub fn prefillMedia(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32, media: ?*const @import("vision.zig").Media) !void {
     try seq.reset(e.ops(), e.w.g);
+    seq.media = media;
+    defer seq.media = null;
+    defer if (media) |m| {
+        seq.rope_delta = m.delta;
+    };
     ctx.len = 0;
     ctx.end = 0;
     const tap_from = prompt.len -| dl.window;

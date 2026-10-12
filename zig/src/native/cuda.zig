@@ -428,6 +428,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     var family_options: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments };
     if (@hasField(F.Options, "slide")) family_options.slide = o.slide;
     if (@hasField(F.Options, "drafter")) family_options.drafter = o.drafter;
+    if (o.vision) |v| {
+        if (!@hasField(F.Options, "vision")) {
+            problem.* = try std.fmt.allocPrint(a, "--vision: the native CUDA engine reads images for Qwen3.8-27B only, not {s} checkpoints", .{o.model_type});
+            return null;
+        }
+        family_options.vision = .{ .image_tokens = v.image_tokens, .max_images = v.max_images };
+    }
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, family_options) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with {s} glue kernels ({s})", .{ o.dir, kernels orelse "its own", @errorName(e) });
         return null;
@@ -435,7 +442,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    const room = after.room(model) -| loaded.learn_bytes;
+    const vision_bytes: usize = if (@hasField(@TypeOf(loaded), "vision_bytes")) loaded.vision_bytes else 0;
+    const room = after.room(model) -| loaded.learn_bytes -| vision_bytes;
     const free = loaded.free_streams;
     const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
@@ -450,7 +458,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // prompt-cache snapshots are Nemotron's (cuda_reuse.zig); a family without them serves without a cache
     const cache = if (@hasDecl(F, "snap_bytes")) budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free)) else 0;
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
-        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else if (vision_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for the image tower's calls", .{toGib(vision_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
@@ -485,7 +493,20 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         gpa.free(h.dir);
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
+    const vision: ?api.Vision = if (@hasDecl(F, "prepareImage")) (if (o.vision) |v| .{
+        .ctx = h,
+        .prepare = struct {
+            fn f(_: *anyopaque, al: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
+                const p = try F.prepareImage(al, bytes, max_tokens);
+                return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+            }
+        }.f,
+        .image_token = F.image_token,
+        .markers = &F.image_markers,
+        .image_tokens = v.image_tokens,
+        .max_images = v.max_images,
+    } else null) else null;
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .structures = loaded.backend.vtable.first_masked != null, .vision = vision }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

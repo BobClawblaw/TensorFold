@@ -7,6 +7,7 @@ const tri = @import("triton.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
 const rnd = @import("round.zig");
+const vision = @import("vision.zig");
 
 const bf = 2;
 pub const Part = rnd.Part;
@@ -39,6 +40,10 @@ pub const Forward = struct {
 
     fn attnShape(f: *const Forward) tri.Attn {
         return .{ .heads = f.g().query_heads, .kv_heads = f.g().kv_heads, .dim = c.head_dim, .half = c.rotary_dim / 2 };
+    }
+
+    fn gpu(f: *const Forward) vision.Gpu {
+        return .{ .d = f.ops.k.d, .s = f.ops.s, .discrete = f.ops.k.discrete };
     }
 
     fn upload32(f: *Forward, dst: u64, values: []const i32) !void {
@@ -225,7 +230,8 @@ pub const Forward = struct {
             defer f.gpa.free(host);
             for (ids, 0..) |tok, r| {
                 host[r] = @intCast(tok);
-                host[W + r] = @intCast(p0 + r);
+                // an image prompt's text rows: their three positions are equal, so one row of them is theirs
+                host[W + r] = if (seq.media) |m| m.pos[p0 + r] else @intCast(p0 + r);
                 for (0..c.conv_taps) |j| host[2 * W + r * c.conv_taps + j] = @intCast(r + j);
             }
             try f.upload32(s.ids, host[0..W]);
@@ -233,6 +239,17 @@ pub const Forward = struct {
             try f.upload32(s.windows, host[2 * W ..]);
         }
         try f.t.embed(s.ids, w.embed.w, w.embed.s, w.embed.b, s.x, W, g_.hidden);
+        // rows of an image take the tower's rows, and the chunk's attention their three positions
+        const media: ?*const vision.Media = if (seq.media) |m| (if (m.hasImage(p0, W)) m else null) else null;
+        if (media) |m| {
+            const n = m.src.len;
+            const host = try f.gpa.alloc(i32, 4 * W);
+            defer f.gpa.free(host);
+            @memcpy(host[0..W], m.src[p0..][0..W]);
+            for (0..3) |a| @memcpy(host[W + a * W ..][0..W], m.pos[a * n + p0 ..][0..W]);
+            try f.upload32(m.dev.ptr, host);
+            try m.tower.splice(f.gpu(), s.x, m.features.ptr, m.dev.ptr, W);
+        }
         var x = s.x;
         var pending: ?u64 = null;
         const kv = g_.kvInner() * bf;
@@ -263,7 +280,10 @@ pub const Forward = struct {
                     try f.ops.prefillDense(s.y, a.q, s.qg, W);
                     try f.ops.prefillDense(s.y, a.k, s.key, W);
                     try f.ops.prefillDense(s.y, a.v, seq.values[i] + p0 * kv, W);
-                    try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, f.attnShape(), c.eps);
+                    if (media) |m| {
+                        const sh = f.attnShape();
+                        try m.tower.attnPrep(f.gpu(), s.qg, s.key, a.q_norm, a.k_norm, m.dev.ptr + W * 4, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, .{ .heads = sh.heads, .kv_heads = sh.kv_heads, .dim = sh.dim, .half = sh.half }, c.eps);
+                    } else try f.t.attnPrep(s.qg, s.key, a.q_norm, a.k_norm, s.pos, w.inv_freq, s.q_rot, seq.keys[i] + p0 * kv, W, f.attnShape(), c.eps);
                     const scale: f32 = @floatCast(std.math.pow(f64, c.head_dim, -0.5));
                     try f.ops.prefillAttention(s.q_rot, seq.keys[i], seq.values[i], s.attn, p0, W, g_.query_heads, g_.kv_heads, scale);
                     try f.t.gateMul(s.attn, s.qg, s.gated, s.gated_xs, W, g_.query_heads, c.head_dim);

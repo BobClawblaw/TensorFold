@@ -13,6 +13,7 @@ const dr = @import("draft.zig");
 const drafts = @import("drafts.zig");
 const lone = @import("lone.zig");
 const trees = @import("tree.zig");
+const vision = @import("vision.zig");
 const be = lanes.backend;
 
 /// The row counts calibrate times (calibration_rows without the tile steps a GB10 skips), to 16 a stream.
@@ -41,6 +42,7 @@ pub const Cuda = struct {
     values: []f64 = &.{},
     pending: Pending = .{},
     drafter: ?*dr.DFlash2 = null, // DFlash2, when its checkpoint is pulled and drafts are on
+    tower: ?*vision.Tower = null, // the image tower, with --vision
     drafting: std.AutoHashMapUnmanaged(*lanes.Stream, *drafts.Stream) = .empty,
     costs: [calibration.len + 1]lanes.config.Cost = undefined, // the forward's ms by a round's rows (calibrate)
     cost_count: usize = 0,
@@ -228,11 +230,18 @@ pub const Cuda = struct {
 
     /// prefill_state into an opened stream: the prompt in chunks, a drafting stream's last window of taps absorbed.
     fn prefillOpened(x: *Cuda, s: *lanes.Stream, seq: *st.Seq) !void {
+        // an image prompt: the tower's rows and the prompt's three positions for its pass (EncodedVision)
+        const media: ?*vision.Media = if (s.images.len == 0) null else blk: {
+            const tower = x.tower orelse return error.VisionDisabled;
+            const gpu: vision.Gpu = .{ .d = x.e.ops().k.d, .s = x.e.ops().s, .discrete = x.e.ops().k.discrete };
+            break :blk try vision.Media.init(x.gpa, tower, gpu, s.prompt(), s.images, prompt_rows);
+        };
+        defer if (media) |m| m.deinit();
         if (x.drafter) |d| if (s.drafts) {
             const ds = try x.draftingOf(s);
-            return lone.prefill(x.e, seq, &ds.ctx, d, s.prompt());
+            return lone.prefillMedia(x.e, seq, &ds.ctx, d, s.prompt(), media);
         };
-        try x.e.prefill(seq, s.prompt());
+        try x.e.prefillMedia(seq, s.prompt(), media);
     }
 
     /// prefill_batch: prompts in shared passes of at most a chunk's rows (a longer one alone, in its chunks).

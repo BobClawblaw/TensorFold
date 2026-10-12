@@ -8,6 +8,8 @@ const st = @import("state.zig");
 const engine = @import("engine.zig");
 const Lanes = @import("lanes.zig").Cuda;
 const dr = @import("draft.zig");
+const vision = @import("vision.zig");
+const image = @import("image.zig");
 
 pub const model_type = "qwen3_5";
 pub const formats: []const []const u8 = &.{"mlx-q4g64"};
@@ -15,7 +17,19 @@ pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = engine.prompt_rows;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, drafter: ?[]const u8 = null, vision: ?Vision = null };
+
+/// --vision's limits: the visual tokens a request's images share, and its images.
+pub const Vision = struct { image_tokens: u32, max_images: u32 };
+
+/// The image placeholder the chat template writes once an image, and the tokens it wraps it in.
+pub const image_token = vision.image_token;
+pub const image_markers = [_]u32{ vision.vision_start, vision.image_token, vision.vision_end };
+
+/// Info.vision's prepare: an image's bytes to the tower's patches (image.zig), on the HTTP thread.
+pub fn prepareImage(a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) !image.Prepared {
+    return image.prepare(a, bytes, max_tokens);
+}
 
 /// A lone drafted stream's own driver (none here: one stream decodes in the lane core too, as under --parallel).
 pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
@@ -31,12 +45,14 @@ pub const Loaded = struct {
     free_streams: u32 = 0,
     /// What a --slide trainer keeps out of the streams' room (none: the 27B does not learn on CUDA yet).
     learn_bytes: usize = 0,
+    /// What the image tower keeps out of the streams' room (--vision): one call's scratch and a request's rows.
+    vision_bytes: usize = 0,
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
 };
 
-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: Lanes, draft: ?*dr.DFlash2 = null };
+const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, lanes: Lanes, draft: ?*dr.DFlash2 = null, tower: ?*vision.Tower = null };
 
 /// The drafter the Python engine pairs with the 27B once pulled (z-lab/Qwen3.8-27B-DFlash2).
 const drafter_repo = "models--z-lab--Qwen3.8-27B-DFlash2";
@@ -82,11 +98,20 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         // the forward's ms by rows: a shared round's tree widths follow the curve
         try own.lanes.calibrate(io, most_streams);
     };
+    var vision_bytes: usize = 0;
+    if (o.vision) |v| {
+        const ops = e.ops();
+        own.tower = try vision.Tower.load(gpa, io, .{ .d = ops.k.d, .s = ops.s, .discrete = ops.k.discrete }, dir);
+        own.lanes.tower = own.tower;
+        vision_bytes = vision.Tower.scratchBytes(vision.max_patches) + @as(usize, v.image_tokens) * vision.out_hidden * 2 + engine.prompt_rows * 16;
+        std.log.info("image tower loaded: {d:.2} GiB, {d:.2} GiB kept for one image call", .{ @as(f64, @floatFromInt(own.tower.?.weight_bytes)) / (1 << 30), @as(f64, @floatFromInt(vision_bytes)) / (1 << 30) });
+    }
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = st.max_rows,
         .stream_bytes = st.Seq.bytes(e.w.g, o.context) + if (own.draft != null) dr.Context.bytes() else 0,
+        .vision_bytes = vision_bytes,
         .ctx = own,
         .deinit = release,
     };
@@ -98,6 +123,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
         error.QwenCheckpointHasNoDraftHead => "this checkpoint has no draft head on CUDA yet: serve with --no-drafts",
+        error.VisionDisabled => "image input needs this server started with --vision",
+        error.BadImagePlaceholders => "the image placeholders do not match the prepared images",
         else => null,
     };
 }
@@ -106,6 +133,7 @@ fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
     own.lanes.deinit();
     if (own.draft) |d| d.deinit();
+    if (own.tower) |t| t.deinit();
     own.e.deinit();
     own.gpa.destroy(own);
 }

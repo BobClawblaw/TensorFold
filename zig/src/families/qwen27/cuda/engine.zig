@@ -6,6 +6,7 @@ const c = @import("shape.zig");
 const kern = @import("kernels.zig");
 const tri = @import("triton.zig");
 const st = @import("state.zig");
+const vision = @import("vision.zig");
 const wts = @import("weights.zig");
 const Forward = @import("forward.zig").Forward;
 const Part = @import("forward.zig").Part;
@@ -73,15 +74,23 @@ pub const Engine = struct {
 
     /// prefill_state from an empty state: the prompt in even chunks of at most `prompt_rows`, its last row normed.
     pub fn prefill(e: *Engine, seq: *st.Seq, prompt: []const u32) !void {
+        return e.prefillMedia(seq, prompt, null);
+    }
+
+    /// prefill with an image prompt's rows and positions (null: text); its decode offset stays on the stream.
+    pub fn prefillMedia(e: *Engine, seq: *st.Seq, prompt: []const u32, media: ?*const vision.Media) !void {
         if (prompt.len == 0) return error.EmptyPrompt;
         if (prompt.len >= seq.capacity) return error.PromptTooLong;
         try seq.reset(e.ops(), e.w.g);
+        seq.media = media;
+        defer seq.media = null;
         var f = e.forward();
         const n = (prompt.len + prompt_rows - 1) / prompt_rows;
         for (0..n) |j| {
             const b = chunkBounds(0, prompt.len, prompt_rows, j);
             try f.chunk(prompt[b[0]..b[1]], seq, j == n - 1);
         }
+        if (media) |m| seq.rope_delta = m.delta;
     }
 
     /// decode.serial_decode, greedy: one-row windows from `pending` until `count` tokens or an end token.

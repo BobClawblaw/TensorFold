@@ -206,3 +206,46 @@ extern "C" __global__ void __launch_bounds__(256) tf_qv_splice(__nv_bfloat16* __
     if (s < 0) return;
     for (int i = threadIdx.x; i < D; i += blockDim.x) x[row * D + i] = features[static_cast<long long>(s) * D + i];
 }
+
+// glue._attn_prep with MROPE (0.6.6's Triton kernel, three position rows): each head's q (from the [q | gate] rows)
+// or k RMS-normed to bf16, then rotate-half over the first 2 * HALF dims, frequency i taking the t, h or w position
+// by Qwen's interleaved sections (axis 1 where i % 3 == 1 and i < 3 * hsec, axis 2 where i % 3 == 2 and
+// i < 3 * wsec, else axis 0). A block of D threads a (row, head); pos is [3][rows].
+extern "C" __global__ void __launch_bounds__(256) tf_qv_attn_prep_mrope(
+    const __nv_bfloat16* __restrict__ qg, const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ qn,
+    const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, const float* __restrict__ inv,
+    __nv_bfloat16* __restrict__ qout, __nv_bfloat16* __restrict__ kout, float eps, int H, int HKV, int D, int HALF,
+    int rows, int hsec, int wsec) {
+    __shared__ float part[8];
+    __shared__ float vals[256];
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    const int d = threadIdx.x;
+    const bool is_q = head < H;
+    const __nv_bfloat16* src = is_q ? qg + (static_cast<long long>(row) * H + head) * 2 * D
+                                    : kv + (static_cast<long long>(row) * HKV + head - H) * D;
+    const __nv_bfloat16* wn = is_q ? qn : kn;
+    const float x = bf(src[d]);
+    float s = x * x;
+    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((d & 31) == 0) part[d >> 5] = s;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int i = 0; i < (D >> 5); ++i) tot += part[i];
+    const float r = 1.0f / sqrtf(tot / D + eps);
+    const float xn = rnd(x * r * bf(wn[d]));
+    vals[d] = xn;
+    __syncthreads();
+    float out = xn;
+    if (d < 2 * HALF) {
+        const int i = d < HALF ? d : d - HALF;
+        const int axis = (i % 3 == 1 && i < 3 * hsec) ? 1 : ((i % 3 == 2 && i < 3 * wsec) ? 2 : 0);
+        const float ang = static_cast<float>(pos[axis * rows + row]) * inv[i];
+        const float cs = cosf(ang), sn = sinf(ang);
+        const float xp = vals[d < HALF ? d + HALF : d - HALF];
+        out = d < HALF ? xn * cs - xp * sn : xn * cs + xp * sn;
+    }
+    __nv_bfloat16* dst = is_q ? qout + (static_cast<long long>(row) * H + head) * D
+                              : kout + (static_cast<long long>(row) * HKV + head - H) * D;
+    dst[d] = __float2bfloat16_rn(out);
+}

@@ -26,6 +26,12 @@ pub const patch_width = channels * temporal * patch * patch; // 1536
 pub const grid_side = 48; // sqrt(num_position_embeddings 2304)
 pub const merged = hidden * merge * merge; // 4608
 pub const eps: f32 = 1e-6;
+/// The language model's rope_parameters.mrope_section (t, h, w frequencies, interleaved).
+pub const mrope_section = [3]u32{ 11, 11, 10 };
+/// Tokens the template writes around an image, and the image placeholder it expands.
+pub const vision_start: u32 = 248053;
+pub const vision_end: u32 = 248054;
+pub const image_token: u32 = 248056;
 /// One tower call's patches: a 4,096-token image's (0.6.6's MAX_PATCHES).
 pub const max_patches = 16384;
 const workspace_bytes = 32 << 20;
@@ -56,6 +62,7 @@ const Fns = struct {
     bias_residual: cuda.Function,
     bias_cast: cuda.Function,
     splice: cuda.Function,
+    attn_prep: cuda.Function,
 };
 
 /// The image tower's weights on the GPU and its kernels; `encode` turns patches into language-width rows.
@@ -98,6 +105,7 @@ pub const Tower = struct {
             .bias_residual = try t.mod.function("tf_qv_bias_residual"),
             .bias_cast = try t.mod.function("tf_qv_bias_cast"),
             .splice = try t.mod.function("tf_qv_splice"),
+            .attn_prep = try t.mod.function("tf_qv_attn_prep_mrope"),
         };
         errdefer t.freeBuffers();
         var src = try source.Source.init(gpa, .{ .d = ops.d, .s = ops.s, .discrete = ops.discrete });
@@ -297,6 +305,11 @@ pub const Tower = struct {
         try t.go(ops, t.f.splice, rows, 1, 256, .{ x, features, src, int(out_hidden) });
     }
 
+    /// glue.attn_prep with three position rows (pos [3][rows], device int32): normed, M-RoPE-rotated q and k.
+    pub fn attnPrep(t: *Tower, ops: Gpu, qg: u64, key: u64, qn: u64, kn: u64, pos: u64, inv: u64, qout: u64, kout: u64, rows: usize, a: struct { heads: usize, kv_heads: usize, dim: usize, half: usize }, eps_: f32) !void {
+        try t.go(ops, t.f.attn_prep, rows, a.heads + a.kv_heads, @intCast(a.dim), .{ qg, key, qn, kn, pos, inv, qout, kout, eps_, int(a.heads), int(a.kv_heads), int(a.dim), int(a.half), int(rows), int(mrope_section[1]), int(mrope_section[2]) });
+    }
+
     fn go(t: *Tower, ops: Gpu, f: cuda.Function, gx: usize, gy: usize, block: u32, args: anytype) !void {
         _ = t;
         var a: cuda.Args = .{};
@@ -394,4 +407,125 @@ test "bilinear taps match align_corners resampling at the ends and middle" {
     const b = taps(9, 10);
     try std.testing.expectEqual(@as(i32, 47), b.i[0]);
     try std.testing.expectEqual(@as(f32, 1), b.w[0]);
+}
+
+/// An image prompt's rows for its prompt pass (0.6.6's EncodedVision): the tower's rows on the GPU, each prompt row's
+/// feature row (or -1), the three rotary positions of every prompt row and the decode offset after the prompt.
+pub const Media = struct {
+    gpa: std.mem.Allocator,
+    tower: *Tower,
+    features: cuda.DeviceBuffer, // bf16 [image rows, out_hidden]
+    src: []i32, // [prompt]: feature row or -1
+    pos: []i32, // [3][prompt]: t, h, w
+    delta: i32,
+    dev: cuda.DeviceBuffer, // a chunk's src and [3][rows] positions
+
+    /// Encodes `images` (Image.at: the first of its tokens' rows) and lays out the prompt's positions as
+    /// transformers' get_rope_index does: text counts up on all three axes; an image sits at the next position with
+    /// its merged rows and columns on the h and w axes; text after it resumes past its larger side.
+    pub fn init(gpa: std.mem.Allocator, tower: *Tower, ops: Gpu, prompt: []const u32, images: anytype, chunk_rows: usize) !*Media {
+        const n = prompt.len;
+        const m = try gpa.create(Media);
+        errdefer gpa.destroy(m);
+        var rows: usize = 0;
+        for (images) |img| rows += img.tokens;
+        m.* = .{ .gpa = gpa, .tower = tower, .features = try cuda.DeviceBuffer.alloc(ops.d, rows * out_hidden * 2), .src = &.{}, .pos = &.{}, .delta = 0, .dev = undefined };
+        errdefer m.features.free();
+        m.dev = try cuda.DeviceBuffer.alloc(ops.d, chunk_rows * 4 * 4);
+        errdefer m.dev.free();
+        m.src = try gpa.alloc(i32, n);
+        errdefer gpa.free(m.src);
+        m.pos = try gpa.alloc(i32, 3 * n);
+        errdefer gpa.free(m.pos);
+        @memset(m.src, -1);
+        // the tower: runs of whole images within one call's patches, in prompt order
+        var done: usize = 0; // feature rows written
+        var i: usize = 0;
+        while (i < images.len) {
+            var j = i;
+            var patches: usize = 0;
+            while (j < images.len and (j == i or patches + images[j].gh * images[j].gw <= max_patches)) : (j += 1) patches += images[j].gh * images[j].gw;
+            const px = try gpa.alloc(f32, patches * patch_width);
+            defer gpa.free(px);
+            const grids = try gpa.alloc(Grid, j - i);
+            defer gpa.free(grids);
+            var at: usize = 0;
+            for (images[i..j], grids) |img, *g| {
+                if (img.pixels.len != @as(usize, img.gh) * img.gw * patch_width or img.tokens * merge * merge != img.gh * img.gw) return error.BadImagePatches;
+                @memcpy(px[at..][0..img.pixels.len], img.pixels);
+                at += img.pixels.len;
+                g.* = .{ .h = img.gh, .w = img.gw };
+            }
+            try tower.encode(ops, px, grids, m.features.ptr + done * out_hidden * 2);
+            for (images[i..j]) |img| done += img.tokens;
+            i = j;
+        }
+        m.delta = try layout(prompt, images, m.src, m.pos);
+        return m;
+    }
+
+    pub fn deinit(m: *Media) void {
+        m.features.free();
+        m.dev.free();
+        m.gpa.free(m.src);
+        m.gpa.free(m.pos);
+        m.gpa.destroy(m);
+    }
+
+    /// Whether rows [p0, p0 + w) hold an image row.
+    pub fn hasImage(m: *const Media, p0: usize, w: usize) bool {
+        for (m.src[p0..][0..w]) |v| if (v >= 0) return true;
+        return false;
+    }
+};
+
+/// The prompt's three rotary positions ([3][n]) and each placeholder row's feature row (src, -1 for text), as
+/// transformers' get_rope_index lays them out; returns the decode offset (rope_delta).
+pub fn layout(prompt: []const u32, images: anytype, src: []i32, pos: []i32) !i32 {
+    const n = prompt.len;
+    @memset(src, -1);
+    var next: i32 = 0;
+    var cursor: usize = 0;
+    var row: i32 = 0;
+    for (images) |img| {
+        const begin: usize = img.at;
+        const h: usize = img.gh / merge;
+        const w: usize = img.gw / merge;
+        const end = begin + h * w;
+        if (begin < cursor or begin == 0 or end >= n or prompt[begin - 1] != vision_start or prompt[end] != vision_end) return error.BadImagePlaceholders;
+        for (prompt[begin..end]) |t| if (t != image_token) return error.BadImagePlaceholders;
+        for (cursor..begin) |r| {
+            const v = next + @as(i32, @intCast(r - cursor));
+            for (0..3) |a| pos[a * n + r] = v;
+        }
+        const base = next + @as(i32, @intCast(begin - cursor));
+        for (0..h * w) |k| {
+            const r = begin + k;
+            pos[r] = base;
+            pos[n + r] = base + @as(i32, @intCast(k / w));
+            pos[2 * n + r] = base + @as(i32, @intCast(k % w));
+            src[r] = row;
+            row += 1;
+        }
+        next = base + @as(i32, @intCast(@max(h, w)));
+        cursor = end;
+    }
+    for (cursor..n) |r| {
+        const v = next + @as(i32, @intCast(r - cursor));
+        for (0..3) |a| pos[a * n + r] = v;
+    }
+    return next - @as(i32, @intCast(cursor));
+}
+
+test "media positions: text counts up, an image sits at one position with its grid, text resumes past its side" {
+    const I = struct { gh: u32, gw: u32, at: u32, tokens: u32 };
+    const prompt = [_]u32{ 7, vision_start, image_token, image_token, image_token, image_token, image_token, image_token, vision_end, 9 };
+    var src: [10]i32 = undefined;
+    var pos: [30]i32 = undefined;
+    const delta = try layout(&prompt, &[_]I{.{ .gh = 4, .gw = 6, .at = 2, .tokens = 6 }}, &src, &pos);
+    try std.testing.expectEqual(@as(i32, -3), delta);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 2, 2, 2, 2, 2, 5, 6 }, pos[0..10]);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 2, 2, 3, 3, 3, 5, 6 }, pos[10..20]);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 4, 2, 3, 4, 5, 6 }, pos[20..30]);
+    try std.testing.expectEqualSlices(i32, &.{ -1, -1, 0, 1, 2, 3, 4, 5, -1, -1 }, &src);
 }
