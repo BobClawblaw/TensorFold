@@ -142,8 +142,10 @@ fn wide(gpa: std.mem.Allocator, logits: []const u16, p: lanes.Sampling, position
         const x = value(logits[id]) / t;
         if (j > 0) {
             const d = best_score - x;
-            if (d > 38) break; // a draw's noise is at most -log(-log(1 - 2^-54)) = 37.43, and x only falls from here
-            if (d > 1 and beyondReach(p.seed, position, id, d)) continue;
+            if (d > 38) { // finite noise is at most -log(-log(1 - 2^-52)) = 36.04; a uniform that rounds to 1 gives +inf
+                if (best_score == std.math.inf(f64)) break; // the first +inf stands: a later one ties, never passes
+                if (lanes.sampling.uniform(p.seed, position, id) != 1.0) continue;
+            } else if (d > 1 and beyondReach(p.seed, position, id, d)) continue;
         }
         const score = x - log(-log(lanes.sampling.uniform(p.seed, position, id)));
         if (j == 0 or score > best_score) {
@@ -162,10 +164,10 @@ const below_e = blk: {
 };
 
 /// Whether the noise for `id` stays a nat short of `d`: -log(-log u) <= -log(1 - u), so 1 - u >= exp(-(d - 1))
-/// bounds it by d - 1, read from the uniform's integer bits against exp of a whole nat at or below d - 1.
+/// bounds it by d - 1, against exp of a whole nat at or below d - 1. 1 - u is exact for the f64 u the draw uses
+/// (Sterbenz past 0.5; below it the bound cannot hold), and a u rounded to 1 gives 0: never passed over.
 fn beyondReach(seed: u64, position: u64, id: u64, d: f64) bool {
-    const m = lanes.sampling.keyBits(seed, position, id) >> 11;
-    const one_minus_u = @as(f64, @floatFromInt((@as(u64, 1) << 53) - m)) * 0x1p-53 - 0x1p-54;
+    const one_minus_u = 1.0 - lanes.sampling.uniform(seed, position, id);
     const j: usize = @intFromFloat(@floor(d) - 1);
     return one_minus_u >= below_e[j] * (1 + 1e-9);
 }
@@ -192,4 +194,21 @@ test "the one-pass draw equals the reference on random rows with ties, signed ze
             }
         };
     }
+}
+
+test "wide draw preserves reference when uniform rounds to one" {
+    const gpa = std.testing.allocator;
+    var words: [300]u16 = @splat(0);
+    words[0] = 0x4280; // 64.0; other logits are zero
+    const p: lanes.Sampling = .{ .seed = 2870505676250484375, .temperature = 1, .top_k = 0, .top_p = 1, .min_p = 0 };
+    try std.testing.expectEqual(@as(f64, 1), lanes.sampling.uniform(p.seed, 0, 4));
+    const expected = try reference(gpa, &words, p, 0);
+    try std.testing.expectEqual(@as(u32, 4), expected);
+    try std.testing.expectEqual(expected, try draw(gpa, &words, p, 0));
+    // the same candidate within the pruning bound (shortfall under 38), and behind a different leader
+    words[0] = 0x41a0; // 20.0
+    try std.testing.expectEqual(try reference(gpa, &words, p, 0), try draw(gpa, &words, p, 0));
+    words[0] = 0;
+    words[2] = 0x4280;
+    try std.testing.expectEqual(try reference(gpa, &words, p, 0), try draw(gpa, &words, p, 0));
 }
