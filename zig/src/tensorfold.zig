@@ -15,6 +15,7 @@ pub const segments = @import("core/segments.zig");
 pub const row_projection = @import("core/row_projection.zig");
 pub const nemotron = @import("families/nemotron/nemotron.zig");
 pub const flashnext_replay = @import("families/flashnext/replay.zig");
+pub const flashnext_sample = @import("families/flashnext/sample.zig");
 pub const flashnext_engine = @import("families/flashnext/engine.zig");
 pub const flashnext_snapshot = @import("families/flashnext/snapshot.zig");
 pub const flashnext_session = @import("families/flashnext/session.zig");

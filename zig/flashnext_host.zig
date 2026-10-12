@@ -2,5 +2,6 @@
 test {
     _ = @import("src/families/flashnext/host_test.zig");
     _ = @import("src/families/flashnext/pack.zig");
+    _ = @import("src/families/flashnext/sample.zig");
     _ = @import("src/families/flashnext/batch_meta_test.zig");
 }
