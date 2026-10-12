@@ -267,7 +267,7 @@ pub const Trainer = struct {
         var ck = try core.Checkpoint.openModel(t.gpa, io, dir);
         defer ck.close();
         // direct reads through the engine loader's slots: copies from the mapping crawl on GB10
-        var src = try Source.init(t.gpa, t.e.ops());
+        var src = try Source.init(t.gpa, .of(t.e.ops()));
         defer src.deinit();
         try src.add(&ck);
         var name: [192]u8 = undefined;
