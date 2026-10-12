@@ -4,7 +4,10 @@
 const std = @import("std");
 const lanes = @import("lanes");
 
-/// k at most this takes the one-pass path; a wider (or unlimited) top-k takes the reference's.
+extern "c" fn exp(x: f64) f64; // libm's, as lanes.sampling's
+extern "c" fn log(x: f64) f64;
+
+/// k at most this takes the one-pass path; a wider (or unlimited) top-k takes `wide`.
 pub const MAX_K = 256;
 
 /// A bf16 word's order as an unsigned key: larger floats give larger keys, -0 and +0 the same.
@@ -62,7 +65,7 @@ pub fn row(base: [*]const u8, vocab: usize, at: usize) []const u16 {
 /// The draw for `logits` with `p` keyed at `position` (p.temperature above 0).
 pub fn draw(gpa: std.mem.Allocator, logits: []const u16, p: lanes.Sampling, position: u64) !u32 {
     const k: usize = p.top_k;
-    if (k == 0 or k > MAX_K or k >= logits.len) return reference(gpa, logits, p, position);
+    if (k == 0 or k > MAX_K or k >= logits.len) return wide(gpa, logits, p, position);
     var keys: [MAX_K]u16 = undefined;
     var ids: [MAX_K]u64 = undefined;
     var filled: usize = 0;
@@ -84,6 +87,89 @@ pub fn draw(gpa: std.mem.Allocator, logits: []const u16, p: lanes.Sampling, posi
     return @intCast(try lanes.sampling.choose(gpa, values[0..filled], ids[0..filled], position, p));
 }
 
+/// A wide or unlimited top-k as `reference` draws it: the candidates in choose's order by a counting sort of their
+/// keys (ids ascending within one), top-p and min-p cut as choose cuts them, then the keyed Gumbel draw in that order,
+/// passing over candidates whose noise cannot lift them past the best score so far (most, without their two logs).
+fn wide(gpa: std.mem.Allocator, logits: []const u16, p: lanes.Sampling, position: u64) !u32 {
+    const starts = try gpa.alloc(u32, 1 << 16);
+    defer gpa.free(starts);
+    @memset(starts, 0);
+    for (logits) |word| {
+        if (word & 0x7f80 == 0x7f80) return error.NonfiniteQwenLogits; // exponent all ones: inf or nan
+        starts[0xffff - key(word)] += 1; // larger keys first
+    }
+    var at: u32 = 0;
+    for (starts) |*c| {
+        const n = c.*;
+        c.* = at;
+        at += n;
+    }
+    const order = try gpa.alloc(u32, logits.len);
+    defer gpa.free(order);
+    for (logits, 0..) |word, id| {
+        const b = 0xffff - @as(usize, key(word));
+        order[starts[b]] = @intCast(id);
+        starts[b] += 1;
+    }
+    const t = @max(p.temperature, 1e-6);
+    const k = @max(1, @min(if (p.top_k != 0) @as(usize, p.top_k) else logits.len, logits.len));
+    const x0 = value(logits[order[0]]) / t;
+    var keep = k;
+    if (p.top_p > 0.0 and p.top_p < 1.0) {
+        const probs = try gpa.alloc(f64, k);
+        defer gpa.free(probs);
+        for (probs, order[0..k]) |*q, id| q.* = exp(value(logits[id]) / t - x0);
+        const total = lanes.sampling.pairwiseSum(probs);
+        var cum: f64 = 0.0;
+        var below: usize = 0;
+        for (probs) |q| { // cum only grows: past top_p no later one counts
+            cum += q / total;
+            if (cum < p.top_p) below += 1 else break;
+        }
+        keep = @min(keep, below + 1);
+    }
+    if (p.min_p > 0.0) {
+        const floor = x0 + p.minLog();
+        var n: usize = 0;
+        for (order[0..keep]) |id| {
+            if (value(logits[id]) / t >= floor) n += 1;
+        }
+        keep = n;
+    }
+    var best: usize = 0;
+    var best_score = -std.math.inf(f64);
+    for (order[0..keep], 0..) |id, j| {
+        const x = value(logits[id]) / t;
+        if (j > 0) {
+            const d = best_score - x;
+            if (d > 38) break; // a draw's noise is at most -log(-log(1 - 2^-54)) = 37.43, and x only falls from here
+            if (d > 1 and beyondReach(p.seed, position, id, d)) continue;
+        }
+        const score = x - log(-log(lanes.sampling.uniform(p.seed, position, id)));
+        if (j == 0 or score > best_score) {
+            best = j;
+            best_score = score;
+        }
+    }
+    return order[best];
+}
+
+/// exp(-j) for the whole nats below a candidate's shortfall, for beyondReach.
+const below_e = blk: {
+    var e: [38]f64 = undefined;
+    for (&e, 0..) |*v, j| v.* = @exp(-@as(f64, @floatFromInt(j)));
+    break :blk e;
+};
+
+/// Whether the noise for `id` stays a nat short of `d`: -log(-log u) <= -log(1 - u), so 1 - u >= exp(-(d - 1))
+/// bounds it by d - 1, read from the uniform's integer bits against exp of a whole nat at or below d - 1.
+fn beyondReach(seed: u64, position: u64, id: u64, d: f64) bool {
+    const m = lanes.sampling.keyBits(seed, position, id) >> 11;
+    const one_minus_u = @as(f64, @floatFromInt((@as(u64, 1) << 53) - m)) * 0x1p-53 - 0x1p-54;
+    const j: usize = @intFromFloat(@floor(d) - 1);
+    return one_minus_u >= below_e[j] * (1 + 1e-9);
+}
+
 test "the one-pass draw equals the reference on random rows with ties, signed zeros and every top-k" {
     const gpa = std.testing.allocator;
     var rng = std.Random.DefaultPrng.init(7);
@@ -92,16 +178,18 @@ test "the one-pass draw equals the reference on random rows with ties, signed ze
     defer gpa.free(words);
     for (0..40) |trial| {
         for (words) |*w| {
-            const f: f32 = @floatCast(r.floatNorm(f64) * 3.0);
+            const f: f32 = @floatCast(r.floatNorm(f64) * @as(f64, if (trial % 2 == 0) 3.0 else 20.0)); // narrow, then wide
             w.* = @intCast(@as(u32, @bitCast(f)) >> 16);
         }
         for (0..64) |j| words[r.uintLessThan(usize, words.len)] = words[j]; // ties
         words[r.uintLessThan(usize, words.len)] = 0x8000;
         words[r.uintLessThan(usize, words.len)] = 0;
-        for ([_]u32{ 1, 2, 20, 64, 256 }) |k| for ([_]f64{ 0.6, 1.0, 1.5 }) |t| {
-            const p: lanes.Sampling = .{ .seed = trial * 31 + k, .temperature = t, .top_k = k, .top_p = 0.95 };
-            const pos: u64 = trial * 7 + k;
-            try std.testing.expectEqual(try reference(gpa, words, p, pos), try draw(gpa, words, p, pos));
+        for ([_]u32{ 0, 1, 2, 20, 64, 256, 300, 4096 }) |k| for ([_]f64{ 0.6, 1.0, 1.5, 4.0 }) |t| {
+            for ([_][2]f64{ .{ 0.95, 0 }, .{ 1.0, 0 }, .{ 0.5, 0.05 }, .{ 1.0, 0.2 } }) |cut| {
+                const p: lanes.Sampling = .{ .seed = trial * 31 + k, .temperature = t, .top_k = k, .top_p = cut[0], .min_p = cut[1] };
+                const pos: u64 = trial * 7 + k;
+                try std.testing.expectEqual(try reference(gpa, words, p, pos), try draw(gpa, words, p, pos));
+            }
         };
     }
 }
