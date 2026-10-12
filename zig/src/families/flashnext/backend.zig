@@ -28,6 +28,7 @@ pub const Backend = struct {
     draft_calls: u64 = 0,
     draft_waits: u64 = 0,
     draft_seconds: f64 = 0,
+    fill_until: f64 = 0, // a prompt pass beside decoding streams waits until their rounds have had its last step's time
     tower: ?*Vision = null, // --vision: a stream's images become its prompt pass's rows (vis_prompt.zig)
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine, n: u32, capacity: usize) !Backend {
@@ -53,7 +54,7 @@ pub const Backend = struct {
     }
 
     pub fn backend(b: *Backend) be.Backend {
-        return .{ .ptr = b, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = b, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
 
     pub fn facts(b: *Backend) lanes.Model {
@@ -138,10 +139,11 @@ pub const Backend = struct {
         return true;
     }
 
-    fn prefill(ptr: *anyopaque, stream: *Stream) anyerror!void {
-        const pool = mtl.objc.Pool.push();
-        defer pool.pop();
-        const b = self(ptr);
+    /// Rows a prompt-pass step takes while other streams decode: their rounds wait for no more than one such step.
+    const FILL_SHARED_ROWS = 1024;
+
+    /// A stream's prompt pass begins: the smallest free session that holds it, a restored prefix, its images' rows.
+    fn begin(b: *Backend, stream: *Stream) !*Session {
         if (stream.sampling) |p| if (p.temperature > 0) return error.GreedyOnly;
         const prompt = stream.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
@@ -149,7 +151,13 @@ pub const Backend = struct {
         const i = try b.slotFor(prompt.len, stream.max_new);
         const s = &b.sessions[i];
         try b.by.put(b.gpa, stream, i);
+        errdefer {
+            _ = b.by.remove(stream);
+            s.used = false;
+            endFill(s);
+        }
         s.used = true;
+        s.filling = true;
         s.held_n = 0;
         s.round = .{};
         s.row0 = 0;
@@ -158,55 +166,102 @@ pub const Backend = struct {
         defer old.restore(b);
         s.m.reset();
         stream.cached = 0;
-        // an image prompt is read whole and never kept: its frame depends on every image in it
-        var arena: std.heap.ArenaAllocator = .init(b.gpa);
-        defer arena.deinit();
-        const images = stream.images.len > 0;
-        if (images) s.m.vis = try vis_prompt.build(b.tower orelse return error.NoVision, b.e.r.device, b.e.r.queue, arena.allocator(), stream.images, prompt.len);
-        defer if (s.m.vis) |v| {
-            v.rows.deinit();
-            s.m.vis = null;
-        };
-        if (stream.reuse.saved) |saved| if (!images) {
+        if (stream.images.len > 0) { // an image prompt is read whole and never kept: its frame depends on every image
+            s.vis_arena = .init(b.gpa);
+            s.m.vis = try vis_prompt.build(b.tower orelse return error.NoVision, b.e.r.device, b.e.r.queue, s.vis_arena.?.allocator(), stream.images, prompt.len);
+        } else if (stream.reuse.saved) |saved| {
             const state: *snap.State = @ptrCast(@alignCast(saved));
             if (state.at < prompt.len and state.at < s.m.cap) {
                 try snap.restore(b.e, state);
                 stream.cached = @intCast(state.at);
             } else stream.reuse_failed = true;
-        };
-        var at: usize = s.m.pos;
-        while (at < prompt.len) {
-            if (stream.isCancelled()) return error.Cancelled;
-            var end = prompt.len;
-            for (stream.chunks) |mark| if (mark > at) {
-                end = @min(end, mark);
-                break;
-            };
-            for (stream.reuse.marks) |mark| if (!images and mark > at) {
-                end = @min(end, mark);
-                break;
-            };
-            const step = fz.chunkRows(at, b.e.pr.step); // past the trained window a chunk scores more blocks a row
-            const call = if (b.e.segments) segments.next(end - at, step, @import("engine.zig").SEG_MIN) else segments.Call{ .rows = @min(end - at, step), .parts = 1 };
-            end = at + call.rows;
-            const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
-            const t_chunk = std.c.mach_absolute_time();
-            s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
-            if (std.c.getenv("FZ_BATCH_LOG") != null) std.log.info("flash next prefill: rows [{d}, {d}) in {d} parts, {d:.1} ms", .{ at, end, call.parts, @as(f64, @floatFromInt(std.c.mach_absolute_time() - t_chunk)) / 24e3 });
-            for (ps[0..call.parts], 0..) |p, k| {
-                const start = at + segments.start(call.rows, call.parts, k);
-                const rows = segments.rows(call.rows, call.parts, k);
-                const count = if (start + rows < prompt.len) rows else rows - 1;
-                try p.mtpKeys(&s.m, start, prompt[start + 1 .. start + 1 + count], p.last);
-                if (start + rows == prompt.len) Session.copy(p.last.at((rows - 1) * fz.WIDE * 2), s.last, fz.WIDE * 2);
-            }
-            s.normalize();
-            at = end;
-            if (!images and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(at)) != null)
-                if (stream.reuse.hook) |hook| hook.at(hook.ptr, stream, @intCast(at));
         }
+        return s;
+    }
+
+    /// A session's prompt-pass state goes: its image rows (once its pass ends, or its stream leaves).
+    fn endFill(s: *Session) void {
+        if (s.m.vis) |v| v.rows.deinit();
+        s.m.vis = null;
+        if (s.vis_arena) |*a| a.deinit();
+        s.vis_arena = null;
+        s.filling = false;
+    }
+
+    /// One chunk of a stream's prompt pass from its session's position, at most `most` rows; true once the pass ends.
+    fn chunk(b: *Backend, s: *Session, stream: *Stream, most: usize) !bool {
+        const prompt = stream.prompt();
+        const images = s.m.vis != null;
+        if (stream.isCancelled()) return error.Cancelled;
+        try b.settle(); // other streams' rounds may have run since the last chunk
+        const old = try b.bind(s);
+        defer old.restore(b);
+        const at: usize = s.m.pos;
+        var end = prompt.len;
+        for (stream.chunks) |mark| if (mark > at) {
+            end = @min(end, mark);
+            break;
+        };
+        for (stream.reuse.marks) |mark| if (!images and mark > at) {
+            end = @min(end, mark);
+            break;
+        };
+        const step = @min(most, fz.chunkRows(at, b.e.pr.step)); // past the trained window a chunk scores more blocks a row
+        const call = if (b.e.segments) segments.next(end - at, step, @import("engine.zig").SEG_MIN) else segments.Call{ .rows = @min(end - at, step), .parts = 1 };
+        end = at + call.rows;
+        const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
+        const t_chunk = std.c.mach_absolute_time();
+        s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
+        if (std.c.getenv("FZ_BATCH_LOG") != null) std.log.info("flash next prefill: rows [{d}, {d}) in {d} parts, {d:.1} ms", .{ at, end, call.parts, @as(f64, @floatFromInt(std.c.mach_absolute_time() - t_chunk)) / 24e3 });
+        for (ps[0..call.parts], 0..) |p, k| {
+            const start = at + segments.start(call.rows, call.parts, k);
+            const rows = segments.rows(call.rows, call.parts, k);
+            const count = if (start + rows < prompt.len) rows else rows - 1;
+            try p.mtpKeys(&s.m, start, prompt[start + 1 .. start + 1 + count], p.last);
+            if (start + rows == prompt.len) Session.copy(p.last.at((rows - 1) * fz.WIDE * 2), s.last, fz.WIDE * 2);
+        }
+        s.normalize();
+        if (!images and std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null)
+            if (stream.reuse.hook) |hook| hook.at(hook.ptr, stream, @intCast(end));
+        if (end < prompt.len) return false;
         s.m.mtp.pos = prompt.len - 1;
         s.m.mtp.drafted = 0;
+        endFill(s);
+        return true;
+    }
+
+    /// The whole prompt pass at once (a lone stream's driver).
+    fn prefill(ptr: *anyopaque, stream: *Stream) anyerror!void {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const b = self(ptr);
+        const s = try b.begin(stream);
+        errdefer endFill(s);
+        while (!try b.chunk(s, stream, std.math.maxInt(usize))) {}
+    }
+
+    /// One step of the prompt pass between the other streams' rounds: a full chunk alone; beside decoding streams
+    /// FILL_SHARED_ROWS, and only once their rounds have had as long as the step before (the GPU shared half and half);
+    /// a prompt's last step (all of a short one) runs at once.
+    fn prefillStep(ptr: *anyopaque, stream: *Stream) anyerror!bool {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const b = self(ptr);
+        const s = if (b.by.get(stream)) |i| &b.sessions[i] else try b.begin(stream);
+        errdefer endFill(s);
+        const shared = for (b.sessions) |*o| {
+            if (o != s and o.used and !o.filling) break true;
+        } else false;
+        const last_step = stream.prompt().len - s.m.pos <= FILL_SHARED_ROWS; // a short prompt never waits its turn
+        if (shared and !last_step and mtl.clock.seconds() < b.fill_until) {
+            if (stream.isCancelled()) return error.Cancelled;
+            return false; // the decoding streams' turn
+        }
+        const t0 = mtl.clock.seconds();
+        const done = try b.chunk(s, stream, if (shared) FILL_SHARED_ROWS else std.math.maxInt(usize));
+        const t1 = mtl.clock.seconds();
+        b.fill_until = t1 + (t1 - t0);
+        return done;
     }
 
     fn first(ptr: *anyopaque, stream: *Stream, position: u64) anyerror!u64 {
@@ -331,6 +386,7 @@ pub const Backend = struct {
     fn release(ptr: *anyopaque, stream: *Stream) void {
         const b = self(ptr);
         const kv = b.by.fetchRemove(stream) orelse return;
+        endFill(&b.sessions[kv.value]); // a stream that leaves mid-pass frees its image rows
         b.sessions[kv.value].used = false;
         b.sessions[kv.value].round = .{};
         b.sessions[kv.value].held_n = 0;
