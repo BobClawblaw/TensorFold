@@ -5,12 +5,13 @@ const tf = @import("tensorfold");
 const vision = tf.flashnext_vision;
 
 const usage =
-    \\tf-flashnext-vision MODEL_DIR REF_DIR [STAGE]
+    \\tf-flashnext-vision MODEL_DIR REF_DIR [STAGE] [IMAGE]
     \\REF_DIR holds meta.json (grid_thw), patches.f32 and the stage's reference: embed.f32 (STAGE embed, the patch
     \\projection plus the position table), block0.f32 (STAGE block0), blocks.f32 (STAGE blocks, after the last block)
     \\or features.f32 (STAGE features, the default: the tower's output rows). Writes native_STAGE.f32 there and prints
     \\the largest and mean absolute differences, the reference's mean magnitude and the rows' cosine similarity; for
     \\features also against features_fp32.f32 (the fp32 tower), beside the bf16 reference's own cosine to it.
+    \\IMAGE: prepare the patches from this file natively, compare them with patches.f32 and run the tower on them.
 ;
 
 fn readFile(a: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
@@ -73,7 +74,26 @@ pub fn main(init: std.process.Init) !void {
     const grid = meta.object.get("grid_thw").?.array.items;
     const gh: u32 = @intCast(grid[1].integer);
     const gw: u32 = @intCast(grid[2].integer);
-    const pixels = try floats(a, ref, "patches.f32");
+    var pixels = try floats(a, ref, "patches.f32");
+    if (args.len > 4) {
+        const img_path = try std.fmt.allocPrintSentinel(a, "{s}", .{args[4]}, 0);
+        const f = try mtl.MappedFile.open(img_path);
+        defer f.deinit();
+        const max_tokens: u32 = @intCast(meta.object.get("max_tokens").?.integer);
+        const prep = try tf.flashnext_image.prepare(a, f.bytes[0..f.size], max_tokens);
+        if (prep.gh != gh or prep.gw != gw) {
+            std.debug.print("grid {d}x{d} differs from the reference's {d}x{d}\n", .{ prep.gh, prep.gw, gh, gw });
+            return error.GridMismatch;
+        }
+        var differ: usize = 0;
+        var max_p: f32 = 0;
+        for (prep.pixels, pixels) |x, y| {
+            if (x != y) differ += 1;
+            max_p = @max(max_p, @abs(x - y));
+        }
+        std.debug.print("patches: {d} of {d} values differ from the reference (largest {d:.6}, one 8-bit level is {d:.6})\n", .{ differ, pixels.len, max_p, 2.0 / 255.0 });
+        pixels = prep.pixels;
+    }
     const P = gh * gw;
     const T = P / vision.patches_per_token;
 

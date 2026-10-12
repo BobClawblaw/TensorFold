@@ -2,7 +2,8 @@
 
     python -I tools/zig/flashnext_vision_fixtures.py --model DIR --images DIR --out DIR [--tower tf-flashnext-vision]
 
-For each PNG or JPEG in --images: transformers' Qwen2VLImageProcessor with the checkpoint's preprocessor_config.json
+For each PNG or JPEG in --images, decoded as the server decodes it (EXIF orientation, alpha over white):
+transformers' Qwen2VLImageProcessor with the checkpoint's preprocessor_config.json
 (sized to --max-tokens visual tokens) gives the patches, and Qwen4ExpVisionModel, built from the checkpoint's
 vision_config and loaded with its `vision_tower.*` tensors (bf16, the patch convolution moved from MLX's channels-last
 layout), runs them in bf16 on the CPU, step by step as its forward does, writing to OUT/<image>/:
@@ -25,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from safetensors import safe_open
 from transformers import Qwen2VLImageProcessor
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpVisionConfig
@@ -79,6 +80,16 @@ def stages(tower: Qwen4ExpVisionModel, pixels: torch.Tensor, grid: torch.Tensor)
     return out
 
 
+def load_rgb(path: Path) -> Image.Image:
+    """The image as the server decodes it: EXIF orientation applied, any alpha composited over white."""
+    im = ImageOps.exif_transpose(Image.open(path))
+    if im.mode in ("RGBA", "LA", "P", "PA") or "transparency" in im.info:
+        im = im.convert("RGBA")
+        white = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        return Image.alpha_composite(white, im).convert("RGB")
+    return im.convert("RGB")
+
+
 def write(path: Path, t: torch.Tensor) -> None:
     path.write_bytes(t.float().contiguous().numpy().astype(np.float32).tobytes())
 
@@ -104,7 +115,7 @@ def main() -> int:
     for img in sorted(p for p in Path(a.images).iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg")):
         dest = out / img.name.replace(".", "-")
         dest.mkdir(parents=True, exist_ok=True)
-        enc = proc(images=Image.open(img).convert("RGB"), return_tensors="pt")
+        enc = proc(images=load_rgb(img), return_tensors="pt")
         pixels, grid = enc["pixel_values"].float(), enc["image_grid_thw"]
         write(dest / "patches.f32", pixels)
         ref = stages(towers["bf16"], pixels.to(torch.bfloat16), grid)
@@ -114,7 +125,7 @@ def main() -> int:
         write(dest / "features_fp32.f32", exact)
         f16, f32 = ref["features"].float(), exact.float()
         cos = torch.nn.functional.cosine_similarity(f16, f32, dim=1)
-        size = Image.open(img).size
+        size = load_rgb(img).size
         meta = {"image": img.name, "size": list(size), "grid_thw": grid[0].tolist(), "max_tokens": a.max_tokens,
                 "tokens": int(f16.shape[0]), "patch_width": int(pixels.shape[1]),
                 "bf16_vs_fp32_cosine": {"mean": float(cos.mean()), "worst": float(cos.min())}}
