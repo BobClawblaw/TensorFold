@@ -12,6 +12,7 @@ const Stream = lanes.Stream;
 const Buf = fz.Buf;
 const mtl = @import("metal");
 const segments = @import("../../core/segments.zig");
+const slots = @import("slots.zig");
 const sample = @import("sample.zig");
 
 /// A stream's sampling when it samples (a temperature above 0); null: the GPU's argmax stands.
@@ -39,6 +40,7 @@ pub const Backend = struct {
     draft_calls: u64 = 0,
     draft_waits: u64 = 0,
     draft_seconds: f64 = 0,
+    sized: bool = false, // FLASHNEXT_SLOT_CONTEXTS set: sessions of several sizes; unset, every stream takes the first free one and none grows
     grow: usize = std.math.maxInt(usize), // reply tokens a session must hold at admission past the prompt (the rest: move)
     paused: std.ArrayList(*Stream) = .empty, // streams that outgrew their session and wait for a larger one to free
     moves: u64 = 0,
@@ -134,46 +136,54 @@ pub const Backend = struct {
         return old;
     }
 
-    /// The free session with the smallest capacity that holds a stream's prompt and its reply's first `grow` tokens
-    /// (slot 0 holds the longest window: keep it for those that need it; a stream that outgrows its session moves:
-    /// makeRoom); error.LaneMemory when only a busy one would (the stream waits), ContextFull when none holds it whole.
+    /// A new stream's session (slots.pick); LaneMemory while only a busy one holds it (it waits), ContextFull when none can.
     fn slotFor(b: *Backend, prompt: usize, max_new: usize) !usize {
-        const need = prompt + @min(max_new, b.grow) + fz.MAXR + 1;
-        var best: ?usize = null;
+        var caps: [fz.MAXR]usize = undefined;
+        var used: [fz.MAXR]bool = undefined;
         var most: usize = 0;
         for (b.sessions, 0..) |s, j| {
+            caps[j] = s.m.cap;
+            used[j] = s.used;
             most = @max(most, s.m.cap);
-            if (s.m.cap >= need and !s.used and (best == null or s.m.cap < b.sessions[best.?].m.cap)) best = j;
         }
-        if (prompt + max_new + fz.MAXR + 1 > most) return error.ContextFull;
-        return best orelse error.LaneMemory;
+        const n = b.sessions.len;
+        const whole = prompt + max_new + slots.WINDOW;
+        const i = slots.pick(caps[0..n], used[0..n], b.sized, prompt, max_new, b.grow) orelse
+            return if (!b.sized) error.NoFreeSlot else if (whole > most) error.ContextFull else error.LaneMemory;
+        if (whole > (if (b.sized) most else caps[i])) return error.ContextFull; // sized, a smaller one grows into the largest
+        return i;
     }
 
-    /// Before a round: a stream left too little room for the next one moves to a free larger session; with none free
-    /// it pauses after this round (its window fits) until one frees (release).
+    /// Before a round, sized only: a stream its session cannot hold to its reply's end moves to a free larger one, or pauses (slots.room).
     fn makeRoom(b: *Backend, stream: *Stream, rows: usize) !void {
+        if (!b.sized) return;
         const i = b.by.get(stream) orelse return error.UnknownStream;
         const s = &b.sessions[i];
-        if (s.m.pos + rows + 2 * (fz.MAXR + 1) <= s.m.cap) return;
-        b.move(stream, i) catch |err| switch (err) {
-            error.LaneMemory => {
-                if (s.m.pos + rows + fz.MAXR + 1 > s.m.cap) return error.ContextFull;
+        var most: usize = 0;
+        var larger = false;
+        for (b.sessions) |o| {
+            most = @max(most, o.m.cap);
+            larger = larger or (!o.used and o.m.cap > s.m.cap);
+        }
+        switch (slots.room(s.m.cap, s.m.pos, rows, stream.prompt().len + stream.max_new + slots.WINDOW, most, larger)) {
+            .ok => {},
+            .move => try b.move(stream, i),
+            .pause => {
                 if (!stream.paused) {
                     try b.paused.append(b.gpa, stream);
                     std.log.info("flash next: a stream at {d} tokens waits for a session larger than {d} tokens to free", .{ s.m.pos, s.m.cap });
                 }
                 stream.paused = true;
             },
-            else => return err,
-        };
+            .full => return error.ContextFull,
+        }
     }
 
-    /// The stream in session `i` into the smallest free larger session that holds its reply's next `grow` tokens (the
-    /// largest free one when none does); LaneMemory when no larger session is free.
+    /// The stream in session `i` into the smallest free larger session holding its next `grow` tokens, else the largest free larger one.
     fn move(b: *Backend, stream: *Stream, i: usize) !void {
         const from = &b.sessions[i];
         const left: usize = @intCast(@max(stream.budgetLeft(), 0));
-        const need = from.m.pos + @min(left, b.grow) + 2 * (fz.MAXR + 1);
+        const need = from.m.pos + @min(left, b.grow) + 2 * slots.WINDOW;
         var best: ?usize = null; // the smallest free larger session that holds `need`
         var most: ?usize = null; // else the largest free larger one
         for (b.sessions, 0..) |o, j| if (!o.used and o.m.cap > from.m.cap) {

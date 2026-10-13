@@ -28,6 +28,7 @@ pub const flashnext_snapshot = @import("families/flashnext/snapshot.zig");
 pub const flashnext_session = @import("families/flashnext/session.zig");
 pub const flashnext_batch_forward = @import("families/flashnext/batch_forward.zig");
 pub const flashnext_backend = @import("families/flashnext/backend.zig");
+pub const flashnext_slots = @import("families/flashnext/slots.zig");
 pub const flashnext_batch_meta = @import("families/flashnext/batch_meta.zig");
 pub const flashnext_learned = @import("families/flashnext/learned.zig");
 pub const flashnext_think_check = @import("families/flashnext/think_check.zig");
@@ -54,6 +55,7 @@ test {
     _ = @import("families/flashnext/dense.zig"); // The core projection adapter keeps format, cuts and tiles.
     _ = @import("families/flashnext/marks.zig"); // a call's marks
     _ = @import("families/flashnext/think.zig"); // a thinking budget's close on the host
+    _ = @import("families/flashnext/slots.zig"); // sized shared sessions: the list, a stream's session, when it grows
     _ = @import("families/flashnext/think_check.zig"); // and in the verdict kernels (Metal)
     _ = @import("families/glm/glm.zig");
     _ = @import("families/qwen3_5/config.zig");

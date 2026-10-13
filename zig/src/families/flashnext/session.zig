@@ -142,8 +142,7 @@ pub const Session = struct {
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
     }
 
-    /// This session's stream into `dst`, a free session with more room: its cache rows, states, n-gram tail and head
-    /// copied on the GPU at a round's end (states settled), so the stream goes on there with the same bits.
+    /// This session's stream into `dst`, a free larger session: cache rows, states, n-gram tail and head copied on the GPU.
     pub fn moveTo(s: *Session, dst: *Session, e: *Engine) !void {
         const m = &s.m;
         const d = &dst.m;
