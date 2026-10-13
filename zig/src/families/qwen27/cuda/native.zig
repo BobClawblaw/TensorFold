@@ -17,6 +17,8 @@ pub const formats: []const []const u8 = &.{"mlx-q4g64"};
 pub const default_context: i64 = 32768;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = engine.prompt_rows;
+/// --drafter: the DFlash2 checkpoint the 27B drafts with (it has no MTP head of its own).
+pub const takes_drafter = true;
 
 /// Prompt-cache copies (reuse.zig), kept in pinned host memory; a state ends where its prompt pass stands.
 pub const snap_bytes = reuse.bytes;
@@ -47,7 +49,7 @@ pub fn prepareImage(a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) !i
 }
 
 /// A lone drafted stream's own driver (none here: one stream decodes in the lane core too, as under --parallel).
-pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
+pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
 
 /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
 pub const Loaded = struct {
