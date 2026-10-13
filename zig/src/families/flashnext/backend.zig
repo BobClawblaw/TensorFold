@@ -62,9 +62,18 @@ pub const Backend = struct {
         return .{ .gpa = gpa, .e = e, .primary = e.m, .sessions = sessions, .hidden = .{ .b = hidden }, .chain_drafts = env.on("FZ_BATCH_MTP_CHAIN"), .serial_drafts = env.on("FZ_BATCH_MTP_SERIAL") };
     }
 
-    /// The lane allocator's prices, timed on the last session before any stream holds it.
+    /// The lane allocator's prices, timed on the last session before any stream holds it; none (unpriced) when it can't be.
     pub fn timeCosts(b: *Backend) !void {
-        const c = try batch_costs.time(b, &b.sessions[b.sessions.len - 1]);
+        if (std.c.getenv("FZ_BATCH_UNPRICED") != null) {
+            std.log.info("flash next: FZ_BATCH_UNPRICED=1: shared rounds unpriced, nothing timed", .{});
+            return;
+        }
+        const s = &b.sessions[b.sessions.len - 1];
+        if (!batch_costs.fits(s.m.cap)) {
+            std.log.info("flash next: a session holds {d} rows, under the {d} that timing shared rounds takes: shared rounds unpriced", .{ s.m.cap, batch_costs.ROWS });
+            return;
+        }
+        const c = try batch_costs.time(b, s);
         b.costs = c;
         std.log.info("flash next: shared forwards {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} ms at 1, 2, 4, 8, 16 rows; a chained draft {d:.2} ms", .{ c.shared[0].ms, c.shared[1].ms, c.shared[3].ms, c.shared[7].ms, c.shared[15].ms, c.step_ms });
     }
@@ -336,8 +345,7 @@ pub const Backend = struct {
         }
     }
 
-    /// Every request's absorb and chained drafts in one command buffer, one wait for the round's drafts (a follow
-    /// past MAXR rows, the prompt's first, absorbs alone first).
+    /// Every request's absorb and chained drafts in one command buffer, one wait (a long follow absorbs alone first).
     fn draftTogether(b: *Backend, requests: []const be.DraftRequest) !void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();

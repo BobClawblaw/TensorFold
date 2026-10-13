@@ -142,8 +142,7 @@ pub const Session = struct {
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
     }
 
-    /// Encode the head's absorb of a kept window and `depth` chained drafts into the open encoder, unsubmitted (one
-    /// command buffer takes every stream's drafts: heldDrafts reads them once it is done); depth 0 absorbs only.
+    /// The head's absorb of a kept window and `depth` chained drafts, encoded unsubmitted (heldDrafts reads them).
     pub fn encodeDrafts(s: *Session, follow: []const u32, hidden: Buf, depth: usize) !void {
         if (follow.len == 0 or follow.len > fz.MAXR or depth >= fz.MAXR) return error.DraftOutOfStep;
         const m = &s.m;

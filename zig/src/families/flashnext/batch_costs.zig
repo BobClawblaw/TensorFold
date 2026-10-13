@@ -1,6 +1,4 @@
-//! The lane allocator's prices for shared rounds, timed at load on a free session: a shared forward's ms by rows
-//! (the fastest of a few at each width, the widest first while the GPU's clocks ramp up) and a chained head step's ms
-//! (a draft past a stream's first, in the one command buffer that takes a round's drafts).
+//! The lane allocator's prices for shared rounds, timed at load on a free session: shared forwards and a chained draft.
 const std = @import("std");
 const lanes = @import("lanes");
 const mtl = @import("metal");
@@ -16,6 +14,13 @@ pub const Costs = struct {
 const PROMPT = 192; // the scratch prompt the windows follow
 const TRIES = 4; // the fastest of these at each width
 const WARM = 6; // widest windows first
+/// Cache rows a session needs to be timed on: the scratch prompt, then windows of up to MAXR rows past it.
+pub const ROWS = PROMPT + fz.MAXR + 1;
+
+/// Whether a session of `cap` rows can be timed on (the chained drafts stay inside the widest window).
+pub fn fits(cap: usize) bool {
+    return cap >= ROWS;
+}
 
 fn tokenAt(i: usize) u32 {
     return @intCast((37 * i + 11) % 50_000 + 1000);
@@ -23,6 +28,7 @@ fn tokenAt(i: usize) u32 {
 
 /// The costs timed on `s` (a free session, empty again after), `b` a *Backend.
 pub fn time(b: anytype, s: *Session) !Costs {
+    if (!fits(s.m.cap)) return error.SessionTooSmall;
     const e = b.e;
     var prompt: [PROMPT]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = tokenAt(i);
@@ -100,4 +106,11 @@ fn chainMs(b: anytype, s: *Session, depth: usize) !f64 {
     try s.m.finish(cb);
     s.heldDrafts(depth);
     return (mtl.clock.seconds() - t0) * 1e3;
+}
+
+test "timing needs the scratch prompt and the widest window past it" {
+    try std.testing.expectEqual(@as(usize, PROMPT + fz.MAXR + 1), ROWS);
+    try std.testing.expect(!fits(ROWS - 1));
+    try std.testing.expect(fits(ROWS));
+    try std.testing.expect(!fits(160)); // --context 128's sessions
 }
