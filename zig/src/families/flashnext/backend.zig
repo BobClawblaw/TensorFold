@@ -205,17 +205,22 @@ pub const Backend = struct {
     /// the prompt cache keeps are theirs), then the engine's GPU-side rounds, two deep, until the stream finishes
     /// (false) or `hooks.yield` asks for it: its state then stands as a shared round leaves it and the lane core takes
     /// it on (true). `hooks`: LaneHost's LoneHooks.
+    /// Commits a lone stream's first token; its prompt as the context holds it after the commit, which can move it.
+    fn commitFirst(gpa: std.mem.Allocator, stream: *Stream, token: u32) ![]const u32 {
+        _ = try stream.commit(gpa, &.{token}, &.{});
+        return stream.prompt();
+    }
+
     pub fn lone(b: *Backend, stream: *Stream, hooks: anytype) !bool {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        const prompt = stream.prompt();
         const s = &b.sessions[0]; // the GPU-side rounds run on the engine's own buffers
         if (s.used) return error.NoFreeSlot;
-        if (prompt.len + stream.max_new + @import("engine.zig").MARGIN > s.m.cap) return error.ContextFull;
+        if (stream.prompt().len + stream.max_new + @import("engine.zig").MARGIN > s.m.cap) return error.ContextFull;
         var handed = false;
         defer if (!handed) release(b, stream);
         try b.fill(stream, 0);
-        _ = try stream.commit(b.gpa, &.{s.first}, &.{});
+        const prompt = try commitFirst(b.gpa, stream, s.first); // decode copies it to the rounds' history before any round commits
         hooks.committed(hooks.ctx);
         if (stream.finished) return false;
         const Hooks = @TypeOf(hooks);
@@ -444,3 +449,18 @@ pub const Backend = struct {
         snap.drop(self(ptr).gpa, @ptrCast(@alignCast(saved)));
     }
 };
+
+test "a lone stream's prompt is read after its first token's commit moves the context" {
+    const gpa = std.testing.allocator;
+    const tokens = [_]u32{ 11, 12, 13, 14, 15, 16, 17 };
+    var stream = try Stream.init(gpa, .{ .id = "lone", .prompt = &tokens, .max_new = 4, .eos = &.{} });
+    defer stream.deinit(gpa);
+    stream.context.shrinkAndFree(gpa, stream.context.items.len); // full: the first token must grow it
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .resize_fail_index = 0 }); // and not in place
+    const before = stream.context.items.ptr;
+    const prompt = try Backend.commitFirst(failing.allocator(), &stream, 99);
+    try std.testing.expect(stream.context.items.ptr != before);
+    try std.testing.expectEqual(stream.context.items.ptr, prompt.ptr);
+    try std.testing.expectEqualSlices(u32, &tokens, prompt);
+    try std.testing.expectEqualSlices(u32, &.{99}, stream.emitted());
+}
