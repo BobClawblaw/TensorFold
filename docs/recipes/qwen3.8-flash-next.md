@@ -82,7 +82,9 @@ pass.
 Additional slots allocate caches for the selected context. Startup reserves their metadata and the prompt-cache
 budget, then checks the physical footprint before accepting requests. A fixed slot count that does not fit is
 refused; lower the count, context or prompt-cache budget. `--prompt-cache-over-cap` overrides only the prompt-cache
-budget. Greedy decoding remains required, so clients must send temperature 0.
+budget. Shared sessions sample: a request with a temperature draws each token on the host from the head's logits
+with the server's keyed sampler (top-k, top-p, min-p, a `seed` or one derived from the prompt), so a sampled reply is
+the same with drafting on and off and alone or beside other streams. `--parallel 1` still decodes greedily only.
 
 The checkpoint gate compares shared replies with fresh legacy replies, with drafting off and on, then checks
 prompt admission, cancellation, slot reuse and a restored prefix while another request remains active:
