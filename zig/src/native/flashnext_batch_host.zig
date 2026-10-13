@@ -21,6 +21,19 @@ const Host = struct {
     warm: mtl.keepalive.Target,
 };
 
+/// What the server may hold in all, sessions and prompt cache: 70% of RAM, or FLASHNEXT_LOAD_LIMIT_GB (GB, as
+/// GLM_LOAD_LIMIT_GB) up to the GPU's recommended working set; past the default the log names the risk, as GLM's does.
+fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
+    const text: ?[]const u8 = if (std.c.getenv("FLASHNEXT_LOAD_LIMIT_GB")) |v| std.mem.span(v) else null;
+    const c = fit.ceiling(total, working_set, text) catch |err| {
+        std.log.err("flash next: FLASHNEXT_LOAD_LIMIT_GB={s} is not a load limit: give a number of GB above 0, or unset it for 70% of RAM", .{text.?});
+        return err;
+    };
+    if (c.capped) std.log.info("flash next: FLASHNEXT_LOAD_LIMIT_GB={s} passes this GPU's recommended working set; the limit is {d:.1} GB", .{ text.?, fit.gibs(c.bytes) * 1.073741824 });
+    if (c.bytes > c.default) std.log.warn("flash next: FLASHNEXT_LOAD_LIMIT_GB lets the server (sessions and prompt cache) take this Mac to {d:.1} GiB, past the default {d:.1} GiB (70% of RAM): a load that wires most of the RAM can stall macOS until its watchdog kills the server", .{ fit.gibs(c.bytes), fit.gibs(c.default) });
+    return c.bytes;
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, streams: u32, cache_gib: ?f64, over: bool, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -32,9 +45,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     eng.hostMode();
     const ready = fit.footprint() orelse return error.NoMemoryReading;
     const total = fit.ram() orelse return error.NoMemoryReading;
+    const cap = try ceiling(total, eng.r.device.maxWorkingSet());
     const reserved = if (!over) (if (cache_gib) |g| (if (g > 0) std.math.lossyCast(u64, g * fit.GiB) else 0) else 0) else 0;
     const fixed = Session.overhead(tf.flashnext_replay.CAP) + tf.flashnext_replay.MAXR * tf.flashnext_replay.WIDE * 2;
-    const available = total / 100 * fit.SHARE_PERCENT -| ready -| fit.MARGIN -| reserved;
+    const available = cap -| ready -| fit.MARGIN -| reserved;
     if (available < fixed) return error.OverMemoryLimit;
     const room = available - fixed;
     const slots = try tf.flashnext_batch_meta.fit(streams, true, room, Session.bytes(capacity));
@@ -45,14 +59,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     h.back = try Backend.init(gpa, eng, slots, capacity);
     errdefer h.back.deinit();
     const allocated = fit.footprint() orelse return error.NoMemoryReading;
-    if (allocated +| fit.MARGIN +| reserved > total / 100 * fit.SHARE_PERCENT)
-        return error.OverMemoryLimit;
+    if (allocated +| fit.MARGIN +| reserved > cap) return error.OverMemoryLimit;
     h.cfg = try lanes.Config.init(gpa, h.back.facts(), tf.flashnext_replay.MAXR, tf.flashnext_replay.MAXR - 1);
     errdefer h.cfg.deinit(gpa);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    const plan = try fit.budget(cache_gib, over, 0, a, why, "");
+    const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .greedy_only = true, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan });
     h.cache = null;

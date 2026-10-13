@@ -74,6 +74,11 @@ New requests join between rounds, and cancelling a request releases its slot for
 `auto` and `--parallel 1` retain the existing single-reply driver. Shared sessions currently run on one Mac;
 `--parallel N` above one with `--speed-up` is refused. Use `--parallel 1` for the two-Mac link.
 
+The ceiling is 70% of RAM, or `FLASHNEXT_LOAD_LIMIT_GB` (GB, up to the GPU's recommended working set). It covers the
+server's whole footprint: the model, the sessions and the prompt cache. Left out, `--prompt-cache-gib` takes what the
+sessions leave under it; a given budget must fit under the same ceiling, and only `--prompt-cache-over-cap` lets it
+pass.
+
 Additional slots allocate caches for the selected context. Startup reserves their metadata and the prompt-cache
 budget, then checks the physical footprint before accepting requests. A fixed slot count that does not fit is
 refused; lower the count, context or prompt-cache budget. `--prompt-cache-over-cap` overrides only the prompt-cache
