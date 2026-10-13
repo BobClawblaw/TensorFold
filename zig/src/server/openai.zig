@@ -29,8 +29,8 @@ pub const Out = struct {
     vt: *const VTable,
 
     pub const VTable = struct {
-        /// 200 with text/event-stream: the stream's head.
-        open: *const fn (ctx: *anyopaque) error{Closed}!void,
+        /// 200 with text/event-stream: the stream's head, with the prepared prompt's token count (0: none).
+        open: *const fn (ctx: *anyopaque, prompt_len: usize) error{Closed}!void,
         /// One ``data:`` payload; null is ``[DONE]``.
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
         /// A whole JSON reply.
@@ -58,7 +58,7 @@ const ClientOut = struct {
         return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
 
-    fn open(ctx: *anyopaque) error{Closed}!void {
+    fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
         const c: *ClientOut = @ptrCast(@alignCast(ctx));
         return sse.open(c.conn);
     }
@@ -120,8 +120,9 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
     try fields.validateModalities(cx, body);
     // rows need each token's exact bytes: a tokenizer whose decoding depends on context (null) can't give them
-    const exact_bytes = json.truthyField(body, "logprobs") and srv.info.logprobs and (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
-    const logprobs = try fields.probabilityOptions(cx, body, exact_bytes);
+    const asked = if (is_chat) json.truthyField(body, "logprobs") else body.field("logprobs") != null;
+    const exact_bytes = asked and srv.info.logprobs and (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
+    const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
@@ -146,18 +147,19 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
+    if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
     input.fields = .{ .object = sampling };
     const streamed = if (body.get("stream")) |s| s.truthy() else false;
+    input.prompt_logprobs = try fields.promptLogprobs(cx, body, !is_chat, streamed, srv.info.prompt_logprobs);
     if (logprobs != null) {
-        // 0.6.6's set: the rows describe the plain reply text, so nothing may reshape or split it
-        if (!is_chat) return cx.refuse("logprobs are supported on /v1/chat/completions only");
+        // 0.6.6's set: the rows describe the plain reply text, so nothing may reshape it
         var structured = false;
         for (grammar.fields) |k| structured = structured or json.truthyField(body, k);
-        if (streamed or input.tools.len > 0 or json.truthyField(body, "stop") or structured or json.truthyField(body, "thinking_budget"))
-            return cx.refuse("logprobs support nonstreamed chat without tools, stop strings, structured output or a thinking budget");
+        if (input.tools.len > 0 or json.truthyField(body, "stop") or structured or json.truthyField(body, "thinking_budget"))
+            return cx.refuse("logprobs support chat without tools, stop strings, structured output or a thinking budget");
     }
     input.logprobs = logprobs;
     var policy: tool_stream.Policy = .{};
@@ -181,14 +183,17 @@ fn legacyPrompt(srv: *Server, cx: *Cx, prompt: ?Value) errors.Refused!chat.Promp
     if (p == .array and p.array.len > 0 and allInts(p.array)) {
         const vocab = srv.text.vocabSize();
         const out = try cx.a.alloc(u32, p.array.len);
-        for (p.array, out) |t, *slot| {
-            const n = if (t == .int) t.int64() else null;
-            if (n == null or n.? < 0 or n.? >= vocab) return cx.fail(.request, "prompt token ids must be integers in the valid range 0 to {d}", .{@as(i64, vocab) - 1});
-            slot.* = @intCast(n.?);
-        }
+        for (p.array, out) |t, *slot| slot.* = try promptId(cx, vocab, t);
         return .{ .ids = out };
     }
     return .{ .text = try promptText(srv, cx, p) };
+}
+
+/// A prompt token id, refused unless it is an integer inside the vocabulary.
+fn promptId(cx: *Cx, vocab: u32, t: Value) errors.Refused!u32 {
+    const n = if (t == .int) t.int64() else null;
+    if (n == null or n.? < 0 or n.? >= vocab) return cx.fail(.request, "prompt token ids must be integers in the valid range 0 to {d}", .{@as(i64, vocab) - 1});
+    return @intCast(n.?);
 }
 
 fn allInts(items: []const Value) bool {
@@ -202,8 +207,9 @@ fn promptText(srv: *Server, cx: *Cx, p: Value) errors.Refused![]const u8 {
         .null => return "",
         .array => |items| {
             if (allInts(items)) {
+                const vocab = srv.text.vocabSize();
                 const toks = try cx.a.alloc(u32, items.len);
-                for (items, toks) |t, *slot| slot.* = if (t == .bool) @intFromBool(t.bool) else @intCast(@min(@max(0, t.int64() orelse 0), std.math.maxInt(u32)));
+                for (items, toks) |t, *slot| slot.* = try promptId(cx, vocab, t);
                 return srv.text.decode(cx.a, toks) catch return error.OutOfMemory;
             }
             var parts: std.ArrayList([]const u8) = .empty;
@@ -253,6 +259,7 @@ const Run = struct {
     created: i64,
     streamed_prose: bool = false,
     prose_sent: std.ArrayList(u8) = .empty, // the content a tool stream sent
+    text_offset: usize = 0, // characters a completion stream's logprob rows have covered
 
     fn chunk(r: *Run, delta: ?Value, finish: ?[]const u8) Allocator.Error!Value {
         const a = r.a;
@@ -266,11 +273,15 @@ const Run = struct {
         if (r.is_chat) {
             const d: Value = if (delta) |v| (if (v == .object) v else if (v.string.len > 0) try chat.deltaOf(a, "content", v.string) else .{ .object = try json.newObject(a) }) else .{ .object = try json.newObject(a) };
             try choice.put(a, "delta", d);
+            // a content delta's rows (logprobs.Stream) are the choice's, as OpenAI streams them
+            if (d == .object) if (d.object.fetchOrderedRemove("logprobs")) |kv| try choice.put(a, "logprobs", kv.value);
             try choice.put(a, "finish_reason", if (finish) |f| .{ .string = f } else .null);
         } else {
-            try choice.put(a, "text", delta orelse .{ .string = "" });
+            const d = delta orelse Value{ .string = "" };
+            const rows = if (d == .object) d.object.get("logprobs") else null;
+            try choice.put(a, "text", if (d == .object) d.object.get("content") orelse .{ .string = "" } else d);
             try choice.put(a, "finish_reason", if (finish) |f| .{ .string = f } else .null);
-            try choice.put(a, "logprobs", .null);
+            try choice.put(a, "logprobs", if (rows) |v| try @import("logprobs.zig").legacy(a, v, &r.text_offset) else .null);
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -344,7 +355,8 @@ const Run = struct {
     /// A context-window refusal on a stream: the role chunk when there are no tools, then the error event and [DONE].
     fn streamedContext(r: *Run, cx: *const Cx, tools: bool, field: []const u8) void {
         const a = r.a;
-        r.out.vt.open(r.out.ctx) catch return;
+        // a context-window refusal: the head opens with no prompt behind it, so it carries no count
+        r.out.vt.open(r.out.ctx, 0) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         logRefused(r.id, cx.message);
         const body = errorBody(a, cx, field) catch return;
@@ -368,7 +380,7 @@ const Run = struct {
         if (!r.is_chat) return;
         const message = json.newObject(r.a) catch return;
         message.put(r.a, "role", .{ .string = "assistant" }) catch return;
-        message.put(r.a, "content", if (calls != null) .null else .{ .string = reply.content }) catch return;
+        message.put(r.a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content }) catch return;
         if (calls) |c| message.put(r.a, "tool_calls", .{ .array = c }) catch return;
         warm.reply(r.srv, r.plan.input, .{ .object = message }, reply.thinking, reply.effort);
     }
@@ -384,7 +396,7 @@ const Run = struct {
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
+            try message.put(a, "content", if (calls != null and reply.content.len == 0) .null else .{ .string = reply.content });
             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
@@ -393,7 +405,9 @@ const Run = struct {
         } else {
             try choice.put(a, "text", .{ .string = reply.content });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
-            try choice.put(a, "logprobs", .null);
+            var from: usize = 0;
+            try choice.put(a, "logprobs", if (reply.logprobs) |lp| try @import("logprobs.zig").legacy(a, lp, &from) else .null);
+            if (reply.prompt_logprobs) |p| try choice.put(a, "prompt_logprobs", p);
         }
         const list = try a.alloc(Value, 1);
         list[0] = .{ .object = choice };
@@ -410,7 +424,8 @@ const Run = struct {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
             if (!s.tools) {
-                if (!r.is_chat and delta != .string) return; // completions stream text only
+                // completions stream text only, with its logprob rows when asked
+                if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
                 return r.emit(r.chunk(delta, null) catch return error.Closed);
             }
             const filtered = r.policyDelta(delta) catch return error.Closed;
@@ -472,7 +487,7 @@ const Run = struct {
         };
         var handed = false; // generate gives the preparing count back from here on
         defer if (!handed) chat.release(r.srv, prepared.preparing);
-        r.out.vt.open(r.out.ctx) catch return;
+        r.out.vt.open(r.out.ctx, prepared.prompt_len) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
         handed = true;

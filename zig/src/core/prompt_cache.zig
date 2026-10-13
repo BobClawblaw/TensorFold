@@ -57,6 +57,23 @@ pub const Snapshots = struct {
     };
 };
 
+/// What a paged store asks of the backend's pages: who holds each, and how many are free.
+pub const Pages = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    /// Bytes of one page, over every layer.
+    bytes: u64,
+
+    pub const VTable = struct {
+        retain: *const fn (ptr: *anyopaque, id: u32) void,
+        release: *const fn (ptr: *anyopaque, id: u32) void,
+        /// How many hold the page: the store counts as one.
+        holders: *const fn (ptr: *anyopaque, id: u32) u32,
+        /// Pages free and not promised to a stream.
+        available: *const fn (ptr: *anyopaque) usize,
+    };
+};
+
 /// What a family's states depend on beyond their position.
 pub const Rules = struct {
     /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
@@ -67,10 +84,14 @@ pub const Rules = struct {
     grid: u32 = 0,
     /// A mark other than the history's is kept only this far from every other mark and the resume point.
     min_gap: u32 = 256,
-    /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+    /// Shorter prompts keep nothing where a mark adds a prompt call; a planned family's marks add none.
     min_prompt: u32 = 4096,
     /// Replies are prefilled in background passes kept at their end: a pass resumed near its history keeps no mark.
     warm: bool = false,
+    /// A paged store (prompt_radix.zig): the tokens a page holds, where its marks and resumes sit (0: not paged).
+    page: u32 = 0,
+    /// A paged store also keeps the prompt's last whole page, for a later turn whose history the request did not name.
+    tail: bool = false,
 };
 
 pub const Entry = struct {
@@ -89,6 +110,9 @@ pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evict
 
 /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
 pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
+
+/// A paged store's `keep`: whether the mark holds a state, and how many leading pages the stream swaps for the store's.
+pub const Kept = struct { held: bool, shared: usize };
 
 /// The entry a backend restores itself (null: the pass starts at 0) and the pass's marks.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
@@ -138,9 +162,32 @@ pub const Store = struct {
         return if (s.family.vtable.spare) |f| f(s.family.ptr) else 0;
     }
 
+    /// A kept state takes `extra` more bytes (a family copied what it shared into it) if the budget has room; never evicts, a pass is under way.
+    pub fn grow(s: *Store, saved: Saved, extra: u64) bool {
+        for (s.entries.items) |e| if (e.tokens.len > 0 and e.saved == saved) {
+            if (extra > s.room()) return false;
+            e.bytes += extra;
+            s.held += extra;
+            return true;
+        };
+        return false;
+    }
+
     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
     pub fn room(s: *const Store) u64 {
         return s.budget -| s.held -| s.spare();
+    }
+
+    /// Kept states free their storage, least valuable first and never `restoring`, until `left.fits()` (false: never).
+    pub fn giveBack(s: *Store, restoring: ?Saved, prompt: []const u32, left: anytype) bool {
+        while (!left.fits()) {
+            const skip = for (s.entries.items) |e| {
+                if (restoring != null and e.saved == restoring.?) break e;
+            } else null;
+            s.remove(s.victimBut(skip, prompt) orelse return false);
+            s.counts.evicted += 1;
+        }
+        return true;
     }
 
     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
@@ -332,7 +379,7 @@ pub const Store = struct {
 
     /// `marks` with the active rewind second: kept however near the other marks, never at or before the resume point.
     fn marksRewind(s: *const Store, a: Allocator, prompt: []const u32, from: u32, history_len: u32, rewind: u32, shared: []const u32, starts: []const u32, previous: []const u32) ![]const u32 {
-        if (prompt.len < s.rules.min_prompt) return &.{};
+        if (!s.rules.planned and prompt.len < s.rules.min_prompt) return &.{};
         var out: std.ArrayList(u32) = .empty;
         var want: std.ArrayList(u32) = .empty;
         defer want.deinit(a);
@@ -522,7 +569,9 @@ fn floorStart(starts: []const u32, at: u32) u32 {
 
 test {
     _ = @import("prompt_cache_test.zig");
+    _ = @import("prompt_cache_learn_test.zig");
     _ = @import("prompt_cache_rewind_test.zig");
+    _ = @import("prompt_cache_give_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
 }

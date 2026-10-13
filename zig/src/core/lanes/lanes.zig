@@ -25,6 +25,7 @@ pub const fake = @import("fake.zig");
 pub const drafter = @import("drafter.zig");
 pub const drafted = @import("drafted.zig");
 pub const logprob = @import("logprob.zig");
+pub const grammar = @import("grammar.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;
@@ -39,6 +40,7 @@ test {
     _ = @import("engine_test.zig");
     _ = @import("gpu_full_test.zig");
     _ = @import("drafted_test.zig");
+    _ = @import("pricing_test.zig");
 }
 
 pub const learned_disk = @import("learned_disk.zig");

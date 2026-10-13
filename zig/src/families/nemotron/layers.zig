@@ -6,6 +6,8 @@ const st = @import("state.zig");
 const fwd = @import("forward.zig");
 const kern = @import("kernels.zig");
 const tree = @import("tree.zig");
+const lesson_route = @import("lesson_route.zig");
+const max_blocks = @import("learn_shape.zig").max_blocks;
 
 const Buffer = mtl.Buffer;
 const Enc = fwd.Enc;
@@ -200,6 +202,7 @@ pub fn moe(f: Forward, e: *Enc, m: wts.Moe, next: anytype, rows: usize, eps: f32
     f.coop(e, "down", m.shared_down, s.sh_act, 0, s.sh_xs, s.sh, rows);
     if (m.slide) |r| rest(f, e, r, s.sh_act, s.sh, rows, f.c.shared_width);
     if (m.adapter) |ad| adapt(f, e, ad, s.sh_act, s.sh, rows);
+    if (m.pocket) |p| if (p.used > 0) taught(f, e, p, s.x, s.sh, rows);
     inline for (.{ "expert_up", "expert_down" }, 0..) |key, j| {
         if (j == 0) e.alongside();
         const fc = if (j == 0) m.fc1 else m.fc2;
@@ -253,9 +256,42 @@ pub fn rest(f: Forward, e: *Enc, r: Buffer, x: Buffer, y: Buffer, rows: usize, w
     e.run(.{ 32 * f.c.hidden, (rows + 7) / 8, 1 }, .{ 256, 1, 1 });
 }
 
+/// The pocket over the rows of streams that read what was learned: every row, or the runs between untaught streams'.
+pub fn taught(f: Forward, e: *Enc, p: wts.Pocket, x: Buffer, y: Buffer, rows: usize) void {
+    if (!f.untaught) return pocket(f, e, p, x, y, 0, rows);
+    var runs: lesson_route.Runs = .{};
+    for (f.segs) |g| if (runs.next(g.rows, g.cache.untaught)) |r| pocket(f, e, p, x, y, r[0], r[1]);
+    if (runs.last()) |r| pocket(f, e, p, x, y, r[0], r[1]);
+}
+
+/// y [rows, D] += relu(x up^T)^2 down from row `first` over the pocket's neurons in use (beside the shared expert's).
+pub fn pocket(f: Forward, e: *Enc, p: wts.Pocket, x: Buffer, y: Buffer, first: usize, rows: usize) void {
+    const d: u32 = @intCast(f.c.hidden);
+    const n: u32 = @intCast(p.used);
+    const row = f.c.hidden * 2; // x and y hold bf16 rows
+    e.pipe(f.k.get("tf_train_lora_in"));
+    e.buf(x, first * row, 0);
+    e.buf(p.up, 0, 1);
+    e.buf(p.z, first * p.used * 4, 2);
+    e.bytes([4]u32{ @intCast(rows), d, n, 0 }, 3);
+    e.buf(p.zn, first * 4, 4);
+    e.run(.{ 32 * p.used, rows, 1 }, .{ 256, 1, 1 });
+    e.pipe(f.k.get("tf_pocket_relu2"));
+    e.buf(p.z, first * p.used * 4, 0);
+    e.bytes(@as(u32, @intCast(rows)) * n, 1);
+    e.run(.{ rows * p.used, 1, 1 }, .{ 256, 1, 1 });
+    e.pipe(f.k.get("tf_train_lora_out"));
+    e.buf(p.z, first * p.used * 4, 0);
+    e.buf(p.down, 0, 1);
+    e.buf(y, first * row, 2);
+    e.bytes([4]u32{ @intCast(rows), d, n, 0 }, 3);
+    e.bytes(@as(f32, 1), 4);
+    e.run(.{ f.c.hidden, rows, 1 }, .{ 256, 1, 1 });
+}
+
 /// y [rows, out] += scale (x a^T) b over the blocks open on each row: a layer's learned change after its projection.
 pub fn adapt(f: Forward, e: *Enc, ad: wts.Adapter, x: Buffer, y: Buffer, rows: usize) void {
-    project(f.k, e, ad, x, rows);
+    project(f.k, e, ad, x, rows, &f.route);
     e.pipe(f.k.get("tf_train_lora_out"));
     e.buf(ad.xa, 0, 0);
     e.buf(ad.b, 0, 1);
@@ -265,8 +301,8 @@ pub fn adapt(f: Forward, e: *Enc, ad: wts.Adapter, x: Buffer, y: Buffer, rows: u
     e.run(.{ ad.out, rows, 1 }, .{ 256, 1, 1 });
 }
 
-/// xa = x a^T over every block, each row's closed blocks zeroed (their gates 0).
-pub fn project(k: *const kern.Kernels, e: *Enc, ad: wts.Adapter, x: Buffer, rows: usize) void {
+/// xa = x a^T over every block, zeroed where `route` gives a row no lesson (their gates 0); decision rows vote.
+pub fn project(k: *const kern.Kernels, e: *Enc, ad: wts.Adapter, x: Buffer, rows: usize, route: *const lesson_route.Route) void {
     e.pipe(k.get("tf_train_lora_in"));
     e.buf(x, 0, 0);
     e.buf(ad.a, 0, 1);
@@ -279,9 +315,37 @@ pub fn project(k: *const kern.Kernels, e: *Enc, ad: wts.Adapter, x: Buffer, rows
     e.buf(ad.xn, 0, 1);
     e.buf(ad.tau, 0, 2);
     e.buf(ad.gates, 0, 3);
-    e.bytes([4]u32{ @intCast(rows), @intCast(ad.rank), @intCast(ad.rank / 16), 0 }, 4);
+    e.bytes([4]u32{ @intCast(rows), @intCast(ad.rank), @intCast(ad.rank / 16), max_blocks }, 4);
     e.bytes(ad.unit, 5);
+    var r = route.*;
+    if (ad.whole) r.whole = 1;
+    e.bytes(r, 6);
+    e.buf(ad.latch, 0, 7);
+    e.buf(ad.score, 0, 8);
     e.run(.{ ad.rank / 16, rows, 1 }, .{ ad.rank / 16, 1, 1 });
+}
+
+/// Any layer's change, for the buffers every layer shares (null: no lesson is attached).
+pub fn firstAdapter(w: *const wts.Weights) ?wts.Adapter {
+    for (w.layers) |l| switch (l) {
+        inline else => |x| if (x.adapter) |ad| return ad,
+    };
+    return null;
+}
+
+/// Each stream whose decision row is in the pass `route` describes: cleared before it, latched (`set`) after it.
+pub fn latchAll(k: *const kern.Kernels, e: *Enc, ad: wts.Adapter, route: *const lesson_route.Route, set: bool) void {
+    for (0..route.count) |s| if (route.decision(s) != null) latch(k, e, ad.need, ad.latch, ad.score, @intCast(route.seg[s][3]), set);
+}
+
+/// A stream's lessons at its decision row (slot): cleared before the pass that holds it, latched (`set`) after it.
+pub fn latch(k: *const kern.Kernels, e: *Enc, need: Buffer, latches: Buffer, score: Buffer, slot: u32, set: bool) void {
+    e.pipe(k.get("tf_lesson_latch"));
+    e.buf(score, 0, 0);
+    e.buf(need, 0, 1);
+    e.buf(latches, 0, 2);
+    e.bytes([4]u32{ slot, max_blocks, @intFromBool(set), max_blocks }, 3);
+    e.run(.{ 1, 1, 1 }, .{ 1, 1, 1 });
 }
 
 /// The routed-expert kernel (j 0: up, 1: down) taking `mb` member rows a pass (3: tf_experts_w, four simdgroups).
