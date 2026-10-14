@@ -3,6 +3,7 @@ pub const config = @import("config.zig");
 pub const geometry = @import("cuda_geometry.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const native = @import("cuda_native.zig");
+pub const native_moe = @import("cuda_native_moe.zig");
 pub const draft = @import("cuda_draft.zig");
 
 test {
