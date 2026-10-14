@@ -540,7 +540,7 @@ pub const Engine = struct {
                     try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
                     try e.proj(m.down, e.act, e.r, total, prompt);
                 },
-                .moe => |m| try e.routed(m.router, m.experts, total, prompt),
+                .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, prompt and total > most_window),
             }
             if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
@@ -551,22 +551,20 @@ pub const Engine = struct {
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
     }
 
-    /// The routed experts over the normed rows in x: the picks, their plan, SwiGLU up, down, the weighted sum into r.
-    fn routed(e: *Engine, router: u64, layer: cuda.experts.Layer, total: usize, prompt: bool) !void {
+    /// Routed experts over `total` normed rows at x into out; `wide` rows take the prefill kernels, else decode's.
+    pub fn routedRows(e: *Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u64, total: usize, wide: bool) !void {
         const g = e.g;
         const slots = g.slots();
         const count = g.experts + 1;
         const pairs = total * slots;
-        // a short prompt chunk takes the decode form, as the dense projections do: its rows keep one-row steps' bits
-        const wide = prompt and total > most_window;
         const tile: usize = if (wide) 64 else 16;
         const items = cuda.grouped.maxItems(pairs, count, tile);
         const plan: cuda.grouped.Plan = .{ .members = e.members, .items = e.items, .counts = e.counts, .rank = e.rank, .hist = e.hist };
         const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts };
-        try e.moe.route(e.stream, e.x, g.hidden, total, router, e.rlogits, g.hidden, count);
+        try e.moe.route(e.stream, x, g.hidden, total, router, e.rlogits, g.hidden, count);
         try e.moe.pick(e.stream, e.rlogits, e.picks, e.wts, total, g.experts, g.top_k);
         try e.plan.route(e.stream, e.picks, pairs, count, tile, plan);
-        const rows_in: cuda.experts.Rows = .{ .x = e.x, .stride = g.hidden, .slots = slots };
+        const rows_in: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
         const act_in: cuda.experts.Rows = .{ .x = e.eact, .stride = g.intermediate };
         if (wide) {
             try grouped.prompt(e.stream, .up, rows_in, layer, plan, e.eact, items, -1);
@@ -575,7 +573,7 @@ pub const Engine = struct {
             try grouped.decode(e.stream, .up, rows_in, layer, plan, e.eact, items, -1);
             try grouped.decode(e.stream, .down_f32, act_in, layer, plan, e.ey, items, -1);
         }
-        try e.moe.combine(e.stream, e.ey, !wide, e.wts, e.r, total, slots, g.hidden);
+        try e.moe.combine(e.stream, e.ey, !wide, e.wts, out, total, slots, g.hidden);
     }
 
     /// Row `i`'s logits from the newest forward that kept logits.
