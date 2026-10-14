@@ -119,9 +119,7 @@ pub const Tri = struct {
         }, &.{ ci("H", a.heads), ci("D", a.dim), ci("G", g), ci("DS", merge_columns), ci("CH", chunk), ci("GR", group_chunks) });
     }
 
-    /// attention8 (attention_kv8.py, captured outside the tree like the rest of the set): attention over e4m3
-    /// caches, `offs` holding each stream's four offsets (key and value bytes, their scales' fp32 elements) from
-    /// `base`; the window's own keys and values stay bf16.
+    /// attention8 (attention_kv8.py): e4m3 cache attention at `base` plus each stream's `offs`; window K/V stay bf16.
     pub fn attention8(t: Tri, q: u64, kn: u64, vn: u64, base: u64, offs: u64, plan: Plan, part: Partials, out: u64, a: Attn) !void {
         const g = a.heads / a.kv_heads;
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(a.dim), -0.5));

@@ -56,9 +56,7 @@ pub fn parentsOf(p: Part, buf: []i32) []const i32 {
     return buf[0..p.tokens.len];
 }
 
-/// attention.plan_host: rows, (first, rows, keys, slots) per stream, items, then window parents (global rows).
-/// Where attnPlan put its segments, in ints from the plan's first: each starts on a 16-byte boundary, so the
-/// attention kernels' plan pointers are the aligned ones Triton's captured variants were compiled for.
+/// Segment offsets in ints of attnPlan's plan_host, each on a 16-byte boundary for Triton's aligned plan pointers.
 const AttnAt = struct { n_items: usize, streams: usize, items: usize, parents: usize };
 
 fn pad16(out: *std.ArrayList(i32), gpa: std.mem.Allocator, from: usize) !usize {
@@ -108,8 +106,7 @@ fn offsetOf(s: *const st.Scratch, ptr: u64) i64 {
     return @divExact(@as(i64, @bitCast(ptr -% s.origin)), bf);
 }
 
-/// Layer `i`'s cache offsets for a stream: bf16 elements of keys and values, or under kv8 e4m3 bytes of keys and
-/// values and fp32 elements of their scales.
+/// Layer `i`'s cache offsets for a stream: bf16 elements of keys and values, or under kv8 e4m3 bytes plus fp32 scales.
 fn cacheOffsets(s: *const st.Scratch, seq: *const st.Seq, i: usize, out: *std.ArrayList(i64), gpa: std.mem.Allocator) !void {
     if (!seq.kv8) return out.appendSlice(gpa, &.{ offsetOf(s, seq.keys[i]), offsetOf(s, seq.values[i]) });
     const d = struct {

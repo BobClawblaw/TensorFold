@@ -1,7 +1,4 @@
-//! The Qwen3.5 vision tower on CUDA (transformers' Qwen3_5VisionModel, as 0.6.6's --vision runs it in bf16): patch
-//! embedding, the learned position grid resampled bilinearly to each image, 27 pre-norm blocks of axial 2-D rotary
-//! attention within each image, and the 2x2 merger to the language model's width. Linears on cuBLASLt (fp32 out),
-//! the rest in qwen_vision.cu.
+//! The Qwen3.5 vision tower on CUDA as 0.6.6's --vision runs it in bf16: patch embed, 27 rotary blocks, 2x2 merger.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -86,8 +83,7 @@ pub const Tower = struct {
     inv: u64 = 0,
     weight_bytes: usize = 0,
 
-    /// The checkpoint's vision_tower tensors (bf16), every one used; the patch convolution's weight as rows of
-    /// [channel, frame, y, x], the order the patches come in.
+    /// The checkpoint's vision_tower tensors (bf16); the patch convolution's weight as [channel, frame, y, x] rows.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: Gpu, dir: []const u8) !*Tower {
         const t = try gpa.create(Tower);
         errdefer gpa.destroy(t);
@@ -212,8 +208,7 @@ pub const Tower = struct {
             workspace_bytes;
     }
 
-    /// Images' patches (fp32 rows of `patch_width`, each image's in its grid's merge order) to their merged rows
-    /// (bf16 [sum(h * w) / 4, out_hidden]) at `out`; every image attends only to itself.
+    /// Images' patches (fp32, merge order) to merged bf16 [sum(h * w) / 4, out_hidden] at `out`, each image on its own.
     pub fn encode(t: *Tower, ops: Gpu, pixels: []const f32, grids: []const Grid, out: u64) !void {
         var n: usize = 0;
         for (grids) |g| {
@@ -299,8 +294,7 @@ pub const Tower = struct {
         try ops.s.synchronize();
     }
 
-    /// A prompt chunk's embeddings `x` (rows bf16 of the language width) take image rows: row r takes `features`
-    /// row src[r] (device int32) where src[r] >= 0.
+    /// Splices image rows into a chunk's embeddings `x`: row r takes `features` row src[r] where src[r] >= 0.
     pub fn splice(t: *Tower, ops: Gpu, x: u64, features: u64, src: u64, rows: usize) !void {
         try t.go(ops, t.f.splice, rows, 1, 256, .{ x, features, src, int(out_hidden) });
     }
@@ -360,8 +354,7 @@ pub fn invFreq(out: []f32) void {
     }
 }
 
-/// One image's patches in merge order: each patch's (row, column) for the rotary, and its 4 bilinear taps (with
-/// align_corners) into the 48x48 learned grid with their fp32 weights, as transformers' vision_utils computes them.
+/// One image's patches in merge order: each one's (row, column) for the rotary and 4 bilinear taps into the 48x48 grid.
 pub fn positions(g: Grid, hw: []i32, idx: []i32, wts: []f32) void {
     const bw = g.w / merge;
     const n = @as(usize, g.h) * g.w;
@@ -409,8 +402,7 @@ test "bilinear taps match align_corners resampling at the ends and middle" {
     try std.testing.expectEqual(@as(f32, 1), b.w[0]);
 }
 
-/// An image prompt's rows for its prompt pass (0.6.6's EncodedVision): the tower's rows on the GPU, each prompt row's
-/// feature row (or -1), the three rotary positions of every prompt row and the decode offset after the prompt.
+/// An image prompt's rows for its prompt pass (0.6.6's EncodedVision): tower rows, feature rows, positions.
 pub const Media = struct {
     gpa: std.mem.Allocator,
     tower: *Tower,
@@ -420,9 +412,7 @@ pub const Media = struct {
     delta: i32,
     dev: cuda.DeviceBuffer, // a chunk's src and [3][rows] positions
 
-    /// Encodes `images` (Image.at: the first of its tokens' rows) and lays out the prompt's positions as
-    /// transformers' get_rope_index does: text counts up on all three axes; an image sits at the next position with
-    /// its merged rows and columns on the h and w axes; text after it resumes past its larger side.
+    /// Encodes `images` and lays out the prompt's positions as transformers' get_rope_index does (see `layout`).
     pub fn init(gpa: std.mem.Allocator, tower: *Tower, ops: Gpu, prompt: []const u32, images: anytype, chunk_rows: usize) !*Media {
         const n = prompt.len;
         const m = try gpa.create(Media);
@@ -479,8 +469,7 @@ pub const Media = struct {
     }
 };
 
-/// The prompt's three rotary positions ([3][n]) and each placeholder row's feature row (src, -1 for text), as
-/// transformers' get_rope_index lays them out; returns the decode offset (rope_delta).
+/// The prompt's rotary positions ([3][n]) and feature rows (src, -1 for text) per get_rope_index; returns rope_delta.
 pub fn layout(prompt: []const u32, images: anytype, src: []i32, pos: []i32) !i32 {
     const n = prompt.len;
     @memset(src, -1);

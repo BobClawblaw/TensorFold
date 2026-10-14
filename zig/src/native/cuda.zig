@@ -369,8 +369,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
-    // a family with prompt-cache snapshots keeps them in device room (Nemotron) or in pinned host memory (the 27B, whose
-    // long window leaves the device none); a family without them serves without a cache
+    // prompt-cache snapshots live in device room (Nemotron) or pinned host memory (the 27B); none means no cache
     const cache = if (!@hasDecl(F, "snap_bytes")) 0 else if (@hasDecl(F, "snap_host")) hostCacheBytes(a, io, o.prompt_cache_gib) else budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window{s}, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in passes of up to {d} rows{s}{s}; {s}", .{
         capability,                                                                                                                                                                      device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else if (vision_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for the image tower's calls", .{toGib(vision_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, if (o.kv8) " (fp8 caches)" else "", toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
@@ -380,8 +379,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (@hasDecl(F, "snap_bytes") and cache > 0) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
-        // Nemotron: a row's bits ignore the cuts and a kept row costs no call, so states keep at any row; its head reads
-        // one token on. The 27B: states on its zero-anchored grid, where a cache-off pass cuts, ending where the pass stands.
+        // Nemotron keeps states at any row, head one token on; the 27B on its zero-anchored grid where cache-off cuts
         const rules: pc.Rules = if (@hasDecl(F, "snap_host")) .{ .lookahead = F.snap_lookahead, .planned = true, .grid = F.prompt_rows } else .{ .lookahead = 1, .min_prompt = 0, .warm = .waits };
         const ready: u64 = if (@hasDecl(F, "snap_ready")) try F.snap_ready(loaded.target, cache) else 0;
         store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &Snaps(F).vtable }, rules, cache - ready);

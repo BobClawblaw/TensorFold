@@ -1,6 +1,4 @@
-// The Qwen3.5 vision tower's kernels (transformers' Qwen3_5VisionModel, as 0.6.6's --vision runs it in bf16).
-// The tower's Linears run on cuBLASLt with fp32 output; each epilogue here adds the bias and rounds to bf16 once,
-// where torch's bf16 Linear rounds, before the op that follows.
+// Qwen3.5 vision tower kernels (0.6.6's --vision in bf16); epilogues add the bias to cuBLASLt's fp32, round once.
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -67,9 +65,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_qv_layernorm(const __nv_bfl
         y[row * D + i] = __float2bfloat16_rn((bf(xr[i]) - mean) * r * bf(w[i]) + bf(b[i]));
 }
 
-// qkv = bf16(acc + b) split into q, k, v [heads][rows][hd]; q and k rotated by the axial 2-D rotary in fp32
-// (apply_rotary_pos_emb_vision): angle j of a head is h * inv[j % half'] for the first quarter's frequencies and
-// w * inv[...] for the second, repeated over both halves; rotate_half pairs j with j +- hd/2.
+// qkv = bf16(acc + b) split into q, k, v [heads][rows][hd]; q and k get the axial 2-D rotary in fp32 (h, then w).
 extern "C" __global__ void __launch_bounds__(128) tf_qv_qkv_rope(const float* __restrict__ acc,
                                                                  const __nv_bfloat16* __restrict__ bias,
                                                                  const int* __restrict__ hw,
@@ -87,6 +83,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_qv_qkv_rope(const float* __
     const long long o = (static_cast<long long>(head) * rows + row) * hd;
     for (int j = threadIdx.x; j < hd; j += blockDim.x) {
         const int c = head * hd + j;
+        // rotate_half pairs j with j +- hd/2; angle h * inv[jj] for the first quarter's frequencies, w * inv after
         const int pj = j < half ? j + half : j - half;
         const int pc = head * hd + pj;
         const int jj = j % half;
@@ -101,8 +98,7 @@ extern "C" __global__ void __launch_bounds__(128) tf_qv_qkv_rope(const float* __
     }
 }
 
-// Bidirectional attention within one image: rows [s0, s0 + n) of q, k, v [heads][rows][HD] attend to each other;
-// out [rows][heads * HD]. A thread a query row with an online softmax in fp32; keys and values in 64-row tiles.
+// Attention within one image's rows [s0, s0 + n); a thread a query row, online softmax in fp32, 64-row key tiles.
 template <int HD>
 __device__ void qv_attention(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
                              const __nv_bfloat16* __restrict__ v, __nv_bfloat16* __restrict__ out, int rows,
@@ -207,10 +203,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_qv_splice(__nv_bfloat16* __
     for (int i = threadIdx.x; i < D; i += blockDim.x) x[row * D + i] = features[static_cast<long long>(s) * D + i];
 }
 
-// glue._attn_prep with MROPE (0.6.6's Triton kernel, three position rows): each head's q (from the [q | gate] rows)
-// or k RMS-normed to bf16, then rotate-half over the first 2 * HALF dims, frequency i taking the t, h or w position
-// by Qwen's interleaved sections (axis 1 where i % 3 == 1 and i < 3 * hsec, axis 2 where i % 3 == 2 and
-// i < 3 * wsec, else axis 0). A block of D threads a (row, head); pos is [3][rows].
+// glue._attn_prep with MROPE: q or k RMS-normed to bf16, then rotate-half by t, h or w position; a block a (row, head).
 extern "C" __global__ void __launch_bounds__(256) tf_qv_attn_prep_mrope(
     const __nv_bfloat16* __restrict__ qg, const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ qn,
     const __nv_bfloat16* __restrict__ kn, const int* __restrict__ pos, const float* __restrict__ inv,
@@ -239,6 +232,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_qv_attn_prep_mrope(
     float out = xn;
     if (d < 2 * HALF) {
         const int i = d < HALF ? d : d - HALF;
+        // Qwen's interleaved sections: axis 1 where i % 3 == 1 and i < 3 * hsec, 2 where i % 3 == 2 and i < 3 * wsec
         const int axis = (i % 3 == 1 && i < 3 * hsec) ? 1 : ((i % 3 == 2 && i < 3 * wsec) ? 2 : 0);
         const float ang = static_cast<float>(pos[axis * rows + row]) * inv[i];
         const float cs = cosf(ang), sn = sinf(ang);

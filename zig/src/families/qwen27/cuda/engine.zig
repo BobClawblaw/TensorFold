@@ -20,8 +20,7 @@ pub fn chunkBounds(start: usize, end: usize, size: usize, j: usize) [2]usize {
     return .{ start + (end - start) * j / n, start + (end - start) * (j + 1) / n };
 }
 
-/// A prompt's chunks from `from`: even splits of the whole prompt (0.6.6's PrefillPlan), or under a prompt cache the
-/// zero-anchored grid, so a pass resumed or kept at a grid point cuts where a fresh pass of the same prompt does.
+/// Chunks from `from`: even splits, or with a prompt cache the zero-anchored grid so resumed passes cut alike.
 pub const Chunks = struct {
     len: usize,
     grid: bool,
@@ -130,7 +129,7 @@ pub const Engine = struct {
         return e.prefillFrom(seq, prompt, 0, media, null);
     }
 
-    /// The prompt from `from` (0, or a grid point the stream's state was restored at), keeping states at `keep`'s marks.
+    /// The prompt from `from` (0, or a grid point its state was restored at), keeping states at `keep`'s marks.
     pub fn prefillFrom(e: *Engine, seq: *st.Seq, prompt: []const u32, from: usize, media: ?*const vision.Media, keep: ?Keep) !void {
         if (prompt.len == 0) return error.EmptyPrompt;
         if (prompt.len >= seq.capacity) return error.PromptTooLong;

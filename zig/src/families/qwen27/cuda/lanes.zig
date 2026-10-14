@@ -230,8 +230,7 @@ pub const Cuda = struct {
         try x.prefillOpened(s, seq);
     }
 
-    /// prefill_state into an opened stream: the prompt in chunks, a drafting stream's last window of taps absorbed. A
-    /// kept state the lane host found is restored first, and the pass stops at its marks for the cache to copy.
+    /// prefill_state into an opened stream: a found kept state restored, then the prompt in chunks to the cache marks.
     fn prefillOpened(x: *Cuda, s: *lanes.Stream, seq: *st.Seq) !void {
         // an image prompt: the tower's rows and the prompt's three positions for its pass (EncodedVision)
         const media: ?*vision.Media = if (s.images.len == 0) null else blk: {

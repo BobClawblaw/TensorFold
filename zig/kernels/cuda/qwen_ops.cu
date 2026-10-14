@@ -23,10 +23,9 @@ struct TfQuant {
     unsigned long long rows;
 };
 
-// --kv-cache fp8: each 256-wide (position, key head) row as e4m3 of x * (448 / amax), its scale s = amax / 448 (1 for
-// a row of zeros). A warp a row, eight rows a block, items on y; attention_kv8.py's quantize and _q8 (the window rows
-// _tail8 quantizes itself) give the same bits.
+// --kv-cache fp8: each 256-wide row as e4m3 of x * (448 / amax), scale amax / 448 (1 for zeros), as attention_kv8.py
 extern "C" __global__ void __launch_bounds__(256) tf_kv_quant(const TfQuant* __restrict__ items) {
+    // a warp a row, eight rows a block, items on y
     const TfQuant it = items[blockIdx.y];
     const unsigned long long row = static_cast<unsigned long long>(blockIdx.x) * 8 + threadIdx.x / 32;
     if (row >= it.rows) return;

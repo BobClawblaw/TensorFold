@@ -57,8 +57,7 @@ __device__ __forceinline__ float rowsum(const float (&c)[8]) {
                      __fadd_rn(__fadd_rn(w[1], w[5]), __fadd_rn(w[3], w[7])));
 }
 
-// F8: the cache is e4m3 rows (kc, vc as bytes) with an fp32 scale a (position, key head) row (ks, vs); staging
-// widens each row to bf16 times its scale, so the tiles and their dots are the bf16 kernel's.
+// F8: e4m3 cache rows (kc, vc) with an fp32 scale a row (ks, vs); staging widens them to bf16, so the rest is bf16's.
 template <int D, int WARPS, int HPC, int NS, bool F8>
 __device__ __forceinline__ void pattn_body(const __nv_bfloat16* __restrict__ q, const void* __restrict__ kc,
                                            const void* __restrict__ vc, const float* __restrict__ ks,
@@ -74,8 +73,7 @@ __device__ __forceinline__ void pattn_body(const __nv_bfloat16* __restrict__ q, 
     const int row0 = blockIdx.x * 16 * RB, last = min(row0 + 16 * RB, W) - 1;
     const int head = hk * G + hg * HPC + warp % HPC, wrow = row0 + (warp / HPC) * 16;
     const int tiles = (p0 + last) / BN + 1, items = 4 * tiles, limit = p0 + W;
-    // F8: an item's e4m3 words and scales go to registers a step ahead (fetch), then widen into its slot (put), so
-    // the loads land while the slot before computes
+    // F8: fetch loads an item's e4m3 words and scales a step ahead, put widens them into its slot, hiding the loads
     constexpr int PER = (HALF * C + THREADS - 1) / THREADS;
     uint2 pre[F8 ? PER : 1];
     float pre_s[F8 ? PER : 1];

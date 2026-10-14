@@ -1,5 +1,4 @@
-//! Qwen3.8-27B CUDA prompt states for the shared cache: a stream's DeltaNet recurrences, conv windows and its attention
-//! rows so far, copied to pinned host memory (a long window's caches leave the device no room for copies).
+//! Qwen3.8-27B CUDA prompt states for the shared cache: DeltaNet recurrences, conv windows and attention rows on host.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -23,8 +22,7 @@ pub const Target = struct {
 /// One piece of a stream's state: its device address and length.
 const Piece = struct { dev: u64, len: usize };
 
-/// The pieces a state at `at` holds, in their order in a copy: each DeltaNet layer's recurrence and conv window, each
-/// attention layer's first `at` key and value rows (and their scales under kv8). `seq` null: lengths only.
+/// A state at `at`'s pieces in copy order (DeltaNet state, conv windows, `at` K/V rows, kv8 scales); seq null: lengths.
 fn pieces(g: c.Geometry, kv8: bool, seq: ?*const st.Seq, at: usize, out: []Piece) []Piece {
     var n: usize = 0;
     const row: usize = g.kvInner() * @as(usize, if (kv8) 1 else 2);

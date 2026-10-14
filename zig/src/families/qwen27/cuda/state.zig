@@ -241,8 +241,7 @@ pub const Scratch = struct {
         return a(usize, slot_rows * g.query_heads * c.head_dim * 4, 256) + 2 * a(usize, slot_rows * g.query_heads * 4, 256);
     }
 
-    /// The slot-rows a stream of `capacity` positions may add to a round: its most slots (attention.slots of any
-    /// keys and window it can hold) times its widest window.
+    /// The slot-rows a stream of `capacity` positions may add to a round: its most slots times its widest window.
     pub fn streamPartRows(capacity: usize) usize {
         return ((capacity + max_rows + tri.chunk - 1) / tri.chunk + 1) * max_rows;
     }

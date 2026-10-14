@@ -45,8 +45,7 @@ pub const pattn_smem: u32 = 98304; // two 32-key slots of 256 dims beside eight 
 /// One item of a batched copy: 16-byte aligned pointers, a multiple of 16 bytes.
 pub const Copy = extern struct { dst: u64, src: u64, bytes: u64 };
 
-/// One item of qwen_ops.cu's kv_quant (--kv-cache fp8): `rows` bf16 rows of 256 from src, as e4m3 rows at dst and
-/// one fp32 scale a row at scale.
+/// One item of qwen_ops.cu's kv_quant (--kv-cache fp8): `rows` bf16 rows of 256 to e4m3 rows plus an fp32 scale each.
 pub const Quant = extern struct { src: u64, dst: u64, scale: u64, rows: u64 };
 
 /// A tiled 4-bit projection: packed words, (kg, npad) scales and biases, n outputs from k inputs.

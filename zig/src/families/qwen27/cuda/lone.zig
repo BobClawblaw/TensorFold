@@ -81,8 +81,7 @@ pub fn prefillMedia(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, 
     return prefillFrom(e, seq, ctx, d, prompt, 0, media, null);
 }
 
-/// prefillMedia from `from` (0, or the grid point a kept state was restored at), keeping states at `keep`'s marks. A
-/// resumed pass's context holds only the rows it read: drafts change no token, so a reply is the same either way.
+/// prefillMedia from `from` (0, or a restored grid point), keeping states at `keep`'s marks; drafts change no token.
 pub fn prefillFrom(e: *Engine, seq: *st.Seq, ctx: *dr.Context, d: *dr.DFlash2, prompt: []const u32, from: usize, media: ?*const @import("vision.zig").Media, keep: ?eng.Keep) !void {
     if (prompt.len >= seq.capacity) return error.PromptTooLong;
     if (from == 0) try seq.reset(e.ops(), e.w.g) else if (from != seq.pos or !eng.resumable(from, prompt.len)) return error.BadReuse;

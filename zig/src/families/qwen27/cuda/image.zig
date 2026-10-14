@@ -1,10 +1,4 @@
-//! An image's bytes to Qwen3.5 vision patches as TensorFold 0.6.6's --vision makes them on CUDA: decoded as its
-//! vision/images.py does with PIL (stb_image here: the stored values, no colour management; EXIF orientation applied;
-//! alpha composited over white with PIL's integer blend), then transformers' Qwen2VLImageProcessorPil at the caps
-//! 0.6.6 passes it: smart_resize to multiples of 32 within [32^2, tokens * 32^2] pixels, PIL's 8-bit bicubic
-//! resampler, x / 255 in float64 rounded to float32, (x - 0.5) / 0.5, and 16x16 patches in 2x2 merge order with each
-//! patch's frame given twice. JPEGs go through libjpeg-turbo (PIL's decoder) when libturbojpeg.so.0 loads, else
-//! stb_image, whose IDCT may differ from PIL's by a level.
+//! An image's bytes to Qwen3.5 vision patches as 0.6.6's --vision makes them: PIL's decode, smart_resize and bicubic.
 const std = @import("std");
 const vision = @import("vision.zig");
 
@@ -54,8 +48,7 @@ pub fn prepareRgb(gpa: std.mem.Allocator, img: Rgb, hash: u64, max_tokens: u32) 
 
 pub const Size = struct { h: u32, w: u32 };
 
-/// transformers' smart_resize: both sides multiples of `factor` (Python's round, half to even), the pixels within
-/// [min_pixels, max_pixels], the aspect ratio kept as well as that allows.
+/// transformers' smart_resize: sides multiples of `factor` (half-to-even), pixels within [min_pixels, max_pixels].
 pub fn smartResize(height: u32, width: u32, min_pixels: u64, max_pixels_: u64) Error!Size {
     const h: f64 = @floatFromInt(height);
     const w: f64 = @floatFromInt(width);
@@ -80,8 +73,7 @@ fn roundEven(x: f64) f64 {
     return if (@abs(x - @trunc(x)) == 0.5 and @mod(r, 2) != 0) r - std.math.sign(x) else r;
 }
 
-/// The resized image scaled by 1/255 (in float64, then float32), normalized by mean 0.5 and std 0.5, cut into
-/// 16x16 patches in 2x2 merge order, each patch [channel, frame (twice), row, column].
+/// The resized image as x / 255 (float64 to float32), normalized by 0.5 and 0.5, in 16x16 patches of 2x2 merge order.
 pub fn patchify(gpa: std.mem.Allocator, img: Rgb) Error![]f32 {
     const P = vision.patch;
     const M = vision.merge;
@@ -145,8 +137,7 @@ const tjpf_rgb = 0;
 const tjcs_cmyk = 3;
 const tjcs_ycck = 4;
 
-/// A JPEG through libjpeg-turbo as PIL decodes it (accurate integer IDCT, fancy upsampling) into RGB rows; null
-/// when TurboJPEG is absent or the image is CMYK (PIL converts those itself).
+/// A JPEG through libjpeg-turbo as PIL decodes it to RGB rows; null without TurboJPEG or for CMYK (PIL converts those).
 fn turboJpeg(gpa: std.mem.Allocator, bytes: []const u8) Error!?Rgb {
     const t = Turbo.get() orelse return null;
     const h = t.init() orelse return null;
@@ -167,8 +158,7 @@ fn turboJpeg(gpa: std.mem.Allocator, bytes: []const u8) Error!?Rgb {
     return .{ .w = @intCast(W), .h = @intCast(H), .px = out };
 }
 
-/// A single-frame PNG or JPEG as 8-bit RGB: upright by its EXIF orientation, alpha composited over white, 16-bit
-/// gray clipped to 255 and other 16-bit layouts cut to their high byte (what PIL's convert("RGB") gives).
+/// A single-frame PNG or JPEG as 8-bit RGB: upright by EXIF, alpha over white, as PIL's convert("RGB") gives.
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!Rgb {
     if (bytes.len < 8 or bytes.len > std.math.maxInt(c_int)) return error.BadImage;
     const n: c_int = @intCast(bytes.len);
@@ -272,11 +262,9 @@ fn tiffOrientation(t: []const u8) u32 {
     return 1;
 }
 
-// The functions below are the ones GLM's image.zig (families/glm) has for its Metal path: the same PIL arithmetic,
-// kept here because the CUDA module cannot import that family's files.
+// Below: GLM's image.zig (families/glm) PIL arithmetic, copied since the CUDA module cannot import that family's files.
 
-/// PIL's exif_transpose: orientation 2-8 as FLIP_LEFT_RIGHT, ROTATE_180, FLIP_TOP_BOTTOM, TRANSPOSE, ROTATE_270,
-/// TRANSVERSE, ROTATE_90; each output pixel read from its source pixel.
+/// PIL's exif_transpose for orientations 2-8; each output pixel read from its source pixel.
 pub fn orient(gpa: std.mem.Allocator, src: Rgb, o: u32) Error!Rgb {
     const w: usize = src.w;
     const h: usize = src.h;
