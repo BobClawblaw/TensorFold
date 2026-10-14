@@ -124,8 +124,7 @@ pub const Set = struct {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
             if (matches(v.spec, args, consts, .exact)) return v;
         }
-        // a variant that assumes less of an argument than this launch gives (no 16-divisibility it has, or a runtime
-        // int where Triton would fold a 1) computes the same for it: Triton specializes for speed, not for values
+        // a variant that assumes less of an argument than the launch gives computes the same for it, so it may serve
         for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
             if (matches(v.spec, args, consts, .general)) return v;
@@ -196,9 +195,11 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bo
                 }
                 const p = param.?;
                 if (!std.mem.eql(u8, p.type, "i32")) return false;
+                // Triton folds a 1 into a constexpr, so a variant reading it at runtime was compiled for other values
+                if (!p.nospec and x == 1) return false;
                 const div = !p.nospec and @mod(x, 16) == 0;
                 switch (fit) {
-                    .exact => if ((!p.nospec and x == 1) or p.div16 != div) return false,
+                    .exact => if (p.div16 != div) return false,
                     .general => if (p.div16 and !div) return false,
                 }
             },
@@ -228,4 +229,77 @@ fn matches(k: KernelJson, args: []const Arg, consts: []const Const, fit: Fit) bo
         runtime += 1;
     }
     return runtime == k.params.len;
+}
+
+/// A set parsed from aot.json text whose variants carry no loaded cubin, so find can be tested without a GPU.
+fn testSet(gpa: std.mem.Allocator, text: []const u8) !Set {
+    const parsed = try std.json.parseFromSlice(SetJson, gpa, text, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    errdefer parsed.deinit();
+    const variants = try gpa.alloc(Variant, parsed.value.kernels.len);
+    for (parsed.value.kernels, variants) |k, *v| v.* = .{ .spec = k, .kernel = undefined };
+    return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
+}
+
+/// Frees a set from testSet: its variants never loaded a cubin, so no module is unloaded.
+fn freeTestSet(gpa: std.mem.Allocator, set: *Set) void {
+    gpa.free(set.variants);
+    set.parsed.deinit();
+}
+
+test "a variant captured without div16 serves a 16-aligned pointer" {
+    const gpa = std.testing.allocator;
+    var set = try testSet(gpa,
+        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,
+        \\ "params":[{"name":"P","type":"*i8","div16":false,"nospec":false}],"consts":{}}]}
+    );
+    defer freeTestSet(gpa, &set);
+    const v = try set.find("k", &.{ptr("P", "*i8", 0x1000)}, &.{});
+    try std.testing.expectEqualStrings("a", v.spec.hash);
+}
+
+test "a variant captured with div16 refuses an unaligned pointer" {
+    var params = [_]ParamJson{.{ .name = "P", .type = "*i8", .div16 = true, .nospec = false }};
+    const k: KernelJson = .{
+        .@"fn" = "k",
+        .hash = "a",
+        .name = "k",
+        .num_warps = 4,
+        .params = &params,
+        .consts = .{},
+    };
+    const unaligned = &[_]Arg{ptr("P", "*i8", 0x1008)};
+    try std.testing.expect(!matches(k, unaligned, &.{}, .exact));
+    try std.testing.expect(!matches(k, unaligned, &.{}, .general));
+}
+
+test "an aligned pointer takes the div16 variant when the set holds both" {
+    const gpa = std.testing.allocator;
+    var set = try testSet(gpa,
+        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,
+        \\ "params":[{"name":"P","type":"*i8","div16":false,"nospec":false}],"consts":{}},
+        \\ {"fn":"k","hash":"b","name":"k","num_warps":4,
+        \\ "params":[{"name":"P","type":"*i8","div16":true,"nospec":false}],"consts":{}}]}
+    );
+    defer freeTestSet(gpa, &set);
+    const v = try set.find("k", &.{ptr("P", "*i8", 0x1000)}, &.{});
+    try std.testing.expectEqualStrings("b", v.spec.hash);
+}
+
+test "a launch of 1 takes only the variant Triton folded it into, in either pass" {
+    const gpa = std.testing.allocator;
+    var set = try testSet(gpa,
+        \\{"kernels":[{"fn":"k","hash":"a","name":"k","num_warps":4,
+        \\ "params":[{"name":"R","type":"i32","div16":false,"nospec":false}],"consts":{}},
+        \\ {"fn":"k","hash":"b","name":"k","num_warps":4,"params":[],"consts":{"R":{"int":1}}}]}
+    );
+    defer freeTestSet(gpa, &set);
+    const runtime = set.variants[0].spec;
+    for ([_]Fit{ .exact, .general }) |fit| try std.testing.expect(!matches(runtime, &.{int("R", 1)}, &.{}, fit));
+    try std.testing.expectEqualStrings("b", (try set.find("k", &.{int("R", 1)}, &.{})).spec.hash);
+    try std.testing.expect(matches(runtime, &.{int("R", 5)}, &.{}, .exact));
+    try std.testing.expect(!matches(runtime, &.{int("R", 32)}, &.{}, .exact));
+    try std.testing.expectEqualStrings("a", (try set.find("k", &.{int("R", 32)}, &.{})).spec.hash);
 }
