@@ -6,8 +6,8 @@ pub const formats = native.formats;
 pub const default_context = native.default_context;
 pub const max_segments = native.max_segments;
 pub const prompt_rows = native.prompt_rows;
-/// Drafts come from the checkpoint's MTP layer, not a separate draft model.
-pub const takes_drafter = false;
+/// --drafter names the checkpoint's own directory: its MTP layer (mtp-4bit.safetensors) drafts chains.
+pub const takes_drafter = true;
 pub const open = native.open;
-pub const openDrafter = native.openDrafter;
+pub const openDrafter = native.openMtp;
 pub const explain = native.explain;

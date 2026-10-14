@@ -7,6 +7,8 @@ pub const dk = 128;
 pub const taps = 4;
 pub const head_dim = 256;
 pub const max_query_heads = 32;
+/// The rotary base the kernels fix (parse checks the config says so).
+pub const theta: f32 = 10000000;
 
 pub const Geometry = struct {
     hidden: usize,
