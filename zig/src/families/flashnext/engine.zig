@@ -625,14 +625,10 @@ pub const Engine = struct {
         return e.decode(prompt, pick, .{ .b = m.last.b, .off = m.last.off + (last_n - 1) * WIDE * 2 }, max_tokens, eos, depth, &watch, out, null);
     }
 
-    /// Where `decode` left a stream it handed over (a cancel with a handoff): its state as a host round leaves it
-    /// (the DeltaNet states kept, the n-gram tail in the model's own buffer, the head absorbed through the last
-    /// cache row), `cache` rows in the cache.
+    /// Where `decode` left a stream it handed over: its state as a host round leaves it, `cache` rows in the cache.
     pub const Handoff = struct { yielded: bool = false, cache: usize = 0 };
 
-    /// The GPU-side rounds after a prompt pass: `prompt` in the cache, `pick` its first token (out has it), `streams`
-    /// the last prompt row's (the head's first drafts), `watch` the reply's thinking budget. With `handoff`, a cancel
-    /// hands the stream over (handOver).
+    /// The GPU-side rounds after a prompt pass from `pick` and the last prompt row's `streams`; with `handoff` a cancel hands the stream over.
     pub fn decode(e: *Engine, prompt: []const u32, pick: u32, streams: Buf, max_tokens: usize, eos: []const u32, depth: ?usize, watch: *think.Watch, out: Out, handoff: ?*Handoff) !Result {
         const r = e.r;
         const m = e.m;
@@ -829,9 +825,7 @@ pub const Engine = struct {
         return res;
     }
 
-    /// The rounds handed over at `cache` rows, `round` the next round's index: the round ahead (greedy rounds run two
-    /// deep) started as each round does, with the last landed round's kept states, n-gram tail and head absorb; past
-    /// that nothing a host round reads. Then the tail into the model's own buffer.
+    /// The rounds handed over at `cache` rows: the round ahead already started as rounds do; the n-gram tail into the model's own buffer.
     fn handOver(e: *Engine, h: *Handoff, round: usize, cache: usize) !void {
         if (e.r.gdn_kept != null) return error.HandoffUnsupported; // kept states replay their rows in the next window
         if ((round - 1) % 2 == 1) {

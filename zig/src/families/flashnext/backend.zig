@@ -229,16 +229,13 @@ pub const Backend = struct {
         s.m.mtp.drafted = 0;
     }
 
-    /// LaneHost's driver for a lone stream: the shared sessions' own prompt pass into the engine's session (the states
-    /// the prompt cache keeps are theirs), then the engine's GPU-side rounds, two deep, until the stream finishes
-    /// (false) or `hooks.yield` asks for it: its state then stands as a shared round leaves it and the lane core takes
-    /// it on (true). `hooks`: LaneHost's LoneHooks.
     /// Commits a lone stream's first token; its prompt as the context holds it after the commit, which can move it.
     fn commitFirst(gpa: std.mem.Allocator, stream: *Stream, token: u32) ![]const u32 {
         _ = try stream.commit(gpa, &.{token}, &.{});
         return stream.prompt();
     }
 
+    /// LaneHost's lone driver: the shared prompt pass into session 0, then the engine's rounds until done (false) or handed over (true).
     pub fn lone(b: *Backend, stream: *Stream, hooks: anytype) !bool {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
