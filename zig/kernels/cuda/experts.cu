@@ -280,3 +280,7 @@ __global__ void plan_scatter(const int* __restrict__ picks, int P, int E, const 
     int, int, const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float);
 TF_EXPERT(1)
 TF_EXPERT(0)
+
+// Pair form: gate and up blocks interleaved per group (M = 2), SwiGLU in the epilogue (2) as fp8/nvfp4's up does.
+#define TF_EXPERT_PAIR(EPI) template __global__ void tf_experts::expert_kernel<64, 2, EPI, 2, 4>(const __nv_bfloat16* __restrict__,     int, int, const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float);
+TF_EXPERT_PAIR(2)
