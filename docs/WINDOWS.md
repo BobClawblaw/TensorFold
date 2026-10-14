@@ -45,6 +45,8 @@ the same rounding points, so a window of up to 16 rows reproduces one-token step
 tensorfold-native serve <Qwen3.5-2B-MLX-4bit> --name qwen2b --context 32768
 tensorfold-native serve <Qwen3.8-27B-MLX-4bit> --name qwen27b --context 8192 --parallel 4 ^
   --drafter <Qwen3.8-27B-DFlash2>
+tensorfold-native serve <Qwen3.6-35B-A3B-MLX-4bit-MTP> --name qwen36 --context 8192 --parallel 2 ^
+  --drafter <Qwen3.6-35B-A3B-MLX-4bit-MTP>
 ```
 
 - Qwen3.5-2B: about 340 tokens/s for one request on an RTX 4090, 1,500 across eight.
@@ -55,6 +57,12 @@ tensorfold-native serve <Qwen3.8-27B-MLX-4bit> --name qwen27b --context 8192 --p
   code at the high), sampled ones at 50 to 70, and four at once reach about 160 aggregate; replies stay identical to
   plain decoding. Loading takes about 80 s: the drafter's weights are quantized to 4 bits on the host and every
   shape is run once, as the driver stalls a process's first use of each kernel and buffer.
+- Qwen3.6-35B-A3B (`qwen3_5_moe`, 18.6 GiB): the same layers with 256 routed experts, 8 a token, in place of the
+  dense MLP. Routing follows the frozen engine's `cuda/moe.py` rule, and the experts run through the grouped affine-4
+  kernel's SwiGLU form, the shared expert last in the same tables. About 100 tokens/s plain for one request. With
+  `--drafter` naming the checkpoint's own directory, its MTP layer (`mtp-4bit.safetensors`) drafts chains of three
+  from each kept row's final normed state: 230 to 260 tokens/s greedy, 180 to 250 sampled, 420 aggregate across two
+  requests; replies stay identical to plain decoding. `TF_MTP_DRAFTS=N` sets the chain's length.
 - A verify window's rows are not snapshotted: each stream logs its rows' recurrence updates and a keep replays the
   accepted path, so the 27B records 32 rows a forward where 8 fit before.
 - `TF_TIMING=1` prints each verify, keep, absorb and hold's milliseconds and the drafted shape (chain or lanes);

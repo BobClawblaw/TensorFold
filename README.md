@@ -75,6 +75,7 @@ The platform column names the hardware tested for each model.
 | GLM-5.3 | EXLR8 `home` profile (trellis K2/K3/K4 experts) | Metal on two M5 Ultras |
 | Qwen3.5-2B | Pinned MLX affine 4-bit, group 64, tied embeddings | Metal on M5 Max; CUDA on RTX 4090 (Windows) |
 | Qwen3.8-27B | MLX affine 4-bit, group 64, own output head; DFlash2 drafter | Metal on M5 Max and M3 Ultra; CUDA on RTX 4090 (Windows) |
+| Qwen3.6-35B-A3B | MLX affine 4-bit, group 64, 8-bit routers; its MTP layer in `mtp-4bit.safetensors` | CUDA on RTX 4090 (Windows) |
 
 Nemotron's named checkpoint is `TensorFold/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit`.
 NVIDIA's NVFP4 checkpoint, `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, serves on CUDA as stored; its bf16 MTP head is quantized to 4-bit at load for drafts.
@@ -90,7 +91,7 @@ Its prompt processing trails mlx_lm for now, and we are fixing it. An M3 Ultra r
 Bonsai, Gemma 4, Qwen3.6 and DeepSeek-V4 are still under qualification for 1.0.x.
 The Python 0.6.6 engine remains available at the `v0.6.6` tag for those models and other backends.
 On CUDA, 1.0.11 serves Nemotron on a GB10, greedy and sampled, with concurrent requests sharing each round.
-On Windows ([docs/WINDOWS.md](docs/WINDOWS.md)), the native build also serves the 2B and the 27B on CUDA, the 27B with its DFlash2 drafter drafting trees.
+On Windows ([docs/WINDOWS.md](docs/WINDOWS.md)), the native build also serves the 2B and the 27B on CUDA, the 27B with its DFlash2 drafter drafting trees, and Qwen3.6-35B-A3B with its MTP layer drafting chains.
 The Linux x86_64 archive adds NVIDIA Ampere cards with compute capability 8.6 (the RTX 30 series, RTX A6000, A10 and A40), tested on an RTX 3090, and Blackwell cards with compute capability 12.0 (the RTX 50 series and RTX PRO 6000 Blackwell), tested on an RTX PRO 6000; the A100 (8.0) is not supported yet.
 
 ## Exact decoding
