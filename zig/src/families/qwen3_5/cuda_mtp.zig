@@ -1,4 +1,4 @@
-//! The Qwen3.6 MTP layer as the drafter on CUDA: chains from a kept row's final normed state and the token after it.
+//! The Qwen3.6 MTP layer as the drafter on CUDA: chains or trees from a kept row's final normed state and next token.
 const std = @import("std");
 const platform = @import("sys");
 const cuda = @import("cuda");
@@ -18,22 +18,30 @@ const most_window = engine.most_window;
 
 /// Drafts a round at most (the frozen engine's DEPTH); TF_MTP_DRAFTS=N sets it, up to a window's rows less one.
 const default_depth = 3;
+/// A tree's lanes at most (the lane planner's widest shape within a window), and the ranks a row's candidates cover.
+const max_lanes = most_window;
+const ranks = lanes.shape.ranks;
+/// The logprob row's words (sample.cu's LP_WORDS): the ids of a row's best tokens sit at words 2 onward.
+const lp_words = 3 + 2 * 20;
 
-const Fns = struct { norm_rope: cuda.Function, attn: cuda.Function };
+const Fns = struct { norm_rope: cuda.Function, attn: cuda.Function, attn_tree: cuda.Function };
 /// qwen35_draft.cu's ring kernels, shared with the DFlash2 drafter.
 const Ring = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, ring_put: cuda.Function };
 const TapRows = extern struct { n: c_int, rows: [most_window]c_int };
 
-/// A stream's context: its ring of keys and values over [begin, end), the newest row's state, and its held chain.
+/// A stream's context: its ring of keys and values over [begin, end), the newest row's state, and its held drafts.
 const Ctx = struct {
     ring: DeviceBuffer,
-    last: DeviceBuffer, // the newest absorbed row's normed output (bf16 hidden): the first chain row's state
+    last: DeviceBuffer, // the newest absorbed row's normed output (bf16 hidden): the first draft row's state
     begin: u64 = 0,
     end: u64 = 0,
-    first: u32 = 0, // the newest absorbed row's draft, its logits' argmax
-    held: [most_window]u32 = undefined,
+    cands: [ranks]u32 = @splat(0), // the newest absorbed row's best tokens by rank (rank 0: its chain draft)
+    held: [max_lanes]u32 = undefined,
     held_n: usize = 0,
 };
+
+/// How a layer pass attends: absorbed or chained rows over the ring and the block's earlier rows, into the ring too.
+const Pass = union(enum) { ring, tree: u64 };
 
 pub const Mtp = struct {
     gpa: std.mem.Allocator,
@@ -48,6 +56,7 @@ pub const Mtp = struct {
     at: usize = 0,
     capacity: usize, // ring rows: every position of the stream's window
     depth: u32,
+    trees: bool, // TF_MTP_TREES=1: the planner's trees instead of chains (measured a wash on this head)
     tap: [1]u32,
     // rows of max_rows, bf16 unless said
     taps_in: u64,
@@ -65,28 +74,37 @@ pub const Mtp = struct {
     vb: u64,
     att: u64,
     xs: u64, // f32 group sums for the projections
-    logits: u64, // one row
+    logits: u64, // max_lanes rows
+    words: u64, // u32 logprob words a lane row
+    picks: u64, // u32 zeros: the logprob rows' pick (unused)
+    lane_state: u64, // each tree lane's normed output
+    lane_k: u64, // each tree lane's key and value rows
+    lane_v: u64,
+    anc: u64, // int32 ancestor table a row: a count, then lane indices
     ids: u64, // u32 the rows' tokens
     tok: u64, // u32 the drawn token
-    staged: cuda.HostBuffer, // pinned: the ids up, the token down
+    staged: cuda.HostBuffer, // pinned: the ids and ancestors up, the token and words down
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
-    /// One chained draft's cost (timed at load).
+    /// One draft level's cost (timed at load): a chained row, or a tree's rows at one depth.
     step_ms: f64 = 1.0,
     /// The target's window ms by rows (cuda_native.zig times them), for the round loop's prices.
     costs: [most_window]lanes.config.Cost = undefined,
     n_costs: usize = 0,
 
+    const anc_stride = 1 + max_lanes;
     const ids_at = 0;
     const tok_at = max_rows * 4;
-    const staged_len = tok_at + 64;
+    const words_at = tok_at + 64;
+    const anc_at = words_at + max_lanes * lp_words * 4;
+    const staged_len = anc_at + max_lanes * anc_stride * 4;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8, capacity: usize) !*Mtp {
         if (!e.g.moe()) return error.NotRouted;
         const d = try gpa.create(Mtp);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .w = undefined, .mod = undefined, .dmod = undefined, .fns = undefined, .ring_fns = undefined, .scratch = undefined, .capacity = capacity, .depth = default_depth, .tap = .{@intCast(e.g.layers - 1)}, .taps_in = 0, .hin = 0, .hn = 0, .emb = 0, .en = 0, .h = 0, .r = 0, .x = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .xs = 0, .logits = 0, .ids = 0, .tok = 0, .staged = undefined };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .w = undefined, .mod = undefined, .dmod = undefined, .fns = undefined, .ring_fns = undefined, .scratch = undefined, .capacity = capacity, .depth = default_depth, .trees = platform.c.getenv("TF_MTP_TREES") != null, .tap = .{@intCast(e.g.layers - 1)}, .taps_in = 0, .hin = 0, .hn = 0, .emb = 0, .en = 0, .h = 0, .r = 0, .x = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .xs = 0, .logits = 0, .words = 0, .picks = 0, .lane_state = 0, .lane_k = 0, .lane_v = 0, .anc = 0, .ids = 0, .tok = 0, .staged = undefined };
         if (platform.c.getenv("TF_MTP_DRAFTS")) |v| d.depth = std.fmt.parseInt(u32, std.mem.span(v), 10) catch default_depth;
         d.depth = @min(@max(d.depth, 1), most_window - 1);
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen36_mtp);
@@ -104,15 +122,16 @@ pub const Mtp = struct {
         _ = try d.layout(true);
         d.staged = try cuda.HostBuffer.alloc(e.d, staged_len);
         errdefer d.staged.free();
-        // the first context, and a chain timed on it (the quickest of several: the first ones pay the driver's stalls)
+        // the first context, and a chain timed on it: the quickest of sixteen, as the driver's stalls last a dozen
         const ctx = try d.create();
         errdefer d.drop(ctx);
         var quickest: f64 = std.math.inf(f64);
-        for (0..6) |_| {
+        for (0..16) |_| {
             try d.absorb(ctx, d.taps_in, 0, 1, null, &.{0});
             const t0 = std.Io.Clock.awake.now(io);
-            try d.hold(ctx, 0, 1, d.depth);
-            quickest = @min(quickest, @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e6);
+            try d.hold(ctx, 0, 1, d.depth, null);
+            const ms = @as(f64, @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds())) / 1e6;
+            quickest = @min(quickest, ms);
         }
         d.step_ms = quickest / @as(f64, @floatFromInt(d.depth));
         d.resetCtx(ctx);
@@ -126,7 +145,7 @@ pub const Mtp = struct {
     }
 
     pub fn setCost(d: *Mtp, rows: u32, ms: f64) void {
-        if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] window {d} rows {d:.2} ms (a chained draft {d:.2})\n", .{ rows, ms, d.step_ms });
+        if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] window {d} rows {d:.2} ms (a draft level {d:.2})\n", .{ rows, ms, d.step_ms });
         if (d.n_costs < d.costs.len) {
             d.costs[d.n_costs] = .{ .width = rows, .ms = ms };
             d.n_costs += 1;
@@ -164,14 +183,16 @@ pub const Mtp = struct {
     fn layout(d: *Mtp, assign: bool) !usize {
         const g = d.e.g;
         const R = max_rows;
+        const L = max_lanes;
         const aw = g.attnWidth();
         const kw = d.kvWidth();
         const sizes = .{
-            .{ "taps_in", R * g.hidden * 2 }, .{ "hin", R * g.hidden * 2 }, .{ "hn", R * g.hidden * 2 },                  .{ "emb", R * g.hidden * 2 },
-            .{ "en", R * g.hidden * 2 },      .{ "h", R * g.hidden * 2 },   .{ "r", R * g.hidden * 2 },                   .{ "x", R * g.hidden * 2 },
-            .{ "qraw", R * 2 * aw * 2 },      .{ "q", R * aw * 2 },         .{ "kraw", R * kw * 2 },                      .{ "kb", R * kw * 2 },
-            .{ "vb", R * kw * 2 },            .{ "att", R * aw * 2 },       .{ "xs", R * (@max(g.hidden, aw) / 64) * 4 }, .{ "logits", g.vocab * 2 },
-            .{ "ids", R * 4 },                .{ "tok", 64 },
+            .{ "taps_in", R * g.hidden * 2 }, .{ "hin", R * g.hidden * 2 },   .{ "hn", R * g.hidden * 2 },                  .{ "emb", R * g.hidden * 2 },
+            .{ "en", R * g.hidden * 2 },      .{ "h", R * g.hidden * 2 },     .{ "r", R * g.hidden * 2 },                   .{ "x", R * g.hidden * 2 },
+            .{ "qraw", R * 2 * aw * 2 },      .{ "q", R * aw * 2 },           .{ "kraw", R * kw * 2 },                      .{ "kb", R * kw * 2 },
+            .{ "vb", R * kw * 2 },            .{ "att", R * aw * 2 },         .{ "xs", R * (@max(g.hidden, aw) / 64) * 4 }, .{ "logits", L * g.vocab * 2 },
+            .{ "words", L * lp_words * 4 },   .{ "picks", L * 4 },            .{ "lane_state", L * g.hidden * 2 },          .{ "lane_k", L * kw * 2 },
+            .{ "lane_v", L * kw * 2 },        .{ "anc", L * anc_stride * 4 }, .{ "ids", R * 4 },                            .{ "tok", 64 },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -204,7 +225,7 @@ pub const Mtp = struct {
         try ctx.ring.fill8(0, null);
         try ctx.last.fill8(0, null);
         try d.absorb(ctx, d.taps_in, 0, 1, null, &.{0}); // any tap rows do: the drafter's own zeroed staging
-        try d.hold(ctx, 0, 1, d.depth);
+        try d.hold(ctx, 0, 1, d.depth, null);
         d.resetCtx(ctx);
         return ctx;
     }
@@ -239,7 +260,7 @@ pub const Mtp = struct {
     }
 
     /// The layer over `rows` rows at slots pos0..: d.ids their tokens, d.hin their states; x gets their normed outputs.
-    fn layer(d: *Mtp, ctx: *Ctx, rows: usize, pos0: u64) !void {
+    fn layer(d: *Mtp, ctx: *Ctx, rows: usize, pos0: u64, pass: Pass) !void {
         const e = d.e;
         const g = e.g;
         const w = &d.w;
@@ -257,26 +278,41 @@ pub const Mtp = struct {
         try d.proj(w.v, d.x, d.vb, rows);
         try e.run(d.fns.norm_rope, .{ rows * g.q_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.qraw, w.q_norm, d.q, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), p0, g.eps, geometry.theta });
         try e.run(d.fns.norm_rope, .{ rows * g.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.kraw, w.k_norm, d.kb, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(kw)), @as(c_int, head_dim), p0, g.eps, geometry.theta });
-        try e.run(d.fns.attn, .{ rows, g.q_heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.qraw, @as(c_int, @intCast(2 * aw)), d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(d.capacity)), @as(c_longlong, @intCast(ctx.begin)), p0, d.att });
+        const heads: c_int = @intCast(g.q_heads);
+        const kvh: c_int = @intCast(g.kv_heads);
+        const cap: c_int = @intCast(d.capacity);
+        const begin: c_longlong = @intCast(ctx.begin);
+        switch (pass) {
+            .ring => try e.run(d.fns.attn, .{ rows, g.q_heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.qraw, @as(c_int, @intCast(2 * aw)), d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), heads, kvh, cap, begin, p0, d.att }),
+            .tree => |anc| try e.run(d.fns.attn_tree, .{ rows, g.q_heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.qraw, @as(c_int, @intCast(2 * aw)), d.kb, d.vb, d.lane_k, d.lane_v, anc, @as(c_int, anc_stride), d.ringK(ctx), d.ringV(ctx), heads, kvh, cap, begin, p0, d.att }),
+        }
         try d.proj(w.o, d.att, d.r, rows);
         try d.norm(d.h, d.r, w.post_norm, d.x, rows);
         try e.routedRows(w.mlp.moe.router, w.mlp.moe.experts, d.x, d.r, rows, rows > most_window);
         try d.norm(d.h, d.r, w.norm, d.x, rows);
-        try e.run(d.ring_fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), @as(c_int, @intCast(kw)), p0, @as(c_int, @intCast(d.capacity)) });
+        if (pass == .ring) try e.run(d.ring_fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), @as(c_int, @intCast(kw)), p0, cap });
     }
 
-    /// Row `row` of x through the target's head: its argmax into `tok` (the host sees it after a synchronize).
-    fn draw(d: *Mtp, row: usize) !void {
+    /// Rows [first, first + n) of x through the target's head: their logits and best tokens' words, row 0's pick.
+    fn draw(d: *Mtp, first: usize, n: usize, cands: bool) !void {
         const e = d.e;
-        try d.proj(e.head, d.x + row * e.g.hidden * 2, d.logits, 1);
+        try d.proj(e.head, d.x + first * e.g.hidden * 2, d.logits, n);
         try e.run(e.fns.argmax, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, .{ d.logits, @as(c_int, @intCast(e.g.vocab)), d.tok });
+        if (cands and d.trees) try e.draws.logprobRows(e.stream, d.logits, e.g.vocab, d.picks, ranks, false, d.words, n);
     }
 
-    fn token(d: *Mtp) !u32 {
+    /// The drawn token, and the first `n` rows' candidates by rank, after a draw.
+    fn fetch(d: *Mtp, n: usize, cands: [][ranks]u32) !u32 {
         const e = d.e;
-        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(d.staged.bytes.ptr + tok_at, d.tok, 4, e.stream.handle), "cuMemcpyDtoHAsync");
+        const st = d.staged.bytes;
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + tok_at, d.tok, 4, e.stream.handle), "cuMemcpyDtoHAsync");
+        if (d.trees and n > 0) try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, n * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
         try e.stream.synchronize();
-        return std.mem.bytesToValue(u32, d.staged.bytes[tok_at..][0..4]);
+        for (cands[0..n], 0..) |*c, r| {
+            const w = std.mem.bytesAsSlice(u32, st[words_at + r * lp_words * 4 ..][0 .. lp_words * 4]);
+            for (c, 0..) |*t, j| t.* = if (d.trees) w[2 + j] else std.mem.bytesToValue(u32, st[tok_at..][0..4]);
+        }
+        return std.mem.bytesToValue(u32, st[tok_at..][0..4]);
     }
 
     fn putIds(d: *Mtp, ids: []const u32) !void {
@@ -313,37 +349,109 @@ pub const Mtp = struct {
             } else try e.run(d.ring_fns.gather_taps, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ tap_ring, @as(c_int, engine.tap_rows), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(g.hidden)), d.taps_in });
             try d.norm(d.taps_in, 0, e.final_norm, d.hin, rows); // the target's final norm: the rows the head read
             try d.putIds(follow[fi..][0..rows]);
-            try d.layer(ctx, rows, start);
+            try d.layer(ctx, rows, start, .ring);
             start += rows;
             n -= rows;
             fi += rows;
             ctx.end = start;
-            // the newest row: its state kept for the chain, its draft drawn
+            // the newest row: its state kept for the drafts, its best tokens drawn
             try ctx.last.copyFrom(0, d.x + (rows - 1) * g.hidden * 2, g.hidden * 2, e.stream.handle);
-            try d.draw(rows - 1);
+            try d.draw(rows - 1, 1, true);
         }
-        ctx.first = try d.token();
+        var cands: [1][ranks]u32 = undefined;
+        ctx.cands[0] = try d.fetch(1, &cands);
+        if (d.trees) ctx.cands = cands[0];
     }
 
-    /// `depth` drafts after `pending` at pos0 (the pending token's slot): the first came with the newest absorbed row.
-    fn hold(d: *Mtp, ctx: *Ctx, pending: u32, pos0: u64, depth: usize) !void {
+    /// `depth` drafts after `pending` at pos0 (the pending token's slot): a chain, or the planner's tree of lanes.
+    fn hold(d: *Mtp, ctx: *Ctx, pending: u32, pos0: u64, depth: usize, lanes_: ?*const lanes.shape.Shape) !void {
+        _ = pending; // the newest absorbed row's follow token, whose candidates ctx.cands are
+        if (ctx.end != pos0) return error.DraftContextBehind;
+        if (lanes_) |l| return d.holdTree(ctx, pos0, l);
         const e = d.e;
         const g = e.g;
-        if (ctx.end != pos0) return error.DraftContextBehind;
-        ctx.held[0] = ctx.first;
+        ctx.held[0] = ctx.cands[0];
         ctx.held_n = 1;
-        _ = pending; // the newest absorbed row's follow token, whose draft ctx.first is
         var k: usize = 1;
         while (k < depth and k < ctx.held.len) : (k += 1) {
             // row k: (the previous row's normed output, the draft before) at slot pos0 + k - 1
             const src = if (k == 1) ctx.last.ptr else d.x;
             try d.scratch.copyFrom(d.hin - d.scratch.ptr, src, g.hidden * 2, e.stream.handle);
             try d.putIds(&.{ctx.held[k - 1]});
-            try d.layer(ctx, 1, pos0 + k - 1);
-            try d.draw(0);
-            ctx.held[k] = try d.token();
+            try d.layer(ctx, 1, pos0 + k - 1, .ring);
+            try d.draw(0, 1, false);
+            var none: [0][ranks]u32 = undefined;
+            ctx.held[k] = try d.fetch(0, &none);
             ctx.held_n = k + 1;
         }
+    }
+
+    /// The tree's lanes, lane i the rank-r candidate of its parent's row; a depth's rows run as one pass.
+    fn holdTree(d: *Mtp, ctx: *Ctx, pos0: u64, l: *const lanes.shape.Shape) !void {
+        const e = d.e;
+        const g = e.g;
+        const n = l.parents.len;
+        if (n > max_lanes) return error.TooManyLanes;
+        var cands: [max_lanes][ranks]u32 = undefined; // each lane's row's candidates, once its row has run
+        var internal: [max_lanes]bool = @splat(false);
+        for (l.parents, l.depths, l.ranks, 0..) |par, dd, rank, i| {
+            if (rank >= ranks or par >= @as(i32, @intCast(i)) or dd >= most_window) return error.BadLanes;
+            if (par >= 0) internal[@intCast(par)] = true else ctx.held[i] = ctx.cands[rank];
+        }
+        // internal lanes by depth: each pass's rows are the lanes at that depth whose rows later lanes read
+        var done: [max_lanes]bool = @splat(false);
+        var depth: u8 = 0;
+        while (depth < most_window) : (depth += 1) {
+            var batch: [max_lanes]usize = undefined;
+            var rows: usize = 0;
+            for (l.depths, 0..) |dd, i| if (dd == depth and internal[i]) {
+                batch[rows] = i;
+                rows += 1;
+            };
+            if (rows == 0) {
+                var any = false;
+                for (l.depths, 0..) |dd, i| any = any or (dd > depth and internal[i]);
+                if (!any) break;
+                continue;
+            }
+            // each row's inputs: its parent's output state, its own token; its ancestors as lane indices
+            const st = d.staged.bytes;
+            const anc = std.mem.bytesAsSlice(i32, st[anc_at..][0 .. rows * anc_stride * 4]);
+            var toks: [max_lanes]u32 = undefined;
+            for (batch[0..rows], 0..) |i, m| {
+                const par = l.parents[i];
+                const src = if (par < 0) ctx.last.ptr else d.lane_state + @as(u64, @intCast(par)) * g.hidden * 2;
+                try d.scratch.copyFrom(d.hin - d.scratch.ptr + m * g.hidden * 2, src, g.hidden * 2, e.stream.handle);
+                toks[m] = ctx.held[i];
+                var count: usize = 0;
+                var a = par;
+                while (a >= 0) : (a = l.parents[@intCast(a)]) {
+                    anc[m * anc_stride + 1 + count] = a;
+                    count += 1;
+                }
+                anc[m * anc_stride] = @intCast(count);
+            }
+            try d.putIds(toks[0..rows]);
+            try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.anc, st.ptr + anc_at, rows * anc_stride * 4, e.stream.handle), "cuMemcpyHtoDAsync");
+            try d.layer(ctx, rows, pos0 + depth, .{ .tree = d.anc });
+            const kw = d.kvWidth();
+            for (batch[0..rows], 0..) |i, m| {
+                try d.scratch.copyFrom(d.lane_state - d.scratch.ptr + i * g.hidden * 2, d.x + m * g.hidden * 2, g.hidden * 2, e.stream.handle);
+                try d.scratch.copyFrom(d.lane_k - d.scratch.ptr + i * kw * 2, d.kb + m * kw * 2, kw * 2, e.stream.handle);
+                try d.scratch.copyFrom(d.lane_v - d.scratch.ptr + i * kw * 2, d.vb + m * kw * 2, kw * 2, e.stream.handle);
+                done[i] = true;
+            }
+            try d.draw(0, rows, true);
+            var got: [max_lanes][ranks]u32 = undefined;
+            _ = try d.fetch(rows, got[0..rows]);
+            for (batch[0..rows], 0..) |i, m| cands[i] = got[m];
+            // the lanes whose parent's row just ran take their tokens now
+            for (l.parents, l.ranks, 0..) |par, rank, i| if (par >= 0 and done[@intCast(par)]) {
+                ctx.held[i] = cands[@intCast(par)][rank];
+            };
+        }
+        ctx.held_n = n;
+        if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] lanes {d} levels {d}\n", .{ n, l.levels() });
     }
 
     // the Drafter contract
@@ -362,7 +470,7 @@ pub const Mtp = struct {
 
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
-        return .{ .depth = d.depth, .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.ringBytes() + d.e.g.hidden * 2, .trees = false, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
+        return .{ .depth = d.depth, .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.ringBytes() + d.e.g.hidden * 2, .trees = d.trees, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -394,7 +502,7 @@ pub const Mtp = struct {
         defer timing("mtp hold", d.io, t0);
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
-            try d.hold(ctx, it.pending, it.position - 1, it.depth);
+            try d.hold(ctx, it.pending, it.position - 1, it.depth, it.lanes);
         }
     }
 

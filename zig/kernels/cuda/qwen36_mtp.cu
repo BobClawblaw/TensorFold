@@ -106,7 +106,66 @@ extern "C" __global__ void __launch_bounds__(32) tf_q36m_attn(const __nv_bfloat1
         for (int i = 0; i < DPL; i++) o[i] = fmaf(b, bf(v[i]), o[i] * a);
         mx = mn;
     }
-    const __nv_bfloat16* g = G + (size_t)m * gstride + (size_t)h * (2 * HD) + HD + lane * DPL;  // the q projection's gate
+    const __nv_bfloat16* g = G + (size_t)m * gstride + (size_t)h * (2 * HD) + HD + lane * DPL;  // the gate half
+#pragma unroll
+    for (int i = 0; i < DPL; i++) {
+        const float gate = 1.0f / (1.0f + __expf(-bf(g[i])));
+        OUT[((size_t)m * heads + h) * HD + lane * DPL + i] = __float2bfloat16_rn(rbf(o[i] / l) * gate);
+    }
+}
+
+// Tree rows at one depth, a warp a (row, head): ring [begin, pos0), the ancestor lanes ANC[m] names, then its own key.
+extern "C" __global__ void __launch_bounds__(32) tf_q36m_attn_tree(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ G, int gstride,
+                                                                     const __nv_bfloat16* __restrict__ KB, const __nv_bfloat16* __restrict__ VB,
+                                                                     const __nv_bfloat16* __restrict__ LK, const __nv_bfloat16* __restrict__ LV,
+                                                                     const int* __restrict__ ANC, int anc_stride, const __nv_bfloat16* __restrict__ RK,
+                                                                     const __nv_bfloat16* __restrict__ RV, int heads, int kv_heads, int W, long long begin,
+                                                                     long long pos0, __nv_bfloat16* __restrict__ OUT) {
+    constexpr int DPL = HD / 32;
+    const int lane = threadIdx.x;
+    const int m = blockIdx.x, h = blockIdx.y;
+    const int kvh = h / (heads / kv_heads);
+    const int width = kv_heads * HD;
+    const float scale = 1.0f / 16.0f;
+    float q[DPL], o[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; i++) {
+        q[i] = bf(Q[((size_t)m * heads + h) * HD + lane * DPL + i]);
+        o[i] = 0.0f;
+    }
+    float mx = -INFINITY, l = 0.0f;
+    for (long long pos = begin; pos < pos0; pos++) {
+        const __nv_bfloat16* k = RK + (size_t)(pos % W) * width + kvh * HD + lane * DPL;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) dot = fmaf(q[i], bf(k[i]), dot);
+        const float s = warp_sum(dot) * scale;
+        const float mn = fmaxf(mx, s);
+        const float a = __expf(mx - mn), b = __expf(s - mn);
+        l = l * a + b;
+        const __nv_bfloat16* v = RV + (size_t)(pos % W) * width + kvh * HD + lane * DPL;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) o[i] = fmaf(b, bf(v[i]), o[i] * a);
+        mx = mn;
+    }
+    const int* anc = ANC + (size_t)m * anc_stride;
+    const int n = anc[0];
+    for (int j = 0; j <= n; j++) {
+        const bool self = j == n;
+        const __nv_bfloat16* k = (self ? KB + (size_t)m * width : LK + (size_t)anc[1 + j] * width) + kvh * HD + lane * DPL;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) dot = fmaf(q[i], bf(k[i]), dot);
+        const float s = warp_sum(dot) * scale;
+        const float mn = fmaxf(mx, s);
+        const float a = __expf(mx - mn), b = __expf(s - mn);
+        l = l * a + b;
+        const __nv_bfloat16* v = (self ? VB + (size_t)m * width : LV + (size_t)anc[1 + j] * width) + kvh * HD + lane * DPL;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) o[i] = fmaf(b, bf(v[i]), o[i] * a);
+        mx = mn;
+    }
+    const __nv_bfloat16* g = G + (size_t)m * gstride + (size_t)h * (2 * HD) + HD + lane * DPL;
 #pragma unroll
     for (int i = 0; i < DPL; i++) {
         const float gate = 1.0f / (1.0f + __expf(-bf(g[i])));

@@ -62,7 +62,8 @@ tensorfold-native serve <Qwen3.6-35B-A3B-MLX-4bit-MTP> --name qwen36 --context 8
   kernel's SwiGLU form, the shared expert last in the same tables. About 100 tokens/s plain for one request. With
   `--drafter` naming the checkpoint's own directory, its MTP layer (`mtp-4bit.safetensors`) drafts chains of three
   from each kept row's final normed state: 230 to 260 tokens/s greedy, 180 to 250 sampled, 420 aggregate across two
-  requests; replies stay identical to plain decoding. `TF_MTP_DRAFTS=N` sets the chain's length.
+  requests; replies stay identical to plain decoding. `TF_MTP_DRAFTS=N` sets the chain's length, and `TF_MTP_TREES=1`
+  drafts the planner's trees instead, which measured no faster than chains on this head.
 - A verify window's rows are not snapshotted: each stream logs its rows' recurrence updates and a keep replays the
   accepted path, so the 27B records 32 rows a forward where 8 fit before.
 - `TF_TIMING=1` prints each verify, keep, absorb and hold's milliseconds and the drafted shape (chain or lanes);
