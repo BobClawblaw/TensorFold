@@ -96,8 +96,8 @@ pub const Backend = struct {
         const c: ?*const batch_costs.Costs = if (b.costs) |*x| x else null;
         // shared rounds priced from the timed forwards, each draft past a stream's first at a chained step's time; a
         // lone stream's depth from the same (FZ_LONE_UNPRICED=1: the heuristic)
-        const lone = c != null and std.c.getenv("FZ_LONE_UNPRICED") == null;
-        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (lone) &c.?.shared else &.{}, .mtp_step_ms = if (lone) c.?.step_ms else 0 };
+        const lone_priced = c != null and std.c.getenv("FZ_LONE_UNPRICED") == null; // not `lone`: that names the lone driver
+        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (lone_priced) &c.?.shared else &.{}, .mtp_step_ms = if (lone_priced) c.?.step_ms else 0 };
     }
 
     fn self(ptr: *anyopaque) *Backend {
