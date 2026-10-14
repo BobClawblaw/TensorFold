@@ -95,6 +95,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
         h.back.sized = true;
         h.back.grow = slotGrow();
     }
+    try h.back.timeCosts();
     const allocated = fit.footprint() orelse return error.NoMemoryReading;
     if (allocated +| fit.MARGIN +| reserved > cap) return error.OverMemoryLimit;
     h.cfg = try lanes.Config.init(gpa, h.back.facts(), tf.flashnext_replay.MAXR, tf.flashnext_replay.MAXR - 1);
@@ -119,7 +120,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     var listed: [tf.flashnext_replay.MAXR * 8]u8 = undefined;
     var w: std.Io.Writer = .fixed(&listed);
     for (caps.items, 0..) |c, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", c }) catch break;
-    std.log.info("Flash Next: {d} session slots ({s} tokens), shared target forwards, serial MTP drafts", .{ slots, w.buffered() });
+    std.log.info("Flash Next: {d} session slots ({s} tokens), shared target forwards, {s}", .{ slots, w.buffered(), if (h.back.serial_drafts) "serial MTP drafts" else "every stream's drafts in one command buffer" });
     return .{ .engine = h.host.engine(), .close = close, .ctx = h };
 }
 

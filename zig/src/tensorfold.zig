@@ -56,6 +56,7 @@ test {
     _ = @import("families/flashnext/marks.zig"); // a call's marks
     _ = @import("families/flashnext/think.zig"); // a thinking budget's close on the host
     _ = @import("families/flashnext/slots.zig"); // sized shared sessions: the list, a stream's session, when it grows
+    _ = @import("families/flashnext/batch_costs.zig"); // the shared rounds' timing needs a session that holds it
     _ = @import("families/flashnext/think_check.zig"); // and in the verdict kernels (Metal)
     _ = @import("families/glm/glm.zig");
     _ = @import("families/qwen3_5/config.zig");
