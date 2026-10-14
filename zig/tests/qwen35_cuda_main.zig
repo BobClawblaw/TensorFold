@@ -1,4 +1,4 @@
-//! `tf-qwen35-cuda <model dir> <step|window|tree|prompt> <ids> <out>`: the ids' logits as bf16 rows for a reference.
+//! `tf-qwen35-cuda <model dir> <step|window|tree|prompt|probe> <ids> <out>`: bf16 logit rows for a reference, or picks.
 const std = @import("std");
 const cuda = @import("cuda");
 const q = @import("qwen35");
@@ -89,6 +89,46 @@ pub fn main(init: std.process.Init) !u8 {
             if (n > 1) try cache.keep(e, path[0..kept]);
             at += kept;
         }
+    } else if (std.mem.eql(u8, args[2], "probe")) {
+        // the first id through layers 0..N (N = the out argument): that layer's routing and rows, for a reference
+        const layer = try std.fmt.parseInt(usize, args[4], 10);
+        const all = e.layers;
+        e.layers = all[0 .. layer + 1];
+        e.graphs.clearRetainingCapacity(); // the warm-up captured every layer; this forward captures the cut
+        try e.forward(&.{.{ .cache = &cache, .rows = 1 }}, ids.items[0..1], .logits);
+        e.layers = all;
+        const g = e.g;
+        if (!g.moe()) return error.NotRouted;
+        const count = g.experts + 1;
+        const logits_f = try a.alloc(f32, count);
+        const picks = try a.alloc(i32, g.slots());
+        const wts = try a.alloc(f32, g.slots());
+        var xrow: [8]u16 = undefined;
+        var rrow: [8]u16 = undefined;
+        try e.arena.download(e.rlogits - e.arena.ptr, std.mem.sliceAsBytes(logits_f));
+        try e.arena.download(e.picks - e.arena.ptr, std.mem.sliceAsBytes(picks));
+        try e.arena.download(e.wts - e.arena.ptr, std.mem.sliceAsBytes(wts));
+        try e.arena.download(e.x - e.arena.ptr, std.mem.sliceAsBytes(&xrow));
+        try e.arena.download(e.r - e.arena.ptr, std.mem.sliceAsBytes(&rrow));
+        std.debug.print("probe layer {d} x[:8]", .{layer});
+        for (xrow) |h| std.debug.print(" {d:.5}", .{@as(f32, @bitCast(@as(u32, h) << 16))});
+        std.debug.print("\nprobe top logits", .{});
+        for (0..10) |_| {
+            var best: usize = 0;
+            for (logits_f[0 .. count - 1], 0..) |v, i| if (v > logits_f[best]) {
+                best = i;
+            };
+            std.debug.print(" ({d}, {d:.5})", .{ best, logits_f[best] });
+            logits_f[best] = -std.math.inf(f32);
+        }
+        std.debug.print(" shared gate {d:.5}\nprobe picks", .{logits_f[count - 1]});
+        for (picks) |pk| std.debug.print(" {d}", .{pk});
+        std.debug.print(" weights", .{});
+        for (wts) |w| std.debug.print(" {d:.5}", .{w});
+        std.debug.print("\nprobe r[:8]", .{});
+        for (rrow) |h| std.debug.print(" {d:.5}", .{@as(f32, @bitCast(@as(u32, h) << 16))});
+        std.debug.print("\n", .{});
+        return 0;
     } else {
         var at: usize = 0;
         while (at < ids.items.len) {

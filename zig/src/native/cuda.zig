@@ -13,7 +13,7 @@ const nemotron_slide = @import("nemotron_slide.zig");
 const drafted = @import("cuda_drafted.zig");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, qwen35.native };
+const registry = .{ nemotron.native, qwen35.native, qwen35.native_moe };
 
 /// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
 const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{

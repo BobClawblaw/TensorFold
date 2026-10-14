@@ -35,12 +35,12 @@ pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh
 
 pub const Delta = struct { qkv: Affine4, z: Affine4, a: Affine4, b: Affine4, out: Affine4, conv: u64, norm: u64, a_log: u64, dt_bias: u64 };
 pub const Attention = struct { q: Affine4, k: Affine4, v: Affine4, o: Affine4, q_norm: u64, k_norm: u64 };
+/// A dense SwiGLU MLP, or routed experts (the shared one last in their tables) behind a router of bf16 rows.
+pub const Mlp = union(enum) { dense: struct { gate: Affine4, up: Affine4, down: Affine4 }, moe: struct { router: u64, experts: cuda.experts.Layer } };
 pub const Layer = struct {
     input_norm: u64,
     post_norm: u64,
-    gate: Affine4,
-    up: Affine4,
-    down: Affine4,
+    mlp: Mlp,
     mixer: union(enum) { delta: Delta, attention: Attention },
 };
 
@@ -80,9 +80,12 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
-    mods: [7]cuda.Module,
+    mods: [11]cuda.Module,
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
+    experts: cuda.experts.Affine4Experts,
+    plan: cuda.grouped.Router,
+    moe: cuda.moe.Fns,
     fns: Fns,
     keeps: Keeps,
     /// Every weight and scratch buffer in one allocation: WDDM's launch cost grows with the allocation count.
@@ -127,6 +130,17 @@ pub const Engine = struct {
     pl: u64,
     po: u64,
     logits: u64,
+    // routed experts' scratch (qwen3_5_moe): logits, picks and weights a row, the plan, the pairs' activations and sums
+    rlogits: u64 = 0,
+    picks: u64 = 0,
+    wts: u64 = 0,
+    members: u64 = 0,
+    items: u64 = 0,
+    counts: u64 = 0,
+    rank: u64 = 0,
+    hist: u64 = 0,
+    eact: u64 = 0,
+    ey: u64 = 0,
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
@@ -174,7 +188,7 @@ pub const Engine = struct {
         e.stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
         errdefer e.stage.free();
         const kk = cuda.kernels;
-        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep };
+        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe };
         var loaded: usize = 0;
         errdefer for (e.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -186,6 +200,9 @@ pub const Engine = struct {
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
         errdefer e.affine.deinit();
         e.draws = try cuda.sample.Draws.resolve(e.mods[5]);
+        e.experts = try cuda.experts.Affine4Experts.resolve(e.mods[7], e.mods[8], e.mods[9], sms);
+        e.plan = try cuda.grouped.Router.resolve(e.mods[7]);
+        e.moe = try cuda.moe.Fns.resolve(e.mods[10]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
         e.layers = try gpa.alloc(Layer, g.layers);
@@ -292,6 +309,20 @@ pub const Engine = struct {
         e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
         e.logits = try t.alloc(most_verify * g.vocab * 2);
+        if (g.moe()) {
+            const pairs = R * g.slots();
+            const count = g.experts + 1;
+            e.rlogits = try t.alloc(R * count * 4);
+            e.picks = try t.alloc(pairs * 4);
+            e.wts = try t.alloc(pairs * 4);
+            e.members = try t.alloc(pairs * 4);
+            e.items = try t.alloc(3 * cuda.grouped.maxItems(pairs, count, 16) * 4);
+            e.counts = try t.alloc(2 * 4);
+            e.rank = try t.alloc(pairs * 4);
+            e.hist = try t.alloc(((pairs + 1023) / 1024) * count * 4);
+            e.eact = try t.alloc(pairs * g.intermediate * 2);
+            e.ey = try t.alloc(pairs * g.hidden * 4);
+        }
         return total;
     }
 
@@ -501,11 +532,16 @@ pub const Engine = struct {
                 },
             }
             try e.norm(true, l.post_norm, total);
-            try e.proj(l.gate, e.x, e.gate, total, prompt);
-            try e.proj(l.up, e.x, e.up, total, prompt);
-            const n: c_longlong = @intCast(total * g.intermediate);
-            try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
-            try e.proj(l.down, e.act, e.r, total, prompt);
+            switch (l.mlp) {
+                .dense => |m| {
+                    try e.proj(m.gate, e.x, e.gate, total, prompt);
+                    try e.proj(m.up, e.x, e.up, total, prompt);
+                    const n: c_longlong = @intCast(total * g.intermediate);
+                    try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
+                    try e.proj(m.down, e.act, e.r, total, prompt);
+                },
+                .moe => |m| try e.routed(m.router, m.experts, total, prompt),
+            }
             if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
             };
@@ -513,6 +549,33 @@ pub const Engine = struct {
         try e.norm(true, e.final_norm, total);
         // the head over the kept rows
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
+    }
+
+    /// The routed experts over the normed rows in x: the picks, their plan, SwiGLU up, down, the weighted sum into r.
+    fn routed(e: *Engine, router: u64, layer: cuda.experts.Layer, total: usize, prompt: bool) !void {
+        const g = e.g;
+        const slots = g.slots();
+        const count = g.experts + 1;
+        const pairs = total * slots;
+        // a short prompt chunk takes the decode form, as the dense projections do: its rows keep one-row steps' bits
+        const wide = prompt and total > most_window;
+        const tile: usize = if (wide) 64 else 16;
+        const items = cuda.grouped.maxItems(pairs, count, tile);
+        const plan: cuda.grouped.Plan = .{ .members = e.members, .items = e.items, .counts = e.counts, .rank = e.rank, .hist = e.hist };
+        const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts };
+        try e.moe.route(e.stream, e.x, g.hidden, total, router, e.rlogits, g.hidden, count);
+        try e.moe.pick(e.stream, e.rlogits, e.picks, e.wts, total, g.experts, g.top_k);
+        try e.plan.route(e.stream, e.picks, pairs, count, tile, plan);
+        const rows_in: cuda.experts.Rows = .{ .x = e.x, .stride = g.hidden, .slots = slots };
+        const act_in: cuda.experts.Rows = .{ .x = e.eact, .stride = g.intermediate };
+        if (wide) {
+            try grouped.prompt(e.stream, .up, rows_in, layer, plan, e.eact, items, -1);
+            try grouped.prompt(e.stream, .down_bf16, act_in, layer, plan, e.ey, items, -1);
+        } else {
+            try grouped.decode(e.stream, .up, rows_in, layer, plan, e.eact, items, -1);
+            try grouped.decode(e.stream, .down_f32, act_in, layer, plan, e.ey, items, -1);
+        }
+        try e.moe.combine(e.stream, e.ey, !wide, e.wts, e.r, total, slots, g.hidden);
     }
 
     /// Row `i`'s logits from the newest forward that kept logits.

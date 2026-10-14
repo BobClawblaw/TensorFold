@@ -21,6 +21,9 @@ pub const Geometry = struct {
     tied: bool,
     context: usize,
     linear: [max_layers]bool,
+    /// Routed experts (qwen3_5_moe): their count and the picks a row makes; 0: a dense MLP of `intermediate`.
+    experts: usize = 0,
+    top_k: usize = 0,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Geometry {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -30,6 +33,14 @@ pub const Geometry = struct {
         return parse(gpa, bytes);
     }
 
+    /// Whether the MLPs are routed experts, whose width is `intermediate` (the shared expert's too).
+    pub fn moe(g: Geometry) bool {
+        return g.experts != 0;
+    }
+    /// A row's expert slots: its picks, then the shared expert.
+    pub fn slots(g: Geometry) usize {
+        return g.top_k + 1;
+    }
     /// Value-head width of the gated delta rule's rows (and of z and the out projection's input).
     pub fn valueWidth(g: Geometry) usize {
         return g.v_heads * dk;
@@ -118,9 +129,15 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     const doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer doc.deinit();
     const root = try object(doc.value);
-    try is(root, "model_type", []const u8, "qwen3_5");
+    const moe = blk: {
+        const v = root.get("model_type") orelse return error.UnsupportedQwenConfig;
+        if (v != .string) return error.UnsupportedQwenConfig;
+        if (std.mem.eql(u8, v.string, "qwen3_5")) break :blk false;
+        if (std.mem.eql(u8, v.string, "qwen3_5_moe")) break :blk true;
+        return error.UnsupportedQwenConfig;
+    };
     const t = try object(root.get("text_config") orelse return error.BadQwenConfig);
-    try is(t, "model_type", []const u8, "qwen3_5_text");
+    try is(t, "model_type", []const u8, if (moe) "qwen3_5_moe_text" else "qwen3_5_text");
     try is(t, "attention_bias", bool, false);
     try is(t, "attn_output_gate", bool, true);
     try is(t, "hidden_act", []const u8, "silu");
@@ -136,7 +153,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     if (q.get("mode")) |m| if (m != .string or !std.mem.eql(u8, m.string, "affine")) return error.UnsupportedQwenQuantization;
     var g: Geometry = .{
         .hidden = try integer(t, "hidden_size"),
-        .intermediate = try integer(t, "intermediate_size"),
+        .intermediate = try integer(t, if (moe) "moe_intermediate_size" else "intermediate_size"),
         .layers = try integer(t, "num_hidden_layers"),
         .vocab = try integer(t, "vocab_size"),
         .k_heads = try integer(t, "linear_num_key_heads"),
@@ -153,6 +170,13 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
         .linear = @splat(false),
     };
     if (g.layers > max_layers or g.hidden % 256 != 0 or g.hidden > 8192 or g.intermediate % 64 != 0) return error.UnsupportedQwenGeometry;
+    if (moe) {
+        g.experts = try integer(t, "num_experts");
+        g.top_k = try integer(t, "num_experts_per_tok");
+        // the shared expert runs in the routed experts' table, so it needs their width
+        if (try integer(t, "shared_expert_intermediate_size") != g.intermediate) return error.UnsupportedQwenGeometry;
+        if (g.experts > 256 or g.top_k > 31 or g.top_k >= g.experts) return error.UnsupportedQwenGeometry;
+    }
     if (g.v_heads % g.k_heads != 0 or g.q_heads % g.kv_heads != 0 or g.q_heads > max_query_heads) return error.UnsupportedQwenGeometry;
     const types = t.get("layer_types") orelse return error.UnsupportedQwenGeometry;
     if (types != .array or types.array.items.len != g.layers) return error.UnsupportedQwenGeometry;
@@ -161,6 +185,29 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
         if (std.mem.eql(u8, kind.string, "linear_attention")) g.linear[i] = true else if (!std.mem.eql(u8, kind.string, "full_attention")) return error.UnsupportedQwenGeometry;
     }
     return g;
+}
+
+test "the 35B-A3B's routed experts: 256 of width 512, 8 a row, the shared one the same width" {
+    const text =
+        \\{"model_type":"qwen3_5_moe","quantization":{"group_size":64,"bits":4,"mode":"affine"},"tie_word_embeddings":false,
+        \\ "text_config":{"model_type":"qwen3_5_moe_text","attention_bias":false,"attn_output_gate":true,"hidden_act":"silu",
+        \\ "head_dim":256,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,
+        \\ "hidden_size":2048,"moe_intermediate_size":512,"shared_expert_intermediate_size":512,"num_experts":256,
+        \\ "num_experts_per_tok":8,"num_hidden_layers":4,"vocab_size":248320,"linear_num_key_heads":16,
+        \\ "linear_num_value_heads":32,"num_attention_heads":16,"num_key_value_heads":2,"rms_norm_eps":1e-06,
+        \\ "max_position_embeddings":262144,
+        \\ "layer_types":["linear_attention","linear_attention","linear_attention","full_attention"],
+        \\ "rope_parameters":{"rope_type":"default","rope_theta":10000000,"partial_rotary_factor":0.25}}}
+    ;
+    const g = try parse(std.testing.allocator, text);
+    try std.testing.expect(g.moe());
+    try std.testing.expectEqual(@as(usize, 256), g.experts);
+    try std.testing.expectEqual(@as(usize, 9), g.slots());
+    try std.testing.expectEqual(@as(usize, 512), g.intermediate);
+    try std.testing.expectEqual(@as(usize, 8192), g.convWidth());
+    const odd = try std.mem.replaceOwned(u8, std.testing.allocator, text, "\"shared_expert_intermediate_size\":512", "\"shared_expert_intermediate_size\":1024");
+    defer std.testing.allocator.free(odd);
+    try std.testing.expectError(error.UnsupportedQwenGeometry, parse(std.testing.allocator, odd));
 }
 
 test "the 27B's widths: 48 value heads over 16 key heads, 24 query heads over 4" {
