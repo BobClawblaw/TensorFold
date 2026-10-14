@@ -1,5 +1,6 @@
 //! Sized shared sessions (FLASHNEXT_SLOT_CONTEXTS): the list, which session a stream takes, and when it must grow.
 const std = @import("std");
+const lanes = @import("lanes");
 const fz = @import("replay.zig");
 
 /// Rows a window past a stream's last committed token can take.
@@ -46,6 +47,33 @@ pub fn room(cap: usize, pos: usize, rows: usize, end: usize, most: usize, larger
     if (larger) return .move;
     if (pos + rows + WINDOW <= cap) return .pause; // this round fits; then wait for a larger session to free
     return .full;
+}
+
+/// Ends a paused stream whose move failed, with an error the host reports as a failed request.
+pub fn endPaused(stream: *lanes.Stream) void {
+    stream.paused = false;
+    stream.finished = true;
+    stream.reason = .@"error";
+    stream.problem = "the reply outgrew its session and could not move to a larger one";
+}
+
+/// Paused streams moved, oldest first: `ctx.moveOut` failing LaneMemory keeps one waiting, any other failure ends it (`ctx.failed`).
+pub fn resumePaused(paused: *std.ArrayList(*lanes.Stream), ctx: anytype) void {
+    var k: usize = 0;
+    while (k < paused.items.len) {
+        const stream = paused.items[k];
+        ctx.moveOut(stream) catch |err| {
+            if (err == error.LaneMemory) {
+                k += 1;
+                continue;
+            }
+            _ = paused.orderedRemove(k);
+            ctx.failed(stream, err);
+            continue;
+        };
+        stream.paused = false;
+        _ = paused.orderedRemove(k);
+    }
 }
 
 test "the list parses counts and repeats, caps each at the window, and refuses overflow and too many sessions" {
@@ -100,4 +128,41 @@ test "a stream that outgrows its session moves while a larger one is free, else 
     try std.testing.expectEqual(Room.pause, run(small, 1024, fz.MAXR, 1, 1024, 8192, big, false));
     try std.testing.expectEqual(Room.pause, run(small, 1024, fz.MAXR, fz.MAXR, 1024, 8192, big, false));
     try std.testing.expectEqual(Room.full, room(small, 1024, fz.MAXR, 1024 + 8192 + WINDOW, small, false)); // no larger session
+}
+
+test "the last larger session frees and a paused stream's move fails: it ends with an error, LaneMemory keeps waiting" {
+    const gpa = std.testing.allocator;
+    var a = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &.{1}, .max_new = 8 });
+    defer a.deinit(gpa);
+    var b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &.{1}, .max_new = 8 });
+    defer b.deinit(gpa);
+    var c = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = &.{1}, .max_new = 8 });
+    defer c.deinit(gpa);
+    var paused: std.ArrayList(*lanes.Stream) = .empty;
+    defer paused.deinit(gpa);
+    for ([_]*lanes.Stream{ &a, &b, &c }) |s| {
+        s.paused = true;
+        try paused.append(gpa, s);
+    }
+    const Mover = struct { // a's copy fails on the GPU, b finds no larger session free, c moves
+        a: *lanes.Stream,
+        b: *lanes.Stream,
+        ended: ?anyerror = null,
+        fn moveOut(m: *@This(), s: *lanes.Stream) !void {
+            if (s == m.a) return error.GpuFailed;
+            if (s == m.b) return error.LaneMemory;
+        }
+        fn failed(m: *@This(), s: *lanes.Stream, err: anyerror) void {
+            m.ended = err;
+            endPaused(s);
+        }
+    };
+    var mover: Mover = .{ .a = &a, .b = &b };
+    resumePaused(&paused, &mover);
+    try std.testing.expectEqual(@as(?anyerror, error.GpuFailed), mover.ended);
+    try std.testing.expect(a.finished and !a.paused and a.reason == .@"error" and a.problem.len > 0);
+    try std.testing.expect(b.paused and !b.finished);
+    try std.testing.expect(!c.paused and !c.finished);
+    try std.testing.expectEqual(@as(usize, 1), paused.items.len);
+    try std.testing.expectEqual(&b, paused.items[0]);
 }

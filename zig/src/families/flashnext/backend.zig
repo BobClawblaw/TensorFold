@@ -229,23 +229,24 @@ pub const Backend = struct {
         std.log.info("flash next: a stream at {d} tokens moved from a {d}-token session to a {d}-token one ({d} moves)", .{ from.m.pos, from.m.cap, b.sessions[j].m.cap, b.moves });
     }
 
-    /// Paused streams into sessions that freed, oldest first; each goes on once moved.
+    /// Paused streams into sessions that freed (slots.resumePaused): a move that fails but for LaneMemory ends the stream.
     fn resumePaused(b: *Backend) void {
-        var k: usize = 0;
-        while (k < b.paused.items.len) {
-            const stream = b.paused.items[k];
-            const i = b.by.get(stream) orelse {
-                _ = b.paused.orderedRemove(k);
-                continue;
-            };
-            b.move(stream, i) catch |err| {
-                if (err != error.LaneMemory) std.log.err("flash next: a paused stream could not move: {s}", .{@errorName(err)});
-                k += 1;
-                continue;
-            };
-            stream.paused = false;
-            _ = b.paused.orderedRemove(k);
-        }
+        slots.resumePaused(&b.paused, b);
+    }
+
+    /// slots.resumePaused's move: the stream into a free larger session, LaneMemory while none is.
+    pub fn moveOut(b: *Backend, stream: *Stream) !void {
+        try b.move(stream, b.by.get(stream) orelse return error.UnknownStream);
+    }
+
+    /// slots.resumePaused's failure: the stream ends with an error the host reports, and its session frees now.
+    pub fn failed(b: *Backend, stream: *Stream, err: anyerror) void {
+        std.log.err("flash next: a paused stream at {d} tokens could not move to a larger session ({s}); it ends with an error", .{ stream.context.items.len, @errorName(err) });
+        slots.endPaused(stream);
+        const kv = b.by.fetchRemove(stream) orelse return;
+        b.sessions[kv.value].used = false;
+        b.sessions[kv.value].round = .{};
+        b.sessions[kv.value].held_n = 0;
     }
 
     /// LaneHost's admission check: a free session holds the request now.

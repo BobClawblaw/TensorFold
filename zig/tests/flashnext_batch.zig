@@ -130,12 +130,12 @@ pub fn main(init: std.process.Init) !void {
         capacity = @max(capacity, ids.len + n + fx.MARGIN);
         ref.* = .{ .a = a };
         const start = mtl.clock.seconds();
-        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, 0, ref.out());
+        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, 0, .{}, ref.out());
         baseline_seconds += mtl.clock.seconds() - start;
         if (ref.tokens.items.len != n) return error.ShortBaseline;
         var drafted: Reply = .{ .a = a };
         const mtp_start = mtl.clock.seconds();
-        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, null, drafted.out());
+        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, null, .{}, drafted.out());
         baseline_mtp_seconds += mtl.clock.seconds() - mtp_start;
         if (!std.mem.eql(u32, drafted.tokens.items, ref.tokens.items)) return error.LegacyMtpTokenMismatch;
     }
@@ -144,7 +144,11 @@ pub fn main(init: std.process.Init) !void {
     for (prompts, 0..) |ids, i| if (ids.len > prompts[longest].len) {
         longest = i;
     };
-    var back = try Backend.init(init.gpa, eng, @intCast(@max(4, count)), capacity);
+    var capacities: [tf.flashnext_replay.MAXR]usize = undefined;
+    const sessions = @max(4, count);
+    if (sessions > capacities.len) return error.BadBatchSlots;
+    @memset(capacities[0..sessions], capacity);
+    var back = try Backend.init(init.gpa, eng, capacities[0..sessions]);
     defer back.deinit();
     try draftDepths(init.gpa, &back, prompts);
     const boundary = 4 * (tf.flashnext_replay.TOP + 1) - 2;
