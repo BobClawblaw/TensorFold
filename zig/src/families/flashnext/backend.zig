@@ -14,6 +14,7 @@ const mtl = @import("metal");
 const segments = @import("../../core/segments.zig");
 const sample = @import("sample.zig");
 const think = @import("think.zig");
+const batch_costs = @import("batch_costs.zig");
 
 /// A stream's sampling when it samples (a temperature above 0); null: the GPU's argmax stands.
 fn sampling(stream: *const Stream) ?lanes.Sampling {
@@ -41,6 +42,8 @@ pub const Backend = struct {
     draft_waits: u64 = 0,
     draft_seconds: f64 = 0,
     lone_handoffs: u64 = 0, // lone streams the engine's rounds handed to the shared ones
+    serial_drafts: bool = false, // FZ_BATCH_MTP_SERIAL=1: each stream's drafts in their own command buffers
+    costs: ?batch_costs.Costs = null, // timeCosts: the lane allocator's prices
 
     pub fn init(gpa: std.mem.Allocator, e: *Engine, n: u32, capacity: usize) !Backend {
         if (n < 2 or n > fz.MAXR or e.r.tp != null) return error.BadBatchSlots;
@@ -53,7 +56,28 @@ pub const Backend = struct {
             made += 1;
         }
         const hidden = try e.r.device.buffer(fz.MAXR * fz.WIDE * 2, fz.opts);
-        return .{ .gpa = gpa, .e = e, .primary = e.m, .sessions = sessions, .hidden = .{ .b = hidden }, .chain_drafts = if (std.c.getenv("FZ_BATCH_MTP_CHAIN")) |v| v[0] == '1' else false };
+        const env = struct {
+            fn on(name: [*:0]const u8) bool {
+                return if (std.c.getenv(name)) |v| v[0] == '1' else false;
+            }
+        };
+        return .{ .gpa = gpa, .e = e, .primary = e.m, .sessions = sessions, .hidden = .{ .b = hidden }, .chain_drafts = env.on("FZ_BATCH_MTP_CHAIN"), .serial_drafts = env.on("FZ_BATCH_MTP_SERIAL") };
+    }
+
+    /// The lane allocator's prices, timed on the last session before any stream holds it; none (unpriced) when it can't be.
+    pub fn timeCosts(b: *Backend) !void {
+        if (std.c.getenv("FZ_BATCH_UNPRICED") != null) {
+            std.log.info("flash next: FZ_BATCH_UNPRICED=1: shared rounds unpriced, nothing timed", .{});
+            return;
+        }
+        const s = &b.sessions[b.sessions.len - 1];
+        if (!batch_costs.fits(s.m.cap)) {
+            std.log.info("flash next: a session holds {d} rows, under the {d} that timing shared rounds takes: shared rounds unpriced", .{ s.m.cap, batch_costs.ROWS });
+            return;
+        }
+        const c = try batch_costs.time(b, s);
+        b.costs = c;
+        std.log.info("flash next: shared forwards {d:.2} {d:.2} {d:.2} {d:.2} {d:.2} ms at 1, 2, 4, 8, 16 rows; a chained draft {d:.2} ms", .{ c.shared[0].ms, c.shared[1].ms, c.shared[3].ms, c.shared[7].ms, c.shared[15].ms, c.step_ms });
     }
 
     pub fn deinit(b: *Backend) void {
@@ -69,7 +93,11 @@ pub const Backend = struct {
     }
 
     pub fn facts(b: *Backend) lanes.Model {
-        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = false };
+        const c: ?*const batch_costs.Costs = if (b.costs) |*x| x else null;
+        // shared rounds priced from the timed forwards, each draft past a stream's first at a chained step's time; a
+        // lone stream's depth from the same (FZ_LONE_UNPRICED=1: the heuristic)
+        const lone = c != null and std.c.getenv("FZ_LONE_UNPRICED") == null;
+        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (lone) &c.?.shared else &.{}, .mtp_step_ms = if (lone) c.?.step_ms else 0 };
     }
 
     fn self(ptr: *anyopaque) *Backend {
@@ -108,7 +136,7 @@ pub const Backend = struct {
         select: ?fz.Select,
         shape: @TypeOf(@as(fz.Select, undefined).q_shape),
         passed: @FieldType(Engine, "passed"),
-        fn restore(old: Binding, b: *Backend) void {
+        pub fn restore(old: Binding, b: *Backend) void {
             b.e.m = old.model;
             b.e.host = old.host;
             b.e.cins = old.cins;
@@ -118,7 +146,7 @@ pub const Backend = struct {
         }
     };
 
-    fn bind(b: *Backend, s: *Session) !Binding {
+    pub fn bind(b: *Backend, s: *Session) !Binding {
         const e = b.e;
         const old: Binding = .{ .model = e.m, .host = e.host, .cins = e.cins, .select = e.r.sel, .shape = e.r.shapes.get("Kc_shape").?, .passed = e.passed };
         try e.r.shapes.put(e.r.arena, "Kc_shape", s.shape);
@@ -301,7 +329,7 @@ pub const Backend = struct {
         return @intCast(handle);
     }
 
-    fn outputs(b: *Backend, s: *Session, row: usize) void {
+    pub fn outputs(b: *Backend, s: *Session, row: usize) void {
         var li: usize = 0;
         for (&s.m.layers) |*l| if (l.linear) {
             l.cs[1] = .{ .b = b.e.o_cs, .off = (li * fz.MAXR + row) * fz.CS_ROW };
@@ -373,6 +401,7 @@ pub const Backend = struct {
 
     fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const b = self(ptr);
+        if (!b.serial_drafts) return b.draftTogether(requests);
         for (requests) |r| {
             const pool = mtl.objc.Pool.push();
             defer pool.pop();
@@ -409,6 +438,58 @@ pub const Backend = struct {
             b.draft_calls += 1;
             b.draft_seconds += mtl.clock.seconds() - start;
         }
+    }
+
+    /// Every request's absorb and chained drafts in one command buffer, one wait (a long follow absorbs alone first).
+    fn draftTogether(b: *Backend, requests: []const be.DraftRequest) !void {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const start = mtl.clock.seconds();
+        var follows: [fz.MAXR][]const u32 = undefined;
+        var hiddens: [fz.MAXR]Buf = undefined;
+        var ones: [fz.MAXR][1]u32 = undefined;
+        if (requests.len > fz.MAXR) return error.DraftOutOfStep;
+        for (requests, 0..) |r, k| {
+            if (r.early or r.lanes != null or r.ranks or r.depth >= fz.MAXR) return error.DraftOutOfStep;
+            const s = try b.session(r.stream);
+            follows[k] = if (r.first) |f| blk: {
+                ones[k][0] = switch (f) {
+                    .value => |v| v,
+                    .handle => |h| @intCast(h),
+                };
+                break :blk ones[k][0..];
+            } else r.follow;
+            if (follows[k].len == 0) return error.DraftOutOfStep;
+            hiddens[k] = if (r.rows) |path| blk: {
+                try s.round.draft(r.start, path, follows[k].len);
+                break :blk b.hidden.at(s.row0 * fz.WIDE * 2);
+            } else s.last;
+            if (follows[k].len > fz.MAXR) { // all but the last MAXR rows absorbed first, on their own
+                const cut = follows[k].len - fz.MAXR;
+                const old = try b.bind(s);
+                defer old.restore(b);
+                _ = try s.m.mtpAbsorb(follows[k][0..cut], hiddens[k]);
+                hiddens[k] = hiddens[k].at(cut * fz.WIDE * 2);
+                follows[k] = follows[k][cut..];
+                b.draft_waits += (cut + fz.MAXR - 1) / fz.MAXR;
+            }
+        }
+        const cb = b.e.r.queue.commandBuffer();
+        b.e.r.enc = cb.compute(if (b.e.r.serial) .serial else .concurrent);
+        for (requests, 0..) |r, k| {
+            const s = try b.session(r.stream);
+            const old = try b.bind(s);
+            defer old.restore(b);
+            s.encodeDrafts(follows[k], hiddens[k], r.depth) catch |err| {
+                b.e.r.enc.end();
+                return err;
+            };
+        }
+        try b.primary.finish(cb);
+        for (requests) |r| (try b.session(r.stream)).heldDrafts(r.depth);
+        b.draft_waits += 1;
+        b.draft_calls += requests.len;
+        b.draft_seconds += mtl.clock.seconds() - start;
     }
 
     fn release(ptr: *anyopaque, stream: *Stream) void {

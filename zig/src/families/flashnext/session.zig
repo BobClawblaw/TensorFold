@@ -142,6 +142,35 @@ pub const Session = struct {
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
     }
 
+    /// The head's absorb of a kept window and `depth` chained drafts, encoded unsubmitted (heldDrafts reads them).
+    pub fn encodeDrafts(s: *Session, follow: []const u32, hidden: Buf, depth: usize) !void {
+        if (follow.len == 0 or follow.len > fz.MAXR or depth >= fz.MAXR) return error.DraftOutOfStep;
+        const m = &s.m;
+        const h = &m.mtp;
+        const r = m.r;
+        const old_select = r.sel;
+        defer r.sel = old_select;
+        h.pos -= h.drafted;
+        h.drafted = 0;
+        h.pooled_n = @min(h.pooled_n, h.pos / 4);
+        @memcpy(h.slots[0].ids8.b.slice(u32, follow.len), follow);
+        for (0..@max(depth, 1)) |i| {
+            r.sel = s.draft_select[i];
+            const rows = if (i == 0) follow.len else 1;
+            const input = if (i == 0) h.slots[0].ids8 else s.draft_ids.at((i - 1) * 4);
+            const streams = if (i == 0) hidden else h.h[1];
+            try m.mtpEncode(i, rows, input, streams, s.draft_ids.at(i * 4));
+            h.pos += rows;
+        }
+    }
+
+    /// encodeDrafts' drafts once their command buffer is done: held, the head's chained rows trimmed at its next absorb.
+    pub fn heldDrafts(s: *Session, depth: usize) void {
+        s.m.mtp.drafted = depth -| 1;
+        @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
+        s.held_n = depth;
+    }
+
     pub fn deinit(s: *Session, gpa: std.mem.Allocator) void {
         for (s.owned.items) |b| b.deinit();
         s.owned.deinit(gpa);

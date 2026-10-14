@@ -54,6 +54,7 @@ pub const Rule = struct {
     family_costs: *const Table,
     shared_costs: *const Table,
     mtp_step_ms: f64,
+    draft_step_ms: f64 = 0, // a shared round's draft past a stream's first (budgets price it)
     plain_guard: bool,
     node_probabilities: bool,
     batch_rows: u32,
@@ -220,7 +221,7 @@ pub const Rule = struct {
         const ones = try r.gpa.alloc(u32, whos.len);
         defer r.gpa.free(ones);
         @memset(ones, 1);
-        const counts = try alloc.allocate(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), @max(whos.len, r.batch_rows));
+        const counts = try alloc.allocatePriced(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), @max(whos.len, r.batch_rows), r.draft_step_ms);
         defer r.gpa.free(counts);
         if (r.plain_guard) {
             // no draft where none pays; a probe after a growing run of plain rounds
