@@ -751,9 +751,12 @@ pub fn seqBytes(e: *const Engine) usize {
     return c.at + per_pos * @as(u64, @intCast(grow_mod.step_positions));
 }
 
-/// A sequence's widest window: the pending token and its drafts (a shared round's rows are several such windows).
+/// A sequence's widest window, drafts or not: calibration times every width and a grammar can force several rows
+/// without drafts (a shared round's rows are several such windows). The DeltaNet replay rows are sized by it.
+const max_window = 16;
 fn windowRows(e: *const Engine) i64 {
-    return @min(@as(i64, e.opts.depth) + 1, 16);
+    _ = e;
+    return max_window;
 }
 
 /// The bytes every sequence's growing caches may map together (the server's room for streams).
@@ -1681,10 +1684,10 @@ fn restore(e: *Engine, b: *Buffers, s: *Seq, next: i64) !void {
 
 pub fn verify(e: *Engine, s: *Seq, ids: []const u32, out: []u32) !void {
     const R: i64 = @intCast(ids.len);
-    if (R > e.buf.rows) return error.WindowTooWide;
+    if (R > e.buf.rows or R > max_window) return error.WindowTooWide;
     if (s.pos + R > e.capacity) return error.PromptTooLong;
     const b = &e.buf;
-    var toks: [16]i64 = undefined;
+    var toks: [max_window]i64 = undefined;
     for (ids, 0..) |t, i| toks[i] = t;
     try room(e, s, R + 1);
     try stage(e, b, s, toks[0..ids.len]);
@@ -1726,7 +1729,7 @@ pub fn verifyShared(e: *Engine, parts: []const Part, out: []u32) !void {
     var R: i64 = 0;
     for (parts, 0..) |p, i| {
         const n: i64 = @intCast(p.ids.len);
-        if (n == 0 or n > 16) return error.WindowTooWide;
+        if (n == 0 or n > max_window) return error.WindowTooWide;
         if (p.s.pos + n > e.capacity) return error.PromptTooLong;
         segs[i] = .{ .s = p.s, .row0 = R, .rows = n };
         R += n;
