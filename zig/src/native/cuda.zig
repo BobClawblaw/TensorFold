@@ -473,7 +473,6 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
 
-/// A family's bytes kept for --slide (0 for families without a learner).
 fn toGib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / gib;
 }
