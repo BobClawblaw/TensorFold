@@ -482,6 +482,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         try own.nccl.check(own.nccl.api.ncclAllGather(warm.ptr, warm.ptr + 2048, 256, .i32, comm, own.ctx.stream.handle), "warm gather");
         try own.ctx.stream.synchronize();
     }
+    // a decode step's gathers (a few rows of partials) as RDMA writes: TF_ROCE=0 keeps NCCL, TF_ROCE_MAX_KB caps a shard
+    own.ctx.roce = try cuda.roce.Gather.init(gpa, io, ctx.d, own.link, roceWanted(), roceMaxBytes());
+    errdefer if (own.ctx.roce) |g| g.deinit();
+    if (own.ctx.roce != null) std.log.info("flash next: gathers up to {d} KiB a rank over RoCE", .{roceMaxBytes() >> 10});
     own.kernels = try api.Kernels.load(gpa, io, ctx.d, ctx.device, kernels_dir);
     errdefer own.kernels.deinit();
     own.store = try weights.load(gpa, io, &own.ctx, &own.kernels, dir, o.rank);
@@ -709,6 +713,7 @@ fn release(p: *anyopaque) void {
     forward.deinit(own.e);
     own.store.deinit();
     own.kernels.deinit();
+    if (own.ctx.roce) |g| g.deinit();
     own.link.close();
     own.nccl.close();
     own.lanes_by.deinit();
@@ -1444,4 +1449,14 @@ fn followLoop(p: *anyopaque) anyerror!void {
             },
         }
     }
+}
+
+fn roceWanted() bool {
+    const v = std.c.getenv("TF_ROCE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+fn roceMaxBytes() usize {
+    const v = std.c.getenv("TF_ROCE_MAX_KB") orelse return 512 << 10;
+    return (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 512) << 10;
 }

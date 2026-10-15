@@ -4,6 +4,7 @@
 //! arguments that point into the capturing sequence's ranges are found at capture and moved by the base difference.
 const std = @import("std");
 const cuda = @import("cuda");
+const api = @import("api.zig");
 const abi = cuda.abi;
 
 pub const Gather = struct { send: u64, recv: u64, count: usize, dt: cuda.nccl.DataType };
@@ -95,10 +96,10 @@ pub const Plan = struct {
         p.bound = to;
     }
 
-    pub fn launch(p: Plan, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream) !void {
+    pub fn launch(p: Plan, ctx: *const api.Ctx, stream: cuda.Stream) !void {
         for (p.items) |it| switch (it) {
             .graph => |g| try g.exec.launchOn(stream),
-            .gather => |g| try nccl.check(nccl.api.ncclAllGather(g.send, g.recv, g.count, g.dt, comm, stream.handle), "ncclAllGather"),
+            .gather => |g| try ctx.allGather(g.send, g.recv, g.count, g.dt, stream),
         };
     }
 };
