@@ -30,7 +30,7 @@ const Ring = struct { gather_taps: cuda.Function, gather_rows: cuda.Function, ri
 const TapRows = extern struct { n: c_int, rows: [most_window]c_int };
 
 /// A stream's context: its ring of keys and values over [begin, end), the newest row's state, and its held drafts.
-const Ctx = struct {
+pub const Ctx = struct {
     ring: DeviceBuffer,
     last: DeviceBuffer, // the newest absorbed row's normed output (bf16 hidden): the first draft row's state
     begin: u64 = 0,
@@ -166,7 +166,7 @@ pub const Mtp = struct {
         d.gpa.destroy(d);
     }
 
-    fn kvWidth(d: *const Mtp) usize {
+    pub fn kvWidth(d: *const Mtp) usize {
         return d.e.g.kv_heads * head_dim;
     }
 
@@ -203,7 +203,7 @@ pub const Mtp = struct {
         return total;
     }
 
-    fn drop(d: *Mtp, ctx: *Ctx) void {
+    pub fn drop(d: *Mtp, ctx: *Ctx) void {
         ctx.last.free();
         ctx.ring.free();
         d.gpa.destroy(ctx);
@@ -215,7 +215,7 @@ pub const Mtp = struct {
     }
 
     /// A new context, touched once (an absorb, then a chain), so no request pays the driver's stall.
-    fn create(d: *Mtp) !*Ctx {
+    pub fn create(d: *Mtp) !*Ctx {
         const ctx = try d.gpa.create(Ctx);
         errdefer d.gpa.destroy(ctx);
         ctx.* = .{ .ring = try DeviceBuffer.alloc(d.e.d, d.ringBytes()), .last = undefined };
@@ -236,12 +236,12 @@ pub const Mtp = struct {
         while (d.pool.items.len < n) d.pool.appendAssumeCapacity(try d.create());
     }
 
-    fn ringK(d: *Mtp, ctx: *Ctx) u64 {
+    pub fn ringK(d: *Mtp, ctx: *Ctx) u64 {
         _ = d;
         return ctx.ring.ptr;
     }
 
-    fn ringV(d: *Mtp, ctx: *Ctx) u64 {
+    pub fn ringV(d: *Mtp, ctx: *Ctx) u64 {
         return ctx.ring.ptr + d.capacity * d.kvWidth() * 2;
     }
 
@@ -260,7 +260,7 @@ pub const Mtp = struct {
     }
 
     /// The layer over `rows` rows at slots pos0..: d.ids their tokens, d.hin their states; x gets their normed outputs.
-    fn layer(d: *Mtp, ctx: *Ctx, rows: usize, pos0: u64, pass: Pass) !void {
+    pub fn layer(d: *Mtp, ctx: *Ctx, rows: usize, pos0: u64, pass: Pass) !void {
         const e = d.e;
         const g = e.g;
         const w = &d.w;
@@ -317,7 +317,7 @@ pub const Mtp = struct {
         return std.mem.bytesToValue(u32, st[tok_at..][0..4]);
     }
 
-    fn putIds(d: *Mtp, ids: []const u32) !void {
+    pub fn putIds(d: *Mtp, ids: []const u32) !void {
         const e = d.e;
         try e.stream.synchronize(); // the previous upload from this staging area has run: an absorb queues one a chunk
         @memcpy(std.mem.bytesAsSlice(u32, d.staged.bytes[ids_at..][0 .. ids.len * 4]), ids);
@@ -325,7 +325,7 @@ pub const Mtp = struct {
     }
 
     /// Target rows [start, start + n) from the tap ring with the token after each; `rows`, when given, picks them.
-    fn absorb(d: *Mtp, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, follow: []const u32) !void {
+    pub fn absorb(d: *Mtp, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, follow: []const u32) !void {
         const e = d.e;
         const g = e.g;
         var start = start_;
@@ -390,7 +390,7 @@ pub const Mtp = struct {
     }
 
     /// The tree's lanes, lane i the rank-r candidate of its parent's row; a depth's rows run as one pass.
-    fn holdTree(d: *Mtp, ctx: *Ctx, pos0: u64, l: *const lanes.shape.Shape) !void {
+    pub fn holdTree(d: *Mtp, ctx: *Ctx, pos0: u64, l: *const lanes.shape.Shape) !void {
         const e = d.e;
         const g = e.g;
         const n = l.parents.len;
@@ -432,6 +432,8 @@ pub const Mtp = struct {
                     anc[m * anc_stride + 1 + count] = a;
                     count += 1;
                 }
+                // root first, as a chain's ring holds them: a lane's sums then equal its path's chained rows
+                std.mem.reverse(i32, anc[m * anc_stride + 1 ..][0..count]);
                 anc[m * anc_stride] = @intCast(count);
             }
             try d.putIds(toks[0..rows]);

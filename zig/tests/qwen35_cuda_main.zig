@@ -8,7 +8,7 @@ pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
     if (args.len != 5) {
-        std.debug.print("usage: tf-qwen35-cuda <model dir> <step|window|tree|prompt> <ids> <out>\n", .{});
+        std.debug.print("usage: tf-qwen35-cuda <model dir> <step|window|tree|prompt|mtp> <ids> <out>\n", .{});
         return 2;
     }
     var ids: std.ArrayList(u32) = .empty;
@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     const e = try E.Engine.init(init.gpa, init.io, &ctx, args[1]);
     defer e.deinit();
+    if (std.mem.eql(u8, args[2], "mtp")) return mtpCheck(init.gpa, init.io, e, args[1], ids.items);
     // TF_Q35_PREFILL=N starts the stream after N cycled ids; TF_Q35_BESIDE=N steps an N-token stream beside it
     const prefill = try envCount("TF_Q35_PREFILL");
     const beside = try envCount("TF_Q35_BESIDE");
@@ -158,6 +159,17 @@ const Fwd = struct {
         try f.e.forward(&.{ part, .{ .cache = o, .rows = 1 } }, all[0 .. toks.len + 1], .logits);
     }
 };
+
+/// The MTP drafter's tree regressions (cuda_mtp_check.zig) after a prompt over the ids fills the target's tap ring.
+fn mtpCheck(gpa: std.mem.Allocator, io: std.Io, e: *E.Engine, dir: []const u8, ids: []const u32) !u8 {
+    const d = try q.mtp.Mtp.init(gpa, io, e, dir, 4096);
+    defer d.deinit();
+    try e.setTaps(d.taps());
+    var cache = try E.Cache.init(gpa, e, 4096);
+    defer cache.deinit(gpa);
+    try fill(e, &cache, ids, ids.len);
+    return if (try q.mtp_check.run(gpa, d, cache.tap.?.ptr, ids)) 0 else 1;
+}
 
 fn envCount(name: [:0]const u8) !usize {
     const v = std.c.getenv(name) orelse return 0;
