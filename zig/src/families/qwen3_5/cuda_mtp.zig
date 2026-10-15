@@ -319,6 +319,7 @@ pub const Mtp = struct {
 
     fn putIds(d: *Mtp, ids: []const u32) !void {
         const e = d.e;
+        try e.stream.synchronize(); // the previous upload from this staging area has run: an absorb queues one a chunk
         @memcpy(std.mem.bytesAsSlice(u32, d.staged.bytes[ids_at..][0 .. ids.len * 4]), ids);
         try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(d.ids, d.staged.bytes.ptr + ids_at, ids.len * 4, e.stream.handle), "cuMemcpyHtoDAsync");
     }
