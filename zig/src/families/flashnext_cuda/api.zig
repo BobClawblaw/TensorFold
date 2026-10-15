@@ -106,6 +106,26 @@ pub const Ctx = struct {
     comm: cuda.nccl.Comm,
     rank: u8,
     world: u8 = 2,
+    /// Small all-gathers as RDMA writes over RoCE (cuda.roce), when both ranks brought it up; NCCL otherwise.
+    roce: ?*cuda.roce.Gather = null,
+
+    /// After a sync that precedes a host read of anything a gather fed: a RoCE gather that timed out wrote nothing, so
+    /// its error is raised here rather than the read taking a previous step's values.
+    pub fn gathered(c: *const Ctx) !void {
+        if (c.roce) |g| try g.check();
+    }
+
+    /// Both ranks' ``count`` values from ``send`` into ``recv`` in rank order (ncclAllGather's layout and bits).
+    pub fn allGather(c: *const Ctx, send: u64, recv: u64, count: usize, dt: cuda.nccl.DataType, stream: cuda.Stream) !void {
+        const size: usize = switch (dt) {
+            .i8, .u8 => 1,
+            .f16, .bf16 => 2,
+            .i32, .u32, .f32 => 4,
+            .i64, .u64, .f64 => 8,
+        };
+        if (c.roce) |g| if (g.fits(count * size, send, recv)) return g.gather(stream.handle, send, recv, count * size);
+        try c.nccl.check(c.nccl.api.ncclAllGather(send, recv, count, dt, c.comm, stream.handle), "ncclAllGather");
+    }
 };
 
 /// The kernels: Triton variants (picked as Triton picks them) and the extension modules.

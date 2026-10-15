@@ -607,7 +607,7 @@ fn step(e: *Engine, kind: u8, s: *Seq, R: i64) !void {
     if (p.shareable) try p.bind(basesOf(s));
     e.use_tick += 1;
     p.last = e.use_tick;
-    return p.launch(e.ctx.nccl, e.ctx.comm, e.k.stream);
+    return p.launch(e.ctx, e.k.stream);
 }
 
 /// TENSORFOLD_FN_GRAPHLOG: the graphs held, and the captures and launches since the last call (one line a request).
@@ -864,7 +864,7 @@ const Pending = struct { g: u64, inj: u64 };
 /// Both ranks' ``count`` values from ``send`` into ``recv`` in rank order; inside a split capture, between its graphs.
 fn gather(e: *Engine, send: u64, recv: u64, count: usize, dt: cuda.nccl.DataType) !void {
     if (e.rec) |r| return r.gather(.{ .send = send, .recv = recv, .count = count, .dt = dt });
-    try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(send, recv, count, dt, e.ctx.comm, e.k.stream.handle), "ncclAllGather");
+    try e.ctx.allGather(send, recv, count, dt, e.k.stream);
 }
 
 fn allGather(e: *Engine, send: u64, recv: u64, count: usize) !void {
@@ -1103,6 +1103,7 @@ fn readPicks(e: *Engine, b: *Buffers, rows: i64, out: []Pick) !void {
     const w: []i32 = @alignCast(std.mem.bytesAsSlice(i32, e.host.bytes[0 .. n * 4]));
     try d.check(d.api.cuMemcpyDtoHAsync_v2(@ptrCast(w.ptr), b.gath, n * 4, e.k.stream.handle), "candidates");
     try e.k.stream.synchronize();
+    try e.ctx.gathered();
     const R: usize = @intCast(rows);
     for (0..R) |r| {
         const a = w[4 * r ..][0..4];
@@ -1158,6 +1159,7 @@ fn splice(e: *Engine, b: *Buffers, sg: Seg) !void {
     a.add(b.h); a.add(fb.ptr); a.add(dp.ptr); a.add(@as(i32, @intCast(D))); a.add(@as(i32, 4));
     try e.k.go(f, .{ .x = @intCast(pairs.items.len / 2) }, 256, 0, &a);
     try e.k.stream.synchronize(); // the pairs' buffer is freed on return
+    try e.ctx.gathered();
 }
 
 /// stage for a shared round: every part's ids, each part's n-gram rows from its own history, then one upload each.
@@ -1408,6 +1410,7 @@ pub fn prefill(e: *Engine, s: *Seq, prompt_u: []const u32, start: usize) !u32 {
     s.fresh = true;
     s.mtp_drafted = 0;
     try e.k.stream.synchronize();
+    try e.ctx.gathered();
     if (s.img) |*im| if (im.feats) |*f| { // the features end with the prompt; the rotary table stays for decode
         f.free();
         im.feats = null;
@@ -1559,6 +1562,7 @@ pub fn prefillMany(e: *Engine, prompts: []const Prompt, firsts: []u32) !void {
         s.mtp_drafted = 0;
     }
     try k.stream.synchronize();
+    try e.ctx.gathered();
 }
 
 /// One window over ``ids`` (the pending token, then drafts): out[r] is the greedy token after row r.
@@ -1638,6 +1642,7 @@ fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want,
     const n: usize = @intCast(rows * draw_mod.W);
     try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(b.tk, b.gtk, n, .i32, e.ctx.comm, k.stream.handle), "candidates");
     try k.stream.synchronize();
+    try e.ctx.gathered();
     try e.ctx.d.check(e.ctx.d.api.cuMemcpyDtoH_v2(@ptrCast(e.cand_host.ptr), b.gtk, 2 * n * 4), "candidates");
     for (want) |w| {
         const blocks = [2][]const i32{ e.cand_host[w.row * draw_mod.W ..][0..draw_mod.W], e.cand_host[n + w.row * draw_mod.W ..][0..draw_mod.W] };
@@ -1652,6 +1657,7 @@ fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want,
 fn drawFull(e: *Engine, row: u64, s: lanes.Sampling, position: u64) !u32 {
     try e.ctx.nccl.check(e.ctx.nccl.api.ncclAllGather(row, e.full.ptr, @intCast(HEAD_N), .bf16, e.ctx.comm, e.k.stream.handle), "full row");
     try e.k.stream.synchronize();
+    try e.ctx.gathered();
     try e.ctx.d.check(e.ctx.d.api.cuMemcpyDtoH_v2(@ptrCast(e.full_host.ptr), e.full.ptr, e.full_host.len * 2), "full row");
     const values = try e.gpa.alloc(f64, e.full_host.len);
     defer e.gpa.free(values);
