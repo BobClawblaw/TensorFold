@@ -849,6 +849,7 @@ pub fn releaseGraphs(e: *Engine, s: *Seq) void {
 }
 
 pub fn freeSeq(e: *Engine, s: *Seq) void {
+    e.k.stream.synchronize() catch {}; // queued work may still write its caches, and unmapping them does not wait
     freeGraphs(e, s);
     detach(e, s);
     s.grow.deinit();

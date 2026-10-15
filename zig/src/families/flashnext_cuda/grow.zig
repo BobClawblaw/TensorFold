@@ -98,7 +98,8 @@ pub const Range = struct {
         r.mapped += grow;
     }
 
-    /// Every chunk unmapped and released (the range stays reserved, for the next request).
+    /// Every chunk unmapped and released (the range stays reserved, for the next request). No work queued on the range
+    /// may still be pending: unmapping does not wait for it (the caller synchronizes).
     pub fn shrink(self: *Range) void {
         for (self.chunks.items) |c| {
             _ = self.d.api.cuMemUnmap(c.at, c.size);
@@ -112,6 +113,9 @@ pub const Range = struct {
     /// ``shrink`` but each region's first chunk (its first step of positions, which every request maps) stays,
     /// zeroed on ``stream``: a reused sequence starts without mapping its caches again.
     pub fn trim(self: *Range, stream: abi.Stream) !void {
+        // the unmapped chunks may still be written by work queued on ``stream`` (a keep's shifts), and cuMemUnmap does
+        // not wait for it: that write faulted at the range (drafts off, where no readback follows the last keep)
+        try self.d.check(self.d.api.cuStreamSynchronize(stream), "cuStreamSynchronize (cache trim)");
         var kept: usize = 0;
         for (self.regions.items) |*r| r.mapped = 0;
         for (self.chunks.items) |c| {
