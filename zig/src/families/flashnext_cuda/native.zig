@@ -737,6 +737,7 @@ const vtable: be.Backend.VTable = .{
     .draft = draftFn,
     .release = releaseFn,
     .probabilities = probabilitiesFn,
+    .held = heldFn,
     .refused = refusedFn,
 };
 
@@ -1223,6 +1224,14 @@ fn probabilitiesFn(p: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
     if (out.len > l.nheld) return false;
     @memcpy(out, l.probs[0..out.len]);
     return true;
+}
+
+/// The stream's held drafts in window order (a grammar walks them before the window is verified).
+fn heldFn(p: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+    const self = of(p);
+    const l = self.lanes_by.getPtr(s) orelse return error.UnknownStream;
+    if (out.len > l.nheld) return error.WindowTooWide;
+    @memcpy(out, l.held[0..out.len]);
 }
 
 fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
