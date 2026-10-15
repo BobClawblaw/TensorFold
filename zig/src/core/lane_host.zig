@@ -77,7 +77,7 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keepBorn(job.request.prompt, born(job.request), at, s, job.request.chunks, job.host.spans(job.request));
+            if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), born(job.request), at, s, job.request.chunks, job.host.spans(job.request));
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -88,7 +88,7 @@ pub const LaneHost = struct {
             defer store.unpin(e); // after resumed, which reads e
             if (!job.started) return;
             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
+            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
         }
     };
 
@@ -317,7 +317,7 @@ pub const LaneHost = struct {
             return false;
         }
         var reuse: lanes.stream.Reuse = .{};
-        if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.prompt, born(r), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), born(r), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = if (l.entry) |e| store.pin(e) else null; // kept alive until its restore reports
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -448,7 +448,7 @@ pub const LaneHost = struct {
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.request.prompt, born(job.request), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
+        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.request.cacheKey(), born(job.request), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");

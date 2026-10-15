@@ -93,6 +93,13 @@ pub const Request = struct {
     prompt_logprobs: ?u8 = null,
     /// An image prompt's inputs in prompt order (Info.vision engines only; the prompt holds their placeholder rows).
     images: []const lanes.Image = &.{},
+    /// The prompt as the prompt cache keys it: each image's placeholder rows as ids from its content (empty: prompt).
+    cache_key: []const u32 = &.{},
+
+    /// The ids the prompt cache keys this request's states by: placeholders stand for their images.
+    pub fn cacheKey(r: *const Request) []const u32 {
+        return if (r.cache_key.len > 0) r.cache_key else r.prompt;
+    }
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
