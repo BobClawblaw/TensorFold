@@ -21,6 +21,7 @@ pub const Dim3 = launch.Dim3;
 pub const graph = @import("graph.zig");
 pub const cublaslt = @import("cublaslt.zig");
 pub const nccl = @import("nccl.zig");
+pub const tp_link = @import("tp_link.zig");
 pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
@@ -63,4 +64,5 @@ test {
     _ = @import("modelopt.zig");
     _ = @import("ck.zig");
     _ = @import("tp_watch.zig");
+    _ = @import("tp_link.zig");
 }

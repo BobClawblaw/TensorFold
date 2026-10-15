@@ -1,4 +1,8 @@
 //! CUDA family registration, device setup, memory admission and the native lane host.
+/// The serve flags this build's engine takes past the common ones (server/cli.zig served()): two GB10 ranks, the
+/// attention cache's codes.
+pub const serves: []const []const u8 = &.{ "--tp", "--kv-dtype" };
+
 const std = @import("std");
 const cuda = @import("cuda");
 const api = @import("engine_api");
@@ -6,6 +10,8 @@ const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const lfm2 = @import("lfm2.zig");
 const glm = @import("glm_cuda");
+const flashnext = @import("flashnext_cuda");
+const with_flashnext = @import("cuda_families").flashnext;
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const lane_backend = @import("cuda_bound.zig");
@@ -15,7 +21,7 @@ const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native };
+const registry = if (with_flashnext) .{ nemotron.native, nemotron.omni, glm.native, flashnext.native } else .{ nemotron.native, nemotron.omni, glm.native };
 
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
@@ -112,6 +118,14 @@ const Host = struct {
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
     dir: []u8 = &.{}, // the model folder the learner writes its lessons into
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
+    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // rank 1 of two: the family's replay loop
+
+    /// Rank 1: the family replays rank 0's calls on this thread (the context was made current here at open).
+    fn followFamily(p: *anyopaque) anyerror!void {
+        const h: *Host = @ptrCast(@alignCast(p));
+        if (h.gpu) |g| try g.ctx.makeCurrent();
+        return h.follow_fn.?(h.family);
+    }
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -204,6 +218,22 @@ const Host = struct {
 
 const refusals = @import("cuda_refusal.zig");
 const record = @import("cuda_record.zig");
+
+/// A tensor-parallel rank above 0 (server/engines.zig follow): the family opened as that rank, then its replay loop
+/// until rank 0 stops; false with ``problem`` set when it cannot.
+pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
+    const opened = (try open(a, gpa, io, o, problem)) orelse return false;
+    defer opened.close(opened.ctx);
+    const f = opened.follow orelse {
+        problem.* = "this family has no tensor-parallel ranks";
+        return false;
+    };
+    f(opened.ctx) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ o.rank, @errorName(e) });
+        return false;
+    };
+    return true;
+}
 
 /// The engine for `o.dir`, or null with `problem` set when `refusal` names a flag or no CUDA family reads it.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
@@ -300,9 +330,18 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         },
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
-    // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP)
+    // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP; Flash Next's two ranks)
+    const two = @hasDecl(F, "two_ranks") and F.two_ranks;
+    if (two and o.tp != 2) {
+        problem.* = try std.fmt.allocPrint(a, "{s} runs on two GPUs here: serve it with --tp 2 --rank 0 on one host and --tp 2 --rank 1 --master <rank 0's address> on the other", .{F.model_type});
+        return null;
+    }
+    if (!two and o.tp != 1) {
+        problem.* = try std.fmt.allocPrint(a, "{s} runs on one GPU: drop --tp", .{F.model_type});
+        return null;
+    }
     const whole = budget.weightBytes(io, o.dir);
-    const weights = if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else whole;
+    const weights = if (@hasDecl(F, "deviceWeightBytes")) F.deviceWeightBytes(io, o.dir) else if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else whole;
     const held0 = cuda.usage(false).device;
     // a family over hosts reads every rank's room after its load, by this budget, and admits by the smallest
     const Probe = struct {
@@ -324,8 +363,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             problem.* = "--vision: this CUDA family reads no images; serve it without --vision";
             return null;
         }
-        const own: ?u32 = comptime if (@hasDecl(F, "default_image_tokens")) F.default_image_tokens else null;
-        opts.vision = .{ .image_tokens = if (vo.image_tokens_set) vo.image_tokens else own orelse vo.image_tokens, .max_images = vo.max_images };
+        if (comptime visionIsFlag(F)) { // its own tower and image path (Flash Next): --vision only turns it on
+            opts.vision = true;
+        } else {
+            const own: ?u32 = comptime if (@hasDecl(F, "default_image_tokens")) F.default_image_tokens else null;
+            opts.vision = .{ .image_tokens = if (vo.image_tokens_set) vo.image_tokens else own orelse vo.image_tokens, .max_images = vo.max_images };
+        }
     }
     if (o.precision) |p| {
         if (!@hasField(F.Options, "precision")) {
@@ -338,6 +381,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (weights > before.room(held0)) {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
+    }
+    if (@hasField(F.Options, "kv_bits")) opts.kv_bits = o.kv_bits else if (o.kv_bits != 8) {
+        problem.* = try std.fmt.allocPrint(a, "{s} keeps an int8 attention cache only: drop --kv-dtype", .{F.model_type});
+        return null;
+    }
+    if (@hasField(F.Options, "rank")) {
+        opts.tp = @intCast(o.tp);
+        opts.rank = @intCast(o.rank);
+        opts.master = if (o.master.len > 0) o.master else null;
+        opts.master_port = o.master_port;
     }
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, opts) catch |e| {
         cuda.tp_watch.fail(@errorName(e)); // a family over hosts: its other ranks stop with this error
@@ -372,7 +425,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    var room = after.room(model) -| loaded.learn_bytes;
+    var room = after.room(model) -| learnBytes(loaded);
     var low: []const u8 = ""; // names the rank whose room bounds the streams, when it is not this one
     if (@hasField(@TypeOf(loaded), "peer_room")) if (loaded.peer_room) |pr| if (pr.bytes < room) {
         room = pr.bytes;
@@ -400,14 +453,19 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
+    if (@hasDecl(F, "setStreams")) F.setStreams(loaded.ctx, streams);
+    if (@hasDecl(F, "setRoom")) F.setRoom(loaded.ctx, room) catch |e| { // a family that sizes each stream's caches out of one pool
+        problem.* = try std.fmt.allocPrint(a, "the ranks could not agree on the stream pool ({s})", .{@errorName(e)});
+        return null;
+    };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
     const held = loaded.stream_bytes * (streams -| free);
     const cache = if (@hasDecl(F, "snap_save")) budget.cacheBytes(o.prompt_cache_gib, room, held) else 0;
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in passes of up to {d} rows{s}{s}; {s}", .{
-        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
-        if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+        capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learnBytes(loaded) > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learnBytes(loaded))}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+        if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else if (@hasField(@TypeOf(loaded), "target")) ", no prompt cache" else ", prompt states kept by the family", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
     if (@hasDecl(F, "snap_save") and cache > 0) {
@@ -464,9 +522,26 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_logprobs = loaded.backend.vtable.prompt_rows,
         .structures = loaded.backend.vtable.first_masked != null,
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
+        .qvision = comptime visionIsFlag(F) and o.vision != null, // a family with its own image path (Flash Next)
+        .admit = if (@hasDecl(F, "fits")) .{ .ctx = loaded.ctx, .fits = F.fits } else null,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
+    const follow_loop: ?*const fn (*anyopaque) anyerror!void = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
+    if (follow_loop) |f| {
+        h.follow_fn = f;
+        return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = Host.followFamily };
+    }
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// A family's bytes kept for --slide (0 for families without a learner).
+/// A family whose Options.vision is a flag (its own image path) rather than the shared tower's limits.
+fn visionIsFlag(comptime F: type) bool {
+    return @hasField(F.Options, "vision") and @FieldType(F.Options, "vision") == bool;
+}
+
+fn learnBytes(loaded: anytype) u64 {
+    return if (@hasField(@TypeOf(loaded), "learn_bytes")) loaded.learn_bytes else 0;
 }
 
 fn toGib(bytes: u64) f64 {

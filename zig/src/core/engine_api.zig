@@ -1,5 +1,8 @@
 //! The engine a server drives (``Engine``), and ``LaneHost``: the lane core served on one thread, rounds left to it.
 const std = @import("std");
+/// Flash Next's image inputs (decoded, resized, patches for its own tower); the server reaches them here.
+pub const QImage = lanes.QImage;
+pub const qwen_image = @import("qwen_image");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
 
@@ -107,6 +110,8 @@ pub const Request = struct {
     pub fn bornLen(r: *const Request) u32 {
         return if (r.born > 0) r.born else @intCast(r.prompt.len);
     }
+    /// Flash Next's image inputs in prompt order (Info.qvision engines; the prompt holds their placeholder rows).
+    qimages: []const lanes.QImage = &.{},
 };
 
 /// An image prepared for the engine's tower (``Vision.prepare``): patches, patch grid, tokens and a content hash.
@@ -251,6 +256,8 @@ pub const Info = struct {
     vision: ?Vision = null,
     /// The engine decodes greedily only: the server refuses a request with a temperature before admitting it.
     greedy_only: bool = false,
+    /// Flash Next encodes its own image inputs (Request.qimages): opened with ``vision`` and its family has a tower.
+    qvision: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
 };
@@ -329,6 +336,8 @@ pub const Open = struct {
     policy: []const u8 = "",
     /// --vision: load the checkpoint's image tower (null: text only; an engine without one refuses).
     vision: ?VisionOpen = null,
+    /// --kv-dtype: bits of the attention cache's codes (8 or 4) for families that keep a quantized cache.
+    kv_bits: u8 = 8,
 };
 
 /// A packed decision: a trunk (pictures expand at `at`), a branch a question, and each branch's labels (`counts`).
@@ -346,7 +355,13 @@ pub const Decision = struct {
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+pub const Opened = struct {
+    engine: Engine,
+    close: *const fn (ctx: *anyopaque) void,
+    ctx: *anyopaque,
+    /// Rank 1 of two: replay rank 0's engine calls until it stops (the server then serves no HTTP); null elsewhere.
+    follow: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+};
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0, limit: ?u64 = null };
 

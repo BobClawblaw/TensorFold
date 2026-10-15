@@ -100,6 +100,8 @@ pub const Held = struct {
 
 /// One image of a prompt: tower input (patches [gh * gw, width]) for the `tokens` placeholder rows from `at`.
 pub const Image = struct { pixels: []const f32, gh: u32, gw: u32, at: u32, tokens: u32 };
+/// Flash Next's image input for its own tower: patches (fp32 [grid h * w, 1536], merge-block order) and grid [1, h, w].
+pub const QImage = struct { patches: []const f32, grid: [3]i64 };
 
 pub const Spec = struct {
     id: []const u8,
@@ -130,6 +132,7 @@ pub const Spec = struct {
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
+    qimages: []const QImage = &.{}, // Flash Next's image inputs, in prompt order (its backend encodes them at prefill)
 };
 
 pub const Stream = struct {
@@ -148,6 +151,7 @@ pub const Stream = struct {
     think_close: []const u32,
     think_end: i64,
     think_open: bool,
+    images: []const Image = &.{},
     loop_guard: bool,
     loop_period: ?u32 = null,
     chunks: []const u32,
@@ -215,6 +219,7 @@ pub const Stream = struct {
             .cancel_check = spec.cancel_check,
             .yield_check = spec.yield_check,
             .think_budget = spec.think_budget,
+            .images = spec.images,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),

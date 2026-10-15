@@ -115,11 +115,20 @@ pub const Linear = struct {
 
     /// Picks the heuristic's first algorithm for this shape once; `workspace_limit` bounds what it may ask for.
     pub fn init(lt: *const Library, m: u64, n: u64, k: u64, out: DataType, workspace_limit: usize) Error!Linear {
-        return initEpilogue(lt, m, n, k, out, workspace_limit, .none);
+        return initFull(lt, m, n, k, .bf16, out, workspace_limit, .none);
     }
 
     /// `init`'s plan, its algorithm also running `epilogue` when it supports it (`epilogue` says if); see `runBias`.
     pub fn initEpilogue(lt: *const Library, m: u64, n: u64, k: u64, out: DataType, workspace_limit: usize, epilogue: Epilogue) Error!Linear {
+        return initFull(lt, m, n, k, .bf16, out, workspace_limit, epilogue);
+    }
+
+    /// ``init`` with ``in`` the type of X and W (bf16, or f32 for an fp32 product).
+    pub fn initTyped(lt: *const Library, m: u64, n: u64, k: u64, in: DataType, out: DataType, workspace_limit: usize) Error!Linear {
+        return initFull(lt, m, n, k, in, out, workspace_limit, .none);
+    }
+
+    fn initFull(lt: *const Library, m: u64, n: u64, k: u64, in: DataType, out: DataType, workspace_limit: usize, epilogue: Epilogue) Error!Linear {
         var self: Linear = undefined;
         self.lt = lt;
         try lt.check(lt.api.cublasLtCreate(&self.handle), "cublasLtCreate");
@@ -131,9 +140,9 @@ pub const Linear = struct {
         try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_transa, &ta, @sizeOf(c_int)), "set transa");
         try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_transb, &tb, @sizeOf(c_int)), "set transb");
         // column-major view: D^T[n,m] = W[n,k] (stored k x n, transposed) . X^T[k,m]
-        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.a, .bf16, k, n, @intCast(k)), "layout W");
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.a, in, k, n, @intCast(k)), "layout W");
         errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.a);
-        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.b, .bf16, k, m, @intCast(k)), "layout X");
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.b, in, k, m, @intCast(k)), "layout X");
         errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.b);
         try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.c, out, n, m, @intCast(n)), "layout D");
         errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.c);

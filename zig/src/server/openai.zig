@@ -132,7 +132,12 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
-        input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+        var msgs = body.get("messages");
+        if (try @import("vision_inputs.zig").extract(srv, cx, msgs)) |x| { // images: decoded, prepared, their parts as text
+            msgs = x.messages;
+            input.qimages = x.images;
+        }
+        input.messages = try messages.normalizeWith(cx, msgs, "system", srv.needs_user_after_tool, .of(srv.info.vision));
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
