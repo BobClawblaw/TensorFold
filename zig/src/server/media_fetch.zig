@@ -1,6 +1,7 @@
 //! Public HTTPS media for --vision-urls as vision/images_http.py fetches it: checked hosts, TLS, 3 redirects, limits.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 
@@ -124,6 +125,11 @@ fn setTimeouts(handle: net.Socket.Handle, ms: i64) void {
 
 /// A TCP connection to the checked address, connect, sends and reads bounded by ``ms`` (SO_SNDTIMEO bounds connect).
 fn connect(addr: net.IpAddress, ms: i64, f: *Failure) Error!net.Stream {
+    // the socket calls below are Linux's; a Windows server refuses image URLs by name
+    return if (comptime builtin.os.tag == .windows) fail(f, "image URLs are not supported on Windows yet") else connectLinux(addr, ms, f);
+}
+
+fn connectLinux(addr: net.IpAddress, ms: i64, f: *Failure) Error!net.Stream {
     const posix = std.posix;
     const linux = std.os.linux;
     const family: u32 = switch (addr) {

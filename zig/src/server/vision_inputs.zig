@@ -1,6 +1,8 @@
 //! A chat request's image_url and video_url parts, prepared and replaced by the text Python's frontend expands them to.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const sys = @import("sys");
 const media_fetch = @import("media_fetch.zig");
 const api = @import("engine_api");
 const json = @import("json.zig");
@@ -250,7 +252,7 @@ fn library(io: std.Io) ?@TypeOf(lib.?) {
     lib_mutex.lockUncancelable(io);
     defer lib_mutex.unlock(io);
     if (lib == null) {
-        var dl = std.DynLib.open("libtfvideo.so") catch return null;
+        var dl = sys.DynLib.open(if (builtin.os.tag == .windows) "tfvideo.dll" else "libtfvideo.so") catch return null;
         const d = dl.lookup(DecodeFn, "tf_video_decode") orelse return null;
         const f = dl.lookup(FreeFn, "tf_video_free") orelse return null;
         lib = .{ .decode = d, .free = f }; // kept open for the server's life
