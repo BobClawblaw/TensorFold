@@ -13,6 +13,7 @@ const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
+const image_key = @import("image_key.zig");
 const Mailbox = @import("mailbox.zig").Mailbox;
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -168,6 +169,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input_in: Input, gone: anytype) Failure!Pr
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
     };
+    if (input.images.len > 0) request.cache_key = try imageCacheKey(srv, a, rendered.ids, input.images);
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
     if (thinking) {
         const budget_field = f.get("thinking_budget");
@@ -576,4 +578,18 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
+}
+
+/// An image prompt's cache key: its placeholder rows (Qwen's image and video pads, GLM's image token) by content.
+fn imageCacheKey(srv: *Server, a: std.mem.Allocator, prompt: []const u32, images: []const api.Image) ![]const u32 {
+    var pads: [3]u32 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "<|image_pad|>", "<|video_pad|>", "<|image|>" }) |name| if (srv.text.tokenId(name)) |t| {
+        pads[n] = t;
+        n += 1;
+    };
+    const key = try image_key.cacheKey(a, prompt, images, pads[0..n]);
+    // no placeholder token known: the key's first id is the images', so no other prompt shares any state
+    if (n == 0 and key.len > 0) key[0] = (try image_key.cacheKey(a, &.{0}, images, &.{0}))[0];
+    return key;
 }

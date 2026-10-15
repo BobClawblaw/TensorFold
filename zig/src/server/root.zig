@@ -34,6 +34,7 @@ test {
     _ = @import("listener.zig");
     _ = @import("hub.zig");
     _ = @import("chunk_plan.zig");
+    _ = @import("image_key.zig");
     _ = @import("status_routes.zig");
     _ = @import("memory_routes.zig");
     _ = @import("process_memory.zig");
