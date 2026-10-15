@@ -21,10 +21,10 @@ __device__ __forceinline__ float warp_sum(float x) {
 
 using namespace tf_q36m;
 
-// A warp a (row, head): RMS norm over HD, rope on [0, ROT) as pairs (i, i + 32) at pos0 + row; OUT (rows, heads, HD).
+// A warp a (row, head): RMS norm, rope on [0, ROT) as pairs (i, i + 32) at pos0 + row * step; OUT (rows, heads, HD)
 extern "C" __global__ void __launch_bounds__(32) tf_q36m_norm_rope(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W,
                                                                      __nv_bfloat16* __restrict__ OUT, int heads, int stride, int in_head,
-                                                                     long long pos0, float eps, float theta) {
+                                                                     long long pos0, int step, float eps, float theta) {
     constexpr int DPL = HD / 32;
     const int head = blockIdx.x % heads;
     const size_t m = blockIdx.x / heads;
@@ -42,7 +42,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q36m_norm_rope(const __nv_bf
 #pragma unroll
     for (int i = 0; i < DPL; i++) n[i] = rbf(bf(W[DPL * t + i]) * (v[i] * inv));
     // a rotary pair's partner sits 32 elements away: DPL = 8 a lane, so 4 lanes away at the same i
-    const float pos = (float)(pos0 + (long long)m);
+    const float pos = (float)(pos0 + (long long)m * step);
     __nv_bfloat16* out = OUT + (m * heads + head) * HD;
 #pragma unroll
     for (int i = 0; i < DPL; i++) {
@@ -114,13 +114,13 @@ extern "C" __global__ void __launch_bounds__(32) tf_q36m_attn(const __nv_bfloat1
     }
 }
 
-// Tree rows at one depth, a warp a (row, head): ring [begin, pos0), the ancestor lanes ANC[m] names, then its own key.
+// Tree rows at one depth, a warp a (row, head): ring [begin, end), the ancestor lanes ANC[m] names, then its own key.
 extern "C" __global__ void __launch_bounds__(32) tf_q36m_attn_tree(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ G, int gstride,
                                                                      const __nv_bfloat16* __restrict__ KB, const __nv_bfloat16* __restrict__ VB,
                                                                      const __nv_bfloat16* __restrict__ LK, const __nv_bfloat16* __restrict__ LV,
                                                                      const int* __restrict__ ANC, int anc_stride, const __nv_bfloat16* __restrict__ RK,
                                                                      const __nv_bfloat16* __restrict__ RV, int heads, int kv_heads, int W, long long begin,
-                                                                     long long pos0, __nv_bfloat16* __restrict__ OUT) {
+                                                                     long long end, __nv_bfloat16* __restrict__ OUT) {
     constexpr int DPL = HD / 32;
     const int lane = threadIdx.x;
     const int m = blockIdx.x, h = blockIdx.y;
@@ -134,7 +134,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_q36m_attn_tree(const __nv_bf
         o[i] = 0.0f;
     }
     float mx = -INFINITY, l = 0.0f;
-    for (long long pos = begin; pos < pos0; pos++) {
+    for (long long pos = begin; pos < end; pos++) {
         const __nv_bfloat16* k = RK + (size_t)(pos % W) * width + kvh * HD + lane * DPL;
         float dot = 0.0f;
 #pragma unroll

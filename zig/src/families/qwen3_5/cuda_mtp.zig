@@ -267,6 +267,8 @@ pub const Mtp = struct {
         const aw = g.attnWidth();
         const kw = d.kvWidth();
         const p0: c_longlong = @intCast(pos0);
+        // a tree pass's rows are sibling lanes at one depth, so they share pos0; chained or absorbed rows step by one
+        const step: c_int = @intFromBool(pass == .ring);
         try e.run(e.fns.embed, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.ids, e.embed_w, e.embed_s, e.embed_b, d.emb, @as(c_int, @intCast(g.hidden)), @as(u64, 0) });
         try d.norm(d.emb, 0, w.norm_e, d.en, rows);
         try d.norm(d.hin, 0, w.norm_h, d.hn, rows);
@@ -276,15 +278,15 @@ pub const Mtp = struct {
         try d.proj(w.q, d.x, d.qraw, rows);
         try d.proj(w.k, d.x, d.kraw, rows);
         try d.proj(w.v, d.x, d.vb, rows);
-        try e.run(d.fns.norm_rope, .{ rows * g.q_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.qraw, w.q_norm, d.q, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), p0, g.eps, geometry.theta });
-        try e.run(d.fns.norm_rope, .{ rows * g.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.kraw, w.k_norm, d.kb, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(kw)), @as(c_int, head_dim), p0, g.eps, geometry.theta });
+        try e.run(d.fns.norm_rope, .{ rows * g.q_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.qraw, w.q_norm, d.q, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), p0, step, g.eps, geometry.theta });
+        try e.run(d.fns.norm_rope, .{ rows * g.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.kraw, w.k_norm, d.kb, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(kw)), @as(c_int, head_dim), p0, step, g.eps, geometry.theta });
         const heads: c_int = @intCast(g.q_heads);
         const kvh: c_int = @intCast(g.kv_heads);
         const cap: c_int = @intCast(d.capacity);
         const begin: c_longlong = @intCast(ctx.begin);
         switch (pass) {
             .ring => try e.run(d.fns.attn, .{ rows, g.q_heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.qraw, @as(c_int, @intCast(2 * aw)), d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), heads, kvh, cap, begin, p0, d.att }),
-            .tree => |anc| try e.run(d.fns.attn_tree, .{ rows, g.q_heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.qraw, @as(c_int, @intCast(2 * aw)), d.kb, d.vb, d.lane_k, d.lane_v, anc, @as(c_int, anc_stride), d.ringK(ctx), d.ringV(ctx), heads, kvh, cap, begin, p0, d.att }),
+            .tree => |anc| try e.run(d.fns.attn_tree, .{ rows, g.q_heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.qraw, @as(c_int, @intCast(2 * aw)), d.kb, d.vb, d.lane_k, d.lane_v, anc, @as(c_int, anc_stride), d.ringK(ctx), d.ringV(ctx), heads, kvh, cap, begin, @as(c_longlong, @intCast(ctx.end)), d.att }),
         }
         try d.proj(w.o, d.att, d.r, rows);
         try d.norm(d.h, d.r, w.post_norm, d.x, rows);
