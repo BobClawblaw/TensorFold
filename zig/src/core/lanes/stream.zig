@@ -98,7 +98,20 @@ pub const Held = struct {
 };
 
 /// An image for a vision tower: patches (fp32 [h * w, 1536], merge-block order), grid [1, h, w]; prompt placeholders.
-pub const Image = struct { patches: []const f32, grid: [3]i64 };
+pub const Image = struct {
+    patches: []const f32,
+    grid: [3]i64,
+
+    /// BLAKE3 of the grid (little-endian) and the patches' bits: the image's identity for kept prompt states.
+    pub fn digest(im: Image) [32]u8 {
+        var h = std.crypto.hash.Blake3.init(.{});
+        for (im.grid) |g| h.update(&std.mem.toBytes(std.mem.nativeToLittle(i64, g)));
+        h.update(std.mem.sliceAsBytes(im.patches));
+        var out: [32]u8 = undefined;
+        h.final(&out);
+        return out;
+    }
+};
 
 pub const Spec = struct {
     id: []const u8,
@@ -452,4 +465,13 @@ test "loop guard fires, closes thinking, and latches once" {
     try std.testing.expect(!s.finished and s.force.items.len == 0);
     _ = try s.commit(gpa, &.{8}, &.{});
     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+}
+
+test "an image's digest covers its grid and every patch bit" {
+    const a: [3]f32 = .{ 0.1, 0.2, 0.3 };
+    const b: [3]f32 = .{ 0.1, 0.2, -0.3 };
+    const da = (Image{ .patches = &a, .grid = .{ 1, 2, 2 } }).digest();
+    try std.testing.expect(!std.mem.eql(u8, &da, &(Image{ .patches = &b, .grid = .{ 1, 2, 2 } }).digest()));
+    try std.testing.expect(!std.mem.eql(u8, &da, &(Image{ .patches = &a, .grid = .{ 1, 1, 4 } }).digest()));
+    try std.testing.expectEqualSlices(u8, &da, &(Image{ .patches = &a, .grid = .{ 1, 2, 2 } }).digest());
 }
