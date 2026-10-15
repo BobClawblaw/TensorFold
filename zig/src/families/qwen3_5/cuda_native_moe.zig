@@ -8,6 +8,7 @@ pub const max_segments = native.max_segments;
 pub const prompt_rows = native.prompt_rows;
 /// --drafter names the checkpoint's own directory: its MTP layer (mtp-4bit.safetensors) drafts chains.
 pub const takes_drafter = true;
+pub const Options = native.Options;
 pub const open = native.open;
 pub const openDrafter = native.openMtp;
 pub const explain = native.explain;
