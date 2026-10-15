@@ -54,6 +54,7 @@ test {
     _ = @import("experts.zig");
     _ = @import("sample.zig");
     _ = @import("rank_scatter.zig");
+    _ = @import("roce.zig");
     _ = launch;
     _ = abi;
     _ = aot;
