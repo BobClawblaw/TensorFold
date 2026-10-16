@@ -34,6 +34,19 @@ fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
     return c.bytes;
 }
 
+/// The sessions past the engine's own from FLASHNEXT_SLOT_CONTEXTS (as "131072,65536x2,16384x8"); null when unset.
+fn slotContexts(gpa: std.mem.Allocator, capacity: usize) !?[]usize {
+    const text = std.mem.trim(u8, std.mem.span(std.c.getenv("FLASHNEXT_SLOT_CONTEXTS") orelse return null), " \t");
+    if (text.len == 0) return null;
+    return try tf.flashnext_slots.parse(gpa, text, capacity, @intCast(fx.MARGIN), tf.flashnext_replay.MAXR - 1);
+}
+
+/// Reply tokens a session must hold past the prompt at admission (FLASHNEXT_SLOT_GROW, default 8192); past them a stream moves.
+fn slotGrow() usize {
+    const v = std.c.getenv("FLASHNEXT_SLOT_GROW") orelse return 8192;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8192;
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, streams: u32, cache_gib: ?f64, over: bool, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
@@ -51,13 +64,37 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     const available = cap -| ready -| fit.MARGIN -| reserved;
     if (available < fixed) return error.OverMemoryLimit;
     const room = available - fixed;
-    const slots = try tf.flashnext_batch_meta.fit(streams, true, room, Session.bytes(capacity));
+    const tiers = slotContexts(gpa, capacity) catch |err| {
+        std.log.err("flash next: FLASHNEXT_SLOT_CONTEXTS is not a list of sessions: token counts of 1024 or more, CONTEXTxN for N alike, at most {d} sessions past the engine's own", .{tf.flashnext_replay.MAXR - 1});
+        return err;
+    };
+    defer if (tiers) |t| gpa.free(t);
+    var caps: std.ArrayList(usize) = .empty;
+    defer caps.deinit(gpa);
+    try caps.append(gpa, capacity); // the engine's own session: the whole window
+    if (tiers) |t| {
+        var bytes: u64 = 0;
+        for (t) |c| bytes += Session.bytes(c);
+        if (bytes > room) {
+            std.log.err("flash next: the sessions FLASHNEXT_SLOT_CONTEXTS lists take {d:.1} GiB; {d:.1} GiB fits under the limit beside the prompt cache", .{ fit.gibs(bytes), fit.gibs(room) });
+            return error.OverMemoryLimit;
+        }
+        try caps.appendSlice(gpa, t);
+    } else {
+        const n = try tf.flashnext_batch_meta.fit(streams, true, room, Session.bytes(capacity));
+        for (1..n) |_| try caps.append(gpa, capacity);
+    }
+    const slots: u32 = @intCast(caps.items.len);
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.gpa = gpa;
     h.eng = eng;
-    h.back = try Backend.init(gpa, eng, slots, capacity);
+    h.back = try Backend.init(gpa, eng, caps.items);
     errdefer h.back.deinit();
+    if (tiers != null) {
+        h.back.sized = true;
+        h.back.grow = slotGrow();
+    }
     try h.back.timeCosts();
     const allocated = fit.footprint() orelse return error.NoMemoryReading;
     if (allocated +| fit.MARGIN +| reserved > cap) return error.OverMemoryLimit;
@@ -68,7 +105,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     errdefer h.core.deinit();
     const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .admit = if (tiers != null) .{ .ctx = &h.back, .fits = Backend.fits } else null });
     // a lone greedy request runs on the engine's GPU-side rounds until a second one arrives (FLASHNEXT_NO_LONE=1: shared rounds)
     if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     h.cache = null;
@@ -82,7 +119,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     h.warm = .{ .queue = eng.r.queue };
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     try h.host.start();
-    std.log.info("Flash Next: {d} session slots, shared target forwards, {s}{s}", .{ slots, if (h.back.serial_drafts) "serial MTP drafts" else "every stream's drafts in one command buffer", if (h.host.lone != null) "; a lone request on the engine's own rounds" else "" });
+    var listed: [tf.flashnext_replay.MAXR * 8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&listed);
+    for (caps.items, 0..) |c, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", c }) catch break;
+    std.log.info("Flash Next: {d} session slots ({s} tokens), shared target forwards, {s}{s}", .{ slots, w.buffered(), if (h.back.serial_drafts) "serial MTP drafts" else "every stream's drafts in one command buffer", if (h.host.lone != null) "; a lone request on the engine's own rounds" else "" });
     return .{ .engine = h.host.engine(), .close = close, .ctx = h };
 }
 
