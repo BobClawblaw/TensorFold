@@ -2,6 +2,7 @@
 
 pub const Config = @import("config.zig").Config;
 pub const Kind = @import("config.zig").Kind;
+pub const Precision = @import("config.zig").Precision;
 pub const weights = @import("cuda_weights.zig");
 pub const kernels = @import("cuda_kernels.zig");
 pub const state = @import("cuda_state.zig");
@@ -27,6 +28,9 @@ pub const reuse = @import("cuda_reuse.zig");
 pub const slide = @import("cuda_slide.zig");
 pub const source = @import("cuda_source.zig");
 pub const torch_ops = @import("cuda_torch_ops.zig");
+pub const worker = @import("cuda_worker.zig");
+pub const omni = @import("cuda_native_omni.zig");
+pub const identity = @import("cuda_identity.zig");
 
 test {
     _ = @import("config.zig");
@@ -45,4 +49,8 @@ test {
     _ = @import("learner.zig");
     _ = @import("subspace.zig");
     _ = @import("cuda_train_back.zig");
+    _ = @import("cuda_latent.zig");
+    _ = @import("cuda_latent_ck.zig");
+    _ = @import("cuda_identity.zig");
+    _ = worker;
 }

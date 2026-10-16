@@ -5,6 +5,8 @@ const steps = @import("steps.zig");
 const models = @import("model.zig");
 const Allocator = std.mem.Allocator;
 pub const Memo = @import("memo.zig").Memo;
+/// A digest of what ids mean as loaded (identity.zig): what Recall keys its record by.
+pub const identity = @import("identity.zig").identity;
 
 pub const Kind = models.Kind;
 pub const Error = models.Error || std.json.ParseError(std.json.Scanner) || error{UnsupportedAddedToken};
@@ -133,6 +135,16 @@ pub const Tokenizer = struct {
         return a.dupe(u32, ids.items);
     }
 
+    /// encodeText through the memo for a long segment: its kept ids, else encoded and kept.
+    fn encodeSegment(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+        const m = t.memo orelse return t.encodeText(ctx, text, first, ids);
+        if (text.len < @import("memo.zig").min_bytes) return t.encodeText(ctx, text, first, ids);
+        if (try m.append(text, first, ctx.a, ids)) return;
+        const from = ids.items.len;
+        try t.encodeText(ctx, text, first, ids);
+        m.put(text, first, ids.items[from..]);
+    }
+
     /// `encode` with no added token matched: text that spells one (a quoted marker) is ordinary text.
     pub fn encodePlain(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -147,16 +159,6 @@ pub const Tokenizer = struct {
         var ids: std.ArrayList(u32) = .empty;
         if (valid.len > 0) try t.encodeTextWith(&ctx, valid, true, &ids, false);
         return a.dupe(u32, ids.items);
-    }
-
-    /// encodeText through the memo for a long segment: its kept ids, else encoded and kept.
-    fn encodeSegment(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
-        const m = t.memo orelse return t.encodeText(ctx, text, first, ids);
-        if (text.len < @import("memo.zig").min_bytes) return t.encodeText(ctx, text, first, ids);
-        if (try m.append(text, first, ctx.a, ids)) return;
-        const from = ids.items.len;
-        try t.encodeText(ctx, text, first, ids);
-        m.put(text, first, ids.items[from..]);
     }
 
     fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
@@ -585,4 +587,8 @@ test "raw token bytes conservatively refuse context-sensitive decoder kinds" {
 
 test {
     _ = @import("memo.zig");
+}
+
+test {
+    _ = @import("identity.zig");
 }

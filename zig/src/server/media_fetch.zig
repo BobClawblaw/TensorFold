@@ -16,6 +16,8 @@ pub const total_s = 30;
 
 /// images_http.MEDIA_TYPES: the declared types an image URL may answer with (WebP is refused after, by its bytes).
 pub const image_media = [_][]const u8{ "image/jpeg", "image/png", "image/webp" };
+/// videos.py VIDEO_MEDIA_TYPES.
+pub const video_media = [_][]const u8{ "video/mp4", "video/webm", "video/quicktime", "video/x-matroska" };
 
 fn fail(f: *Failure, text: []const u8) Error {
     f.text = text;
@@ -108,6 +110,12 @@ pub fn join(a: std.mem.Allocator, base: []const u8, location: []const u8) ![]con
     return std.fmt.allocPrint(a, "{s}{s}{s}", .{ origin, dir, location });
 }
 
+/// One download's deadline: `seconds` from now, or the request's `deadline` when that comes first.
+pub fn within(io: Io, deadline: Io.Timestamp, seconds: i64) Io.Timestamp {
+    const one = Io.Clock.awake.now(io).addDuration(.fromSeconds(seconds));
+    return if (one.nanoseconds < deadline.nanoseconds) one else deadline;
+}
+
 fn remaining(io: Io, deadline: Io.Timestamp, f: *Failure) Error!i64 {
     const left = Io.Clock.awake.now(io).durationTo(deadline).toMilliseconds();
     if (left <= 0) return fail(f, "image download timed out");
@@ -120,15 +128,22 @@ pub const Body = struct { data: []u8, media: []const u8 };
 /// What one request gave: the body, or a redirect's location.
 pub const Got = union(enum) { body: Body, redirect: []const u8 };
 
-/// `url`'s bytes and media type (one of `media_types`), at most `max_bytes`, before `deadline`, redirects rechecked.
+/// `url`'s bytes and media type (of `media_types`), at most `max_bytes`, by `deadline`, each redirect checked again.
 pub fn fetch(a: std.mem.Allocator, io: Io, url: []const u8, max_bytes: usize, deadline: Io.Timestamp, media_types: []const []const u8, f: *Failure) Error!Body {
     return fetchVia(a, io, url, max_bytes, deadline, media_types, f, Network{});
 }
 
 /// fetch over `via`, whose request(a, io, url, max_bytes, deadline, media_types, f) answers one checked URL.
-pub fn fetchVia(a: std.mem.Allocator, io: Io, url_in: []const u8, max_bytes: usize, deadline_in: Io.Timestamp, media_types: []const []const u8, f: *Failure, via: anytype) Error!Body {
-    const one = Io.Clock.awake.now(io).addDuration(.fromSeconds(timeout_s));
-    const deadline = if (one.nanoseconds < deadline_in.nanoseconds) one else deadline_in;
+pub fn fetchVia(
+    a: std.mem.Allocator,
+    io: Io,
+    url_in: []const u8,
+    max_bytes: usize,
+    deadline: Io.Timestamp,
+    media_types: []const []const u8,
+    f: *Failure,
+    via: anytype,
+) Error!Body {
     var url = url_in;
     var hop: usize = 0;
     while (true) : (hop += 1) {
@@ -192,7 +207,7 @@ pub fn answer(a: std.mem.Allocator, io: Io, r: *Io.Reader, max_bytes: usize, dea
     if (encoded) return fail(f, "compressed HTTP image responses are unsupported");
     for (media_types) |m| {
         if (std.mem.eql(u8, m, media)) break;
-    } else return fail(f, "image URL content type must be JPEG, PNG or WebP");
+    } else return fail(f, if (media_types.ptr == &image_media) "image URL content type must be JPEG, PNG or WebP" else try std.fmt.allocPrint(a, "media URL content type must be one of {s}", .{try std.mem.join(a, ", ", media_types)}));
     if (length) |n| if (n > max_bytes) return fail(f, too_big);
     var data: std.ArrayList(u8) = .empty;
     if (chunked) {
@@ -352,7 +367,21 @@ test "public addresses as Python's ipaddress checks them" {
         }
     }.of;
     for ([_][4]u8{ .{ 8, 8, 8, 8 }, .{ 151, 101, 1, 69 }, .{ 1, 1, 1, 1 } }) |b| try std.testing.expect(publicIp(ip4(b)));
-    for ([_][4]u8{ .{ 10, 1, 2, 3 }, .{ 127, 0, 0, 1 }, .{ 169, 254, 169, 254 }, .{ 172, 20, 0, 1 }, .{ 192, 168, 1, 1 }, .{ 100, 100, 0, 1 }, .{ 0, 0, 0, 0 }, .{ 224, 0, 0, 1 }, .{ 255, 255, 255, 255 }, .{ 168, 63, 129, 16 }, .{ 192, 0, 0, 9 }, .{ 198, 18, 0, 1 }, .{ 203, 0, 113, 5 } }) |b|
+    for ([_][4]u8{
+        .{ 10, 1, 2, 3 },
+        .{ 127, 0, 0, 1 },
+        .{ 169, 254, 169, 254 },
+        .{ 172, 20, 0, 1 },
+        .{ 192, 168, 1, 1 },
+        .{ 100, 100, 0, 1 },
+        .{ 0, 0, 0, 0 },
+        .{ 224, 0, 0, 1 },
+        .{ 255, 255, 255, 255 },
+        .{ 168, 63, 129, 16 },
+        .{ 192, 0, 0, 9 },
+        .{ 198, 18, 0, 1 },
+        .{ 203, 0, 113, 5 },
+    }) |b|
         try std.testing.expect(!publicIp(ip4(b)));
     try std.testing.expect(publicIp(ip6("2606:4700::1111")));
     for ([_][]const u8{ "::1", "::", "fe80::1", "fc00::1", "ff02::1", "::ffff:8.8.8.8", "2002:808:808::1", "2001::1", "2001:db8::1", "64:ff9b::808:808" }) |t|
