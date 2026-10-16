@@ -175,7 +175,7 @@ fn holdResident(h: *Host) !void {
     try buffers.appendSlice(h.gpa, h.eng.r.held.items);
     for (h.back.sessions) |s| try buffers.appendSlice(h.gpa, s.owned.items);
     try buffers.append(h.gpa, h.back.hidden.b);
-    h.resident = try Resident.hold(h.gpa, h.host.io, h.eng.r.device, h.eng.r.queue, buffers.items, "flash next shared") orelse return;
+    h.resident = try Resident.holdUnder(h.gpa, h.host.io, h.eng.r.device, h.eng.r.queue, buffers.items, "flash next shared", h.load_limit) orelse return;
     const r = &h.resident.?;
     h.warm = r.target();
     h.eng.r.follow = r.follow();

@@ -472,7 +472,7 @@ pub fn openWarmed(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cach
 
 /// The engine's buffers in one residency set the idle keepalive's ticks use; buffers made later join it or stay out.
 fn holdResident(h: *Host) !void {
-    h.resident = try Resident.hold(h.gpa, h.io, h.eng.r.device, h.eng.r.queue, h.eng.r.held.items, "flash next") orelse return;
+    h.resident = try Resident.holdUnder(h.gpa, h.io, h.eng.r.device, h.eng.r.queue, h.eng.r.held.items, "flash next", if (h.load_limit > 0) h.load_limit else null) orelse return;
     const r = &h.resident.?;
     h.warm = r.target();
     h.eng.r.follow = r.follow();

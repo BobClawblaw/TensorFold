@@ -100,8 +100,10 @@ Each packed window uses its own seed, sampling settings and absolute token posit
 greedy only. The model gate below must verify sampled token parity across routes, drafting and batch composition.
 
 The shared host's residency set includes the engine, session caches and metadata, shared hidden rows and later
-prompt snapshots. Residency stays within 70% of RAM even when the load limit is raised; a refused set leaves the
-server running without it. `FLASHNEXT_NO_RESIDENCY=1` disables the set. With a prompt cache, background warm turns
+prompt snapshots. Residency uses the same validated load limit as the host, with a 2 GiB margin inside it for
+growing buffers. The default stays at 70% of RAM; `FLASHNEXT_LOAD_LIMIT_GB` can raise or lower that ceiling, capped
+by RAM and the GPU working set. A refused set leaves the server running without it, and `--prompt-cache-over-cap`
+does not raise the residency ceiling. `FLASHNEXT_NO_RESIDENCY=1` disables the set. With a prompt cache, warm turns
 keep the end of a reply as the single-request host does. Idle latency and throughput need fresh measurements.
 
 The checkpoint gate compares shared replies with fresh legacy replies, with drafting off and on, then checks
