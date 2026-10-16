@@ -20,6 +20,11 @@ pub const max_rows = 128;
 pub const max_segs = 32;
 /// Rows of a verify forward at most: each row's logits are kept and drawn.
 pub const most_verify = 32;
+
+/// tf_q35_argmax_slices' blocks a row (ARGMAX_SLICE entries each).
+fn argmaxSlices(vocab: usize) usize {
+    return (vocab + 4095) / 4096;
+}
 /// A window's rows at most (exact: one-row steps' bits; qwen35.cuh's MAXW, the rows a stream's log holds).
 pub const most_window = 16;
 /// Partial attention chunks a row at most (qwen35.cuh's MAXCH): each row's chunk width grows with its own keys.
@@ -58,7 +63,8 @@ const Fns = struct {
     attn_merge: cuda.Function,
     attn_gate: cuda.Function,
     mlp_act: cuda.Function,
-    argmax: cuda.Function,
+    argmax_slices: cuda.Function,
+    argmax_merge: cuda.Function,
     tap: cuda.Function,
 };
 
@@ -127,6 +133,7 @@ pub const Engine = struct {
     pl: u64,
     po: u64,
     logits: u64,
+    amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
@@ -292,6 +299,7 @@ pub const Engine = struct {
         e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
         e.logits = try t.alloc(most_verify * g.vocab * 2);
+        e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
         return total;
     }
 
@@ -323,6 +331,16 @@ pub const Engine = struct {
     }
 
     /// h += r if `residual`, x = the normed h; `sums`: x's group sums into xs, for a projAgain over x.
+    /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
+    fn argmax(e: *Engine, first: usize, n: usize, toks: u64) !void {
+        if (n == 0) return;
+        const slices = argmaxSlices(e.g.vocab);
+        const pv = e.amax;
+        const pi = e.amax + n * slices * 4;
+        try e.run(e.fns.argmax_slices, .{ slices, n, 1 }, .{ 256, 1, 1 }, .{ e.logits + first * e.g.vocab * 2, @as(c_int, @intCast(e.g.vocab)), pv, pi });
+        try e.run(e.fns.argmax_merge, .{ n, 1, 1 }, .{ 32, 1, 1 }, .{ pv, pi, @as(c_int, @intCast(slices)), toks + first * 4 });
+    }
+
     fn norm(e: *Engine, residual: bool, w: u64, rows: usize, sums: bool) !void {
         try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, if (sums) e.xs else @as(u64, 0) });
     }
@@ -427,12 +445,17 @@ pub const Engine = struct {
         switch (keep) {
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
+                var greedy: usize = 0; // the run of greedy rows ending at i, argmaxed together
                 for (pk, 0..) |p, i| {
-                    const row = e.logits + i * g.vocab * 2;
-                    if (p.rule != null) {
-                        try e.draws.draw(e.stream, row, g.vocab, e.tables.ptr + rules_at + i * @sizeOf(cuda.sample.Rule), e.tables.ptr + meta_at + i * 4, 0, toks + i * 4, 1, null, null);
-                    } else try e.run(e.fns.argmax, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, .{ row, @as(c_int, @intCast(g.vocab)), toks + i * 4 });
+                    if (p.rule == null) {
+                        greedy += 1;
+                        continue;
+                    }
+                    try e.argmax(i - greedy, greedy, toks);
+                    greedy = 0;
+                    try e.draws.draw(e.stream, e.logits + i * g.vocab * 2, g.vocab, e.tables.ptr + rules_at + i * @sizeOf(cuda.sample.Rule), e.tables.ptr + meta_at + i * 4, 0, toks + i * 4, 1, null, null);
                 }
+                try e.argmax(pk.len - greedy, greedy, toks);
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
