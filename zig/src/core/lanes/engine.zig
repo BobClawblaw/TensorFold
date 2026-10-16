@@ -124,16 +124,14 @@ pub const Engine = struct {
             var i: usize = 0;
             while (i < e.live.items.len) {
                 const s = e.live.items[i];
-                if (!s.finished) {
-                    i += 1;
-                    continue;
-                }
-                _ = e.live.orderedRemove(i);
-                trail.finish(e, s) catch |err| {
-                    if (failure == null) failure = err;
-                };
-                e.release(s);
-                again = true;
+                if (s.finished) {
+                    _ = e.live.orderedRemove(i);
+                    trail.finish(e, s) catch |err| {
+                        if (failure == null) failure = err;
+                    };
+                    e.release(s);
+                    again = true;
+                } else i += 1;
             }
         }
         if (failure) |err| return err;

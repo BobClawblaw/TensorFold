@@ -8,6 +8,7 @@ const Backend = tf.flashnext_backend.Backend;
 const Session = tf.flashnext_session.Session;
 const fx = tf.flashnext_engine;
 const fit = @import("cache_fit.zig");
+const Resident = @import("resident.zig").Resident;
 
 const Host = struct {
     gpa: std.mem.Allocator,
@@ -19,6 +20,8 @@ const Host = struct {
     host: api.LaneHost,
     cache: ?api.prompt_cache.Store = null,
     warm: mtl.keepalive.Target,
+    resident: ?Resident,
+    load_limit: u64,
 };
 
 /// The whole-footprint ceiling: 70% of RAM or FLASHNEXT_LOAD_LIMIT_GB, capped by the GPU working set.
@@ -113,14 +116,21 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     h.cache = null;
     if (plan.budget_bytes > 0) {
-        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = Backend.snapBytes, .save = Backend.snapSave, .restore = Backend.snapRestore, .drop = Backend.snapDrop, .charged = Backend.snapCharged, .spare = Backend.snapSpare, .trim = Backend.snapTrim, .reuses = Backend.snapReuses } }, .{ .lookahead = 1, .planned = true }, plan.budget_bytes);
+        h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = Backend.snapBytes, .save = Backend.snapSave, .restore = Backend.snapRestore, .drop = Backend.snapDrop, .charged = Backend.snapCharged, .spare = Backend.snapSpare, .trim = Backend.snapTrim, .reuses = Backend.snapReuses } }, .{ .lookahead = 1, .planned = true, .warm = .on }, plan.budget_bytes);
         h.host.cache = &h.cache.?;
         h.host.info_.prompt_cache = true;
+        h.host.info_.warm_turns = true;
     }
     errdefer if (h.cache) |*store| store.deinit();
     h.host.explain = .{ .text = words };
     h.warm = .{ .queue = eng.r.queue };
+    h.resident = null;
+    h.load_limit = cap;
+    if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h) catch |err|
+        std.log.warn("flash next shared: no residency set ({s})", .{@errorName(err)});
+    errdefer dropResident(h);
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
+    h.host.memory = .{ .ctx = h, .read = memory };
     try h.host.start();
     var listed: [tf.flashnext_replay.MAXR * 8]u8 = undefined;
     var w: std.Io.Writer = .fixed(&listed);
@@ -145,11 +155,41 @@ fn close(ctx: *anyopaque) void {
     const h: *Host = @ptrCast(@alignCast(ctx));
     h.host.stop();
     if (h.cache) |*store| store.deinit();
+    dropResident(h);
     h.core.deinit();
     h.cfg.deinit(h.gpa);
     h.back.deinit();
     h.eng.deinit();
     h.gpa.destroy(h);
+}
+
+fn memory(ctx: ?*anyopaque, reset_peak: bool) ?api.Memory {
+    const h: *Host = @ptrCast(@alignCast(ctx.?));
+    return fit.hostMemory(h.load_limit, reset_peak);
+}
+
+/// Session-owned buffers stay allocated until close, beside the runner's buffers and shared hidden rows.
+fn holdResident(h: *Host) !void {
+    var buffers: std.ArrayList(mtl.Buffer) = .empty;
+    defer buffers.deinit(h.gpa);
+    try buffers.appendSlice(h.gpa, h.eng.r.held.items);
+    for (h.back.sessions) |s| try buffers.appendSlice(h.gpa, s.owned.items);
+    try buffers.append(h.gpa, h.back.hidden.b);
+    h.resident = try Resident.hold(h.gpa, h.host.io, h.eng.r.device, h.eng.r.queue, buffers.items, "flash next shared") orelse return;
+    const r = &h.resident.?;
+    h.warm = r.target();
+    h.eng.r.follow = r.follow();
+    h.eng.snap_pool.follow = r.follow();
+}
+
+/// Stop reporting new buffers before releasing the set and then the session/backend buffers it held.
+fn dropResident(h: *Host) void {
+    const r = if (h.resident) |*x| x else return;
+    h.eng.r.follow = null;
+    h.eng.snap_pool.follow = null;
+    r.deinit();
+    h.resident = null;
+    h.warm = .{ .queue = h.eng.r.queue };
 }
 
 /// Auto with room for only one session transfers the loaded engine, preserving the chosen footprint limit.

@@ -441,6 +441,10 @@ pub fn openLoaded(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cach
     eng.peer_budget = budget; // rank 1: its kept states and free buffers stay inside the same budget
     eng.snap_pool.max = budget;
     const follower: ?std.Thread = if (eng.followsPeer()) try std.Thread.spawn(.{}, follow, .{eng}) else null; // rank 1
+    errdefer if (follower) |th| {
+        eng.stopFollowing();
+        th.join();
+    };
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     const context_limit: i64 = tf.flashnext_replay.CAP - fx.MARGIN;
