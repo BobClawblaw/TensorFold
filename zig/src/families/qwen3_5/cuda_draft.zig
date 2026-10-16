@@ -136,7 +136,18 @@ const Ctx = struct {
     end: u64 = 0,
     held: [engine.most_window]u32 = undefined,
     held_n: usize = 0,
+    // a grown tree's parents (-1: under the pending token) and each node's log-chance under its parent; 0 nodes: a chain
+    parents: [engine.most_window]i32 = undefined,
+    own: [engine.most_window]f64 = undefined,
+    grown: usize = 0,
 };
+
+/// best_first's settings, as the 27B engine's DFlash2 trees: children a node, the selector's weight, the softmax scale.
+const tree_branch = 4;
+const tree_edge = 0.6;
+const tree_scale = 1.5;
+/// A grown tree's nodes at most (TF_DRAFT_NODES overrides; TF_NO_TREES drafts chains).
+const tree_nodes = 15;
 
 pub const Draft = struct {
     gpa: std.mem.Allocator,
@@ -426,10 +437,15 @@ pub const Draft = struct {
         try e.stream.synchronize();
         if (lanes_) |l| {
             try d.selectLanes(ctx, pending, rows, l);
+            ctx.grown = 0;
             if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] lanes {d} levels {d}\n", .{ l.parents.len, l.levels() });
+        } else if (d.nodes() > 0) {
+            d.grow(ctx, pending, rows, @min(depth, d.nodes()));
+            if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] tree {d}\n", .{ctx.held_n});
         } else {
             d.select(ctx, pending, rows);
             ctx.held_n = @min(depth, rows);
+            ctx.grown = 0;
             if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] chain {d}\n", .{ctx.held_n});
         }
     }
@@ -461,6 +477,85 @@ pub const Draft = struct {
         return w[2 + pick];
     }
 
+    /// The nodes a grown tree takes at most: 0 when the drafter drafts chains and lane trees (TF_NO_TREES, TF_DRAFT_NODES=0).
+    fn nodes(d: *const Draft) usize {
+        _ = d;
+        if (platform.c.getenv("TF_NO_TREES") != null) return 0;
+        const n = if (platform.c.getenv("TF_DRAFT_NODES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch tree_nodes else tree_nodes;
+        return @min(n, engine.most_window - 1);
+    }
+
+    /// Row `r`'s candidates after `pred`, scored as best_first scores them: (unary + edge x selector) / scale, as log-chances.
+    fn chancesAfter(d: *const Draft, r: usize, pred: u32, out: *[lp_top]f64) void {
+        const c = d.c;
+        const w = std.mem.bytesAsSlice(u32, d.staged.bytes[words_at..][r * lp_words * 4 ..][0 .. lp_words * 4]);
+        const hp = std.mem.bytesAsSlice(u16, d.staged.bytes[hp_at..][r * c.rank * 2 ..][0 .. c.rank * 2]);
+        var most: f64 = -std.math.inf(f64);
+        for (0..c.topk) |j| {
+            const cand = w[2 + j];
+            var edge: f64 = 0;
+            for (0..c.rank) |k| edge += @as(f64, bf16(d.w.predecessor[pred * c.rank + k])) * bf16(hp[k]) * bf16(d.w.successor[cand * c.rank + k]);
+            out[j] = (@as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + tree_edge * edge) / tree_scale;
+            most = @max(most, out[j]);
+        }
+        var total: f64 = 0;
+        for (out[0..c.topk]) |v| total += @exp(v - most);
+        const log_total = most + @log(total);
+        for (out[0..c.topk]) |*v| v.* -= log_total;
+    }
+
+    /// best_first over the rows' candidates: the open node with the least path cost next, ties by parent, token, row.
+    fn grow(d: *Draft, ctx: *Ctx, pending: u32, rows: usize, most: usize) void {
+        const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
+        var open: [tree_branch * (engine.most_window + 1)]Open = undefined;
+        var n_open: usize = 0;
+        const w0 = d.staged.bytes[words_at..];
+        var count: usize = 0;
+        var pred = pending;
+        var parent: i32 = -1;
+        var row: usize = 0;
+        var path: f64 = 0;
+        while (true) {
+            // the node just taken (or the pending token) opens its best children on the next row
+            if (row < rows) {
+                var lc: [lp_top]f64 = undefined;
+                d.chancesAfter(row, pred, &lc);
+                var order: [lp_top]usize = undefined;
+                for (order[0..d.c.topk], 0..) |*o, i| o.* = i;
+                std.mem.sort(usize, order[0..d.c.topk], &lc, struct {
+                    fn more(v: *const [lp_top]f64, a: usize, b: usize) bool {
+                        return v[a] > v[b] or (v[a] == v[b] and a < b);
+                    }
+                }.more);
+                const w = std.mem.bytesAsSlice(u32, w0[row * lp_words * 4 ..][0 .. lp_words * 4]);
+                for (order[0..@min(tree_branch, d.c.topk)]) |j| {
+                    if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
+                    open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
+                    n_open += 1;
+                }
+            }
+            if (count == most or n_open == 0) break;
+            var best: usize = 0;
+            for (open[1..n_open], 1..) |o, i| {
+                const b = open[best];
+                if (o.cost < b.cost or (o.cost == b.cost and (o.parent < b.parent or (o.parent == b.parent and (o.token < b.token or (o.token == b.token and o.row < b.row)))))) best = i;
+            }
+            const node = open[best];
+            open[best] = open[n_open - 1];
+            n_open -= 1;
+            ctx.held[count] = node.token;
+            ctx.parents[count] = node.parent;
+            ctx.own[count] = node.own;
+            pred = node.token;
+            parent = @intCast(count);
+            row = node.row + 1;
+            path = node.cost;
+            count += 1;
+        }
+        ctx.held_n = count;
+        ctx.grown = count;
+    }
+
     /// The path through the rows' candidates: each row's best after the one before.
     fn select(d: *Draft, ctx: *Ctx, pending: u32, rows: usize) void {
         var pred = pending;
@@ -484,7 +579,7 @@ pub const Draft = struct {
     // the Drafter contract
 
     pub fn drafter(d: *Draft) dr.Drafter {
-        return .{ .ptr = d, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn } };
+        return .{ .ptr = d, .vtable = &.{ .taps = tapsFn, .facts = factsFn, .open = openFn, .absorb = absorbFn, .hold = holdFn, .held = heldFn, .release = releaseFn, .tree = treeFn, .chances = chancesFn } };
     }
 
     fn cast(p: *anyopaque) *Draft {
@@ -499,7 +594,7 @@ pub const Draft = struct {
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
         // TF_NO_TREES=1: chains only (for comparing)
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.c.ringBytes(), .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs] };
+        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.c.ringBytes(), .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(d.nodes()) };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -542,6 +637,24 @@ pub const Draft = struct {
             if (o.len > ctx.held_n) return error.TooFewDrafts;
             @memcpy(o, ctx.held[0..o.len]);
         }
+    }
+
+    fn treeFn(p: *anyopaque, s: *Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
+        const d = cast(p);
+        const ctx = d.streams.get(s) orelse return error.UnknownStream;
+        if (ctx.grown == 0) return null;
+        const tokens = try gpa.dupe(u32, ctx.held[0..ctx.grown]);
+        errdefer gpa.free(tokens);
+        return .{ .count = @intCast(ctx.grown), .tokens = tokens, .parents = try gpa.dupe(i32, ctx.parents[0..ctx.grown]) };
+    }
+
+    /// A grown tree's nodes' chances: each its own chance under its parent times its parent's.
+    fn chancesFn(p: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const d = cast(p);
+        const ctx = d.streams.get(s) orelse return error.UnknownStream;
+        if (ctx.grown == 0 or out.len > ctx.grown) return false;
+        for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| o.* = @exp(own) * (if (parent >= 0) out[@intCast(parent)] else 1);
+        return true;
     }
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
