@@ -158,3 +158,67 @@ pub fn draws(gpu: Gpu) !void {
     try check.expect(worst < 1e-3, "sample: a pick's share is {e} off its f64 value", .{worst});
     check.pass("sample: {d} draws equal the Metal rule's host references", .{total});
 }
+
+/// topkRows' two stages against tf_logprob_rows: the same k ids and logits, word for word, on every row kind and width.
+pub fn topk(gpu: Gpu) !void {
+    const gpa = gpu.gpa;
+    var m = try cuda.Module.load(gpu.d, cuda.kernels.sample);
+    defer m.unload();
+    const d = try cuda.sample.Draws.resolve(m);
+    var stream = try cuda.Stream.init(gpu.d, true);
+    defer stream.deinit();
+    const n_rows = 7;
+    const lp_words = 3 + 2 * 20;
+    const widths = [_]usize{ 248320, 131072, 4097, 4096, 100, 10 };
+    const ks = [_]u8{ 1, 16, 20 };
+    const most = widths[0];
+    const host = try gpa.alloc(u16, n_rows * most);
+    defer gpa.free(host);
+    const wide = try gpa.alloc(f32, n_rows * most);
+    defer gpa.free(wide);
+    var logits = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * most * 2);
+    defer logits.free();
+    var picks = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * 4);
+    defer picks.free();
+    try picks.fill8(0, null);
+    var parts = try cuda.DeviceBuffer.alloc(gpu.d, cuda.sample.Draws.topkPartsBytes(most, 20, n_rows));
+    defer parts.free();
+    var want_dev = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * lp_words * 4);
+    defer want_dev.free();
+    var got_dev = try cuda.DeviceBuffer.alloc(gpu.d, n_rows * lp_words * 4);
+    defer got_dev.free();
+    var cases: usize = 0;
+    var differ: usize = 0;
+    for (widths) |n| for (std.enums.values(Kind), 0..) |kind, ki| for ([_]bool{ false, true }) |odd| {
+        for (0..n_rows) |r| {
+            const row = host[r * n ..][0..n];
+            fill(kind, ki * 37 + r + n, row, wide[r * n ..][0..n]);
+            // -inf and NaN entries: tf_logprob_rows never takes a NaN, and takes -inf only past every finite entry
+            if (odd) for (row, 0..) |*h, i| {
+                if (i % 5 == 1) h.* = 0xFF80 else if (i % 13 == 3) h.* = 0x7FC0;
+            };
+        }
+        try logits.uploadAsync(0, std.mem.sliceAsBytes(host[0 .. n_rows * n]), stream.handle);
+        for (ks) |k| {
+            try d.logprobRows(stream, logits.ptr, n, picks.ptr, k, false, want_dev.ptr, n_rows);
+            try d.topkRows(stream, logits.ptr, n, k, parts.ptr, got_dev.ptr, n_rows);
+            try stream.synchronize();
+            var want: [n_rows * lp_words]u32 = undefined;
+            var got: [n_rows * lp_words]u32 = undefined;
+            try want_dev.download(0, std.mem.sliceAsBytes(&want));
+            try got_dev.download(0, std.mem.sliceAsBytes(&got));
+            for (0..n_rows) |r| {
+                const w = want[r * lp_words ..][0..lp_words];
+                const g = got[r * lp_words ..][0..lp_words];
+                cases += 1;
+                if (!std.mem.eql(u32, w[2..][0..k], g[2..][0..k]) or !std.mem.eql(u32, w[22..][0..k], g[22..][0..k])) {
+                    differ += 1;
+                    std.debug.print("DIFFER {s}{s} width {d} k {d} row {d}: first ids {d} / {d}\n", .{ @tagName(kind), if (odd) " inf+nan" else "", n, k, r, w[2], g[2] });
+                }
+            }
+        }
+    };
+    std.debug.print("RESULT topk: {d} rows, {d} differ from tf_logprob_rows\n", .{ cases, differ });
+    try check.expect(differ == 0, "topk: {d} of {d} rows differ", .{ differ, cases });
+    check.pass("topk: {d} rows equal tf_logprob_rows' k best", .{cases});
+}

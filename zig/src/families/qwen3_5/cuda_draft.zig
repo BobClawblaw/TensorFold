@@ -173,7 +173,7 @@ pub const Draft = struct {
     act: u64,
     logits: u64,
     words: u64, // u32 logprob words a row
-    picks: u64, // u32 zeros: the logprob rows' pick (unused)
+    parts: u64, // topkRows' slice candidates
     hp: u64,
     ids: u64, // u32 the block's ids
     staged: cuda.HostBuffer, // pinned: the ids up, the words and projected rows down
@@ -197,7 +197,7 @@ pub const Draft = struct {
         const c = try Config.read(gpa, io, dir, e.g);
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .picks = 0, .hp = 0, .ids = 0, .staged = undefined };
+        d.* = .{ .gpa = gpa, .io = io, .e = e, .c = c, .w = undefined, .mod = undefined, .fns = undefined, .scratch = undefined, .taps_in = 0, .th = 0, .thn = 0, .kabs = 0, .kn = 0, .vabs = 0, .xs = 0, .h = 0, .h2 = 0, .x = 0, .xin = 0, .dyn = 0, .qraw = 0, .q = 0, .kraw = 0, .kb = 0, .vb = 0, .att = 0, .o = 0, .gate = 0, .up = 0, .act = 0, .logits = 0, .words = 0, .parts = 0, .hp = 0, .ids = 0, .staged = undefined };
         d.mod = try cuda.Module.load(e.d, cuda.kernels.qwen35_draft);
         errdefer d.mod.unload();
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(d.fns, name) = try d.mod.function("tf_q35d_" ++ name);
@@ -210,7 +210,6 @@ pub const Draft = struct {
         _ = try d.layout(true);
         d.staged = try cuda.HostBuffer.alloc(e.d, stagedLen(c.rank));
         errdefer d.staged.free();
-        try d.picksZero();
         // the first context, and a hold timed on it (the quickest of several: the first ones pay the driver's stalls)
         const ctx = try d.create();
         errdefer d.drop(ctx);
@@ -272,7 +271,7 @@ pub const Draft = struct {
             .{ "qraw", B * c.qWidth() * 2 },             .{ "q", B * c.qWidth() * 2 },       .{ "kraw", B * c.kvWidth() * 2 },              .{ "kb", B * c.kvWidth() * 2 },
             .{ "vb", B * c.kvWidth() * 2 },              .{ "att", B * c.qWidth() * 2 },     .{ "o", B * c.hidden * 2 },                    .{ "gate", B * c.intermediate * 2 },
             .{ "up", B * c.intermediate * 2 },           .{ "act", B * c.intermediate * 2 }, .{ "logits", B * c.vocab * 2 },                .{ "words", B * lp_words * 4 },
-            .{ "picks", B * 4 },                         .{ "hp", B * c.rank * 2 },          .{ "ids", B * 4 },
+            .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },                         .{ "hp", B * c.rank * 2 },          .{ "ids", B * 4 },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -281,11 +280,6 @@ pub const Draft = struct {
             if (assign) @field(d, s[0]) = d.scratch.ptr + at;
         }
         return total;
-    }
-
-    fn picksZero(d: *Draft) !void {
-        const zero: [64]u8 = @splat(0);
-        try d.e.d.check(d.e.d.api.cuMemcpyHtoD_v2(d.picks, &zero, 64), "cuMemcpyHtoD");
     }
 
     fn drop(d: *Draft, ctx: *Ctx) void {
@@ -414,7 +408,7 @@ pub const Draft = struct {
         const rows = B - 1;
         try d.norm(d.h + c.hidden * 2, d.w.final_norm, d.x, rows);
         try d.proj(e.head, d.x, d.logits, rows);
-        try e.draws.logprobRows(e.stream, d.logits, c.vocab, d.picks, @intCast(c.topk), false, d.words, rows);
+        try e.draws.topkRows(e.stream, d.logits, c.vocab, @intCast(c.topk), d.parts, d.words, rows);
         try d.proj(d.w.selector, d.x, d.hp, rows);
         const st = d.staged.bytes;
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
