@@ -6,7 +6,7 @@ const fz = @import("replay.zig");
 /// Rows a window past a stream's last committed token can take.
 pub const WINDOW = fz.MAXR + 1;
 
-/// The sessions past the engine's own from `text` (counts, `CONTEXTxN` for N alike), each at most `capacity`, `most` in all.
+/// Parses up to most extra sessions; CONTEXTxN repeats a size, each capped at capacity.
 pub fn parse(gpa: std.mem.Allocator, text: []const u8, capacity: usize, margin: usize, most: usize) ![]usize {
     var caps: std.ArrayList(usize) = .empty;
     errdefer caps.deinit(gpa);
@@ -24,7 +24,7 @@ pub fn parse(gpa: std.mem.Allocator, text: []const u8, capacity: usize, margin: 
     return try caps.toOwnedSlice(gpa);
 }
 
-/// A new stream's session: unsized the first free one (the caller checks it holds the reply), sized the smallest free one holding the prompt and `grow`.
+/// Chooses first-free when unsized, else the smallest free session holding the prompt and grow tokens.
 pub fn pick(caps: []const usize, used: []const bool, sized: bool, prompt: usize, max_new: usize, grow: usize) ?usize {
     const need = prompt + @min(max_new, grow) + WINDOW;
     var best: ?usize = null;
@@ -39,7 +39,7 @@ pub fn pick(caps: []const usize, used: []const bool, sized: bool, prompt: usize,
 /// What a stream needs from its session before a round.
 pub const Room = enum { ok, move, pause, full };
 
-/// Room in a `cap`-row session at `pos` for a `rows` window, the reply ending by `end`, `most` the largest session, `larger` one free.
+/// Checks the next window and reply end against this session, the largest session and free larger slots.
 pub fn room(cap: usize, pos: usize, rows: usize, end: usize, most: usize, larger: bool) Room {
     if (end <= cap) return .ok; // the reply ends inside this session: it never grows
     if (end > most) return .full; // no session holds it: never wait for one
@@ -57,7 +57,7 @@ pub fn endPaused(stream: *lanes.Stream) void {
     stream.problem = "the reply outgrew its session and could not move to a larger one";
 }
 
-/// Paused streams moved, oldest first: `ctx.moveOut` failing LaneMemory keeps one waiting, any other failure ends it (`ctx.failed`).
+/// Resumes oldest first; LaneMemory waits, other moveOut errors call failed.
 pub fn resumePaused(paused: *std.ArrayList(*lanes.Stream), ctx: anytype) void {
     var k: usize = 0;
     while (k < paused.items.len) {

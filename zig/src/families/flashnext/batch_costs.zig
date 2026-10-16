@@ -36,7 +36,7 @@ pub fn time(b: anytype, s: *Session) !Costs {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const old = try b.bind(s);
-        defer old.restore(b);
+        defer old.restore(b.e);
         s.m.reset();
         const ps = [1]*fz.Prompt{e.pr};
         _ = try fz.Prompt.chunkN(&ps, &s.m, b.gpa, &prompt);
@@ -92,7 +92,7 @@ fn chainMs(b: anytype, s: *Session, depth: usize) !f64 {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const old = try b.bind(s);
-    defer old.restore(b);
+    defer old.restore(b.e);
     s.m.mtp.pos = PROMPT - 1;
     s.m.mtp.drafted = 0;
     const follow = [1]u32{tokenAt(PROMPT)};

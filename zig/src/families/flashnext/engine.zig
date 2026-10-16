@@ -613,7 +613,7 @@ pub const Engine = struct {
     /// Where `decode` left a stream it handed over: its state as a host round leaves it, `cache` rows in the cache.
     pub const Handoff = struct { yielded: bool = false, cache: usize = 0 };
 
-    /// The GPU-side rounds after a prompt pass from `pick` and the last prompt row's `streams`; with `handoff` a cancel hands the stream over.
+    /// GPU rounds after prefill; cancellation yields through handoff when supplied.
     pub fn decode(e: *Engine, prompt: []const u32, pick: u32, streams: Buf, max_tokens: usize, eos: []const u32, depth: ?usize, watch: *think.Watch, out: Out, handoff: ?*Handoff) !Result {
         const r = e.r;
         const m = e.m;
@@ -827,7 +827,7 @@ pub const Engine = struct {
         return res;
     }
 
-    /// The rounds handed over at `cache` rows: the round ahead already started as rounds do; the n-gram tail into the model's own buffer.
+    /// Hands over at cache rows after the queued round, restoring the n-gram tail.
     fn handOver(e: *Engine, h: *Handoff, round: usize, cache: usize) !void {
         if (e.r.gdn_kept != null) return error.HandoffUnsupported; // kept states replay their rows in the next window
         if ((round - 1) % 2 == 1) {

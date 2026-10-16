@@ -40,8 +40,7 @@ pub fn encode(e: *Engine, segs: []const Seg, rows: usize, ids: Buf) !void {
         }
         try m.hcProject(t.h[cur], l.ahc, "qa_hc_down@ahc", "qa_hc_up@ahc", t.inj_a);
         try m.lane(t.mixed, fz.D, l.proj, if (l.linear) "lane_qmm_bytes_grouped@gdn.in" else "lane_qmm_bytes_grouped@att.proj", t.p);
-        r.touch(l.out.wq);
-        r.touch(l.out.sbt);
+        @import("lane_w.zig").touch(r, l.out);
         if (l.linear) {
             for (segs) |g| {
                 const v = view(t.*, g.row0);

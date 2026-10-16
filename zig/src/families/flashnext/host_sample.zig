@@ -1,8 +1,12 @@
-//! The keyed host sampler over a bf16 logits row, in one pass: the top-k candidates by an order-preserving integer key
-//! of each bf16 word, then lanes.sampling.choose. The candidates, their order and the draw equal `reference`, which is
-//! qwen3_5/backend.zig's draw without its mask (two passes in f64), kept here for wide top-k and the tests.
+//! Keyed bf16 sampling with bounded top-k or sorted wide candidates, matching the reference draw.
 const std = @import("std");
 const lanes = @import("lanes");
+
+/// Positive-temperature sampling for a stream, or null for the GPU argmax.
+pub fn active(params: ?lanes.Sampling) ?lanes.Sampling {
+    const p = params orelse return null;
+    return if (p.temperature > 0) p else null;
+}
 
 extern "c" fn exp(x: f64) f64; // libm's, as lanes.sampling's
 extern "c" fn log(x: f64) f64;
@@ -87,9 +91,7 @@ pub fn draw(gpa: std.mem.Allocator, logits: []const u16, p: lanes.Sampling, posi
     return @intCast(try lanes.sampling.choose(gpa, values[0..filled], ids[0..filled], position, p));
 }
 
-/// A wide or unlimited top-k as `reference` draws it: the candidates in choose's order by a counting sort of their
-/// keys (ids ascending within one), top-p and min-p cut as choose cuts them, then the keyed Gumbel draw in that order,
-/// passing over candidates whose noise cannot lift them past the best score so far (most, without their two logs).
+/// Wide top-k in reference order, with probability cuts and bounded-noise skips before the keyed draw.
 fn wide(gpa: std.mem.Allocator, logits: []const u16, p: lanes.Sampling, position: u64) !u32 {
     const starts = try gpa.alloc(u32, 1 << 16);
     defer gpa.free(starts);
@@ -163,11 +165,11 @@ const below_e = blk: {
     break :blk e;
 };
 
-/// Whether the noise for `id` stays a nat short of `d`: -log(-log u) <= -log(1 - u), so 1 - u >= exp(-(d - 1))
-/// bounds it by d - 1, against exp of a whole nat at or below d - 1. 1 - u is exact for the f64 u the draw uses
-/// (Sterbenz past 0.5; below it the bound cannot hold), and a u rounded to 1 gives 0: never passed over.
+/// Whether the Gumbel noise stays below d - 1; a uniform value rounded to 1 is never skipped.
 fn beyondReach(seed: u64, position: u64, id: u64, d: f64) bool {
+    // Above 0.5 this subtraction is exact; below it the bound cannot hold.
     const one_minus_u = 1.0 - lanes.sampling.uniform(seed, position, id);
+    // -log(-log u) <= -log(1-u); compare against the whole-nat bound below d - 1.
     const j: usize = @intFromFloat(@floor(d) - 1);
     return one_minus_u >= below_e[j] * (1 + 1e-9);
 }

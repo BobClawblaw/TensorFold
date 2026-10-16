@@ -142,7 +142,7 @@ pub const Session = struct {
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));
     }
 
-    /// This session's stream into `dst`, a free larger session: cache rows, states, n-gram tail and head copied on the GPU.
+    /// Copies this session's cache, recurrent state, n-gram tail and head to a free larger session on the GPU.
     pub fn moveTo(s: *Session, dst: *Session, e: *Engine) !void {
         const m = &s.m;
         const d = &dst.m;
@@ -216,7 +216,7 @@ pub const Session = struct {
         }
     }
 
-    /// encodeDrafts' drafts once their command buffer is done: held, the head's chained rows trimmed at its next absorb.
+    /// Reads completed encoded drafts and trims chained rows at the next absorb.
     pub fn heldDrafts(s: *Session, depth: usize) void {
         s.m.mtp.drafted = depth -| 1;
         @memcpy(s.held[0..depth], s.draft_ids.b.slice(u32, depth));

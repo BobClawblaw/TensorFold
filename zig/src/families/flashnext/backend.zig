@@ -1,4 +1,4 @@
-//! Flash Next's isolated sessions behind the shared lane scheduler; target rounds batch, MTP drafts are serial.
+//! Isolated Flash Next sessions sharing target rounds and MTP command buffers.
 const std = @import("std");
 const lanes = @import("lanes");
 const fz = @import("replay.zig");
@@ -16,12 +16,6 @@ const slots = @import("slots.zig");
 const sample = @import("host_sample.zig");
 const think = @import("think.zig");
 const batch_costs = @import("batch_costs.zig");
-
-/// A stream's sampling when it samples (a temperature above 0); null: the GPU's argmax stands.
-fn sampling(stream: *const Stream) ?lanes.Sampling {
-    const p = stream.sampling orelse return null;
-    return if (p.temperature > 0) p else null;
-}
 
 /// Row `row` of a [rows, VOCAB] bf16 logits buffer, drawn with `p` keyed at `position`.
 fn drawRow(gpa: std.mem.Allocator, logits: Buf, row: usize, p: lanes.Sampling, position: u64) !u32 {
@@ -70,7 +64,7 @@ pub const Backend = struct {
         return .{ .gpa = gpa, .e = e, .primary = e.m, .sessions = sessions, .hidden = .{ .b = hidden }, .chain_drafts = env.on("FZ_BATCH_MTP_CHAIN"), .serial_drafts = env.on("FZ_BATCH_MTP_SERIAL") };
     }
 
-    /// The lane allocator's prices, timed on the last session before any stream holds it; none (unpriced) when it can't be.
+    /// Times shared-round costs on the last free session, or leaves them unpriced when it cannot fit.
     pub fn timeCosts(b: *Backend) !void {
         if (std.c.getenv("FZ_BATCH_UNPRICED") != null) {
             std.log.info("flash next: FZ_BATCH_UNPRICED=1: shared rounds unpriced, nothing timed", .{});
@@ -101,8 +95,7 @@ pub const Backend = struct {
 
     pub fn facts(b: *Backend) lanes.Model {
         const c: ?*const batch_costs.Costs = if (b.costs) |*x| x else null;
-        // shared rounds priced from the timed forwards, each draft past a stream's first at a chained step's time; a
-        // lone stream's depth from the same (FZ_LONE_UNPRICED=1: the heuristic)
+        // Timed forwards price shared rounds; each extra draft costs one chained head step.
         const lone_priced = c != null and std.c.getenv("FZ_LONE_UNPRICED") == null; // not `lone`: that names the lone driver
         return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (lone_priced) &c.?.shared else &.{}, .mtp_step_ms = if (lone_priced) c.?.step_ms else 0 };
     }
@@ -136,37 +129,13 @@ pub const Backend = struct {
         };
     }
 
-    const Binding = struct {
-        model: *fz.Model,
-        host: @FieldType(Engine, "host"),
-        cins: [2]Buf,
-        select: ?fz.Select,
-        shape: @TypeOf(@as(fz.Select, undefined).q_shape),
-        passed: @FieldType(Engine, "passed"),
-        pub fn restore(old: Binding, b: *Backend) void {
-            b.e.m = old.model;
-            b.e.host = old.host;
-            b.e.cins = old.cins;
-            b.e.r.sel = old.select;
-            b.e.r.shapes.put(b.e.r.arena, "Kc_shape", old.shape) catch unreachable;
-            b.e.passed = old.passed;
-        }
-    };
+    const Binding = @import("session_binding.zig").Binding;
 
-    pub fn bind(b: *Backend, s: *Session) !Binding {
-        const e = b.e;
-        const old: Binding = .{ .model = e.m, .host = e.host, .cins = e.cins, .select = e.r.sel, .shape = e.r.shapes.get("Kc_shape").?, .passed = e.passed };
-        try e.r.shapes.put(e.r.arena, "Kc_shape", s.shape);
-        e.m = &s.m;
-        e.host = .{ .rows = s.m.t.rows, .mdims = s.m.t.mdims, .pos8 = s.m.t.pos8, .nk8 = s.m.t.nk8, .kvmeta = s.m.t.kvmeta, .slots = s.m.mtp.slots };
-        e.cins[0] = s.m.ple.cin;
-        e.r.sel = s.select[fz.CATCH - 1];
-        e.passed = null;
-        e.hostMode();
-        return old;
+    pub fn bind(b: *Backend, session_: *Session) !Binding {
+        return @import("session_binding.zig").bind(b.e, session_);
     }
 
-    /// A new stream's session (slots.pick); LaneMemory while only a busy one holds it (it waits), ContextFull when none can.
+    /// Chooses a slot; LaneMemory means wait, ContextFull means no session can hold the reply.
     fn slotFor(b: *Backend, prompt: usize, max_new: usize) !usize {
         var caps: [fz.MAXR]usize = undefined;
         var used: [fz.MAXR]bool = undefined;
@@ -184,7 +153,7 @@ pub const Backend = struct {
         return i;
     }
 
-    /// Before a round, sized only: a stream its session cannot hold to its reply's end moves to a free larger one, or pauses (slots.room).
+    /// Moves or pauses a sized stream when its remaining reply needs a larger session.
     fn makeRoom(b: *Backend, stream: *Stream, rows: usize) !void {
         if (!b.sized) return;
         const i = b.by.get(stream) orelse return error.UnknownStream;
@@ -209,7 +178,7 @@ pub const Backend = struct {
         }
     }
 
-    /// The stream in session `i` into the smallest free larger session holding its next `grow` tokens, else the largest free larger one.
+    /// Moves to the smallest free larger session holding the next grow tokens, or the largest available.
     fn move(b: *Backend, stream: *Stream, i: usize) !void {
         const from = &b.sessions[i];
         const left: usize = @intCast(@max(stream.budgetLeft(), 0));
@@ -231,7 +200,7 @@ pub const Backend = struct {
         std.log.info("flash next: a stream at {d} tokens moved from a {d}-token session to a {d}-token one ({d} moves)", .{ from.m.pos, from.m.cap, b.sessions[j].m.cap, b.moves });
     }
 
-    /// Paused streams into sessions that freed (slots.resumePaused): a move that fails but for LaneMemory ends the stream.
+    /// Resumes paused streams; errors other than LaneMemory terminate the affected stream.
     fn resumePaused(b: *Backend) void {
         slots.resumePaused(&b.paused, b);
     }
@@ -283,7 +252,7 @@ pub const Backend = struct {
         s.row0 = 0;
         outputs(b, s, 0);
         const old = try b.bind(s);
-        defer old.restore(b);
+        defer old.restore(b.e);
         s.m.reset();
         stream.cached = 0;
         if (stream.reuse.saved) |saved| {
@@ -309,8 +278,8 @@ pub const Backend = struct {
             end = at + call.rows;
             const ps = [2]*fz.Prompt{ b.e.pr, b.e.pr2 };
             s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
-            // the pass's last row's logits are in the model's head buffer until the next forward: a sampled first token now
-            if (end == prompt.len) if (sampling(stream)) |p| {
+            // Sample before the next forward replaces the last prompt row's logits.
+            if (end == prompt.len) if (sample.active(stream.sampling)) |p| {
                 s.first = try drawRow(b.gpa, s.m.t.logits, 0, p, prompt.len);
             };
             for (ps[0..call.parts], 0..) |p, k| {
@@ -329,13 +298,7 @@ pub const Backend = struct {
         s.m.mtp.drafted = 0;
     }
 
-    /// Commits a lone stream's first token; its prompt as the context holds it after the commit, which can move it.
-    fn commitFirst(gpa: std.mem.Allocator, stream: *Stream, token: u32) ![]const u32 {
-        _ = try stream.commit(gpa, &.{token}, &.{});
-        return stream.prompt();
-    }
-
-    /// LaneHost's lone driver: the shared prompt pass into session 0, then the engine's rounds until done (false) or handed over (true).
+    /// Runs a lone request in session 0 until it finishes or hands over to shared rounds.
     pub fn lone(b: *Backend, stream: *Stream, hooks: anytype) !bool {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
@@ -345,7 +308,7 @@ pub const Backend = struct {
         var handed = false;
         defer if (!handed) release(b, stream);
         try b.fill(stream, 0);
-        const prompt = try commitFirst(b.gpa, stream, s.first); // decode copies it to the rounds' history before any round commits
+        const prompt = try @import("lone_stream.zig").commitFirst(b.gpa, stream, s.first); // decode copies it to the rounds' history before any round commits
         hooks.committed(hooks.ctx);
         if (stream.finished) return false;
         const Hooks = @TypeOf(hooks);
@@ -373,7 +336,7 @@ pub const Backend = struct {
         var ho: Engine.Handoff = .{};
         {
             const old = try b.bind(s);
-            defer old.restore(b);
+            defer old.restore(b.e);
             outputs(b, s, 0);
             var watch = try think.Watch.init(.{}); // no thinking budget: lone_host_lone.fits keeps those in the lane core
             const res = try b.e.decode(prompt, s.first, s.last, stream.max_new, stream.eos, null, &watch, .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled }, &ho);
@@ -480,7 +443,7 @@ pub const Backend = struct {
         try b.primary.finish(cb);
         Session.copy(b.primary.last, b.hidden, plan.total * fz.WIDE * 2);
         for (out, 0..) |o, i| @memcpy(o.sampled, t.picks.b.slice(u32, plan.total)[plan.starts[i]..][0..o.sampled.len]);
-        for (windows, out, 0..) |w, o, i| if (sampling(w.stream)) |p| {
+        for (windows, out, 0..) |w, o, i| if (sample.active(w.stream.sampling)) |p| {
             for (o.sampled, w.positions, 0..) |*tok, pos, j| tok.* = try drawRow(b.gpa, t.logits, plan.starts[i] + j, p, pos);
         };
         b.window_count += 1;
@@ -518,7 +481,7 @@ pub const Backend = struct {
                 break :blk b.hidden.at(s.row0 * fz.WIDE * 2);
             } else s.last;
             const old = try b.bind(s);
-            defer old.restore(b);
+            defer old.restore(b.e);
             s.held_n = r.depth;
             if (follow.len == 0) return error.DraftOutOfStep;
             const start = mtl.clock.seconds();
@@ -565,7 +528,7 @@ pub const Backend = struct {
             if (follows[k].len > fz.MAXR) { // all but the last MAXR rows absorbed first, on their own
                 const cut = follows[k].len - fz.MAXR;
                 const old = try b.bind(s);
-                defer old.restore(b);
+                defer old.restore(b.e);
                 _ = try s.m.mtpAbsorb(follows[k][0..cut], hiddens[k]);
                 hiddens[k] = hiddens[k].at(cut * fz.WIDE * 2);
                 follows[k] = follows[k][cut..];
@@ -577,7 +540,7 @@ pub const Backend = struct {
         for (requests, 0..) |r, k| {
             const s = try b.session(r.stream);
             const old = try b.bind(s);
-            defer old.restore(b);
+            defer old.restore(b.e);
             s.encodeDrafts(follows[k], hiddens[k], r.depth) catch |err| {
                 b.e.r.enc.end();
                 return err;
@@ -620,7 +583,7 @@ pub const Backend = struct {
         const b = self(ptr);
         const s = try b.session(@ptrCast(@alignCast(owner orelse return error.NoStream)));
         const old = try b.bind(s);
-        defer old.restore(b);
+        defer old.restore(b.e);
         return try snap.save(b.e, b.gpa, at);
     }
     pub fn snapRestore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
@@ -630,18 +593,3 @@ pub const Backend = struct {
         snap.drop(self(ptr).gpa, @ptrCast(@alignCast(saved)));
     }
 };
-
-test "a lone stream's prompt is read after its first token's commit moves the context" {
-    const gpa = std.testing.allocator;
-    const tokens = [_]u32{ 11, 12, 13, 14, 15, 16, 17 };
-    var stream = try Stream.init(gpa, .{ .id = "lone", .prompt = &tokens, .max_new = 4, .eos = &.{} });
-    defer stream.deinit(gpa);
-    stream.context.shrinkAndFree(gpa, stream.context.items.len); // full: the first token must grow it
-    var failing = std.testing.FailingAllocator.init(gpa, .{ .resize_fail_index = 0 }); // and not in place
-    const before = stream.context.items.ptr;
-    const prompt = try Backend.commitFirst(failing.allocator(), &stream, 99);
-    try std.testing.expect(stream.context.items.ptr != before);
-    try std.testing.expectEqual(stream.context.items.ptr, prompt.ptr);
-    try std.testing.expectEqualSlices(u32, &tokens, prompt);
-    try std.testing.expectEqualSlices(u32, &.{99}, stream.emitted());
-}
