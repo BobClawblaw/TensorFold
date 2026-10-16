@@ -423,11 +423,6 @@ fn learnedStates(gpa: Allocator, io: std.Io, eng: *fx.Engine, root: []const u8, 
 pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, speed_up: ?[]const u8, cache_gib: ?f64, over_cap: bool, learn: ?Learn, a: Allocator, why: *[]const u8) !*Host {
     const eng = try fx.Engine.loadWith(gpa, io, dir, dump, speed_up);
     errdefer eng.deinit();
-    return openLoaded(gpa, io, eng, window, cache_gib, over_cap, learn, null, a, why);
-}
-
-/// Opens a loaded engine without loading its weights again; the caller retains ownership on error.
-pub fn openLoaded(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cache_gib: ?f64, over_cap: bool, learn: ?Learn, limit: ?u64, a: Allocator, why: *[]const u8) !*Host {
     if (learn != null and eng.r.tp != null) {
         why.* = "--learn is not kept across a Flash Next pair yet: leave it out, or serve on one Mac";
         return error.LearnOnPair;
@@ -436,6 +431,11 @@ pub fn openLoaded(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cach
         std.log.err("flash next: warm-up failed: {s}", .{@errorName(err)});
         return err;
     };
+    return openWarmed(gpa, io, eng, window, cache_gib, over_cap, learn, null, a, why);
+}
+
+/// Takes an already warmed engine without loading or warming again; the caller retains ownership on error.
+pub fn openWarmed(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cache_gib: ?f64, over_cap: bool, learn: ?Learn, limit: ?u64, a: Allocator, why: *[]const u8) !*Host {
     const cache_plan = try cacheBudget(eng, cache_gib, over_cap, limit, a, why);
     const budget = cache_plan.budget_bytes;
     eng.peer_budget = budget; // rank 1: its kept states and free buffers stay inside the same budget
