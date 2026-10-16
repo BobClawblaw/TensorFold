@@ -29,6 +29,38 @@ pub fn nodes() usize {
     return @min(n, engine.most_window - 1);
 }
 
+/// Offered tree nodes (their parent's row kept) and those that landed, by own log-chance in half-nat bins: greedy
+/// rounds', then every round's (as the 27B engine keeps them). A node's chance is its bin's, its own chance the prior.
+pub const Landing = struct {
+    counts: [2][16][2]f64 = @splat(@splat(.{ 0, 0 })),
+
+    fn bin(own: f64) usize {
+        return @min(15, @as(usize, @intFromFloat(@max(0, @floor(-own / 0.5)))));
+    }
+
+    pub fn observe(l: *Landing, sampled: bool, own: f64, landed: bool) void {
+        for (l.counts[@intFromBool(sampled)..]) |*table| {
+            const x = &table[bin(own)];
+            x[0] += 1;
+            if (landed) x[1] += 1;
+        }
+    }
+
+    pub fn chance(l: *const Landing, sampled: bool, own: f64) f64 {
+        const x = l.counts[@intFromBool(sampled)][bin(own)];
+        return (x[1] + 2 * @exp(own)) / (x[0] + 2);
+    }
+
+    /// A verified window's offered nodes (the first `offered`, node i at row i + 1) against the rows it kept.
+    pub fn observeTree(l: *Landing, sampled: bool, parents: []const i32, own: []const f64, offered: usize, kept: []const u32) void {
+        for (parents[0..@min(offered, parents.len)], own[0..@min(offered, own.len)], 0..) |p, o, i| {
+            const parent_row: u32 = if (p < 0) 0 else @intCast(p + 1);
+            if (std.mem.indexOfScalar(u32, kept, parent_row) == null) continue;
+            l.observe(sampled, o, std.mem.indexOfScalar(u32, kept, @intCast(i + 1)) != null);
+        }
+    }
+};
+
 fn bf16(h: u16) f64 {
     return @as(f32, @bitCast(@as(u32, h) << 16));
 }
@@ -147,6 +179,20 @@ pub fn grow(c: Candidates, pending: u32, rows: usize, most: usize, tokens: []u32
         count += 1;
     }
     return count;
+}
+
+test "landing: a node is offered when its parent's row is kept, and landed when its own is" {
+    var l: Landing = .{};
+    // nodes 0 and 1 under the pending row, node 2 under node 0; the window kept rows 0, 1 (node 0) and 3 (node 2)
+    l.observeTree(false, &.{ -1, -1, 0 }, &.{ -0.1, -1.2, -0.3 }, 3, &.{ 0, 1, 3 });
+    try std.testing.expectEqual(@as(f64, 2), l.counts[0][0][0]); // nodes 0 and 2, both landed
+    try std.testing.expectEqual(@as(f64, 2), l.counts[0][0][1]);
+    try std.testing.expectEqual(@as(f64, 1), l.counts[0][2][0]); // node 1 offered, not landed
+    try std.testing.expectEqual(@as(f64, 0), l.counts[0][2][1]);
+    try std.testing.expectEqual(l.counts[0], l.counts[1]); // greedy rounds count for sampled streams too
+    l.observeTree(true, &.{-1}, &.{-0.1}, 1, &.{0});
+    try std.testing.expect(l.chance(true, -0.1) < l.chance(false, -0.1));
+    try std.testing.expectApproxEqAbs((2 + 2 * @exp(@as(f64, -0.1))) / 4, l.chance(false, -0.1), 1e-12);
 }
 
 test "best first: a node's children follow it, the cheapest open node first, chances that sum to one a row" {

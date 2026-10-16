@@ -16,6 +16,8 @@ const Stream = lanes.Stream;
 const max_rows = engine.max_rows;
 /// The logprob row's words (sample.cu's LP_WORDS) and its best-token capacity.
 const lp_words = 3 + 2 * 20;
+/// A hold's rows: the reference's 16-row blocks (dflash2.block), past the 8 the checkpoint was trained with.
+const draft_block = 16;
 const lp_top = 20;
 
 pub const Config = struct {
@@ -98,7 +100,8 @@ pub const Config = struct {
         // what the kernels fix: the head width, two-tap convolutions, a block of 8, the selector's top-k within a row
         if (c.head_dim != 128 or try int(d.object, "conv_kernel_size") != 2 or c.block != 8 or c.topk > lp_top or c.mask >= c.vocab) return error.UnsupportedDraftConfig;
         if (c.hidden != target.hidden or c.vocab != target.vocab or c.hidden % 256 != 0 or c.hidden % c.group != 0 or c.heads % c.kv_heads != 0 or c.layers > 8) return error.UnsupportedDraftConfig;
-        if (c.window < c.block or c.window > engine.tap_rows - max_rows) return error.UnsupportedDraftConfig;
+        if (c.window < draft_block or c.window > engine.tap_rows - max_rows) return error.UnsupportedDraftConfig;
+        c.block = draft_block;
         return c;
     }
 };
@@ -185,6 +188,8 @@ pub const Draft = struct {
     streams: std.AutoHashMapUnmanaged(*Stream, *Ctx) = .empty,
     /// Contexts between streams, allocated and run once (`reserve`), as the driver stalls a buffer's first kernel.
     pool: std.ArrayList(*Ctx) = .empty,
+    /// Grown trees' nodes offered and landed, by own chance: the nodes' chances the round loop prices.
+    landing: tree.Landing = .{},
     /// One level of a hold (a hold drafts every level at once; timed at load, over the block's levels).
     step_ms: f64 = 1.0,
     /// The target's window ms by rows (cuda_native.zig times them), for the round loop's prices.
@@ -483,6 +488,13 @@ pub const Draft = struct {
         for (items) |it| {
             const ctx = d.streams.get(it.stream) orelse return error.UnknownStream;
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
+            if (it.offered > 0 and ctx.grown > 0) {
+                var prefix: [engine.most_window]u32 = undefined;
+                for (prefix[0..@min(it.follow.len, prefix.len)], 0..) |*x, i| x.* = @intCast(i);
+                const kept = it.rows orelse prefix[0..@min(it.follow.len, prefix.len)];
+                d.landing.observeTree(it.stream.sampling != null, ctx.parents[0..ctx.grown], ctx.own[0..ctx.grown], it.offered, kept);
+            }
+            ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
             if (it.rows) |rs| {
                 try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs);
@@ -518,12 +530,13 @@ pub const Draft = struct {
         return .{ .count = @intCast(ctx.grown), .tokens = tokens, .parents = try gpa.dupe(i32, ctx.parents[0..ctx.grown]) };
     }
 
-    /// A grown tree's nodes' chances: each its own chance under its parent times its parent's.
+    /// A grown tree's nodes' chances: each its landing chance under its parent times its parent's.
     fn chancesFn(p: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
         const d = cast(p);
         const ctx = d.streams.get(s) orelse return error.UnknownStream;
         if (ctx.grown == 0 or out.len > ctx.grown) return false;
-        for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| o.* = @exp(own) * (if (parent >= 0) out[@intCast(parent)] else 1);
+        const sampled = s.sampling != null;
+        for (out, ctx.parents[0..out.len], ctx.own[0..out.len]) |*o, parent, own| o.* = d.landing.chance(sampled, own) * (if (parent >= 0) out[@intCast(parent)] else 1);
         return true;
     }
 
@@ -534,7 +547,7 @@ pub const Draft = struct {
 };
 
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
-const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4 };
+const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4, 0.37, 0.35, 0.33, 0.31, 0.29, 0.28, 0.27, 0.26 };
 
 /// TF_TIMING=1: each call's wall time on stderr.
 pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {

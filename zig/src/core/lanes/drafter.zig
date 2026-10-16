@@ -21,7 +21,14 @@ pub const Facts = struct {
 };
 
 /// Target rows [start, start + features.rows) and the token after each; `rows`, when given, picks which to absorb.
-pub const Absorb = struct { stream: *Stream, features: Features, start: u64, follow: []const u32, rows: ?[]const u32 = null };
+pub const Absorb = struct {
+    stream: *Stream,
+    features: Features,
+    start: u64,
+    follow: []const u32,
+    rows: ?[]const u32 = null,
+    offered: u32 = 0, // the drafter's grown tree's first nodes the verified window carried (0: none of its own)
+};
 
 /// `depth` drafts after `pending` at `position`; with `lanes` a tree, lane i the rank-r choice after its parent.
 pub const Hold = struct { stream: *Stream, pending: u32, position: u64, depth: u32, lanes: ?*const Shape = null };
