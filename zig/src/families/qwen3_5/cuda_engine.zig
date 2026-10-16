@@ -322,7 +322,7 @@ pub const Engine = struct {
 
     fn projSums(e: *Engine, l: Affine4, x: u64, out: u64, rows: usize, prompt: bool, sums: bool) !void {
         if (prompt and rows > 16) return e.affine.prompt(e.stream, x, l, out, rows);
-        if (sums) try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, e.xs, @as(c_int, @intCast(l.k)), e.tables.ptr + params_at });
+        if (sums) try e.run(e.fns.sums, .{ rows, (l.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, e.xs, @as(c_int, @intCast(l.k)), e.tables.ptr + params_at });
         var at: usize = 0;
         while (at < rows) : (at += 16) {
             const n = @min(16, rows - at);

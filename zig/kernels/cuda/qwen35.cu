@@ -9,6 +9,19 @@ __device__ __forceinline__ bool past_rows(const int* P, int m) { return P != nul
 __device__ __forceinline__ bool past_windows(const int* P, int s) { return P != nullptr && s >= P[3]; }
 __device__ __forceinline__ bool recorded(const int* P) { return P != nullptr && P[4] != 0; }
 
+// One 64-entry group's sum, its entries added in order (x 16-byte aligned).
+__device__ __forceinline__ float group_sum(const __nv_bfloat16* x) {
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 64; j += 8) {
+        const uint4 w = *reinterpret_cast<const uint4*>(x + j);
+        const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&w);
+#pragma unroll
+        for (int k = 0; k < 8; k++) s += bf(b[k]);
+    }
+    return s;
+}
+
 // MLX affine 4-bit token rows: out = bf16(s * q + b), D wide.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_embed(const int* __restrict__ ids, const uint8_t* __restrict__ W,
                                                                  const __nv_bfloat16* __restrict__ S, const __nv_bfloat16* __restrict__ B,
@@ -31,7 +44,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
                                                                const int* __restrict__ P, float* __restrict__ XS) {
     constexpr int MAXE = 32;
     __shared__ float red[8];
-    __shared__ __nv_bfloat16 xrow[8192];
+    __shared__ __align__(16) __nv_bfloat16 xrow[8192];
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
     const int t = threadIdx.x;
@@ -90,23 +103,15 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     }
     if (XS == nullptr) return;
     __syncthreads();
-    for (int g = t; g < D / 64; g += blockDim.x) {
-        float s = 0.0f;
-        for (int j = 0; j < 64; j++) s += bf(xrow[g * 64 + j]);
-        XS[row * (D / 64) + g] = s;
-    }
+    for (int g = t; g < D / 64; g += blockDim.x) XS[row * (D / 64) + g] = group_sum(xrow + g * 64);
 }
 
-// The 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows), a thread a group.
-extern "C" __global__ void tf_q35_sums(const __nv_bfloat16* __restrict__ X, float* __restrict__ XS, int D, const int* __restrict__ P) {
+// The 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows, groups / 64), a thread a group.
+extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X, float* __restrict__ XS, int D, const int* __restrict__ P) {
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
-    for (int g = threadIdx.x; g < D / 64; g += blockDim.x) {
-        const __nv_bfloat16* x = X + row * D + g * 64;
-        float s = 0.0f;
-        for (int j = 0; j < 64; j++) s += bf(x[j]);
-        XS[row * (D / 64) + g] = s;
-    }
+    const int g = blockIdx.y * blockDim.x + threadIdx.x;
+    if (g < D / 64) XS[row * (D / 64) + g] = group_sum(X + row * D + g * 64);
 }
 
 // Conv, silu, q/k norms, the linear heads' decay and write: a warp a (row, head) over q, k, v; taps from the parents.

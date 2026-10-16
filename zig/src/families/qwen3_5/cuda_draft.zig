@@ -327,7 +327,7 @@ pub const Draft = struct {
     fn projSums(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize, sums: bool) !void {
         const e = d.e;
         if (rows > 16) return e.affine.prompt(e.stream, x, l, out, rows);
-        if (sums) try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.k)), @as(u64, 0) });
+        if (sums) try e.run(e.fns.sums, .{ rows, (l.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.k)), @as(u64, 0) });
         try e.affine.decode(e.stream, x, d.xs, l, out, rows);
     }
 
