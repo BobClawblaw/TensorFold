@@ -71,6 +71,56 @@ path, resolved matmul route and GPU identity; changing arithmetic requires a fre
 Load-time shared-forward checks compare each stream with its own call. A failed check limits forwards
 to one stream, while successful checks allow the lane engine to combine requests.
 
+## Native Metal shared sessions
+
+The native 6-bit MTP engine enables shared target rounds with an explicit `--parallel N` above one:
+
+```bash
+tensorfold-native serve TensorFold/Qwen3.8-Flash-Next-MLX-6bit-MTP \
+  --parallel 4 --context 16384 --temperature 0
+```
+
+Each request holds its own recurrent state, attention cache, n-gram history and MTP cache. The scheduler packs
+up to 16 target rows, including draft rows, into one layer loop. Projections and experts process those rows
+together; recurrence, convolution and attention read each request's own state. MTP heads draft serially.
+New requests join between rounds, and cancelling a request releases its slot for another request.
+
+`auto` and `--parallel 1` retain the existing single-reply driver. Shared sessions currently run on one Mac;
+`--parallel N` above one with `--speed-up` is refused. Use `--parallel 1` for the two-Mac link.
+
+The ceiling is 70% of RAM, or `FLASHNEXT_LOAD_LIMIT_GB` (GB, up to the GPU's recommended working set). It covers the
+server's whole footprint: the model, the sessions and the prompt cache. Left out, `--prompt-cache-gib` takes what the
+sessions leave under it; a given budget must fit under the same ceiling, and only `--prompt-cache-over-cap` lets it
+pass.
+
+Additional slots allocate caches for the selected context. Startup reserves their metadata and the prompt-cache
+budget, then checks the physical footprint before accepting requests. A fixed slot count that does not fit is
+refused; lower the count, context or prompt-cache budget. `--prompt-cache-over-cap` overrides only the prompt-cache
+budget. Shared sessions sample: a request with a temperature draws each token on the host from the head's logits
+with the server's keyed sampler (top-k, top-p, min-p, a `seed` or one derived from the prompt), so a sampled reply is
+the same with drafting on and off and alone or beside other streams. `--parallel 1` still decodes greedily only.
+
+The checkpoint gate compares shared replies with fresh legacy replies, with drafting off and on, then checks
+prompt admission, cancellation, slot reuse and a restored prefix while another request remains active:
+
+```bash
+zig build tf-flashnext-batch
+python tools/zig/flashnext_batch_prompts.py MODEL_DIR /tmp/flashnext-prompts
+FZ_N=128 zig-out/bin/tf-flashnext-batch MODEL_DIR /tmp/flashnext-prompts/*.json
+```
+
+Run with one model process on the GPU. For a served comparison with identical requests and settings:
+
+```bash
+zig build native
+python tools/zig/flashnext_batch_serve.py zig-out/native/bin/tensorfold-native \
+  MODEL_DIR /tmp/flashnext-prompts /tmp/flashnext-served --parallel 1,4
+```
+
+The served gate starts one server at a time on loopback port 52417, compares response bodies with the serial
+reference and records wall time, generated tokens and peak running and waiting requests. End-to-end time includes
+the prompts. The checkpoint gate separately establishes exact token equality.
+
 ## CUDA
 
 On CUDA Flash Next serves NVFP4 and EXL3 checkpoints, and the MLX 4-bit checkpoint as the portable option: the same

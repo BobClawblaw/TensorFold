@@ -56,6 +56,7 @@ pub const Engine = struct {
                 .family_costs = &cfg.family_costs,
                 .shared_costs = &cfg.shared_costs,
                 .mtp_step_ms = cfg.mtp_step_ms,
+                .draft_step_ms = cfg.draft_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
                 .batch_rows = cfg.batch_rows,
@@ -306,7 +307,10 @@ pub const Engine = struct {
             for (heads.items, budgets) |i, d| try e.draftLate(plans[i].stream, plans[i].position, outcomes[i].follow, outcomes[i].path, d);
         }
         try e.backend.keep(windows, paths);
-        const ms = e.clock.elapsedMs(.overhead);
+        // the drafts budgets priced past each stream's first are no part of the round's overhead
+        var steps: i64 = 0;
+        for (budgets) |d| steps += @max(0, d - 1);
+        const ms = e.clock.elapsedMs(.overhead) - e.cfg.draft_step_ms * @as(f64, @floatFromInt(steps));
         try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(plans.len)), f("rows", int(total)), f("ms", ev.bits(ms)) });
         try e.rule.observeOverhead(@intCast(plans.len), total, ms, sampled, e.rule.headMs(budgets));
     }
