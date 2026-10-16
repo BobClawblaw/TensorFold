@@ -29,8 +29,7 @@ pub fn nodes() usize {
     return @min(n, engine.most_window - 1);
 }
 
-/// Offered tree nodes (their parent's row kept) and those that landed, by own log-chance in half-nat bins: greedy
-/// rounds', then every round's (as the 27B engine keeps them). A node's chance is its bin's, its own chance the prior.
+/// Offered tree nodes (parent row kept) and landed ones by own log-chance in half-nat bins, greedy then every round's.
 pub const Landing = struct {
     counts: [2][16][2]f64 = @splat(@splat(.{ 0, 0 })),
 
