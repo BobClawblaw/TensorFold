@@ -113,12 +113,20 @@ Run with one model process on the GPU. For a served comparison with identical re
 ```bash
 zig build native
 python tools/zig/flashnext_batch_serve.py zig-out/native/bin/tensorfold-native \
-  MODEL_DIR /tmp/flashnext-prompts /tmp/flashnext-served --parallel 1,4
+  MODEL_DIR /tmp/flashnext-prompts /tmp/flashnext-served \
+  --parallel 1,default,auto,4 --context 16384 --require-shared-rounds
 ```
 
-The served gate starts one server at a time on loopback port 52417, compares response bodies with the serial
-reference and records wall time, generated tokens and peak running and waiting requests. End-to-end time includes
-the prompts. The checkpoint gate separately establishes exact token equality.
+The served gate starts one server at a time on loopback port 52417. `default` omits `--parallel`; `auto` passes
+it explicitly. Each block uses the same context and requests, including thinking on and off. It compares response
+bodies, token counts and native token fingerprints with the serial reference and records wall time and peak
+running and waiting requests. `--require-shared-rounds` also requires multi-stream GPU forwards in the batch log
+during those requests. Running requests alone do not prove shared rounds. If auto falls back to one session,
+that shared-round gate fails and the receipt retains the observed results.
+
+End-to-end time includes prompts. The shared-round check enables `FZ_BATCH_LOG`, so its times include logging;
+omit that option for a separate timing run. Repeat into a fresh output directory with `--context 65536` or another
+context that fits the checkpoint. The checkpoint gate separately checks prompt admission, cancellation and reuse.
 
 ## CUDA
 

@@ -3,7 +3,9 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -49,12 +51,16 @@ def request(case, tokens, gate):
 
 def run(args, slots, cases, block):
     log_path = args.output / f"serve-{slots}-block-{block}.log"
+    command = [str(args.binary), "serve", str(args.model), "--name", "batch-gate", "--host", "127.0.0.1",
+               "--port", "52417", "--context", str(getattr(args, "context", 16384)),
+               "--temperature", "0", "--prompt-cache-gib", "0", "--no-update-check"]
+    if str(slots) != "default":
+        command += ["--parallel", str(slots)]
+    env = os.environ.copy()
+    if getattr(args, "require_shared_rounds", False):
+        env["FZ_BATCH_LOG"] = "1"
     with log_path.open("w") as log:
-        process = subprocess.Popen([
-            str(args.binary), "serve", str(args.model), "--name", "batch-gate", "--host", "127.0.0.1",
-            "--port", "52417", "--context", "16384", "--parallel", str(slots),
-            "--temperature", "0", "--prompt-cache-gib", "0", "--no-update-check",
-        ], stdout=log, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
         (args.output / "server.pid").write_text(str(process.pid) + "\n")
         try:
             deadline = time.monotonic() + 240
@@ -72,6 +78,7 @@ def run(args, slots, cases, block):
                 raise TimeoutError("native server startup")
             batches = []
             for iteration in range(args.rounds):
+                log_start = log_path.stat().st_size
                 stop = threading.Event()
                 peaks = [0, 0]
 
@@ -95,13 +102,18 @@ def run(args, slots, cases, block):
                         futures = [pool.submit(request, case, args.tokens, gate) for case in cases]
                         results = [future.result() for future in futures]
                     seconds = time.monotonic() - start
+                    log_end = log_path.stat().st_size
                 finally:
                     stop.set()
                     watcher.join(timeout=4)
                 generated = sum(result["tokens"] for result in results)
+                with log_path.open("rb") as observed:
+                    observed.seek(log_start)
+                    rounds = re.findall(rb"flashnext batch: streams (\d+), rows \d+, shared rounds \d+",
+                                        observed.read(log_end - log_start))
                 batch = {"iteration": iteration, "seconds": seconds, "tokens": generated,
                          "tokens_per_second": generated / seconds, "peak_running": peaks[0],
-                         "peak_waiting": peaks[1], "results": results}
+                         "peak_waiting": peaks[1], "shared_rounds": sum(int(n) > 1 for n in rounds), "results": results}
                 batches.append(batch)
                 print(json.dumps({"parallel": slots, **{key: batch[key] for key in
                       ("iteration", "seconds", "tokens", "tokens_per_second", "peak_running", "peak_waiting")}}), flush=True)
@@ -124,15 +136,21 @@ def main():
     parser.add_argument("output", type=Path)
     parser.add_argument("--tokens", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--parallel", default="1,4")
+    parser.add_argument("--parallel", default="1,default,auto,4",
+                        help="comma-separated blocks starting with 1; default omits --parallel")
+    parser.add_argument("--context", type=int, default=16384)
+    parser.add_argument("--require-shared-rounds", action="store_true",
+                        help="enable batch logging and require multi-stream GPU rounds (timings include logging)")
     args = parser.parse_args()
-    if args.tokens < 1 or args.rounds < 1:
-        parser.error("tokens and rounds must be positive")
-    slots = [int(value) for value in args.parallel.split(",")]
-    if not slots or slots[0] != 1 or any(value < 1 or value > 16 for value in slots):
-        parser.error("parallel must start with 1 and stay within 1..16")
+    if args.tokens < 1 or args.rounds < 1 or args.context < 1:
+        parser.error("tokens, rounds and context must be positive")
+    slots = args.parallel.split(",")
+    if slots[0] != "1" or any(value not in {"default", "auto", *(str(n) for n in range(1, 17))} for value in slots):
+        parser.error("parallel must start with 1 and contain default, auto or 1..16")
     args.output.mkdir(parents=True, exist_ok=True)
-    receipt = {"reply_token_limit": args.tokens, "rounds": args.rounds, "exact": False, "runs": {}}
+    receipt = {"reply_token_limit": args.tokens, "rounds": args.rounds, "context": args.context,
+               "exact": False, "shared_rounds_verified": False,
+               "batch_logging": args.require_shared_rounds or "FZ_BATCH_LOG" in os.environ, "runs": {}}
     (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     cases = [json.loads((args.fixtures / f"{name}.json").read_text()) for name in
              ("short", "thinking", "sparse", "sparse-thinking")]
@@ -142,6 +160,7 @@ def main():
         for batch in batches:
             batch["block"] = block
         receipt["runs"].setdefault(str(count), []).extend(batches)
+        (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
         for batch in batches:
             replies = [{key: result[key] for key in ("reply", "tokens", "prompt_tokens", "token_sha")}
                        for result in batch["results"]]
@@ -151,10 +170,15 @@ def main():
                 receipt["exact"] = False
                 (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
                 raise RuntimeError("HTTP replies differ from serial reference")
-        if count > 1 and not any(batch["peak_running"] > 1 for batch in batches):
+        if count != "1" and not any(batch["peak_running"] > 1 for batch in batches):
             raise RuntimeError("no simultaneous HTTP sessions observed")
+        if args.require_shared_rounds and count != "1" and not any(batch["shared_rounds"] > 0 for batch in batches):
+            raise RuntimeError("no shared GPU rounds observed; auto may have fallen back to one session")
         (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     receipt["exact"] = True
+    receipt["shared_rounds_verified"] = any(key != "1" for key in receipt["runs"]) and all(
+        any(batch["shared_rounds"] > 0 for batch in batches)
+        for key, batches in receipt["runs"].items() if key != "1")
     (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
 
 
