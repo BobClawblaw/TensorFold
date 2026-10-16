@@ -93,13 +93,29 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     float total = 0.0f;
     for (int i = 0; i < 8; i++) total += red[i];
     const float inv = rsqrtf(total / (float)D + eps);
+    if ((E & 3) == 0) {
 #pragma unroll
-    for (int i = 0; i < MAXE; i++) {
-        if (i >= E) break;
-        const int d = t * E + i;
-        const __nv_bfloat16 x = __float2bfloat16_rn(bf(W[d]) * (hv[i] * inv));
-        X[row * D + d] = x;
-        xrow[d] = x;
+        for (int i = 0; i < MAXE; i += 4) {
+            if (i >= E) break;
+            const int d = t * E + i;
+            const uint2 ww = *reinterpret_cast<const uint2*>(W + d);
+            const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&ww);
+            uint2 xw;
+            __nv_bfloat16* xb = reinterpret_cast<__nv_bfloat16*>(&xw);
+#pragma unroll
+            for (int j = 0; j < 4; j++) xb[j] = __float2bfloat16_rn(bf(wb[j]) * (hv[i + j] * inv));
+            *reinterpret_cast<uint2*>(X + row * D + d) = xw;
+            *reinterpret_cast<uint2*>(xrow + d) = xw;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < MAXE; i++) {
+            if (i >= E) break;
+            const int d = t * E + i;
+            const __nv_bfloat16 x = __float2bfloat16_rn(bf(W[d]) * (hv[i] * inv));
+            X[row * D + d] = x;
+            xrow[d] = x;
+        }
     }
     if (XS == nullptr) return;
     __syncthreads();
@@ -220,9 +236,36 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
 #pragma unroll
     for (int i = 0; i < PT; i++) state[i] = st[i];
     int prev = -1;  // the row the registers' state follows
+    // row r's inputs, loaded while row r - 1 computes
+    float kn[PT], qn[PT], vn = 0.0f, gn = 0.0f, bn = 0.0f;
+    int pn = -1;
+    auto load = [&](int row) {
+        const uint2 kw = *reinterpret_cast<const uint2*>(k + ((size_t)row * NK + hk) * DK + PT * dk);
+        const uint2 qw = *reinterpret_cast<const uint2*>(q + ((size_t)row * NK + hk) * DK + PT * dk);
+        const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(&kw);
+        const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(&qw);
+#pragma unroll
+        for (int i = 0; i < PT; i++) {
+            kn[i] = bf(kb[i]);
+            qn[i] = bf(qb[i]);
+        }
+        vn = bf(v[((size_t)row * NV + hv) * DK + dv]);
+        gn = g[row * NV + hv];
+        bn = bf(beta[row * NV + hv]);
+        pn = rowpar[row];
+    };
+    if (sg.rows > 0) load(sg.row0);
     for (int r = 0; r < sg.rows; r++) {
         const int row = sg.row0 + r;
-        const int parent = rowpar[row];
+        float kc[PT], qc[PT];
+#pragma unroll
+        for (int i = 0; i < PT; i++) {
+            kc[i] = kn[i];
+            qc[i] = qn[i];
+        }
+        const float vc = vn, gc = gn, bc = bn;
+        const int parent = pn;
+        if (r + 1 < sg.rows) load(row + 1);
         if (parent != prev) {
             // a branch: its parent's state from the stream's and the ancestors' logged updates, oldest first
             int anc[MAXW];
@@ -241,15 +284,6 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_gdn_chain(Geo geo, cons
             }
         }
         prev = row;
-        float kc[PT], qc[PT];
-#pragma unroll
-        for (int i = 0; i < PT; i++) {
-            kc[i] = bf(k[((size_t)row * NK + hk) * DK + PT * dk + i]);
-            qc[i] = bf(q[((size_t)row * NK + hk) * DK + PT * dk + i]);
-        }
-        const float vc = bf(v[((size_t)row * NV + hv) * DK + dv]);
-        const float gc = g[row * NV + hv];
-        const float bc = bf(beta[row * NV + hv]);
         float kv_mem = 0.0f;
 #pragma unroll
         for (int i = 0; i < PT; i++) {
