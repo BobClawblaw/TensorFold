@@ -57,3 +57,8 @@ pub fn fit(want: u32, fixed: bool, room: u64, per_slot: u64) !u32 {
     if (fixed and n < want) return error.OverMemoryLimit;
     return n;
 }
+
+/// Default auto uses shared sessions; explicit one, learning and paired serving keep their own host.
+pub fn shared(fixed: bool, streams: u32, paired: bool, learning: bool) bool {
+    return (!fixed or streams > 1) and !paired and !learning;
+}

@@ -21,8 +21,7 @@ const Host = struct {
     warm: mtl.keepalive.Target,
 };
 
-/// What the server may hold in all, sessions and prompt cache: 70% of RAM, or FLASHNEXT_LOAD_LIMIT_GB (GB, as
-/// GLM_LOAD_LIMIT_GB) up to the GPU's recommended working set; past the default the log names the risk, as GLM's does.
+/// The whole-footprint ceiling: 70% of RAM or FLASHNEXT_LOAD_LIMIT_GB, capped by the GPU working set.
 fn ceiling(total: u64, working_set: u64) error{BadLoadLimit}!u64 {
     const text: ?[]const u8 = if (std.c.getenv("FLASHNEXT_LOAD_LIMIT_GB")) |v| std.mem.span(v) else null;
     const c = fit.ceiling(total, working_set, text) catch |err| {
@@ -41,13 +40,13 @@ fn slotContexts(gpa: std.mem.Allocator, capacity: usize) !?[]usize {
     return try tf.flashnext_slots.parse(gpa, text, capacity, @intCast(fx.MARGIN), tf.flashnext_replay.MAXR - 1);
 }
 
-/// Reply tokens a session must hold past the prompt at admission (FLASHNEXT_SLOT_GROW, default 8192); past them a stream moves.
+/// Admission requires FLASHNEXT_SLOT_GROW reply tokens (default 8192); longer replies can move.
 fn slotGrow() usize {
     const v = std.c.getenv("FLASHNEXT_SLOT_GROW") orelse return 8192;
     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8192;
 }
 
-pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, streams: u32, cache_gib: ?f64, over: bool, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
+pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, streams: u32, streams_fixed: bool, cache_gib: ?f64, over: bool, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const capacity: usize = @intCast(@min(tf.flashnext_replay.CAP, window + fx.MARGIN));
@@ -55,20 +54,22 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     errdefer eng.deinit();
     if (eng.r.tp != null) return error.BatchSpeedUpUnsupported;
     try eng.warm();
-    eng.hostMode();
     const ready = fit.footprint() orelse return error.NoMemoryReading;
     const total = fit.ram() orelse return error.NoMemoryReading;
     const cap = try ceiling(total, eng.r.device.maxWorkingSet());
     const reserved = if (!over) (if (cache_gib) |g| (if (g > 0) std.math.lossyCast(u64, g * fit.GiB) else 0) else 0) else 0;
-    const fixed = Session.overhead(tf.flashnext_replay.CAP) + tf.flashnext_replay.MAXR * tf.flashnext_replay.WIDE * 2;
-    const available = cap -| ready -| fit.MARGIN -| reserved;
-    if (available < fixed) return error.OverMemoryLimit;
-    const room = available - fixed;
     const tiers = slotContexts(gpa, capacity) catch |err| {
         std.log.err("flash next: FLASHNEXT_SLOT_CONTEXTS is not a list of sessions: token counts of 1024 or more, CONTEXTxN for N alike, at most {d} sessions past the engine's own", .{tf.flashnext_replay.MAXR - 1});
         return err;
     };
     defer if (tiers) |t| gpa.free(t);
+    const overhead = Session.overhead(tf.flashnext_replay.CAP) + tf.flashnext_replay.MAXR * tf.flashnext_replay.WIDE * 2;
+    const available = cap -| ready -| fit.MARGIN -| reserved;
+    if (available < overhead) {
+        if (!streams_fixed and tiers == null) return single(gpa, io, eng, window, cache_gib, over, cap, a, why);
+        return error.OverMemoryLimit;
+    }
+    const room = available - overhead;
     var caps: std.ArrayList(usize) = .empty;
     defer caps.deinit(gpa);
     try caps.append(gpa, capacity); // the engine's own session: the whole window
@@ -81,9 +82,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
         }
         try caps.appendSlice(gpa, t);
     } else {
-        const n = try tf.flashnext_batch_meta.fit(streams, true, room, Session.bytes(capacity));
+        const n = try tf.flashnext_batch_meta.fit(streams, streams_fixed, room, Session.bytes(capacity));
+        if (n < 2) return single(gpa, io, eng, window, cache_gib, over, cap, a, why);
         for (1..n) |_| try caps.append(gpa, capacity);
     }
+    eng.hostMode();
     const slots: u32 = @intCast(caps.items.len);
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
@@ -106,7 +109,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .admit = if (tiers != null) .{ .ctx = &h.back, .fits = Backend.fits } else null });
-    // a lone greedy request runs on the engine's GPU-side rounds until a second one arrives (FLASHNEXT_NO_LONE=1: shared rounds)
+    // FLASHNEXT_NO_LONE=1 keeps even lone requests on shared rounds.
     if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     h.cache = null;
     if (plan.budget_bytes > 0) {
@@ -147,4 +150,11 @@ fn close(ctx: *anyopaque) void {
     h.back.deinit();
     h.eng.deinit();
     h.gpa.destroy(h);
+}
+
+/// Auto with room for only one session transfers the loaded engine, preserving the chosen footprint limit.
+fn single(gpa: std.mem.Allocator, io: std.Io, eng: *fx.Engine, window: i64, cache_gib: ?f64, over: bool, cap: u64, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
+    const host = @import("flashnext_host.zig");
+    const h = try host.openLoaded(gpa, io, eng, window, cache_gib, over, null, cap, a, why);
+    return .{ .engine = h.engine(), .close = host.close, .ctx = h };
 }

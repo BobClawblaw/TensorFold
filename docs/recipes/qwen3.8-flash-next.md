@@ -73,7 +73,7 @@ to one stream, while successful checks allow the lane engine to combine requests
 
 ## Native Metal shared sessions
 
-The native 6-bit MTP engine enables shared target rounds with an explicit `--parallel N` above one:
+The native 6-bit MTP engine uses shared target rounds with the default `--parallel auto` when at least two sessions fit. An explicit count fixes the number of sessions:
 
 ```bash
 tensorfold-native serve TensorFold/Qwen3.8-Flash-Next-MLX-6bit-MTP \
@@ -82,11 +82,10 @@ tensorfold-native serve TensorFold/Qwen3.8-Flash-Next-MLX-6bit-MTP \
 
 Each request holds its own recurrent state, attention cache, n-gram history and MTP cache. The scheduler packs
 up to 16 target rows, including draft rows, into one layer loop. Projections and experts process those rows
-together; recurrence, convolution and attention read each request's own state. MTP heads draft serially.
+together; recurrence, convolution and attention read each request's own state. Every stream's MTP drafts share one command buffer; `FZ_BATCH_MTP_SERIAL=1` restores serial drafting.
 New requests join between rounds, and cancelling a request releases its slot for another request.
 
-`auto` and `--parallel 1` retain the existing single-reply driver. Shared sessions currently run on one Mac;
-`--parallel N` above one with `--speed-up` is refused. Use `--parallel 1` for the two-Mac link.
+`auto` chooses up to 16 sessions from the memory left after loading the model and reserving the prompt cache. If fewer than two fit, it opens the single-reply driver instead. Explicit `--parallel 1`, `--learn`, and the two-Mac path retain their supported driver. Shared sessions run on one Mac; `--parallel N` above one with `--speed-up` is refused. Use `--parallel 1` for the two-Mac link.
 
 The ceiling is 70% of RAM, or `FLASHNEXT_LOAD_LIMIT_GB` (GB, up to the GPU's recommended working set). It covers the
 server's whole footprint: the model, the sessions and the prompt cache. Left out, `--prompt-cache-gib` takes what the

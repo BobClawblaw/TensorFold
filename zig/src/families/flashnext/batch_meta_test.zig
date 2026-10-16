@@ -62,3 +62,15 @@ test "shared draft before keep and lone draft after rejection use the same forwa
     try lone.begin(0, 1);
     try std.testing.expectError(error.WindowOutOfStep, lone.begin(1, 1));
 }
+
+test "default auto selects shared sessions while explicit one, learning and pairs keep their host" {
+    try std.testing.expect(meta.shared(false, 8, false, false));
+    try std.testing.expect(meta.shared(true, 4, false, false));
+    try std.testing.expect(!meta.shared(true, 1, false, false));
+    try std.testing.expect(!meta.shared(false, 8, true, false));
+    try std.testing.expect(!meta.shared(false, 8, false, true));
+    try std.testing.expect(!meta.shared(true, 4, false, true));
+    try std.testing.expectEqual(@as(u32, 1), try meta.fit(16, false, 0, 1024));
+    try std.testing.expectEqual(@as(u32, 3), try meta.fit(16, false, 2048, 1024));
+    try std.testing.expectError(error.OverMemoryLimit, meta.fit(4, true, 2048, 1024));
+}
