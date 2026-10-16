@@ -74,3 +74,12 @@ test "default auto selects shared sessions while explicit one, learning and pair
     try std.testing.expectEqual(@as(u32, 3), try meta.fit(16, false, 2048, 1024));
     try std.testing.expectError(error.OverMemoryLimit, meta.fit(4, true, 2048, 1024));
 }
+
+test "an explicit --parallel above one refuses pairs and learning alike, auto and one never refuse" {
+    try std.testing.expect(meta.refusal(false, 16, true, true) == null);
+    try std.testing.expect(meta.refusal(true, 1, true, true) == null);
+    try std.testing.expect(meta.refusal(true, 4, false, false) == null);
+    try std.testing.expect(std.mem.indexOf(u8, meta.refusal(true, 4, true, false).?, "--speed-up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta.refusal(true, 4, true, true).?, "--speed-up") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta.refusal(true, 4, false, true).?, "--learn") != null);
+}
