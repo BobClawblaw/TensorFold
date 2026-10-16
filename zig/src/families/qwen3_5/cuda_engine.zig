@@ -304,8 +304,17 @@ pub const Engine = struct {
 
     /// out (rows, n) = x (rows, k) through `l`: 16-row decode tiles (a row's bits batch-independent) or a prompt GEMM.
     pub fn proj(e: *Engine, l: Affine4, x: u64, out: u64, rows: usize, prompt: bool) !void {
+        return e.projSums(l, x, out, rows, prompt, true);
+    }
+
+    /// proj over the x of the proj or norm just before it: their group sums of x are still in xs.
+    pub fn projAgain(e: *Engine, l: Affine4, x: u64, out: u64, rows: usize, prompt: bool) !void {
+        return e.projSums(l, x, out, rows, prompt, false);
+    }
+
+    fn projSums(e: *Engine, l: Affine4, x: u64, out: u64, rows: usize, prompt: bool, sums: bool) !void {
         if (prompt and rows > 16) return e.affine.prompt(e.stream, x, l, out, rows);
-        try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, e.xs, @as(c_int, @intCast(l.k)), e.tables.ptr + params_at });
+        if (sums) try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, e.xs, @as(c_int, @intCast(l.k)), e.tables.ptr + params_at });
         var at: usize = 0;
         while (at < rows) : (at += 16) {
             const n = @min(16, rows - at);
@@ -313,8 +322,9 @@ pub const Engine = struct {
         }
     }
 
-    fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at });
+    /// h += r if `residual`, x = the normed h; `sums`: x's group sums into xs, for a projAgain over x.
+    fn norm(e: *Engine, residual: bool, w: u64, rows: usize, sums: bool) !void {
+        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, if (sums) e.xs else @as(u64, 0) });
     }
 
     /// A chain row's rowanc: its index in its window, as a prompt chunk's rows outnumber the bits.
@@ -470,14 +480,14 @@ pub const Engine = struct {
         var di: usize = 0;
         var ai: c_int = 0;
         for (e.layers, 0..) |l, i| {
-            try e.norm(i != 0, l.input_norm, total);
+            try e.norm(i != 0, l.input_norm, total, true);
             switch (l.mixer) {
                 .delta => |m| {
                     const layer: c_int = @intCast(di);
-                    try e.proj(m.qkv, e.x, e.qkv, total, prompt);
-                    try e.proj(m.z, e.x, e.z, total, prompt);
-                    try e.proj(m.a, e.x, e.a, total, prompt);
-                    try e.proj(m.b, e.x, e.b, total, prompt);
+                    try e.projAgain(m.qkv, e.x, e.qkv, total, prompt);
+                    try e.projAgain(m.z, e.x, e.z, total, prompt);
+                    try e.projAgain(m.a, e.x, e.a, total, prompt);
+                    try e.projAgain(m.b, e.x, e.b, total, prompt);
                     try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                     try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                     try e.run(e.fns.gdn_chain, .{ 1, geometry.dk / 4, g.v_heads * nseg }, .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
@@ -487,9 +497,9 @@ pub const Engine = struct {
                 },
                 .attention => |m| {
                     const aw = g.attnWidth();
-                    try e.proj(m.q, e.x, e.qraw, total, prompt);
-                    try e.proj(m.k, e.x, e.kraw, total, prompt);
-                    try e.proj(m.v, e.x, e.vraw, total, prompt);
+                    try e.projAgain(m.q, e.x, e.qraw, total, prompt);
+                    try e.projAgain(m.k, e.x, e.kraw, total, prompt);
+                    try e.projAgain(m.v, e.x, e.vraw, total, prompt);
                     try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                     try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
                     try e.run(e.fns.rope, .{ total, 1, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, ai, t_params });
@@ -500,9 +510,9 @@ pub const Engine = struct {
                     ai += 1;
                 },
             }
-            try e.norm(true, l.post_norm, total);
-            try e.proj(l.gate, e.x, e.gate, total, prompt);
-            try e.proj(l.up, e.x, e.up, total, prompt);
+            try e.norm(true, l.post_norm, total, true);
+            try e.projAgain(l.gate, e.x, e.gate, total, prompt);
+            try e.projAgain(l.up, e.x, e.up, total, prompt);
             const n: c_longlong = @intCast(total * g.intermediate);
             try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
             try e.proj(l.down, e.act, e.r, total, prompt);
@@ -510,7 +520,7 @@ pub const Engine = struct {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
             };
         }
-        try e.norm(true, e.final_norm, total);
+        try e.norm(true, e.final_norm, total, false);
         // the head over the kept rows
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
     }

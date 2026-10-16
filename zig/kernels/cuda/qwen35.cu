@@ -25,29 +25,54 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_embed(const int* __rest
 }
 
 // h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)); D a multiple of 256 up to 8192; a 256-thread block a row.
+// XS (may be null): x's 64-group sums as tf_q35_sums makes them, for the decode projections that read x next.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X, float eps, int D,
-                                                               const int* __restrict__ P) {
+                                                               const int* __restrict__ P, float* __restrict__ XS) {
     constexpr int MAXE = 32;
     __shared__ float red[8];
+    __shared__ __nv_bfloat16 xrow[8192];
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
     const int t = threadIdx.x;
     const int E = D / 256;
     float hv[MAXE];
     float ss = 0.0f;
+    if ((E & 3) == 0) {
+        // the same entries and order a thread at a time, four at a load
 #pragma unroll
-    for (int i = 0; i < MAXE; i++) {
-        if (i >= E) break;
-        const size_t at = row * D + t * E + i;
-        float h = bf(H[at]);
-        if (R != nullptr) {
-            const __nv_bfloat16 hb = __float2bfloat16_rn(h + bf(R[at]));
-            H[at] = hb;
-            h = bf(hb);
+        for (int i = 0; i < MAXE; i += 4) {
+            if (i >= E) break;
+            const size_t at = row * D + t * E + i;
+            uint2 hw = *reinterpret_cast<const uint2*>(H + at);
+            __nv_bfloat16* hb = reinterpret_cast<__nv_bfloat16*>(&hw);
+            if (R != nullptr) {
+                const uint2 rw = *reinterpret_cast<const uint2*>(R + at);
+                const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rw);
+#pragma unroll
+                for (int j = 0; j < 4; j++) hb[j] = __float2bfloat16_rn(bf(hb[j]) + bf(rb[j]));
+                *reinterpret_cast<uint2*>(H + at) = hw;
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                hv[i + j] = bf(hb[j]);
+                ss = fmaf(hv[i + j], hv[i + j], ss);
+            }
         }
-        hv[i] = h;
-        ss = fmaf(h, h, ss);
+    } else {
+#pragma unroll
+        for (int i = 0; i < MAXE; i++) {
+            if (i >= E) break;
+            const size_t at = row * D + t * E + i;
+            float h = bf(H[at]);
+            if (R != nullptr) {
+                const __nv_bfloat16 hb = __float2bfloat16_rn(h + bf(R[at]));
+                H[at] = hb;
+                h = bf(hb);
+            }
+            hv[i] = h;
+            ss = fmaf(h, h, ss);
+        }
     }
     ss = warp_sum(ss);
     if ((t & 31) == 0) red[t >> 5] = ss;
@@ -59,7 +84,16 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     for (int i = 0; i < MAXE; i++) {
         if (i >= E) break;
         const int d = t * E + i;
-        X[row * D + d] = __float2bfloat16_rn(bf(W[d]) * (hv[i] * inv));
+        const __nv_bfloat16 x = __float2bfloat16_rn(bf(W[d]) * (hv[i] * inv));
+        X[row * D + d] = x;
+        xrow[d] = x;
+    }
+    if (XS == nullptr) return;
+    __syncthreads();
+    for (int g = t; g < D / 64; g += blockDim.x) {
+        float s = 0.0f;
+        for (int j = 0; j < 64; j++) s += bf(xrow[g * 64 + j]);
+        XS[row * (D / 64) + g] = s;
     }
 }
 

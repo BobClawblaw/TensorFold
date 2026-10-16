@@ -316,15 +316,25 @@ pub const Draft = struct {
 
     /// out (rows, n) = x (rows, k) through `l`, as the target's decode tiles or prompt GEMM, with the drafter's sums.
     fn proj(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize) !void {
+        return d.projSums(l, x, out, rows, true);
+    }
+
+    /// proj over the x of an earlier proj or norm, nothing between them writing x or xs: its group sums are still in xs.
+    fn projAgain(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize) !void {
+        return d.projSums(l, x, out, rows, false);
+    }
+
+    fn projSums(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize, sums: bool) !void {
         const e = d.e;
         if (rows > 16) return e.affine.prompt(e.stream, x, l, out, rows);
-        try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.k)), @as(u64, 0) });
+        if (sums) try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.k)), @as(u64, 0) });
         try e.affine.decode(e.stream, x, d.xs, l, out, rows);
     }
 
+    /// out = the normed h, and its group sums into xs for a projAgain over out.
     fn norm(d: *Draft, h: u64, w: u64, out: u64, rows: usize) !void {
         const e = d.e;
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ h, @as(u64, 0), w, out, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0) });
+        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ h, @as(u64, 0), w, out, d.c.eps, @as(c_int, @intCast(d.c.hidden)), @as(u64, 0), d.xs });
     }
 
     fn dynConv(d: *Draft, x: u64, dyn: u64, base: u64, res: u64, out: u64, rows: usize, branch: usize) !void {
@@ -360,9 +370,9 @@ pub const Draft = struct {
             try d.proj(d.w.fc, d.taps_in, d.th, rows);
             try d.norm(d.th, d.w.hidden_norm, d.thn, rows);
             for (d.w.layers, 0..) |l, i| {
-                try d.proj(l.k, d.thn, d.kabs, rows);
+                try d.projAgain(l.k, d.thn, d.kabs, rows);
                 try d.normRope(d.kabs, l.k_norm, d.kn, rows, c.kv_heads, start);
-                try d.proj(l.v, d.thn, d.vabs, rows);
+                try d.projAgain(l.v, d.thn, d.vabs, rows);
                 try e.run(d.fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kn, d.vabs, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(c.kvWidth())), @as(c_longlong, @intCast(start)), @as(c_int, @intCast(c.ringRows())) });
             }
             start += rows;
@@ -385,21 +395,21 @@ pub const Draft = struct {
         try e.run(e.fns.embed, .{ B, 1, 1 }, .{ 256, 1, 1 }, .{ d.ids, e.embed_w, e.embed_s, e.embed_b, d.h, @as(c_int, @intCast(c.hidden)), @as(u64, 0) });
         for (d.w.layers, 0..) |l, i| {
             try d.norm(d.h, l.input_norm, d.x, B);
-            try d.proj(l.attn_conv, d.x, d.dyn, B);
+            try d.projAgain(l.attn_conv, d.x, d.dyn, B);
             try d.dynConv(d.x, d.dyn, l.attn_base, 0, d.xin, B, 0);
             try d.proj(l.q, d.xin, d.qraw, B);
-            try d.proj(l.k, d.xin, d.kraw, B);
-            try d.proj(l.v, d.xin, d.vb, B);
+            try d.projAgain(l.k, d.xin, d.kraw, B);
+            try d.projAgain(l.v, d.xin, d.vb, B);
             try d.normRope(d.qraw, l.q_norm, d.q, B, c.heads, pos0);
             try d.normRope(d.kraw, l.k_norm, d.kb, B, c.kv_heads, pos0);
             try e.run(d.fns.attn, .{ B, c.heads, 1 }, .{ 32, 1, 1 }, .{ d.q, d.kb, d.vb, d.ringK(ctx, i), d.ringV(ctx, i), @as(c_int, @intCast(B)), @as(c_int, @intCast(c.heads)), @as(c_int, @intCast(c.kv_heads)), @as(c_int, @intCast(c.ringRows())), @as(c_longlong, @intCast(ctx.begin)), @as(c_longlong, @intCast(pos0)), @as(c_int, @intCast(c.window)), d.att });
             try d.proj(l.o, d.att, d.o, B);
             try d.dynConv(d.o, d.dyn, l.attn_base, d.h, d.h2, B, 1);
             try d.norm(d.h2, l.post_norm, d.x, B);
-            try d.proj(l.mlp_conv, d.x, d.dyn, B);
+            try d.projAgain(l.mlp_conv, d.x, d.dyn, B);
             try d.dynConv(d.x, d.dyn, l.mlp_base, 0, d.xin, B, 0);
             try d.proj(l.gate, d.xin, d.gate, B);
-            try d.proj(l.up, d.xin, d.up, B);
+            try d.projAgain(l.up, d.xin, d.up, B);
             try e.run(e.fns.mlp_act, .{ (B * c.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ d.gate, d.up, d.act, @as(c_longlong, @intCast(B * c.intermediate)), @as(u64, 0), @as(c_int, @intCast(c.intermediate)) });
             try d.proj(l.down, d.act, d.o, B);
             try d.dynConv(d.o, d.dyn, l.mlp_base, d.h2, d.h, B, 1);
@@ -407,9 +417,9 @@ pub const Draft = struct {
         // the mask rows' logits through the target's head, their best tokens and their selector projections
         const rows = B - 1;
         try d.norm(d.h + c.hidden * 2, d.w.final_norm, d.x, rows);
-        try d.proj(e.head, d.x, d.logits, rows);
+        try d.projAgain(e.head, d.x, d.logits, rows);
         try e.draws.topkRows(e.stream, d.logits, c.vocab, @intCast(c.topk), d.parts, d.words, rows);
-        try d.proj(d.w.selector, d.x, d.hp, rows);
+        try d.projAgain(d.w.selector, d.x, d.hp, rows);
         const st = d.staged.bytes;
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
