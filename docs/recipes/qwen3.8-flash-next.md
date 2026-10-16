@@ -73,11 +73,11 @@ to one stream, while successful checks allow the lane engine to combine requests
 
 ## Native Metal shared sessions
 
-The native 6-bit MTP engine uses shared target rounds with the default `--parallel auto` when at least two sessions fit. An explicit count fixes the number of sessions:
+The native 6-bit MTP engine uses shared target rounds with the default `--parallel auto` when at least two sessions fit. Without `FLASHNEXT_SLOT_CONTEXTS`, an explicit count fixes the number of sessions. The default needs no parallel flag:
 
 ```bash
 tensorfold-native serve TensorFold/Qwen3.8-Flash-Next-MLX-6bit-MTP \
-  --parallel 4 --context 16384 --temperature 0
+  --context 16384 --temperature 0
 ```
 
 Each request holds its own recurrent state, attention cache, n-gram history and MTP cache. The scheduler packs
