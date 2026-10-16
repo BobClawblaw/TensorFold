@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const be = @import("backend.zig");
 const Model = @import("config.zig").Model;
 const Stream = @import("stream.zig").Stream;
+const Held = @import("stream.zig").Held;
 const dr = @import("drafter.zig");
 
 /// What the wrapper knows of a drafting stream.
@@ -44,7 +45,7 @@ pub const Drafted = struct {
     }
 
     pub fn backend(x: *Drafted) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = tree, .release = release } };
     }
 
     /// The target's facts with the drafter's depth, step cost, prior, plain guard and batching; chains drafted late.
@@ -61,6 +62,12 @@ pub const Drafted = struct {
         m.draft_streams = d.batched;
         m.draft_probabilities = false;
         m.head_trees = d.trees;
+        if (d.tree_nodes > 0) {
+            // the drafter grows its own trees, best first, and prices their nodes
+            m.drafts = @min(d.tree_nodes, if (target.exact_width > 1) target.exact_width - 1 else 0);
+            m.draft_probabilities = x.drafter.vtable.chances != null;
+            m.head_trees = false;
+        }
         if (d.window_costs.len > 0) m.window_costs = d.window_costs;
         if (d.lane_costs.len > 0) m.lane_costs = d.lane_costs;
         return m;
@@ -195,6 +202,21 @@ pub const Drafted = struct {
         }
         if (x.absorbs.items.len > 0) try x.drafter.absorb(x.absorbs.items);
         if (x.holds.items.len > 0) try x.drafter.hold(x.holds.items);
+    }
+
+    /// A drafter-grown tree's node chances (false: none, so the rule's per-depth rates price it).
+    fn probabilities(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const x = self(ptr);
+        if (!x.lanes.contains(s)) return false;
+        return x.drafter.chances(s, out);
+    }
+
+    /// A drafter-grown tree as host tokens and parents; null: the drafter holds a chain or nothing grown.
+    fn tree(ptr: *anyopaque, s: *Stream, gpa: Allocator) anyerror!?Held {
+        const x = self(ptr);
+        const lane = x.lanes.get(s) orelse return null;
+        if (lane.filler > 0) return null;
+        return x.drafter.tree(s, gpa);
     }
 
     fn dropStream(x: *Drafted, s: *Stream) void {
