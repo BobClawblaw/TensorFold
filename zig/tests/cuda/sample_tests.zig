@@ -223,7 +223,7 @@ pub fn topk(gpu: Gpu) !void {
     check.pass("topk: {d} rows equal tf_logprob_rows' k best", .{cases});
 }
 
-/// qwen35.cu's two-stage greedy argmax against the host rule: the highest logit, ties to the lower id, NaN and -inf never.
+/// qwen35.cu's two-stage greedy argmax against the host rule: the highest logit, ties to the lower id, no NaN or -inf.
 pub fn q35Argmax(gpu: Gpu) !void {
     const gpa = gpu.gpa;
     var m = try cuda.Module.load(gpu.d, cuda.kernels.qwen35);

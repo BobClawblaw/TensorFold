@@ -330,7 +330,6 @@ pub const Engine = struct {
         }
     }
 
-    /// h += r if `residual`, x = the normed h; `sums`: x's group sums into xs, for a projAgain over x.
     /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
     fn argmax(e: *Engine, first: usize, n: usize, toks: u64) !void {
         if (n == 0) return;
@@ -341,6 +340,7 @@ pub const Engine = struct {
         try e.run(e.fns.argmax_merge, .{ n, 1, 1 }, .{ 32, 1, 1 }, .{ pv, pi, @as(c_int, @intCast(slices)), toks + first * 4 });
     }
 
+    /// h += r if `residual`, x = the normed h; `sums`: x's group sums into xs, for a projAgain over x.
     fn norm(e: *Engine, residual: bool, w: u64, rows: usize, sums: bool) !void {
         try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, if (sums) e.xs else @as(u64, 0) });
     }

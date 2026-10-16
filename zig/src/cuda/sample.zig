@@ -95,7 +95,7 @@ pub const Draws = struct {
         try launch_.launch(d.logprob_rows_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 1024 } }, s, &a);
     }
 
-    /// logprobRows' `k` best ids and logits alone (its other words zero), over many blocks a row: `parts` holds topkPartsBytes.
+    /// logprobRows' `k` best ids and logits alone (other words zero), many blocks a row; `parts`: topkPartsBytes.
     pub fn topkRows(d: *const Draws, s: Stream, logits: u64, vocab: usize, k: u8, parts: u64, out: u64, rows: usize) !void {
         const slices = std.math.divCeil(usize, vocab, topk_slice) catch unreachable;
         const pv = parts;

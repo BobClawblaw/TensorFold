@@ -37,8 +37,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_embed(const int* __rest
     }
 }
 
-// h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)); D a multiple of 256 up to 8192; a 256-thread block a row.
-// XS (may be null): x's 64-group sums as tf_q35_sums makes them, for the decode projections that read x next.
+// h = bf16(h + r) (r may be null), x = bf16(w * (h * inv)), XS (may be null) x's group sums; D 256k up to 8192.
 extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __restrict__ H, const __nv_bfloat16* __restrict__ R,
                                                                const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ X, float eps, int D,
                                                                const int* __restrict__ P, float* __restrict__ XS) {
@@ -122,7 +121,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     for (int g = t; g < D / 64; g += blockDim.x) XS[row * (D / 64) + g] = group_sum(xrow + g * 64);
 }
 
-// The 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows, groups / 64), a thread a group.
+// 64-group sums of bf16 rows D wide (the decode projections' input sums). Grid (rows, groups / 64), a thread a group.
 extern "C" __global__ void __launch_bounds__(64) tf_q35_sums(const __nv_bfloat16* __restrict__ X, float* __restrict__ XS, int D, const int* __restrict__ P) {
     if (past_rows(P, blockIdx.x)) return;
     const size_t row = blockIdx.x;
@@ -544,8 +543,7 @@ extern "C" __global__ void tf_q35_mlp_act(const __nv_bfloat16* __restrict__ GATE
     OUT[i] = __float2bfloat16_rn(gf / (1.0f + expf(-gf)) * bf(UP[i]));
 }
 
-// Greedy rows' tokens in two stages: block (slice, row) takes its ARGMAX_SLICE entries' best, then a warp a row merges.
-// The best is the highest logit (NaN never, -inf never: 0x7fffffff then), ties to the lowest id.
+// Greedy tokens, a block a slice then a warp a row: the highest logit (no NaN or -inf), ties to the lowest id.
 constexpr int ARGMAX_SLICE = 4096;
 
 __device__ __forceinline__ void argmax_take(float v, int i, float& best, int& id) {

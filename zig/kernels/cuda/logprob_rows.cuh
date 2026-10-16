@@ -142,7 +142,7 @@ __device__ void logprob_row(const __nv_bfloat16* L, unsigned V, unsigned pick, u
     }
 }
 
-// A row's k best alone, in two stages: a slice of TOPK_SLICE entries a block, then one block over the slices' k best each.
+// A row's k best alone, in two stages: TOPK_SLICE entries a block, then a block over the slices' k best.
 constexpr unsigned TOPK_TG = 256;
 constexpr unsigned TOPK_SLICE = 4096;
 

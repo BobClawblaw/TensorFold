@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const weights = @import("cuda_draft_weights.zig");
+const tree = @import("cuda_draft_tree.zig");
 
 const E = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
@@ -136,18 +137,11 @@ const Ctx = struct {
     end: u64 = 0,
     held: [engine.most_window]u32 = undefined,
     held_n: usize = 0,
-    // a grown tree's parents (-1: under the pending token) and each node's log-chance under its parent; 0 nodes: a chain
+    // a grown tree's parents (-1: the pending token) and nodes' log-chances under them; 0 nodes: a chain
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
 };
-
-/// best_first's settings, as the 27B engine's DFlash2 trees: children a node, the selector's weight, the softmax scale.
-const tree_branch = 4;
-const tree_edge = 0.6;
-const tree_scale = 1.5;
-/// A grown tree's nodes at most (TF_DRAFT_NODES overrides; TF_NO_TREES drafts chains).
-const tree_nodes = 15;
 
 pub const Draft = struct {
     gpa: std.mem.Allocator,
@@ -276,13 +270,13 @@ pub const Draft = struct {
         const B = c.block;
         const R = max_rows;
         const sizes = .{
-            .{ "taps_in", R * c.n_taps * c.hidden * 2 }, .{ "th", R * c.hidden * 2 },        .{ "thn", R * c.hidden * 2 },                  .{ "kabs", R * c.kvWidth() * 2 },
-            .{ "kn", R * c.kvWidth() * 2 },              .{ "vabs", R * c.kvWidth() * 2 },   .{ "xs", R * (c.n_taps * c.hidden / 64) * 4 }, .{ "h", B * c.hidden * 2 },
-            .{ "h2", B * c.hidden * 2 },                 .{ "x", B * c.hidden * 2 },         .{ "xin", B * c.hidden * 2 },                  .{ "dyn", B * c.dynamic() * 2 },
-            .{ "qraw", B * c.qWidth() * 2 },             .{ "q", B * c.qWidth() * 2 },       .{ "kraw", B * c.kvWidth() * 2 },              .{ "kb", B * c.kvWidth() * 2 },
-            .{ "vb", B * c.kvWidth() * 2 },              .{ "att", B * c.qWidth() * 2 },     .{ "o", B * c.hidden * 2 },                    .{ "gate", B * c.intermediate * 2 },
-            .{ "up", B * c.intermediate * 2 },           .{ "act", B * c.intermediate * 2 }, .{ "logits", B * c.vocab * 2 },                .{ "words", B * lp_words * 4 },
-            .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) },                         .{ "hp", B * c.rank * 2 },          .{ "ids", B * 4 },
+            .{ "taps_in", R * c.n_taps * c.hidden * 2 },                        .{ "th", R * c.hidden * 2 },        .{ "thn", R * c.hidden * 2 },                  .{ "kabs", R * c.kvWidth() * 2 },
+            .{ "kn", R * c.kvWidth() * 2 },                                     .{ "vabs", R * c.kvWidth() * 2 },   .{ "xs", R * (c.n_taps * c.hidden / 64) * 4 }, .{ "h", B * c.hidden * 2 },
+            .{ "h2", B * c.hidden * 2 },                                        .{ "x", B * c.hidden * 2 },         .{ "xin", B * c.hidden * 2 },                  .{ "dyn", B * c.dynamic() * 2 },
+            .{ "qraw", B * c.qWidth() * 2 },                                    .{ "q", B * c.qWidth() * 2 },       .{ "kraw", B * c.kvWidth() * 2 },              .{ "kb", B * c.kvWidth() * 2 },
+            .{ "vb", B * c.kvWidth() * 2 },                                     .{ "att", B * c.qWidth() * 2 },     .{ "o", B * c.hidden * 2 },                    .{ "gate", B * c.intermediate * 2 },
+            .{ "up", B * c.intermediate * 2 },                                  .{ "act", B * c.intermediate * 2 }, .{ "logits", B * c.vocab * 2 },                .{ "words", B * lp_words * 4 },
+            .{ "parts", cuda.sample.Draws.topkPartsBytes(c.vocab, c.topk, B) }, .{ "hp", B * c.rank * 2 },          .{ "ids", B * 4 },
         };
         var total: usize = 0;
         inline for (sizes) |s| {
@@ -330,7 +324,7 @@ pub const Draft = struct {
         return d.projSums(l, x, out, rows, true);
     }
 
-    /// proj over the x of an earlier proj or norm, nothing between them writing x or xs: its group sums are still in xs.
+    /// proj over the x of an earlier proj or norm (nothing between writing x or xs): its group sums are in xs.
     fn projAgain(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize) !void {
         return d.projSums(l, x, out, rows, false);
     }
@@ -435,145 +429,21 @@ pub const Draft = struct {
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + words_at, d.words, rows * lp_words * 4, e.stream.handle), "cuMemcpyDtoHAsync");
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(st.ptr + hp_at, d.hp, rows * c.rank * 2, e.stream.handle), "cuMemcpyDtoHAsync");
         try e.stream.synchronize();
+        const cands: tree.Candidates = .{ .words = st[words_at..][0 .. rows * lp_words * 4], .projected = st[hp_at..][0 .. rows * c.rank * 2], .topk = c.topk, .rank = c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor };
+        ctx.grown = 0;
         if (lanes_) |l| {
-            try d.selectLanes(ctx, pending, rows, l);
-            ctx.grown = 0;
-            if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] lanes {d} levels {d}\n", .{ l.parents.len, l.levels() });
-        } else if (d.nodes() > 0) {
-            d.grow(ctx, pending, rows, @min(depth, d.nodes()));
-            if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] tree {d}\n", .{ctx.held_n});
+            if (l.parents.len > ctx.held.len) return error.TooManyLanes;
+            try tree.lanesOf(cands, pending, rows, l, ctx.held[0..l.parents.len]);
+            ctx.held_n = l.parents.len;
+        } else if (tree.nodes() > 0) {
+            const n = @min(depth, tree.nodes());
+            ctx.grown = tree.grow(cands, pending, rows, n, ctx.held[0..n], ctx.parents[0..n], ctx.own[0..n]);
+            ctx.held_n = ctx.grown;
         } else {
-            d.select(ctx, pending, rows);
+            tree.chain(cands, pending, ctx.held[0..rows]);
             ctx.held_n = @min(depth, rows);
-            ctx.grown = 0;
-            if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] chain {d}\n", .{ctx.held_n});
         }
-    }
-
-    /// Row `r`'s `rank`th candidate after `pred`: unary logit + pred . projected . successor, ties to the earlier one.
-    fn choice(d: *const Draft, r: usize, pred: u32, rank: usize) u32 {
-        const c = d.c;
-        const w = std.mem.bytesAsSlice(u32, d.staged.bytes[words_at..][r * lp_words * 4 ..][0 .. lp_words * 4]);
-        const hp = std.mem.bytesAsSlice(u16, d.staged.bytes[hp_at..][r * c.rank * 2 ..][0 .. c.rank * 2]);
-        var scores: [lp_top]f32 = undefined;
-        for (0..c.topk) |j| {
-            const cand = w[2 + j];
-            const unary: f32 = @bitCast(w[2 + lp_top + j]);
-            var edge: f32 = 0;
-            for (0..c.rank) |k| edge += bf16(d.w.predecessor[pred * c.rank + k]) * bf16(hp[k]) * bf16(d.w.successor[cand * c.rank + k]);
-            scores[j] = unary + edge;
-        }
-        var taken: [lp_top]bool = @splat(false);
-        var pick: usize = 0;
-        for (0..rank + 1) |_| {
-            var best: f32 = -std.math.inf(f32);
-            pick = 0;
-            for (0..c.topk) |j| if (!taken[j] and scores[j] > best) {
-                best = scores[j];
-                pick = j;
-            };
-            taken[pick] = true;
-        }
-        return w[2 + pick];
-    }
-
-    /// The nodes a grown tree takes at most: 0 when the drafter drafts chains and lane trees (TF_NO_TREES, TF_DRAFT_NODES=0).
-    fn nodes(d: *const Draft) usize {
-        _ = d;
-        if (platform.c.getenv("TF_NO_TREES") != null) return 0;
-        const n = if (platform.c.getenv("TF_DRAFT_NODES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch tree_nodes else tree_nodes;
-        return @min(n, engine.most_window - 1);
-    }
-
-    /// Row `r`'s candidates after `pred`, scored as best_first scores them: (unary + edge x selector) / scale, as log-chances.
-    fn chancesAfter(d: *const Draft, r: usize, pred: u32, out: *[lp_top]f64) void {
-        const c = d.c;
-        const w = std.mem.bytesAsSlice(u32, d.staged.bytes[words_at..][r * lp_words * 4 ..][0 .. lp_words * 4]);
-        const hp = std.mem.bytesAsSlice(u16, d.staged.bytes[hp_at..][r * c.rank * 2 ..][0 .. c.rank * 2]);
-        var most: f64 = -std.math.inf(f64);
-        for (0..c.topk) |j| {
-            const cand = w[2 + j];
-            var edge: f64 = 0;
-            for (0..c.rank) |k| edge += @as(f64, bf16(d.w.predecessor[pred * c.rank + k])) * bf16(hp[k]) * bf16(d.w.successor[cand * c.rank + k]);
-            out[j] = (@as(f64, @as(f32, @bitCast(w[2 + lp_top + j]))) + tree_edge * edge) / tree_scale;
-            most = @max(most, out[j]);
-        }
-        var total: f64 = 0;
-        for (out[0..c.topk]) |v| total += @exp(v - most);
-        const log_total = most + @log(total);
-        for (out[0..c.topk]) |*v| v.* -= log_total;
-    }
-
-    /// best_first over the rows' candidates: the open node with the least path cost next, ties by parent, token, row.
-    fn grow(d: *Draft, ctx: *Ctx, pending: u32, rows: usize, most: usize) void {
-        const Open = struct { cost: f64, parent: i32, token: u32, row: usize, own: f64 };
-        var open: [tree_branch * (engine.most_window + 1)]Open = undefined;
-        var n_open: usize = 0;
-        const w0 = d.staged.bytes[words_at..];
-        var count: usize = 0;
-        var pred = pending;
-        var parent: i32 = -1;
-        var row: usize = 0;
-        var path: f64 = 0;
-        while (true) {
-            // the node just taken (or the pending token) opens its best children on the next row
-            if (row < rows) {
-                var lc: [lp_top]f64 = undefined;
-                d.chancesAfter(row, pred, &lc);
-                var order: [lp_top]usize = undefined;
-                for (order[0..d.c.topk], 0..) |*o, i| o.* = i;
-                std.mem.sort(usize, order[0..d.c.topk], &lc, struct {
-                    fn more(v: *const [lp_top]f64, a: usize, b: usize) bool {
-                        return v[a] > v[b] or (v[a] == v[b] and a < b);
-                    }
-                }.more);
-                const w = std.mem.bytesAsSlice(u32, w0[row * lp_words * 4 ..][0 .. lp_words * 4]);
-                for (order[0..@min(tree_branch, d.c.topk)]) |j| {
-                    if (!std.math.isFinite(lc[j]) or n_open == open.len) break;
-                    open[n_open] = .{ .cost = path - lc[j], .parent = parent, .token = w[2 + j], .row = row, .own = lc[j] };
-                    n_open += 1;
-                }
-            }
-            if (count == most or n_open == 0) break;
-            var best: usize = 0;
-            for (open[1..n_open], 1..) |o, i| {
-                const b = open[best];
-                if (o.cost < b.cost or (o.cost == b.cost and (o.parent < b.parent or (o.parent == b.parent and (o.token < b.token or (o.token == b.token and o.row < b.row)))))) best = i;
-            }
-            const node = open[best];
-            open[best] = open[n_open - 1];
-            n_open -= 1;
-            ctx.held[count] = node.token;
-            ctx.parents[count] = node.parent;
-            ctx.own[count] = node.own;
-            pred = node.token;
-            parent = @intCast(count);
-            row = node.row + 1;
-            path = node.cost;
-            count += 1;
-        }
-        ctx.held_n = count;
-        ctx.grown = count;
-    }
-
-    /// The path through the rows' candidates: each row's best after the one before.
-    fn select(d: *Draft, ctx: *Ctx, pending: u32, rows: usize) void {
-        var pred = pending;
-        for (0..rows) |r| {
-            ctx.held[r] = d.choice(r, pred, 0);
-            pred = ctx.held[r];
-        }
-    }
-
-    /// The tree's lanes in order: lane i the rank-r candidate at its depth's row after its parent lane's token.
-    fn selectLanes(d: *Draft, ctx: *Ctx, pending: u32, rows: usize, l: *const lanes.shape.Shape) !void {
-        if (l.parents.len > ctx.held.len) return error.TooManyLanes;
-        for (l.parents, l.depths, l.ranks, 0..) |par, depth, rank, i| {
-            if (depth >= rows or rank >= d.c.topk or par >= @as(i32, @intCast(i))) return error.BadLanes;
-            const pred = if (par < 0) pending else ctx.held[@intCast(par)];
-            ctx.held[i] = d.choice(depth, pred, rank);
-        }
-        ctx.held_n = l.parents.len;
+        if (platform.c.getenv("TF_TIMING") != null) std.debug.print("[timing] held {d}, grown {d}\n", .{ ctx.held_n, ctx.grown });
     }
 
     // the Drafter contract
@@ -594,7 +464,7 @@ pub const Draft = struct {
     fn factsFn(p: *anyopaque) dr.Facts {
         const d = cast(p);
         // TF_NO_TREES=1: chains only (for comparing)
-        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.c.ringBytes(), .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(d.nodes()) };
+        return .{ .depth = @intCast(d.c.block - 1), .step_ms = d.step_ms, .prior = &prior, .plain_guard = true, .batched = false, .stream_bytes = d.c.ringBytes(), .trees = platform.c.getenv("TF_NO_TREES") == null, .window_costs = d.costs[0..d.n_costs], .lane_costs = d.costs[0..d.n_costs], .tree_nodes = @intCast(tree.nodes()) };
     }
 
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
@@ -666,10 +536,6 @@ pub const Draft = struct {
 /// Acceptance by depth until a stream has its own (the reference's chat text: measured, see the commit).
 const prior = [_]f64{ 0.75, 0.65, 0.58, 0.52, 0.47, 0.43, 0.4 };
 
-fn bf16(h: u16) f32 {
-    return @bitCast(@as(u32, h) << 16);
-}
-
 /// TF_TIMING=1: each call's wall time on stderr.
 pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {
     if (platform.c.getenv("TF_TIMING") == null) return;
@@ -677,6 +543,10 @@ pub fn timing(what: []const u8, io: std.Io, t0: std.Io.Timestamp) void {
     const ns: f64 = @floatFromInt(t0.durationTo(now).toNanoseconds());
     const at: f64 = @floatFromInt(@mod(now.toNanoseconds(), 1_000_000_000_000));
     std.debug.print("[timing] {s} {d:.2} ms at {d:.1}\n", .{ what, ns / 1e6, at / 1e6 });
+}
+
+test {
+    _ = tree;
 }
 
 test "a drafter config with a zero divisor is refused, and any admitted rank's selector rows fit the staging area" {
