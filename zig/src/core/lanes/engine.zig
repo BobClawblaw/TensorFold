@@ -115,24 +115,28 @@ pub const Engine = struct {
         e.sweep() catch {}; // its release may have ended another (a backend's paused stream that could not move)
     }
 
-    /// Releases the live streams that finished, again while a release ends another, so none outlives its job.
-    fn sweep(e: *Engine) !void {
+    /// Reaps finished streams before the host frees their jobs; tracing failure cannot interrupt cleanup.
+    pub fn sweep(e: *Engine) !void {
+        var failure: ?anyerror = null;
         var again = true;
         while (again) {
             again = false;
-            var kept: usize = 0;
-            for (e.live.items) |s| {
-                if (s.finished) {
-                    try trail.finish(e, s);
-                    e.release(s);
-                    again = true;
+            var i: usize = 0;
+            while (i < e.live.items.len) {
+                const s = e.live.items[i];
+                if (!s.finished) {
+                    i += 1;
                     continue;
                 }
-                e.live.items[kept] = s;
-                kept += 1;
+                _ = e.live.orderedRemove(i);
+                trail.finish(e, s) catch |err| {
+                    if (failure == null) failure = err;
+                };
+                e.release(s);
+                again = true;
             }
-            e.live.shrinkRetainingCapacity(kept);
         }
+        if (failure) |err| return err;
     }
 
     /// One round for every live stream (Python `_family_step`).
