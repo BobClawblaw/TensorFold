@@ -95,20 +95,30 @@ pass.
 Additional slots allocate caches for the selected context. Startup reserves their metadata and the prompt-cache
 budget, then checks the physical footprint before accepting requests. A fixed slot count that does not fit is
 refused; lower the count, context or prompt-cache budget. `--prompt-cache-over-cap` overrides only the prompt-cache
-budget. Shared sessions sample: a request with a temperature draws each token on the host from the head's logits
-with the server's keyed sampler (top-k, top-p, min-p, a `seed` or one derived from the prompt), so a sampled reply is
-the same with drafting on and off and alone or beside other streams. `--parallel 1` still decodes greedily only.
+budget. Shared sessions draw sampled tokens with the same GPU sampler as the single-Mac `--parallel 1` path.
+Each packed window uses its own seed, sampling settings and absolute token positions. The two-Mac path remains
+greedy only. The model gate below must verify sampled token parity across routes, drafting and batch composition.
+
+The shared host's residency set includes the engine, session caches and metadata, shared hidden rows and later
+prompt snapshots. Residency stays within 70% of RAM even when the load limit is raised; a refused set leaves the
+server running without it. `FLASHNEXT_NO_RESIDENCY=1` disables the set. With a prompt cache, background warm turns
+keep the end of a reply as the single-request host does. Idle latency and throughput need fresh measurements.
 
 The checkpoint gate compares shared replies with fresh legacy replies, with drafting off and on, then checks
 prompt admission, cancellation, slot reuse and a restored prefix while another request remains active:
 
 ```bash
 zig build tf-flashnext-batch
+zig-out/bin/tf-flashnext-batch --sampling-only
 python tools/zig/flashnext_batch_prompts.py MODEL_DIR /tmp/flashnext-prompts
 FZ_N=128 zig-out/bin/tf-flashnext-batch MODEL_DIR /tmp/flashnext-prompts/*.json
+FZ_SAMPLE=1 FZ_N=128 zig-out/bin/tf-flashnext-batch MODEL_DIR /tmp/flashnext-prompts/*.json
 ```
 
-Run with one model process on the GPU. For a served comparison with identical requests and settings:
+These device gates require exclusive GPU use. `--sampling-only` uses synthetic logits and checks distinct seeds,
+positions and row offsets against the shared GPU-rule reference, including untouched greedy and spare rows.
+`FZ_SAMPLE=1` repeats the model gate with fixed seeds per prompt. Compilation alone does not pass either gate.
+For a served comparison with identical requests and settings:
 
 ```bash
 zig build native

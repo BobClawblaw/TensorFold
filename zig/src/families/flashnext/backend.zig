@@ -13,15 +13,9 @@ const Buf = fz.Buf;
 const mtl = @import("metal");
 const segments = @import("../../core/segments.zig");
 const slots = @import("slots.zig");
-const sample = @import("host_sample.zig");
+const sample = @import("batch_sample.zig");
 const think = @import("think.zig");
 const batch_costs = @import("batch_costs.zig");
-
-/// Row `row` of a [rows, VOCAB] bf16 logits buffer, drawn with `p` keyed at `position`.
-fn drawRow(gpa: std.mem.Allocator, logits: Buf, row: usize, p: lanes.Sampling, position: u64) !u32 {
-    const bytes = logits.b.contents()[logits.off + row * fz.VOCAB * 2 ..][0 .. fz.VOCAB * 2];
-    return sample.draw(gpa, @as([*]const u16, @ptrCast(@alignCast(bytes.ptr)))[0..fz.VOCAB], p, position);
-}
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -280,7 +274,7 @@ pub const Backend = struct {
             s.first = try fz.Prompt.chunkN(ps[0..call.parts], &s.m, b.gpa, prompt[at..end]);
             // Sample before the next forward replaces the last prompt row's logits.
             if (end == prompt.len) if (sample.active(stream.sampling)) |p| {
-                s.first = try drawRow(b.gpa, s.m.t.logits, 0, p, prompt.len);
+                s.first = try sample.first(b.e, &s.m, p, @intCast(prompt.len));
             };
             for (ps[0..call.parts], 0..) |p, k| {
                 const start = at + segments.start(call.rows, call.parts, k);
@@ -440,12 +434,13 @@ pub const Backend = struct {
         const cb = b.e.r.queue.commandBuffer();
         b.e.r.enc = cb.compute(.serial);
         try forward.encode(b.e, segs[0..windows.len], plan.total, t.ids8);
+        @memcpy(b.e.draw_at.b.slice(u32, fz.MAXR)[0..plan.total], plan.keys[0..plan.total]);
+        for (windows, 0..) |w, i| if (sample.active(w.stream.sampling)) |p| {
+            sample.encode(b.e.r.enc, b.e.r.draw_pipe, t.logits, b.e.draw_at, t.picks, plan.starts[i], w.rows(), p);
+        };
         try b.primary.finish(cb);
         Session.copy(b.primary.last, b.hidden, plan.total * fz.WIDE * 2);
         for (out, 0..) |o, i| @memcpy(o.sampled, t.picks.b.slice(u32, plan.total)[plan.starts[i]..][0..o.sampled.len]);
-        for (windows, out, 0..) |w, o, i| if (sample.active(w.stream.sampling)) |p| {
-            for (o.sampled, w.positions, 0..) |*tok, pos, j| tok.* = try drawRow(b.gpa, t.logits, plan.starts[i] + j, p, pos);
-        };
         b.window_count += 1;
         if (windows.len > 1) b.shared_count += 1;
         if (std.c.getenv("FZ_BATCH_LOG") != null)

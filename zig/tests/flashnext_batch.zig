@@ -1,4 +1,4 @@
-//! Checkpoint gate: shared target rounds against fresh legacy greedy replies, including admission and cancellation.
+//! Checkpoint gate: shared target rounds against legacy replies, including seeded draws, admission and cancellation.
 const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
@@ -32,10 +32,14 @@ const Reply = struct {
         return false;
     }
     fn marked(_: *anyopaque, _: usize) void {}
-    fn out(r: *Reply) fx.Out {
-        return .{ .ctx = r, .prefilled = prefilled, .tokens = emitted, .cancelled = cancelled, .marked = marked };
+    fn out(r: *Reply, sampling: ?lanes.Sampling) fx.Out {
+        return .{ .ctx = r, .prefilled = prefilled, .tokens = emitted, .cancelled = cancelled, .marked = marked, .sampling = sampling };
     }
 };
+
+fn samplingFor(enabled: bool, index: usize) ?lanes.Sampling {
+    return if (enabled) .{ .seed = 1234 + index, .temperature = 0.7, .top_k = 40, .top_p = 0.9, .min_p = 0.05 } else null;
+}
 
 fn prompt(a: std.mem.Allocator, path: []const u8) ![]u32 {
     const f = try mtl.MappedFile.open(try std.fmt.allocPrintSentinel(a, "{s}", .{path}, 0));
@@ -109,9 +113,18 @@ fn draftDepths(a: std.mem.Allocator, back: *Backend, prompts: []const []u32) !vo
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
-    if (args.len < 4) return error.ExpectedModelAndTwoPromptFiles;
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampling-only"))
+        return @import("flashnext_batch_sample.zig").check(init.gpa);
+    if (args.len < 4) return error.ExpectedModelAndTwoPromptFiles;
+    const sampled = if (std.c.getenv("FZ_SAMPLE")) |v| blk: {
+        const text = std.mem.span(v);
+        if (std.mem.eql(u8, text, "1")) break :blk true;
+        if (std.mem.eql(u8, text, "0")) break :blk false;
+        return error.BadSamplingFlag;
+    } else false;
+    std.debug.print("GATE sampled {any}: temperature0.7 top_k40 top_p0.9 min_p0.05 seeds1234+prompt_index\n", .{sampled});
     const n: u32 = if (std.c.getenv("FZ_N")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 32;
     if (n < 8) return error.NeedEightReplyTokens;
     const count = args.len - 2;
@@ -125,17 +138,17 @@ pub fn main(init: std.process.Init) !void {
     var capacity: usize = 1024;
     var baseline_seconds: f64 = 0;
     var baseline_mtp_seconds: f64 = 0;
-    for (args[2..], prompts, refs) |path, *ids, *ref| {
+    for (args[2..], prompts, refs, 0..) |path, *ids, *ref, i| {
         ids.* = try prompt(a, path);
         capacity = @max(capacity, ids.len + n + fx.MARGIN);
         ref.* = .{ .a = a };
         const start = mtl.clock.seconds();
-        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, 0, .{}, ref.out());
+        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, 0, .{}, ref.out(samplingFor(sampled, i)));
         baseline_seconds += mtl.clock.seconds() - start;
         if (ref.tokens.items.len != n) return error.ShortBaseline;
         var drafted: Reply = .{ .a = a };
         const mtp_start = mtl.clock.seconds();
-        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, null, .{}, drafted.out());
+        _ = try eng.generateFrom(ids.*, 0, &.{}, n, &.{}, null, .{}, drafted.out(samplingFor(sampled, i)));
         baseline_mtp_seconds += mtl.clock.seconds() - mtp_start;
         if (!std.mem.eql(u32, drafted.tokens.items, ref.tokens.items)) return error.LegacyMtpTokenMismatch;
     }
@@ -168,6 +181,7 @@ pub fn main(init: std.process.Init) !void {
             .prompt = ids,
             .max_new = n,
             .drafts = drafts,
+            .sampling = samplingFor(sampled, i),
         });
         defer for (streams) |*s| s.deinit(init.gpa);
         const start = mtl.clock.seconds();
@@ -189,11 +203,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("PASS drafts {any}: {d} streams, {d} exact tokens, {d} shared forwards, {d:.3}s, legacy serial {d:.3}s\n", .{ drafts, count, count * n, back.shared_count - before, seconds, baseline });
         std.debug.print("MEASURE chain {any}: draft calls {d}, waits {d}, draft {d:.6}s, total {d:.6}s\n", .{ mode.chain, back.draft_calls - draft_before, back.draft_waits - waits_before, back.draft_seconds - draft_seconds_before, seconds });
         // Admit a third prompt after a shared round, cancel its peer, and reuse the released slot.
-        var first = try lanes.Stream.init(init.gpa, .{ .id = "survivor", .prompt = prompts[0], .max_new = n, .drafts = drafts });
+        var first = try lanes.Stream.init(init.gpa, .{ .id = "survivor", .prompt = prompts[0], .max_new = n, .drafts = drafts, .sampling = samplingFor(sampled, 0) });
         defer first.deinit(init.gpa);
-        var cancelled = try lanes.Stream.init(init.gpa, .{ .id = "cancelled", .prompt = prompts[1], .max_new = n, .drafts = drafts });
+        var cancelled = try lanes.Stream.init(init.gpa, .{ .id = "cancelled", .prompt = prompts[1], .max_new = n, .drafts = drafts, .sampling = samplingFor(sampled, 1) });
         defer cancelled.deinit(init.gpa);
-        var admitted = try lanes.Stream.init(init.gpa, .{ .id = "admitted", .prompt = prompts[1], .max_new = n, .drafts = drafts });
+        var admitted = try lanes.Stream.init(init.gpa, .{ .id = "admitted", .prompt = prompts[1], .max_new = n, .drafts = drafts, .sampling = samplingFor(sampled, 1) });
         defer admitted.deinit(init.gpa);
         try core.addStream(&first);
         try core.addStream(&cancelled);
@@ -212,6 +226,7 @@ pub fn main(init: std.process.Init) !void {
             .prompt = prompts[longest],
             .max_new = 1,
             .drafts = drafts,
+            .sampling = samplingFor(sampled, longest),
             .reuse = .{ .marks = &marks, .hook = .{ .ptr = &mark, .at = Mark.at } },
         });
         defer primer.deinit(init.gpa);
@@ -219,13 +234,14 @@ pub fn main(init: std.process.Init) !void {
         if (mark.err) |err| return err;
         const saved = mark.saved orelse return error.NoSnapshot;
         defer Backend.snapDrop(&back, saved);
-        var peer = try lanes.Stream.init(init.gpa, .{ .id = "cache-peer", .prompt = prompts[0], .max_new = n, .drafts = drafts });
+        var peer = try lanes.Stream.init(init.gpa, .{ .id = "cache-peer", .prompt = prompts[0], .max_new = n, .drafts = drafts, .sampling = samplingFor(sampled, 0) });
         defer peer.deinit(init.gpa);
         var resumed = try lanes.Stream.init(init.gpa, .{
             .id = "cache-resumed",
             .prompt = prompts[longest],
             .max_new = n,
             .drafts = drafts,
+            .sampling = samplingFor(sampled, longest),
             .reuse = .{ .saved = saved, .at = marks[0] },
         });
         defer resumed.deinit(init.gpa);

@@ -1,4 +1,4 @@
-//! Keyed bf16 sampling with bounded top-k or sorted wide candidates, matching the reference draw.
+//! Historical bf16 host sampler; shared serving uses batch_sample.zig and the GPU rule.
 const std = @import("std");
 const lanes = @import("lanes");
 
