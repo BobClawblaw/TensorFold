@@ -69,6 +69,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan });
+    // a lone greedy request runs on the engine's GPU-side rounds until a second one arrives (FLASHNEXT_NO_LONE=1: shared rounds)
+    if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     h.cache = null;
     if (plan.budget_bytes > 0) {
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = Backend.snapBytes, .save = Backend.snapSave, .restore = Backend.snapRestore, .drop = Backend.snapDrop, .charged = Backend.snapCharged, .spare = Backend.snapSpare, .trim = Backend.snapTrim, .reuses = Backend.snapReuses } }, .{ .lookahead = 1, .planned = true }, plan.budget_bytes);
@@ -80,8 +82,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     h.warm = .{ .queue = eng.r.queue };
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     try h.host.start();
-    std.log.info("Flash Next: {d} session slots, shared target forwards, {s}", .{ slots, if (h.back.serial_drafts) "serial MTP drafts" else "every stream's drafts in one command buffer" });
+    std.log.info("Flash Next: {d} session slots, shared target forwards, {s}{s}", .{ slots, if (h.back.serial_drafts) "serial MTP drafts" else "every stream's drafts in one command buffer", if (h.host.lone != null) "; a lone request on the engine's own rounds" else "" });
     return .{ .engine = h.host.engine(), .close = close, .ctx = h };
+}
+
+fn loneRun(ctx: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    return h.back.lone(s, hooks);
 }
 
 fn words(_: ?*anyopaque, err: anyerror) ?[]const u8 {

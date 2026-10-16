@@ -13,6 +13,7 @@ const Buf = fz.Buf;
 const mtl = @import("metal");
 const segments = @import("../../core/segments.zig");
 const sample = @import("host_sample.zig");
+const think = @import("think.zig");
 const batch_costs = @import("batch_costs.zig");
 
 /// A stream's sampling when it samples (a temperature above 0); null: the GPU's argmax stands.
@@ -40,6 +41,7 @@ pub const Backend = struct {
     draft_calls: u64 = 0,
     draft_waits: u64 = 0,
     draft_seconds: f64 = 0,
+    lone_handoffs: u64 = 0, // lone streams the engine's rounds handed to the shared ones
     serial_drafts: bool = false, // FZ_BATCH_MTP_SERIAL=1: each stream's drafts in their own command buffers
     costs: ?batch_costs.Costs = null, // timeCosts: the lane allocator's prices
 
@@ -94,8 +96,8 @@ pub const Backend = struct {
         const c: ?*const batch_costs.Costs = if (b.costs) |*x| x else null;
         // shared rounds priced from the timed forwards, each draft past a stream's first at a chained step's time; a
         // lone stream's depth from the same (FZ_LONE_UNPRICED=1: the heuristic)
-        const lone = c != null and std.c.getenv("FZ_LONE_UNPRICED") == null;
-        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (lone) &c.?.shared else &.{}, .mtp_step_ms = if (lone) c.?.step_ms else 0 };
+        const lone_priced = c != null and std.c.getenv("FZ_LONE_UNPRICED") == null; // not `lone`: that names the lone driver
+        return .{ .exact_width = fz.MAXR, .first_copy_rows = 4, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 8, .streams_exact = true, .hidden_rows = true, .batch_rows = fz.MAXR, .max_streams = @intCast(b.sessions.len), .draft_streams = !b.serial_drafts, .shared_costs = if (c) |x| &x.shared else &.{}, .draft_step_ms = if (c != null and !b.serial_drafts) c.?.step_ms else 0, .window_costs = if (lone_priced) &c.?.shared else &.{}, .mtp_step_ms = if (lone_priced) c.?.step_ms else 0 };
     }
 
     fn self(ptr: *anyopaque) *Backend {
@@ -160,13 +162,18 @@ pub const Backend = struct {
     fn prefill(ptr: *anyopaque, stream: *Stream) anyerror!void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        const b = self(ptr);
+        try self(ptr).fill(stream, null);
+    }
+
+    /// A stream's whole prompt pass, in session `slot` when given (free), else the first free one.
+    fn fill(b: *Backend, stream: *Stream, slot: ?usize) !void {
         const prompt = stream.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
         try b.settle();
-        const i = for (b.sessions, 0..) |s, j| {
+        const i = slot orelse for (b.sessions, 0..) |s, j| {
             if (!s.used) break j;
         } else return error.NoFreeSlot;
+        if (b.sessions[i].used) return error.NoFreeSlot;
         const s = &b.sessions[i];
         if (prompt.len + stream.max_new + fz.MAXR + 1 > s.m.cap) return error.ContextFull;
         try b.by.put(b.gpa, stream, i);
@@ -220,6 +227,91 @@ pub const Backend = struct {
         }
         s.m.mtp.pos = prompt.len - 1;
         s.m.mtp.drafted = 0;
+    }
+
+    /// Commits a lone stream's first token; its prompt as the context holds it after the commit, which can move it.
+    fn commitFirst(gpa: std.mem.Allocator, stream: *Stream, token: u32) ![]const u32 {
+        _ = try stream.commit(gpa, &.{token}, &.{});
+        return stream.prompt();
+    }
+
+    /// LaneHost's lone driver: the shared prompt pass into session 0, then the engine's rounds until done (false) or handed over (true).
+    pub fn lone(b: *Backend, stream: *Stream, hooks: anytype) !bool {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const s = &b.sessions[0]; // the GPU-side rounds run on the engine's own buffers
+        if (s.used) return error.NoFreeSlot;
+        if (stream.prompt().len + stream.max_new + @import("engine.zig").MARGIN > s.m.cap) return error.ContextFull;
+        var handed = false;
+        defer if (!handed) release(b, stream);
+        try b.fill(stream, 0);
+        const prompt = try commitFirst(b.gpa, stream, s.first); // decode copies it to the rounds' history before any round commits
+        hooks.committed(hooks.ctx);
+        if (stream.finished) return false;
+        const Hooks = @TypeOf(hooks);
+        const Ctx = struct {
+            gpa: std.mem.Allocator,
+            stream: *Stream,
+            hooks: Hooks,
+            failed: ?anyerror = null,
+            fn prefilled(_: *anyopaque) void {}
+            fn tokens(p: *anyopaque, toks: []const u32) bool {
+                const c: *@This() = @ptrCast(@alignCast(p));
+                _ = c.stream.commit(c.gpa, toks, &.{}) catch |err| {
+                    c.failed = err;
+                    return true;
+                };
+                c.hooks.committed(c.hooks.ctx);
+                return c.stream.finished;
+            }
+            fn cancelled(p: *anyopaque) bool { // a request waits, or one is cancelled: the lane core takes over
+                const c: *@This() = @ptrCast(@alignCast(p));
+                return c.hooks.yield(c.hooks.ctx);
+            }
+        };
+        var c: Ctx = .{ .gpa = b.gpa, .stream = stream, .hooks = hooks };
+        var ho: Engine.Handoff = .{};
+        {
+            const old = try b.bind(s);
+            defer old.restore(b);
+            outputs(b, s, 0);
+            var watch = try think.Watch.init(.{}); // no thinking budget: lone_host_lone.fits keeps those in the lane core
+            const res = try b.e.decode(prompt, s.first, s.last, stream.max_new, stream.eos, null, &watch, .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled }, &ho);
+            if (c.failed) |err| return err;
+            stream.rounds += res.rounds;
+            stream.drafted += res.drafted;
+            stream.accepted += res.accepted;
+            if (res.rounds > 0) stream.min_rows = if (stream.min_rows == 0) res.min_rows else @min(stream.min_rows, res.min_rows);
+        }
+        if (!ho.yielded) {
+            if (!stream.finished) { // the rounds ended where the stream did not (eos or length by the engine's count)
+                stream.finished = true;
+                stream.reason = .stop;
+            }
+            return false;
+        }
+        const ctx = stream.context.items;
+        const at = ho.cache; // the cache's rows: every committed token but the last, the next window's first
+        if (at + 1 != ctx.len or at < 2) return error.HandoffOutOfStep;
+        s.m.pos = at;
+        s.m.state = 0;
+        s.m.state_row = 0;
+        s.m.ple.hist = .{ ctx[at - 2], ctx[at - 1] };
+        s.m.mtp.pos = at;
+        s.m.mtp.drafted = 0;
+        s.m.mtp.pooled_n = @min(s.m.mtp.pooled_n, at / 4); // blocks the rounds pooled are pooled again here
+        for (&s.m.layers) |*l| if (!l.linear) {
+            l.pooled_n = @min(l.pooled_n, at / 4);
+        };
+        s.held_n = 0;
+        s.round = .{};
+        stream.cache_len = at;
+        stream.pending = ctx[at];
+        stream.next = null;
+        handed = true;
+        b.lone_handoffs += 1;
+        std.log.info("flash next: a lone stream at {d} tokens handed to the shared rounds ({d} handoffs)", .{ at, b.lone_handoffs });
+        return true;
     }
 
     fn first(ptr: *anyopaque, stream: *Stream, position: u64) anyerror!u64 {
@@ -435,3 +527,18 @@ pub const Backend = struct {
         snap.drop(self(ptr).gpa, @ptrCast(@alignCast(saved)));
     }
 };
+
+test "a lone stream's prompt is read after its first token's commit moves the context" {
+    const gpa = std.testing.allocator;
+    const tokens = [_]u32{ 11, 12, 13, 14, 15, 16, 17 };
+    var stream = try Stream.init(gpa, .{ .id = "lone", .prompt = &tokens, .max_new = 4, .eos = &.{} });
+    defer stream.deinit(gpa);
+    stream.context.shrinkAndFree(gpa, stream.context.items.len); // full: the first token must grow it
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .resize_fail_index = 0 }); // and not in place
+    const before = stream.context.items.ptr;
+    const prompt = try Backend.commitFirst(failing.allocator(), &stream, 99);
+    try std.testing.expect(stream.context.items.ptr != before);
+    try std.testing.expectEqual(stream.context.items.ptr, prompt.ptr);
+    try std.testing.expectEqualSlices(u32, &tokens, prompt);
+    try std.testing.expectEqualSlices(u32, &.{99}, stream.emitted());
+}

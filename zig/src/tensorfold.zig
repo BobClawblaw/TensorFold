@@ -65,6 +65,7 @@ test {
     _ = @import("families/flashnext/dense.zig"); // The core projection adapter keeps format, cuts and tiles.
     _ = @import("families/flashnext/marks.zig"); // a call's marks
     _ = @import("families/flashnext/think.zig"); // a thinking budget's close on the host
+    _ = @import("families/flashnext/backend.zig"); // the shared sessions' backend (a lone stream's prompt after its first commit)
     _ = @import("families/flashnext/batch_costs.zig"); // the shared rounds' timing needs a session that holds it
     _ = @import("families/flashnext/think_check.zig"); // and in the verdict kernels (Metal)
     _ = @import("families/flashnext/sample.zig"); // a sampled window's draws on the GPU (Metal)
