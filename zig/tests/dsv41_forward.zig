@@ -66,6 +66,8 @@ pub fn main(init: std.process.Init) !void {
     var dir = try std.Io.Dir.cwd().openDir(init.io, out_dir, .{});
     defer dir.close(init.io);
     try dir.writeFile(init.io, .{ .sub_path = "logits.bin", .data = logits });
+    // the last index source's (layer 36's) picks for every row, when the whole input was one call
+    if (dumping) try dir.writeFile(init.io, .{ .sub_path = "picks.bin", .data = scratch.picks.contents()[0 .. ids.len * q.state.picks * 4] });
     if (dumping) for (dump_bufs, 0..) |b, i| {
         var name: [32]u8 = undefined;
         const n = try std.fmt.bufPrint(&name, "layer{d}.bin", .{i});
