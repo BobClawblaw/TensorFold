@@ -118,7 +118,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     errdefer h.core.deinit();
     const plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, ""); // the cache under the same limit as the sessions
     eng.snap_pool.max = plan.budget_bytes;
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .admit = if (tiers != null) .{ .ctx = &h.back, .fits = Backend.fits } else null });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .structures = true, .admit = if (tiers != null) .{ .ctx = &h.back, .fits = Backend.fits } else null });
     // FLASHNEXT_NO_LONE=1 keeps even lone requests on shared rounds.
     if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     if (vis) |v| {

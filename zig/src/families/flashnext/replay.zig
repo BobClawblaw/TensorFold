@@ -48,7 +48,7 @@ pub const Entry = struct { fd: std.c.fd_t, at: usize, len: usize };
 pub const Variant = struct { inputs: [][]const u8, outputs: [][]const u8, meta: [][]const u8, pipe: mtl.Pipeline, file: []const u8 = "", name: []const u8 = "", text: []const u8 = "" };
 pub const Site = struct { v: *Variant, grid: mtl.Size, tg: mtl.Size };
 
-const glue_source =
+pub const glue_source =
     \\#include <metal_stdlib>
     \\using namespace metal;
     \\// meta: position of row 0, key capacity, rows
@@ -1455,6 +1455,7 @@ test {
     _ = @import("drafts.zig"); // the depth rule's tests
     _ = @import("replay_held_test.zig"); // Run.release and the held list (#732)
     _ = vis_prompt; // an image prompt's frame, its spans and its cache key
+    _ = @import("grammar.zig"); // structured output: masked rows on the GPU against the host draw
 }
 
 test "catch-up slots: every layer's dispatch reads its own first block after the later layers' writes" {
