@@ -122,7 +122,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     // FLASHNEXT_NO_LONE=1 keeps even lone requests on shared rounds.
     if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     if (vis) |v| {
-        h.host.info_.vision = .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &v.markers, .image_tokens = v.capacity, .max_images = v.max_images };
+        h.host.info_.vision = images.offer(v, h, prepareImage, prepareVideo);
         h.host.images_uncached = true; // the shifted frame (vis_prompt.frame): an image moves the rows before it
     }
     h.cache = null;
@@ -157,6 +157,12 @@ fn buildImages(ctx: *anyopaque, a: std.mem.Allocator, imgs: []const lanes.stream
 
 fn releaseImages(_: *anyopaque, p: *VisPrompt) void {
     p.rows.deinit();
+}
+
+/// Info.vision's video prepare: on the HTTP thread.
+fn prepareVideo(ctx: *anyopaque, a: std.mem.Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    return images.prepareVideo(h.vis.?, a, src, max_tokens, max_frames);
 }
 
 /// Info.vision's prepare: on the HTTP thread.

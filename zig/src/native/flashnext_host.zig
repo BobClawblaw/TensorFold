@@ -474,7 +474,7 @@ pub fn openWarmed(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cach
     const context_limit: i64 = tf.flashnext_replay.CAP - fx.MARGIN;
     h.* = .{ .gpa = gpa, .io = io, .eng = eng, .follower = follower, .load_limit = limit orelse 0, .vis = vis, .info_ = .{ .name = "flashnext-zig", .prompt_cache_plan = cache_plan, .lanes = 1, .greedy_only = eng.r.tp != null, .context_window = @intCast(if (window > 0) @min(window, context_limit) else context_limit) } };
     h.warm = .{ .queue = eng.r.queue };
-    if (vis) |v| h.info_.vision = .{ .ctx = h, .prepare = prepareImage, .image_token = v.c.image_token, .markers = &v.markers, .image_tokens = v.capacity, .max_images = v.max_images };
+    if (vis) |v| h.info_.vision = images.offer(v, h, prepareImage, prepareVideo);
     // macOS unwires idle GPU memory within seconds: the engine's buffers join one set the idle keepalive's ticks use
     if (std.c.getenv("FLASHNEXT_NO_RESIDENCY") == null) holdResident(h) catch |err| std.log.warn("flash next: no residency set ({s}): the first request after an idle second waits for the model's memory", .{@errorName(err)});
     errdefer dropResident(h);
@@ -506,6 +506,12 @@ fn holdResident(h: *Host) !void {
     h.warm = r.target();
     h.eng.r.follow = r.follow();
     h.eng.snap_pool.follow = r.follow(); // kept states' buffers join it, and leave it before they are freed
+}
+
+/// Info.vision's video prepare: on the HTTP thread.
+fn prepareVideo(ctx: *anyopaque, a: Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    return images.prepareVideo(h.vis.?, a, src, max_tokens, max_frames);
 }
 
 /// Info.vision's prepare, on the HTTP thread: the tower's patches for an image's bytes.

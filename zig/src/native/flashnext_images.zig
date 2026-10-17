@@ -1,4 +1,4 @@
-//! Flash Next's images (--vision, one Mac): the shared Qwen-VL tower's rows for a request's prompt pass, its frame.
+//! Flash Next's images and videos (--vision): the shared Qwen-VL tower's rows for a request's prompt pass, its frame.
 const std = @import("std");
 const mtl = @import("metal");
 const api = @import("engine_api");
@@ -21,6 +21,8 @@ pub const Vision = struct {
     capacity: u32, // image tokens one request holds (--vision-image-tokens)
     max_images: u32, // and images (--vision-max-images)
     markers: [3]u32, // vision_start, image_pad, vision_end: text that spells one stays text
+    video_markers: [3]u32, // vision_start, video_pad, vision_end
+    video: api.VisionOpen, // the video limits the server was started with
 
     /// Buffers to keep resident with the engine's.
     pub fn buffers(v: *const Vision) [2]mtl.Buffer {
@@ -61,13 +63,17 @@ pub fn open(gpa: Allocator, io: std.Io, eng: *fx.Engine, dir: []const u8, o: api
     }
     const v = try gpa.create(Vision);
     errdefer gpa.destroy(v);
-    v.* = .{ .gpa = gpa, .c = c, .tower = undefined, .prep = undefined, .capacity = o.image_tokens, .max_images = o.max_images, .markers = .{ c.vision_start, c.image_token, c.vision_end } };
-    // one image a pass: the tower's scratch holds the largest image the processor makes under the request's budget
-    const largest: u32 = @intCast(@min(@as(u64, o.image_tokens), c.max_pixels / (@as(u64, c.factor()) * c.factor())));
+    const videos = c.video_token != null;
+    v.* = .{ .gpa = gpa, .c = c, .tower = undefined, .prep = undefined, .capacity = o.image_tokens + if (videos) o.video_tokens else 0, .max_images = o.max_images, .markers = .{ c.vision_start, c.image_token, c.vision_end }, .video_markers = .{ c.vision_start, c.video_token orelse 0, c.vision_end }, .video = o };
+    // one image a pass: the tower's scratch holds the largest image, or video pair, the processors make under the budgets
+    const per = @as(u64, c.factor()) * c.factor();
+    const image_most = @min(@as(u64, o.image_tokens), c.max_pixels / per);
+    const pair_most = if (videos) @min(@as(u64, o.video_tokens), c.max_pixels / (vl.video.min_frames * per)) else 0;
+    const largest: u32 = @intCast(@max(image_most, pair_most));
     v.tower = try Tower.load(gpa, io, eng.r.device, dir, c, largest);
     errdefer v.tower.deinit();
     v.prep = try vp.Prep.init(eng.r.device);
-    std.log.info("flash next: image tower loaded ({d:.2} GiB with scratch for {d} image tokens a request)", .{ @as(f64, @floatFromInt(v.tower.bytes)) / (1 << 30), o.image_tokens });
+    std.log.info("flash next: image tower loaded ({d:.2} GiB with scratch for {d} tokens a pass; {d} image and {d} video tokens a request)", .{ @as(f64, @floatFromInt(v.tower.bytes)) / (1 << 30), largest, o.image_tokens, if (videos) o.video_tokens else 0 });
     return v;
 }
 
@@ -108,6 +114,36 @@ pub fn build(v: *Vision, eng: *fx.Engine, a: Allocator, images: []const api.Imag
 pub fn release(eng: *fx.Engine, p: ?*vp.VisPrompt) void {
     eng.m.vis = null;
     if (p) |q| q.rows.deinit();
+}
+
+/// Info.vision for a host: images, and videos when the checkpoint names a video token.
+pub fn offer(v: *Vision, ctx: *anyopaque, prepare_image: @FieldType(api.Vision, "prepare"), prepare_video: @FieldType(api.VideoOffer, "prepare")) api.Vision {
+    var o: api.Vision = .{ .ctx = ctx, .prepare = prepare_image, .image_token = v.c.image_token, .markers = &v.markers, .image_tokens = v.video.image_tokens, .max_images = v.max_images };
+    if (v.c.video_token) |t| o.video = .{ .prepare = prepare_video, .video_token = t, .group_open = v.c.vision_start, .group_close = v.c.vision_end, .group_token = t, .time_first = true, .markers = &v.video_markers, .video_tokens = v.video.video_tokens, .max_videos = v.video.max_videos, .max_frames = v.video.max_frames };
+    return o;
+}
+
+/// Info.vision's video prepare: a decoded video's frames to the tower's pairs (core/qwen_vl video), on the HTTP thread.
+pub fn prepareVideo(v: *const Vision, a: Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
+    const Adapter = struct {
+        src: api.VideoSource,
+        fn decode(c: *anyopaque, indices: []const u32, sink: *vl.video.Sink) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            const into = struct {
+                fn take(s: *anyopaque, k: usize, rgb: []const u8, w: u32, h: u32, stride: usize) anyerror!void {
+                    const g: *vl.video.Sink = @ptrCast(@alignCast(s));
+                    try g.take(k, rgb, w, h, stride);
+                }
+            }.take;
+            try self.src.decode(self.src.ctx, indices, .{ .ctx = sink, .take = into });
+        }
+    };
+    var ad: Adapter = .{ .src = src };
+    const s: vl.video.Source = .{ .frames = src.frames, .rate_num = src.rate_num, .rate_den = src.rate_den, .width = src.width, .height = src.height, .ctx = &ad, .decode = Adapter.decode };
+    const p = try vl.video.prepare(a, s, v.c, max_tokens, max_frames);
+    const groups = try a.alloc(api.PreparedImage, p.groups.len);
+    for (groups, p.groups) |*g, q| g.* = .{ .pixels = q.pixels, .gh = q.gh, .gw = q.gw, .tokens = q.tokens, .hash = q.hash };
+    return .{ .groups = groups, .times = p.times };
 }
 
 /// Info.vision's prepare: an image's bytes to the tower's patches (core/qwen_vl geometry), on the HTTP thread.
