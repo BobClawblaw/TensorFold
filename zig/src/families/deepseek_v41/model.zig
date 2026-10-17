@@ -40,7 +40,8 @@ pub const Model = struct {
         const files = try shards.shardFiles(gpa, io, dir);
         defer shards.freeShardFiles(gpa, files);
         for (files) |path| try m.checkpoint.addFile(m.device, path, "");
-        m.weights = try weights.load(&m.checkpoint, &m.config, drafts);
+        // the DSpark head when asked for and the checkpoint has it (mtp.*)
+        m.weights = try weights.load(&m.checkpoint, &m.config, drafts and m.checkpoint.has("mtp.0.attn.wq_a.weight"));
         m.kernels = try kernels.load(m.device, &m.config);
         errdefer m.kernels.deinit();
         m.engram = try engram.Engram.open(gpa, io, dir, &m.config);

@@ -41,7 +41,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         problem.* = try std.fmt.allocPrint(a, "--context {d} is outside DeepSeek-V4.1-Flash's 1 to {d} tokens", .{ window, config.context });
         return null;
     }
-    const model = q.Model.load(gpa, io, o.dir, false) catch |err| {
+    const model = q.Model.load(gpa, io, o.dir, true) catch |err| {
         problem.* = try std.fmt.allocPrint(a, cannot, .{@errorName(err)});
         return null;
     };
@@ -53,7 +53,8 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     const chunk = 256;
     h.metal = try q.backend.Metal.init(gpa, model, .{ .capacity = window, .chunk = chunk });
     errdefer h.metal.deinit();
-    h.config = try lanes.Config.init(gpa, h.metal.facts(), 1, 0);
+    const rows: u32 = if (h.metal.drafts != null) q.backend.window_rows else 1;
+    h.config = try lanes.Config.init(gpa, h.metal.facts(), rows, rows - 1);
     errdefer h.config.deinit(gpa);
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.metal.backend(), h.clock.clock());
