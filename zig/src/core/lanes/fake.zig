@@ -106,6 +106,11 @@ pub const Fake = struct {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
     }
 
+    /// Both: prompts a chunk a call, and short ones (up to 8 tokens) several in one pass (`many_rows`).
+    pub fn batchedSteps(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .prefill_many = prefillMany, .many_rows = 8, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
+    }
+
     fn self(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
     }
