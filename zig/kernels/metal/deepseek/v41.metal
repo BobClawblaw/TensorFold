@@ -64,13 +64,23 @@ inline float pow2_ceil(float x) {
   for (int s = 0; s < S; s++) X[(size_t(r) * S + s) * D + d] = v;
 }
 
-// The pending branch into the streams in place: x'[k] = post[k] * branch + sum_j comb[j][k] x[j].
+// The MoE branch as ds_moe_combine rounds it: the routed experts' rows then the shared expert's, summed in f32.
+static float combined(const device bfloat* Y, const device bfloat* SH, int topk, int r, int d) {
+  float acc = 0.0f;
+  for (int k = 0; k < topk; k++) acc += float(Y[(size_t(r) * topk + k) * D + d]);
+  acc += float(SH[size_t(r) * D + d]);
+  return float(bfloat(acc));
+}
+
+// The pending branch into the streams in place: x'[k] = post[k] * branch + sum_j comb[j][k] x[j]. With topk > 0 the
+// branch is the MoE's, combined here from the routed experts' rows Y and the shared expert's SH.
 [[kernel]] void ds_hc_expand(device bfloat* X [[buffer(0)]], const device bfloat* BR [[buffer(1)]],
                              const device float* POST [[buffer(2)]], const device float* COMB [[buffer(3)]],
-                             uint2 g [[thread_position_in_grid]]) {
+                             const device bfloat* Y [[buffer(4)]], const device bfloat* SH [[buffer(5)]],
+                             constant int& topk [[buffer(6)]], uint2 g [[thread_position_in_grid]]) {
   const uint d = g.x, r = g.y;
   device bfloat* x = X + size_t(r) * F;
-  const float b = float(BR[size_t(r) * D + d]);
+  const float b = topk > 0 ? combined(Y, SH, topk, int(r), int(d)) : float(BR[size_t(r) * D + d]);
   float xs[S];
   for (int j = 0; j < S; j++) xs[j] = float(x[j * D + d]);
   const device float* c = COMB + r * S * S;
@@ -115,6 +125,54 @@ constant constexpr int SLICES = F / 1024;
   if (int(t) <= MIX) {
     float s = 0.0f;
     for (int k = 0; k < 8; k++) s += red[k][t];
+    PART[(size_t(r) * SLICES + j) * (MIX + 1) + t] = s;
+  }
+}
+
+// ds_hc_expand then ds_hc_mix_part in one: the pending branch into the streams, read from X and written to XO (the
+// other buffer: a threadgroup reads every stream at its columns while others write theirs), the slice's mix sums from
+// the bf16 values written, as ds_hc_mix_part would read them back.
+[[kernel]] void ds_hc_expand_mix(const device bfloat* X [[buffer(0)]], const device bfloat* BR [[buffer(1)]],
+                                 const device float* POST [[buffer(2)]], const device float* COMB [[buffer(3)]],
+                                 const device float* FN [[buffer(4)]], device float* PART [[buffer(5)]],
+                                 device bfloat* XO [[buffer(6)]], const device bfloat* Y [[buffer(7)]],
+                                 const device bfloat* SH [[buffer(8)]], constant int& topk [[buffer(9)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint2 tpos [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                 uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float red[8][MIX + 1];
+  const int j = int(tg.x), r = int(tg.y);
+  const uint t = tpos.x;
+  const int col = 1024 * j + 4 * int(t);
+  const int k = col / D, d0 = col % D;
+  const device bfloat* x = X + size_t(r) * F;
+  const device float* cm = COMB + r * S * S;
+  float v[4];
+  for (int i = 0; i < 4; i++) {
+    const int d = d0 + i;
+    const float b = topk > 0 ? combined(Y, SH, topk, r, d) : float(BR[size_t(r) * D + d]);
+    float xs[S];
+    for (int jj = 0; jj < S; jj++) xs[jj] = float(x[jj * D + d]);
+    float mm = 0.0f;
+    for (int jj = 0; jj < S; jj++) mm += cm[jj * S + k] * xs[jj];
+    const bfloat o = bfloat(POST[r * S + k] * b + mm);
+    XO[size_t(r) * F + col + i] = o;
+    v[i] = float(o);
+  }
+  float acc[MIX + 1];
+  acc[MIX] = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
+  for (int m = 0; m < MIX; m++) {
+    const device float* f = FN + size_t(m) * F + col;
+    acc[m] = f[0] * v[0] + f[1] * v[1] + f[2] * v[2] + f[3] * v[3];
+  }
+  for (int m = 0; m <= MIX; m++) {
+    const float s = simd_sum(acc[m]);
+    if (lane == 0) red[sg][m] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(t) <= MIX) {
+    float s = 0.0f;
+    for (int q = 0; q < 8; q++) s += red[q][t];
     PART[(size_t(r) * SLICES + j) * (MIX + 1) + t] = s;
   }
 }

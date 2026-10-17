@@ -111,6 +111,7 @@ pub const Scratch = struct {
     ids: mtl.Buffer,
     pos: mtl.Buffer,
     x: mtl.Buffer, // the streams, bf16 [rows, 4, 5120]
+    x2: mtl.Buffer, // the other streams buffer: a fused expand writes it, then the two swap
     normed: mtl.Buffer,
     branch: mtl.Buffer,
     pre: [2]mtl.Buffer, // f32 [rows, 4]: the carried collapse, and this boundary's
@@ -185,6 +186,7 @@ pub const Scratch = struct {
         out.ids = try m.alloc(rows * 4);
         out.pos = try m.alloc(rows * 4);
         out.x = try m.alloc(rows * c.hc * c.hidden * 2);
+        out.x2 = try m.alloc(rows * c.hc * c.hidden * 2);
         out.normed = try m.alloc(rows * c.hidden * 2);
         out.branch = try m.alloc(rows * c.hidden * 2);
         for (&out.pre) |*p| p.* = try m.alloc(rows * c.hc * 4);

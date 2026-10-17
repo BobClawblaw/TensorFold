@@ -67,6 +67,11 @@ pub var dispatches: usize = 0;
 pub var trace = false;
 /// The next dispatch runs alongside the one before it (`Enc.with`): no barrier between them.
 var joined = false;
+/// A sublayer's branch waits to be expanded into the streams (`Enc.expand`): the next boundary that mixes does it in
+/// its own first dispatch; anything else that reads the streams flushes it first.
+var pending_expand = false;
+/// The pending branch is the MoE's, still to be combined from its routed (this many a row) and shared rows.
+var pending_topk: i32 = 0;
 var last_pipe: []const u8 = "";
 pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
 
@@ -319,12 +324,30 @@ const Enc = struct {
     fn boundary(self: Enc, hc: ?wts.Hc, pre_in: Buffer, pre_out: Buffer, norm: wts.Tensor) void {
         const s = self.s;
         if (hc) |h| {
-            self.pipe("ds_hc_mix_part");
-            self.buf(s.x, 0, 0);
-            self.tensor(h.fn_, 1);
-            self.buf(s.hc_part, 0, 2);
-            self.groups(.{ c.hc * c.hidden / 1024, self.rows, 1 }, .{ 256, 1, 1 });
-        }
+            if (pending_expand) {
+                pending_expand = false;
+                self.pipe("ds_hc_expand_mix");
+                self.buf(s.x, 0, 0);
+                self.buf(s.branch, 0, 1);
+                self.buf(s.post, 0, 2);
+                self.buf(s.comb, 0, 3);
+                self.tensor(h.fn_, 4);
+                self.buf(s.hc_part, 0, 5);
+                self.buf(s.x2, 0, 6);
+                self.buf(s.experts, 0, 7);
+                self.buf(s.shared, 0, 8);
+                self.args(pending_topk, 9);
+                pending_topk = 0;
+                self.groups(.{ c.hc * c.hidden / 1024, self.rows, 1 }, .{ 256, 1, 1 });
+                std.mem.swap(Buffer, &s.x, &s.x2);
+            } else {
+                self.pipe("ds_hc_mix_part");
+                self.buf(s.x, 0, 0);
+                self.tensor(h.fn_, 1);
+                self.buf(s.hc_part, 0, 2);
+                self.groups(.{ c.hc * c.hidden / 1024, self.rows, 1 }, .{ 256, 1, 1 });
+            }
+        } else self.flush();
         if (hc != null) self.pipe("ds_hc_boundary") else self.pipe("ds_hc_collapse");
         self.buf(s.x, 0, 0);
         if (hc) |h| {
@@ -346,13 +369,26 @@ const Enc = struct {
         self.groups(.{ self.rows, 1, 1 }, .{ 1024, 1, 1 });
     }
 
+    /// The sublayer's branch into the streams, deferred to the next boundary (or `flush`).
     fn expand(self: Enc) void {
+        _ = self;
+        pending_expand = true;
+    }
+
+    /// A deferred expand, now: before anything but a mixing boundary reads the streams.
+    fn flush(self: Enc) void {
+        if (!pending_expand) return;
+        pending_expand = false;
         const s = self.s;
         self.pipe("ds_hc_expand");
         self.buf(s.x, 0, 0);
         self.buf(s.branch, 0, 1);
         self.buf(s.post, 0, 2);
         self.buf(s.comb, 0, 3);
+        self.buf(s.experts, 0, 4);
+        self.buf(s.shared, 0, 5);
+        self.args(pending_topk, 6);
+        pending_topk = 0;
         self.threads(.{ c.hidden, self.rows, 1 }, .{ 256, 1, 1 });
     }
 };
@@ -403,6 +439,8 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
     var cb = m.queue.commandBuffer();
     const w = &m.weights;
     var e = cb.compute(.concurrent);
+    pending_expand = false;
+    pending_topk = 0;
     const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = s, .rows = rows, .base = base };
     x.pipe("ds_embed");
     x.buf(s.ids, 0, 0);
@@ -424,6 +462,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
     for (&w.layers, 0..) |*l, i| {
         if (drafting) if (std.mem.indexOfScalar(usize, &c.draft_targets, i)) |t| {
             // the draft head reads its target layers' attention inputs: the mean of the four streams
+            x.flush();
             x.pipe("ds_stream_mean");
             x.buf(s.x, 0, 0);
             x.buf(s.mh, 0, 1);
@@ -432,6 +471,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
         };
         try block(x, cache, i, l);
         if (dump) |d| { // the streams after each block: the buffers are untracked, so each block completes first
+            x.flush();
             e.end();
             cb.commit();
             cb.wait();
@@ -486,10 +526,7 @@ fn condition(x: Enc, cache: *st.Cache) void {
     for (stages, cache.stage_rings.?, 0..) |*stage, ring, k| {
         const a = &stage.block.attn;
         x.linear(a.wkv, s.mainx, 0, s.kv, 0, x.rows);
-        x.rms(s.kv, 0, a.kv_norm, s.kv, 0, x.rows, c.head_dim);
-        x.rope(s.kv, x.rows, 1, c.head_dim, s.pos, x.m.freq(c.layers + k), false);
-        x.fp8(s.kv, x.rows * c.head_dim);
-        x.put(s.kv, s.pos, ring, x.rows, c.head_dim, st.ring);
+        x.kvFinish(s.kv, a.kv_norm, x.m.freq(c.layers + k), ring);
     }
 }
 
@@ -511,6 +548,8 @@ pub fn draft(m: *Model, ds: *st.Scratch, cache: *st.Cache, token: u32, at: usize
 
     var cb = m.queue.commandBuffer();
     var e = cb.compute(.concurrent);
+    pending_expand = false;
+    pending_topk = 0;
     const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = ds, .rows = n, .base = at + 1 };
     x.pipe("ds_embed");
     x.buf(ds.ids, 0, 0);
@@ -580,6 +619,7 @@ fn secs(a: std.c.timespec, b: std.c.timespec) f64 {
 fn block(x: Enc, cache: *st.Cache, i: usize, l: *const wts.Layer) !void {
     const s = x.s;
     if (l.engram) |eg| {
+        x.flush();
         x.linear(eg.wkv, s.engram_rows[c.engramIndex(i).?], 0, s.engram_kv, 0, x.rows);
         x.pipe("ds_engram");
         x.buf(s.x, 0, 0);
@@ -816,12 +856,8 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
         glu(x, rows, false);
         x.linear(mo.shared.w2, s.act, 0, s.shared, 0, rows);
     }
-    x.pipe("ds_moe_combine");
-    x.buf(s.experts, 0, 0);
-    x.buf(s.shared, 0, 1);
-    x.buf(s.branch, 0, 2);
-    x.args(@as(i32, @intCast(topk)), 3);
-    x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+    // the branch, routed rows plus the shared one, is summed where the expand that follows reads it
+    pending_topk = @intCast(topk);
     try x.cut(7);
 }
 
