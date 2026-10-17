@@ -103,7 +103,7 @@ pub const Metal = struct {
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .release = releaseFn } };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -228,6 +228,14 @@ pub const Metal = struct {
     fn readFn(_: *anyopaque, handle: u64) !u32 {
         if (handle >= c.vocab) return error.InvalidDeepseekToken;
         return @intCast(handle);
+    }
+
+    /// The stream's held drafts as tokens (structured output masks them before a window takes them).
+    fn heldFn(ptr: *anyopaque, stream: *lanes.Stream, out: []u32) !void {
+        const self = cast(ptr);
+        const cache = try self.cacheOf(stream);
+        if (out.len > cache.held_n) return error.DeepseekWindowOutOfStep;
+        @memcpy(out, cache.held[0..out.len]);
     }
 
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) !void {
