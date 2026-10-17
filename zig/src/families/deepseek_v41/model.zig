@@ -41,7 +41,7 @@ pub const Model = struct {
         defer shards.freeShardFiles(gpa, files);
         for (files) |path| try m.checkpoint.addFile(m.device, path, "");
         m.weights = try weights.load(&m.checkpoint, &m.config, drafts);
-        m.kernels = try kernels.load(m.device);
+        m.kernels = try kernels.load(m.device, &m.config);
         errdefer m.kernels.deinit();
         m.engram = try engram.Engram.open(gpa, io, dir, &m.config);
         errdefer m.engram.deinit();

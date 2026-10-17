@@ -70,6 +70,30 @@ pub const Engram = struct {
         }
     }
 
+    /// Rows `first..first + count` of a call, both engram layers, into `dsts` (bf16 [count, 24 x 256] each): every
+    /// row's pages are asked for first (madvise WILLNEED), so the SSD serves a chunk's thousands of lookups at once
+    /// instead of one page fault after another, then each row is dequantized.
+    pub fn gatherRows(self: *const Engram, ids: []const i32, first: usize, count: usize, dsts: [c.engram_layers.len][]u16) !void {
+        const page = std.heap.pageSize();
+        for (0..c.engram_layers.len) |e| {
+            const t = self.tables[e];
+            for (0..count) |r| {
+                var rows: [c.engram_cols]u64 = undefined;
+                self.rowsAt(e, ids, first + r, &rows);
+                for (rows) |row| {
+                    if (row >= t.count) return error.EngramRowOutOfRange;
+                    const at = @intFromPtr(t.rows.ptr) + row * c.engram_row;
+                    const lo = std.mem.alignBackward(usize, at, page);
+                    const hi = std.mem.alignForward(usize, at + c.engram_row, page);
+                    _ = std.c.madvise(@ptrFromInt(lo), hi - lo, std.c.MADV.WILLNEED);
+                }
+            }
+        }
+        for (0..c.engram_layers.len) |e| for (0..count) |r| {
+            try self.gather(e, ids, first + r, dsts[e][r * c.engram_cols * c.engram_dim ..][0 .. c.engram_cols * c.engram_dim]);
+        };
+    }
+
     /// Position `p`'s 24 rows of engram layer `e`, dequantized into `dst` (bf16 [24 x 256]).
     pub fn gather(self: *const Engram, e: usize, ids: []const i32, p: usize, dst: []u16) !void {
         std.debug.assert(dst.len == c.engram_cols * c.engram_dim);

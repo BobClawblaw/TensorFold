@@ -119,6 +119,13 @@ pub const Scratch = struct {
     act: mtl.Buffer,
     experts: mtl.Buffer,
     shared: mtl.Buffer,
+    /// A prompt chunk's slots sorted by expert: each expert's first sorted slot, sorted -> slot, the sorted weights,
+    /// the sorted slots' input rows, and the tensor units' group sums of a projection's input rows.
+    offs: mtl.Buffer,
+    order: mtl.Buffer,
+    wsort: mtl.Buffer,
+    xsort: mtl.Buffer,
+    sums: mtl.Buffer,
     engram_rows: [c.engram_layers.len]mtl.Buffer, // bf16 [rows, 24 x 256] a layer, filled on the host
     /// Compressed groups this call completes, a KV source each (written on the host while encoding, read when the
     /// command buffer runs, so no two sources share one): their positions (for RoPE) and indices (cache rows).
@@ -166,6 +173,11 @@ pub const Scratch = struct {
         out.act = try m.alloc(slots * c.moe_inter * 2);
         out.experts = try m.alloc(slots * c.hidden * 2);
         out.shared = try m.alloc(rows * c.hidden * 2);
+        out.offs = try m.alloc((c.experts + 1) * 4);
+        out.order = try m.alloc(slots * 4);
+        out.wsort = try m.alloc(slots * 4);
+        out.xsort = try m.alloc(slots * c.hidden * 2);
+        out.sums = try m.alloc(@max(rows * (c.o_groups * c.o_rank) / 64, slots * c.hidden / 64) * 4);
         for (&out.engram_rows) |*b| b.* = try m.alloc(rows * c.engram_cols * c.engram_dim * 2);
         for (&out.gpos, &out.gidx) |*p, *g| {
             p.* = try m.alloc(rows * 4);

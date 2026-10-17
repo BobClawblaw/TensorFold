@@ -7,6 +7,7 @@ const st = @import("state.zig");
 const wts = @import("weights.zig");
 const c = @import("config.zig");
 const row = @import("../../core/row_projection.zig");
+const am = @import("../../core/affine_mm.zig");
 const Buffer = mtl.Buffer;
 
 pub const Head = enum { last, all, none };
@@ -28,11 +29,20 @@ const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: 
 const RouteArgs = extern struct { experts: i32, topk: i32, scale: f32 };
 const GluArgs = extern struct { width: i32, weighted: i32, limit: f32 };
 const EngramArgs = extern struct { eps: f32, text_rows: i32 };
+const SortArgs = extern struct { slots: i32, experts: i32 };
+/// Rows from which a call's projections take the tensor units (core/affine_mm), on GPUs that have them.
+const nax_rows = 16;
+/// A buffer and byte offset as core/affine_mm binds them.
+const Ref = struct { buf: Buffer, off: usize = 0 };
+
+fn matrix(w: row.Weights) struct { w: Ref, s: Ref, b: Ref, n: u32, k: u32 } {
+    return .{ .w = .{ .buf = w.w, .off = w.w_off }, .s = .{ .buf = w.scales, .off = w.s_off }, .b = .{ .buf = w.biases, .off = w.b_off }, .n = @intCast(w.n), .k = @intCast(w.k) };
+}
 
 /// GPU seconds by section when set (`sections` names them): each section then runs in its own command buffer,
 /// waited for (a profile, not a served speed).
 pub var profile: ?*[sections.len]f64 = null;
-pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head" };
+pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
 
 const Enc = struct {
     ep: *mtl.ComputeEncoder,
@@ -41,6 +51,12 @@ const Enc = struct {
     s: *st.Scratch,
     rows: usize,
     base: usize, // the first row's position
+
+    /// The tensor-unit pipelines for `w` when this call is a prompt chunk of nax_rows or more.
+    fn nax(self: Enc, w: row.Weights) ?am.Pipes {
+        if (self.rows < nax_rows) return null;
+        return self.m.kernels.naxPipes(.{ .bits = w.bits, .group = @intCast(w.group) });
+    }
 
     /// With `profile`, everything encoded since the last cut runs now and its GPU time counts for `section`.
     fn cut(self: Enc, section: usize) !void {
@@ -73,8 +89,15 @@ const Enc = struct {
         self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
 
-    /// y[rows, n] = x[rows, k] W^T on the row kernels.
+    /// y[rows, n] = x[rows, k] W^T: the tensor units for a prompt chunk's rows, else the row kernels.
     fn linear(self: Enc, w: wts.Linear, x: Buffer, x_off: usize, y: Buffer, y_off: usize, rows: usize) void {
+        if (rows >= nax_rows) if (self.nax(w)) |p| {
+            const xr = Ref{ .buf = x, .off = x_off };
+            const sums = Ref{ .buf = self.s.sums };
+            am.rowSums(self.ep.*, p, @intCast(w.group), xr, sums, @intCast(rows), @intCast(w.k));
+            am.dense(self.ep.*, p, xr, sums, matrix(w), Ref{ .buf = y, .off = y_off }, @intCast(rows));
+            return;
+        };
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
         self.buf(x, x_off, 0);
@@ -220,9 +243,15 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
     for (s.pos.slice(i32, rows), 0..) |*p, i| p.* = @intCast(base + i);
     cache.engram_ids.shrinkRetainingCapacity(base);
     for (tokens) |t| cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, true));
-    for (0..c.engram_layers.len) |e| {
-        const dst = s.engram_rows[e].slice(u16, rows * c.engram_cols * c.engram_dim);
-        for (0..rows) |r| try m.engram.gather(e, cache.engram_ids.items, base + r, dst[r * c.engram_cols * c.engram_dim ..][0 .. c.engram_cols * c.engram_dim]);
+    var h0: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &h0);
+    var dsts: [c.engram_layers.len][]u16 = undefined;
+    for (&dsts, s.engram_rows) |*d, b| d.* = b.slice(u16, rows * c.engram_cols * c.engram_dim);
+    try m.engram.gatherRows(cache.engram_ids.items, base, rows, dsts);
+    if (profile) |p| {
+        var h1: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &h1);
+        p[10] += @as(f64, @floatFromInt(h1.sec - h0.sec)) + @as(f64, @floatFromInt(h1.nsec - h0.nsec)) / 1e9;
     }
     for (s.pre[0].slice(f32, rows * c.hc), 0..) |*v, i| v.* = if (i % c.hc == 0) 1 else 0;
 
@@ -327,7 +356,8 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     }
     try x.cut(2);
     // sparse attention over the window and the picks, then the output's RoPE taken back
-    x.pipe("ds_attend");
+    const wide = rows >= nax_rows; // prompt chunks: 8 heads a threadgroup share each key tile
+    if (wide) x.pipe("ds_attend_rows") else x.pipe("ds_attend");
     x.buf(s.q, 0, 0);
     x.buf(cache.windows[layer], 0, 1);
     x.buf(comp, 0, 2);
@@ -335,7 +365,7 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     x.tensor(a.sink, 4);
     x.buf(s.o, 0, 5);
     x.args(AttnArgs{ .first_pos = @intCast(x.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)) }, 6);
-    x.groups(.{ c.heads, rows, 1 }, .{ 256, 1, 1 });
+    if (wide) x.groups(.{ c.heads / 8, rows, 1 }, .{ 512, 1, 1 }) else x.groups(.{ c.heads, rows, 1 }, .{ 256, 1, 1 });
     x.rope(s.o, rows, c.heads, c.head_dim, s.pos, freq, true);
     try x.cut(3);
     // the grouped low-rank output: fp8-rounded heads, block-diagonal wo_a (bf16), wo_b
@@ -460,10 +490,37 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
     x.args(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .scale = c.route_scale }, 4);
     x.groups(.{ rows, 1, 1 }, .{ (experts + 31) / 32 * 32, 1, 1 });
     try x.cut(5);
-    x.indexed(mo.w1, slots, s.normed, s.route_pick, s.gate);
-    x.indexed(mo.w3, slots, s.normed, s.route_pick, s.up);
-    glu(x, slots, true);
-    x.indexed(mo.w2, slots, s.act, s.route_pick, s.experts);
+    if (x.nax(mo.w1.one)) |p| {
+        // a prompt chunk: slots sorted by expert, each expert's rows through its weights once on the tensor units
+        const e = x.ep.*;
+        x.pipe("ds_sort_slots");
+        x.buf(s.route_pick, 0, 0);
+        x.buf(s.route_weight, 0, 1);
+        x.buf(s.offs, 0, 2);
+        x.buf(s.order, 0, 3);
+        x.buf(s.wsort, 0, 4);
+        x.args(SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }, 5);
+        x.threads(.{ 1, 1, 1 }, .{ 1, 1, 1 });
+        x.pipe("ds_gather_rows");
+        x.buf(s.normed, 0, 0);
+        x.buf(s.order, 0, 1);
+        x.buf(s.xsort, 0, 2);
+        x.args([2]i32{ c.hidden, @intCast(topk) }, 3);
+        x.threads(.{ c.hidden, slots, 1 }, .{ 256, 1, 1 });
+        const sums = Ref{ .buf = s.sums };
+        const offs = Ref{ .buf = s.offs };
+        am.rowSums(e, p, 64, Ref{ .buf = s.xsort }, sums, @intCast(slots), c.hidden);
+        am.gather(e, p, Ref{ .buf = s.xsort }, sums, matrix(mo.w1.one), offs, Ref{ .buf = s.gate }, @intCast(slots), @intCast(experts));
+        am.gather(e, p, Ref{ .buf = s.xsort }, sums, matrix(mo.w3.one), offs, Ref{ .buf = s.up }, @intCast(slots), @intCast(experts));
+        gluWith(x, slots, true, s.wsort);
+        am.rowSums(e, p, 64, Ref{ .buf = s.act }, sums, @intCast(slots), c.moe_inter);
+        am.gatherTo(e, p, Ref{ .buf = s.act }, sums, matrix(mo.w2.one), offs, Ref{ .buf = s.experts }, Ref{ .buf = s.order }, @intCast(slots), @intCast(experts));
+    } else {
+        x.indexed(mo.w1, slots, s.normed, s.route_pick, s.gate);
+        x.indexed(mo.w3, slots, s.normed, s.route_pick, s.up);
+        glu(x, slots, true);
+        x.indexed(mo.w2, slots, s.act, s.route_pick, s.experts);
+    }
     try x.cut(6);
     x.linear(mo.shared.w1, s.normed, 0, s.gate, 0, rows);
     x.linear(mo.shared.w3, s.normed, 0, s.up, 0, rows);
@@ -479,11 +536,15 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
 }
 
 fn glu(x: Enc, n: usize, weighted: bool) void {
+    gluWith(x, n, weighted, x.s.route_weight);
+}
+
+fn gluWith(x: Enc, n: usize, weighted: bool, weights: Buffer) void {
     const s = x.s;
     x.pipe("ds_swiglu");
     x.buf(s.gate, 0, 0);
     x.buf(s.up, 0, 1);
-    x.buf(s.route_weight, 0, 2);
+    x.buf(weights, 0, 2);
     x.buf(s.act, 0, 3);
     x.args(GluArgs{ .width = c.moe_inter, .weighted = @intFromBool(weighted), .limit = c.swiglu_limit }, 4);
     x.threads(.{ c.moe_inter, n, 1 }, .{ 256, 1, 1 });

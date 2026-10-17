@@ -639,6 +639,85 @@ struct AttnArgs {
   }
 }
 
+constant constexpr int AH = 8;     // heads a threadgroup
+constant constexpr int AT = 8;     // keys a tile
+constant constexpr int AMAX = 640; // keys a row at most: the window and the indexer's picks
+
+// The row's j-th key: its window (positions pos - nwin + 1 .. pos, from the ring), then its compressed picks.
+inline const device bfloat* attn_key(const device bfloat* RING, const device bfloat* COMP, const device int* picks,
+                                     int pos, int nwin, int ring, int j) {
+  if (j < nwin) return RING + size_t((pos - nwin + 1 + j) % ring) * HD;
+  return COMP + size_t(max(picks[j - nwin], 0)) * HD;
+}
+
+// ds_attend's arithmetic for prompt chunks: one threadgroup (512 threads) a (row, 8 heads), each tile of 8 keys read
+// once into threadgroup memory for the 8 heads (28 KB: the tile and the scores). A decode step has too few rows to
+// fill the GPU this way (8 threadgroups), so it keeps ds_attend's threadgroup a head.
+[[kernel]] void ds_attend_rows(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
+                               const device bfloat* COMP [[buffer(2)]], const device int* PICKS [[buffer(3)]],
+                               const device float* SINK [[buffer(4)]], device bfloat* O [[buffer(5)]],
+                               constant AttnArgs& a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                               uint2 tpos [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
+  const uint t = tpos.x;
+  const int h0 = int(tg.x) * AH, r = int(tg.y);
+  const int pos = a.first_pos + r;
+  const int nwin = min(a.window, pos + 1);
+  const int nkeys = nwin + a.picks;
+  const device int* picks = PICKS + size_t(r) * a.picks;
+  const device bfloat* q = Q + (size_t(r) * 64 + h0) * HD;
+  threadgroup bfloat ks[AT][HD];
+  threadgroup float sc[AH][AMAX];
+  threadgroup float den[AH];
+  for (int k0 = 0; k0 < nkeys; k0 += AT) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(t); i < AT * HD; i += 512) {
+      const int kk = i / HD;
+      ks[kk][i % HD] = (k0 + kk < nkeys) ? attn_key(RING, COMP, picks, pos, nwin, a.ring, k0 + kk)[i % HD] : bfloat(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int pr = int(sg); pr < AH * AT; pr += 16) {
+      const int h = pr / AT, kk = pr % AT, j = k0 + kk;
+      if (j >= nkeys) continue;
+      float dot = 0.0f;
+      for (int d = int(lane); d < HD; d += 32) dot += float(q[h * HD + d]) * float(ks[kk][d]);
+      dot = simd_sum(dot);
+      if (lane == 0) sc[h][j] = (j < nwin || picks[j - nwin] >= 0) ? dot * a.scale : -INFINITY;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(sg) < AH) {
+    const int h = int(sg);
+    float m = -1e30f;
+    for (int j = int(lane); j < nkeys; j += 32) m = max(m, sc[h][j]);
+    m = simd_max(m);
+    float l = 0.0f;
+    for (int j = int(lane); j < nkeys; j += 32) {
+      const float p = precise::exp(sc[h][j] - m);
+      sc[h][j] = p;
+      l += p;
+    }
+    l = simd_sum(l);
+    if (lane == 0) den[h] = l + precise::exp(SINK[h0 + h] - m);
+  }
+  float acc[AH];
+  for (int h = 0; h < AH; h++) acc[h] = 0.0f;
+  for (int k0 = 0; k0 < nkeys; k0 += AT) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(t); i < AT * HD; i += 512) {
+      const int kk = i / HD;
+      ks[kk][i % HD] = (k0 + kk < nkeys) ? attn_key(RING, COMP, picks, pos, nwin, a.ring, k0 + kk)[i % HD] : bfloat(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int nt = min(AT, nkeys - k0);
+    for (int kk = 0; kk < nt; kk++) {
+      const float v = float(ks[kk][t]);
+      for (int h = 0; h < AH; h++) acc[h] += sc[h][k0 + kk] * v;
+    }
+  }
+  for (int h = 0; h < AH; h++) O[(size_t(r) * 64 + h0 + h) * HD + t] = bfloat(acc[h] / den[h]);
+}
+
 // ---------------------------------------------------------------- MoE
 
 struct RouteArgs {
@@ -753,6 +832,44 @@ struct GluArgs {
   for (int k = 0; k < topk; k++) acc += float(Y[(size_t(r) * topk + k) * D + d]);
   acc += float(SH[size_t(r) * D + d]);
   OUT[size_t(r) * D + d] = bfloat(acc);
+}
+
+struct SortArgs {
+  int slots;
+  int experts;
+};
+
+// A prompt chunk's routed slots sorted by expert (stable: slot order inside an expert), for core/affine_mm's
+// gathers: OFFS each expert's first sorted slot, ORDER sorted -> slot, WS the slots' weights in sorted order.
+// One thread: a chunk has at most a few thousand slots.
+[[kernel]] void ds_sort_slots(const device uint* PICK [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
+                              device int* OFFS [[buffer(2)]], device int* ORDER [[buffer(3)]],
+                              device float* WS [[buffer(4)]], constant SortArgs& a [[buffer(5)]],
+                              uint t [[thread_position_in_grid]]) {
+  if (t != 0) return;
+  for (int e = 0; e < a.experts; e++) OFFS[e] = 0;
+  for (int i = 0; i < a.slots; i++) OFFS[PICK[i]]++;
+  int at = 0;
+  for (int e = 0; e < a.experts; e++) {
+    const int n = OFFS[e];
+    OFFS[e] = at;
+    at += n;
+  }
+  // place, then shift the offsets back (each expert's fill pointer ends at the next one's start)
+  for (int i = 0; i < a.slots; i++) {
+    const int at2 = OFFS[PICK[i]]++;
+    ORDER[at2] = i;
+    WS[at2] = WEIGHT[i];
+  }
+  for (int e = a.experts - 1; e > 0; e--) OFFS[e] = OFFS[e - 1];
+  OFFS[0] = 0;
+}
+
+// Sorted slot i's input row: X[ORDER[i] / topk] (a token's row for each of its picks).
+[[kernel]] void ds_gather_rows(const device bfloat* X [[buffer(0)]], const device int* ORDER [[buffer(1)]],
+                               device bfloat* Y [[buffer(2)]], constant int2& wk [[buffer(3)]],
+                               uint2 g [[thread_position_in_grid]]) {
+  Y[size_t(g.y) * wk.x + g.x] = X[size_t(ORDER[g.y] / wk.y) * wk.x + g.x];
 }
 
 // ---------------------------------------------------------------- engram
