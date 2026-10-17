@@ -87,10 +87,43 @@ struct HcArgs {
   int iters;
 };
 
-// One threadgroup of 1024 a row. MIX: the stream's mixes (normed by its rms) split into this boundary's pre, post
-// and Sinkhorn comb. Always: the streams collapsed with PRE_IN (the previous boundary's pre), rms-normed by NORMW.
+constant constexpr int SLICES = F / 1024;
+
+// The mixes' partial sums: a threadgroup of 256 a (1024-column slice, row), each slice's 24 mix products and its
+// sum of squares into PART [rows, SLICES, MIX + 1].
+[[kernel]] void ds_hc_mix_part(const device bfloat* X [[buffer(0)]], const device float* FN [[buffer(1)]],
+                               device float* PART [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
+                               uint2 tpos [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                               uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float red[8][MIX + 1];
+  const int j = int(tg.x), r = int(tg.y);
+  const uint t = tpos.x;
+  const device bfloat* x = X + size_t(r) * F + 1024 * j + 4 * int(t);
+  float v[4];
+  for (int i = 0; i < 4; i++) v[i] = float(x[i]);
+  float acc[MIX + 1];
+  acc[MIX] = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3];
+  for (int m = 0; m < MIX; m++) {
+    const device float* f = FN + size_t(m) * F + 1024 * j + 4 * int(t);
+    acc[m] = f[0] * v[0] + f[1] * v[1] + f[2] * v[2] + f[3] * v[3];
+  }
+  for (int m = 0; m <= MIX; m++) {
+    const float s = simd_sum(acc[m]);
+    if (lane == 0) red[sg][m] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (int(t) <= MIX) {
+    float s = 0.0f;
+    for (int k = 0; k < 8; k++) s += red[k][t];
+    PART[(size_t(r) * SLICES + j) * (MIX + 1) + t] = s;
+  }
+}
+
+// One threadgroup of 1024 a row. MIX: the slices' partial sums (ds_hc_mix_part) added in order, normed by the
+// stream's rms, split into this boundary's pre, post and Sinkhorn comb. Always: the streams collapsed with PRE_IN
+// (the previous boundary's pre), rms-normed by NORMW.
 template <bool MIXES>
-[[kernel]] void ds_hc_boundary(const device bfloat* X [[buffer(0)]], const device float* FN [[buffer(1)]],
+[[kernel]] void ds_hc_boundary(const device bfloat* X [[buffer(0)]], const device float* PART [[buffer(1)]],
                                const device float* BASE [[buffer(2)]], const device float* SCALE [[buffer(3)]],
                                const device float* PRE_IN [[buffer(4)]], const device bfloat* NORMW [[buffer(5)]],
                                constant HcArgs& a [[buffer(6)]], device float* PRE_OUT [[buffer(7)]],
@@ -103,21 +136,9 @@ template <bool MIXES>
   threadgroup float pre_in[S];
   const device bfloat* x = X + size_t(r) * F;
   if (MIXES) {
-    float acc[MIX + 1];
-    for (int m = 0; m <= MIX; m++) acc[m] = 0.0f;
-    for (int f = int(t); f < F; f += 1024) {
-      const float v = float(x[f]);
-      acc[MIX] += v * v;
-      for (int m = 0; m < MIX; m++) acc[m] += FN[size_t(m) * F + f] * v;
-    }
-    for (int m = 0; m <= MIX; m++) {
-      const float s = simd_sum(acc[m]);
-      if (lane == 0) red[sg][m] = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (int(t) <= MIX) {
       float s = 0.0f;
-      for (int k = 0; k < 32; k++) s += red[k][t];
+      for (int j = 0; j < SLICES; j++) s += PART[(size_t(r) * SLICES + j) * (MIX + 1) + t];
       tot[t] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -163,10 +163,17 @@ const Enc = struct {
     /// `pre_in` and normed by `norm` into `normed`.
     fn boundary(self: Enc, hc: ?wts.Hc, pre_in: Buffer, pre_out: Buffer, norm: wts.Tensor) void {
         const s = self.s;
+        if (hc) |h| {
+            self.pipe("ds_hc_mix_part");
+            self.buf(s.x, 0, 0);
+            self.tensor(h.fn_, 1);
+            self.buf(s.hc_part, 0, 2);
+            self.groups(.{ c.hc * c.hidden / 1024, self.rows, 1 }, .{ 256, 1, 1 });
+        }
         if (hc != null) self.pipe("ds_hc_boundary") else self.pipe("ds_hc_collapse");
         self.buf(s.x, 0, 0);
         if (hc) |h| {
-            self.tensor(h.fn_, 1);
+            self.buf(s.hc_part, 0, 1);
             self.tensor(h.base, 2);
             self.tensor(h.scale, 3);
         } else {

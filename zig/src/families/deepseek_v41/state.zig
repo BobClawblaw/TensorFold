@@ -95,6 +95,7 @@ pub const Scratch = struct {
     pre: [2]mtl.Buffer, // f32 [rows, 4]: the carried collapse, and this boundary's
     post: mtl.Buffer,
     comb: mtl.Buffer,
+    hc_part: mtl.Buffer, // f32 [rows, 20 slices, 25]: a boundary's partial mix sums
     qr: mtl.Buffer,
     q: mtl.Buffer,
     kv: mtl.Buffer,
@@ -141,6 +142,7 @@ pub const Scratch = struct {
         for (&out.pre) |*p| p.* = try m.alloc(rows * c.hc * 4);
         out.post = try m.alloc(rows * c.hc * 4);
         out.comb = try m.alloc(rows * c.hc * c.hc * 4);
+        out.hc_part = try m.alloc(rows * (c.hc * c.hidden / 1024) * (c.hc_mix + 1) * 4);
         out.qr = try m.alloc(rows * c.q_rank * 2);
         out.q = try m.alloc(rows * c.heads * c.head_dim * 2);
         out.kv = try m.alloc(rows * c.head_dim * 2);
