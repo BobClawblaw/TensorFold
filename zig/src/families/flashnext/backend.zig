@@ -17,6 +17,13 @@ const sample = @import("batch_sample.zig");
 const think = @import("think.zig");
 const batch_costs = @import("batch_costs.zig");
 
+/// A stream's images through the host's tower: its prompt pass's rows and frame (in `a`), then their release.
+pub const Images = struct {
+    ctx: *anyopaque,
+    build: *const fn (ctx: *anyopaque, a: std.mem.Allocator, images: []const lanes.stream.Image, prompt_len: usize) anyerror!*fz.vis_prompt.VisPrompt,
+    release: *const fn (ctx: *anyopaque, p: *fz.vis_prompt.VisPrompt) void,
+};
+
 pub const Backend = struct {
     gpa: std.mem.Allocator,
     e: *Engine,
@@ -37,6 +44,7 @@ pub const Backend = struct {
     moves: u64 = 0,
     serial_drafts: bool = false, // FZ_BATCH_MTP_SERIAL=1: each stream's drafts in their own command buffers
     costs: ?batch_costs.Costs = null, // timeCosts: the lane allocator's prices
+    images: ?Images = null, // --vision: the tower's rows for a stream's images; null: an image stream fails
 
     /// Sessions of the given capacities (the first, the engine's own, holds its whole window whatever is given).
     pub fn init(gpa: std.mem.Allocator, e: *Engine, capacities: []const usize) !Backend {
@@ -249,6 +257,14 @@ pub const Backend = struct {
         defer old.restore(b.e);
         s.m.reset();
         stream.cached = 0;
+        var arena: std.heap.ArenaAllocator = .init(b.gpa);
+        defer arena.deinit();
+        const vis: ?*fz.vis_prompt.VisPrompt = if (stream.images.len > 0) try (b.images orelse return error.NoImageTower).build(b.images.?.ctx, arena.allocator(), stream.images, prompt.len) else null;
+        s.m.vis = vis;
+        defer if (vis) |p| {
+            s.m.vis = null;
+            b.images.?.release(b.images.?.ctx, p);
+        };
         if (stream.reuse.saved) |saved| {
             const state: *snap.State = @ptrCast(@alignCast(saved));
             if (state.at < prompt.len and state.at < s.m.cap) {

@@ -48,6 +48,7 @@ pub const LaneHost = struct {
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     recall: ?*lanes.recall_store.Store = null, // Recall's record: drafts from earlier requests (lane_host_recall.zig)
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
+    images_uncached: bool = false, // an image request neither resumes nor keeps: the family's image frame moves the rows before it
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
@@ -299,7 +300,7 @@ pub const LaneHost = struct {
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.cancel(job); // other work came first: it never ran
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        if (h.cache) |store| if (r.prompt_logprobs == null and h.taught(r)) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -410,6 +411,11 @@ pub const LaneHost = struct {
         recalls.prompted(h, job);
     }
 
+    /// Whether the cache may resume or keep a request's states.
+    fn taught(h: *const LaneHost, r: *const Request) bool {
+        return !r.untaught and !(h.images_uncached and r.images.len > 0);
+    }
+
     /// A request's decoded prompt rows, for a backend that keeps their bits (`decoded_rows`); otherwise none.
     fn spans(h: *const LaneHost, r: *const Request) []const [2]u32 {
         return if (h.decoded_rows) r.decode_spans else &.{};
@@ -418,14 +424,14 @@ pub const LaneHost = struct {
     /// A prompt-only pass on a `warm_turns` engine: the backend prefills, the cache keeps its end (a mark, if keyed on)
     fn warmPass(h: *LaneHost, job: *Job, began: i96) bool {
         const be = h.core.backend;
-        if (h.cache) |store| if (job.marks.len == 0 and (job.request.untaught or store.rules.lookahead > 0)) return h.cancel(job); // it would keep nothing
+        if (h.cache) |store| if (job.marks.len == 0 and (!h.taught(job.request) or store.rules.lookahead > 0)) return h.cancel(job); // it would keep nothing
         be.prefill(&job.stream) catch |e| { // a yield ends it like a cancel: what it prefilled is kept
             if (e != error.Cancelled and e != error.Yielded) return h.drop(job, h.words(e));
             be.release(&job.stream);
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
+        if (h.cache) |store| _ = if (h.taught(job.request) and store.rules.lookahead == 0) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");
