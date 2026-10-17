@@ -33,6 +33,18 @@ fn closing(rest: []const u8, text: []const u8) ?usize {
     return if (std.mem.startsWith(u8, rest[i..], text)) i + text.len else null;
 }
 
+const longest_dsml_open = blk: {
+    var n: usize = 0;
+    for (tool_parse.dsml_dialects) |d| n = @max(n, d.open.len);
+    break :blk n;
+};
+
+/// The DSML dialect whose block `text` opens with.
+fn dsmlOpener(text: []const u8) ?*const tool_parse.Dsml {
+    for (&tool_parse.dsml_dialects) |*d| if (std.mem.startsWith(u8, text, d.open)) return d;
+    return null;
+}
+
 /// Streams XML argument deltas and validated DSML envelopes, matching the final parser.
 pub const Streamer = struct {
     a: Allocator,
@@ -52,6 +64,7 @@ pub const Streamer = struct {
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
     tools: []const Value,
     dsml_start: ?usize = null,
+    dsml_close: []const u8 = "", // the open DSML block's closer (its dialect's)
     dsml_searched: usize = 0,
     dsml_seen: bool = false,
     buffered_start: usize = 0,
@@ -109,28 +122,27 @@ pub const Streamer = struct {
                             return;
                         }
                     }
-                    const dsml_open = reply_text.calls[2][0];
-                    const dsml_close = reply_text.calls[2][1];
                     if (s.dsml_start) |start| {
-                        const from = @max(s.pos, s.dsml_searched -| (dsml_close.len - 1));
-                        const end = reply_text.findTag(text, from, dsml_close) orelse {
+                        const from = @max(s.pos, s.dsml_searched -| (s.dsml_close.len - 1));
+                        const end = reply_text.findTag(text, from, s.dsml_close) orelse {
                             s.dsml_searched = text.len;
                             return;
                         };
-                        s.pos = end + dsml_close.len;
+                        s.pos = end + s.dsml_close.len;
                         s.searched = s.pos;
                         s.dsml_start = null;
                         const parsed = try tool_parse.parse(s.a, text[start..s.pos], s.tools, null);
                         if (parsed.calls) |calls| try s.emitCalls(calls, out);
                     }
                     if (text.len < s.searched) s.searched = s.pos;
-                    const from = @min(text.len, @max(s.pos, s.searched -| (dsml_open.len - 1)));
+                    const from = @min(text.len, @max(s.pos, s.searched -| (longest_dsml_open - 1)));
                     var at = from;
                     while (std.mem.indexOfScalarPos(u8, text, at, '<')) |start| {
-                        if (std.mem.startsWith(u8, text[start..], dsml_open)) {
+                        if (dsmlOpener(text[start..])) |d| {
                             s.dsml_seen = true;
                             s.dsml_start = start;
-                            s.pos = start + dsml_open.len;
+                            s.dsml_close = d.close;
+                            s.pos = start + d.open.len;
                             s.dsml_searched = s.pos;
                             break;
                         }

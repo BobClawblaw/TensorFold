@@ -159,3 +159,25 @@ test "closed rejected calls and literal less-than prose preserve later consumer 
         }
     }
 }
+
+test "DeepSeek-V4.1's spaced DSML calls agree in whole and streamed consumer replies" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "Looking it up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n" ++
+        "<｜DSML｜ parameter name=\"q\" string=\"true\">louvre hours</｜DSML｜ parameter>\n" ++
+        "<｜DSML｜ parameter name=\"n\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+    const tokens = try TestText.encode(undefined, a, raw, false);
+    for ([_]bool{ false, true }) |batched| {
+        var backend: CallEngine = .{ .tokens = tokens, .batched = batched };
+        const whole = try sendWith(backend.engine(), .chat, dsml_body ++ ",\"stream\":false}", .{});
+        const streamed = try sendWith(backend.engine(), .chat, dsml_body ++ ",\"stream\":true}", .{});
+        try std.testing.expectEqual(@as(?u16, 200), whole.status);
+        try std.testing.expectEqual(@as(usize, 1), whole.calls);
+        try std.testing.expectEqual(whole.calls, streamed.calls);
+        try std.testing.expectEqualStrings("{\"q\":\"louvre hours\",\"n\":2}", whole.arguments[0..whole.arguments_len]);
+        try std.testing.expectEqualStrings("{\"q\":\"louvre hours\",\"n\":2}", streamed.arguments[0..streamed.arguments_len]);
+        try std.testing.expectEqualStrings("Looking it up.", whole.content());
+        try std.testing.expectEqualStrings(whole.content(), streamed.content());
+    }
+}

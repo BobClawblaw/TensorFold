@@ -517,3 +517,31 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own 
     }
     try std.testing.expect(compared > 1000);
 }
+
+/// A DeepSeek-V4.1 reply's calls as its chat template writes them: a " calls" block, a space after every marker.
+const v41_calls = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n" ++
+    "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n" ++
+    "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n" ++
+    "<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"opts\" string=\"false\">{\"lang\": \"fr\", \"n\": [1, 2]}</｜DSML｜ parameter>\n" ++
+    "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+
+test "DeepSeek-V4.1's spaced DSML calls parse as V4's do" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}},{\"type\":\"function\",\"function\":{\"name\":\"search\"}}]")).ok.array;
+    const parsed = try parse(a, "Checking.\n\n" ++ v41_calls, tools, null);
+    try std.testing.expectEqual(@as(usize, 2), parsed.calls.?.len);
+    const first = parsed.calls.?[0].get("function").?;
+    try std.testing.expectEqualStrings("get_weather", first.strField("name").?);
+    try std.testing.expectEqualStrings("{\"city\":\"Paris\",\"days\":3}", first.strField("arguments").?);
+    const second = parsed.calls.?[1].get("function").?;
+    try std.testing.expectEqualStrings("search", second.strField("name").?);
+    try std.testing.expectEqualStrings("{\"opts\":{\"lang\":\"fr\",\"n\":[1,2]}}", second.strField("arguments").?);
+    try std.testing.expectEqualStrings("Checking.", parsed.content);
+    // unfinished: no call, the text kept
+    const open = "Checking." ++ v41_calls[0..60];
+    const none = try parse(a, open, tools, null);
+    try std.testing.expect(none.calls == null);
+    try std.testing.expectEqualStrings(open, none.content);
+}
