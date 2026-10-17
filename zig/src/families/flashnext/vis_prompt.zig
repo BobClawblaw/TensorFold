@@ -2,6 +2,7 @@
 const std = @import("std");
 const mtl = @import("metal");
 const ks = @import("kernel_sources");
+const lanes = @import("lanes");
 
 /// An image's tokens: the prompt slot of its first, how many, its merged grid, and its first row of the tower's rows.
 pub const Span = struct { at: u32, n: u32, mh: u32, mw: u32, row: u32 };
@@ -56,6 +57,18 @@ pub fn shiftOf(spans: []const Span) i64 {
     return shift;
 }
 
+/// A request's frame for the cache key: its shift (0, the text frame, for none), each image's merge read from its grid.
+pub fn frameKey(images: []const lanes.stream.Image) u32 {
+    var shift: u64 = 0;
+    for (images) |img| {
+        if (img.tokens == 0) continue;
+        const merge = std.math.sqrt(img.gh * img.gw / img.tokens);
+        if (merge == 0) continue;
+        shift += img.tokens - @max(img.gh / merge, img.gw / merge);
+    }
+    return @truncate(shift);
+}
+
 /// get_rope_index's positions below the last image's end, shifted so the text after it rotates at its own slot.
 pub fn frame(gpa: std.mem.Allocator, spans: []const Span) ![]i32 {
     if (spans.len == 0) return &.{};
@@ -63,6 +76,7 @@ pub fn frame(gpa: std.mem.Allocator, spans: []const Span) ![]i32 {
     const end: usize = @as(usize, last.at) + last.n;
     const shift = shiftOf(spans);
     const out = try gpa.alloc(i32, end * 3);
+    errdefer gpa.free(out);
     var cur: i64 = 0; // transformers' current_pos
     var slot: usize = 0;
     for (spans) |s| {
@@ -111,6 +125,14 @@ test "two images: each starts where transformers' running position left the text
     try std.testing.expectEqualSlices(i32, &.{ 5, 5, 5, 6, 6, 6 }, p[15..21]);
     try std.testing.expectEqualSlices(i32, &.{ 7, 7, 7, 7, 7, 8 }, p[21..27]);
     try std.testing.expectError(error.BadImageSpans, frame(a, &.{.{ .at = 0, .n = 5, .mh = 2, .mw = 2, .row = 0 }}));
+}
+
+test "the frame key: the shift, so one image set's states fit only its own frame" {
+    const px: []const f32 = &.{};
+    try std.testing.expectEqual(@as(u32, 0), frameKey(&.{}));
+    // a 4 x 6 patch grid (2 x 3 merged, 6 tokens) moves the frame by 3; a 2 x 4 one (1 x 2, 2 tokens) by none
+    try std.testing.expectEqual(@as(u32, 3), frameKey(&.{.{ .pixels = px, .gh = 4, .gw = 6, .at = 3, .tokens = 6 }}));
+    try std.testing.expectEqual(@as(u32, 3), frameKey(&.{ .{ .pixels = px, .gh = 4, .gw = 6, .at = 3, .tokens = 6 }, .{ .pixels = px, .gh = 2, .gw = 4, .at = 12, .tokens = 2 } }));
 }
 
 test "the rows of a span a chunk holds" {

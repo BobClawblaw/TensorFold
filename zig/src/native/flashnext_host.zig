@@ -24,6 +24,7 @@ const Job = struct {
     cached: u32 = 0, // prompt tokens restored from the prompt cache
     restore_ns: i96 = 0, // the cache's lookup and restore before the prompt pass
     keep_ns: i96 = 0, // the cache's saves at the pass's marks
+    key: []const u32 = &.{}, // the cache's words for its states: the prompt, or with images its image-keyed words
 };
 
 /// The engine's thread owns the GPU; requests wait their turn, foreground first, each in arrival order.
@@ -289,8 +290,7 @@ pub const Host = struct {
         fn marked(ctx: *anyopaque, at: usize) void {
             const c: *Ctx = @ptrCast(@alignCast(ctx));
             const t0 = c.h.now();
-            if (c.job.request.images.len > 0) return; // an image prompt's rows are not named by its tokens alone
-            if (c.h.cache) |*store| if (store.keep(c.job.request.prompt, @intCast(at), null, c.job.request.chunks, &.{})) c.h.saved.append(c.h.gpa, @intCast(at)) catch {}; // held here: rank 1 keeps its copy
+            if (c.h.cache) |*store| if (store.keep(c.job.key, @intCast(at), null, c.job.request.chunks, &.{})) c.h.saved.append(c.h.gpa, @intCast(at)) catch {}; // held here: rank 1 keeps its copy
             c.job.keep_ns += c.h.now() - t0;
         }
 
@@ -358,28 +358,25 @@ pub const Host = struct {
         const kept0 = if (h.cache) |*store| store.counts.kept else 0;
         const t_begin = h.now();
         h.prompt = r.prompt; // a learned state read back in `begin` is named by these tokens
+        job.key = if (r.images.len > 0) images.key(arena.allocator(), r) catch r.prompt else r.prompt; // a state fits its frame alone
+        if (h.cache) |*store| if (r.prompt.len + r.max_tokens + fx.MARGIN <= tf.flashnext_replay.CAP) {
+            plan = store.beginRewind(arena.allocator(), job.key, r.history_len, r.rewind_len, r.shared_prefixes, &.{}, null, &.{}) catch .{};
+        };
         var vis: ?*tf.flashnext_replay.vis_prompt.VisPrompt = null;
         defer images.release(h.eng, vis);
-        if (r.images.len > 0) { // the tower's rows over the image tokens, in a frame the cache does not name: no reuse
-            if (r.background) { // a next turn's pass would keep nothing: the tower and the prompt pass are skipped
-                emit(job, .{ .prefilled = 0 });
-                fin.reason = .stop;
-                return;
-            }
+        if (r.images.len > 0) { // the tower's rows over the image tokens past the resume point
             const v = h.vis orelse {
                 emit(job, .{ .prefilled = 0 });
                 fin.message = "this server reads no images (start it with --vision)";
                 return;
             };
-            vis = images.build(v, h.eng, arena.allocator(), r.images, r.prompt.len) catch |e| {
+            vis = images.build(v, h.eng, arena.allocator(), r.images, r.prompt.len, plan.from) catch |e| {
                 emit(job, .{ .prefilled = 0 });
                 fin.message = @errorName(e);
                 return;
             };
             h.eng.m.vis = vis;
-        } else if (h.cache) |*store| if (r.prompt.len + r.max_tokens + fx.MARGIN <= tf.flashnext_replay.CAP) {
-            plan = store.beginRewind(arena.allocator(), r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, &.{}, null, &.{}) catch .{};
-        };
+        }
         job.restore_ns = h.now() - t_begin;
         job.cached = plan.from;
         defer if (job.prefilled) |done| std.log.info("prompt pass: {d} -> {d} tokens in {d:.1} ms (waited {d:.1} ms; lookup and restore {d:.1} ms, peer handoff {d:.1} ms, keeps {d:.1} ms)", .{ job.cached, r.prompt.len, ms(done - job.began), ms(job.began - job.queued), ms(job.restore_ns), ms(h.eng.handoff_ns), ms(job.keep_ns) });

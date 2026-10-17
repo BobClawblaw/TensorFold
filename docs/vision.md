@@ -208,8 +208,10 @@ embeddings in all four of the model's hyper-connection streams, and the prompt p
 the text after the last image keeps its own slot: decoding, drafts and later tokens run as for text. Text-only requests
 get the tokens they got without the flag.
 
-- **Prompt cache:** an image or video request neither resumes from nor keeps a cached state. The shift moves every
-  position before the request's last image, so a state kept from one turn would not fit the next turn's.
+- **Prompt cache:** image and video conversations resume past their images. The shift moves every position before the
+  request's last image, so a kept state is named by the shift as well as the tokens and images: a later turn with the
+  same images resumes, and a turn that adds an image reads its prompt again. The tower skips the images a resumed state
+  already holds. Replies equal the cache off's in multi-turn image and video chats, on one stream and shared sessions.
 - **Memory:** the tower and its scratch take 1.73 GiB at the default 4,096 image tokens, counted against the load limit;
   a request's rows take 20 KiB a visual token while its prompt pass runs.
 - **Checks on an M5 Ultra:** five test pictures got the grids and patches of transformers' Pillow processor bit for bit;

@@ -123,7 +123,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
     if (vis) |v| {
         h.host.info_.vision = images.offer(v, h, prepareImage, prepareVideo);
-        h.host.images_uncached = true; // the shifted frame (vis_prompt.frame): an image moves the rows before it
+        h.host.frame_key = tf.flashnext_replay.vis_prompt.frameKey; // the shifted frame: an image moves the rows before it
     }
     h.cache = null;
     if (plan.budget_bytes > 0) {
@@ -150,9 +150,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump: ?[]const 
     return .{ .engine = h.host.engine(), .close = close, .ctx = h };
 }
 
-fn buildImages(ctx: *anyopaque, a: std.mem.Allocator, imgs: []const lanes.stream.Image, prompt_len: usize) anyerror!*VisPrompt {
+fn buildImages(ctx: *anyopaque, a: std.mem.Allocator, imgs: []const lanes.stream.Image, prompt_len: usize, from: usize) anyerror!*VisPrompt {
     const h: *Host = @ptrCast(@alignCast(ctx));
-    return images.build(h.vis.?, h.eng, a, imgs, prompt_len);
+    return images.build(h.vis.?, h.eng, a, imgs, prompt_len, from);
 }
 
 fn releaseImages(_: *anyopaque, p: *VisPrompt) void {

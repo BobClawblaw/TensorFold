@@ -77,8 +77,8 @@ pub fn open(gpa: Allocator, io: std.Io, eng: *fx.Engine, dir: []const u8, o: api
     return v;
 }
 
-/// The request's images through the tower: the prompt pass's rows (four streams each) and frame; `release` frees them.
-pub fn build(v: *Vision, eng: *fx.Engine, a: Allocator, images: []const api.Image, prompt_len: usize) !*vp.VisPrompt {
+/// The request's images through the tower, but those ending by `from` (resumed past): the prompt pass's rows and frame.
+pub fn build(v: *Vision, eng: *fx.Engine, a: Allocator, images: []const api.Image, prompt_len: usize, from: usize) !*vp.VisPrompt {
     const merge = v.c.merge;
     var total: usize = 0;
     const spans = try a.alloc(vp.Span, images.len);
@@ -98,6 +98,7 @@ pub fn build(v: *Vision, eng: *fx.Engine, a: Allocator, images: []const api.Imag
     defer out.deinit();
     const t0 = std.c.mach_absolute_time();
     for (images, spans) |img, s| { // one image a pass: the tower's host-written tables are one image's
+        if (s.at + s.n <= from) continue; // a restored state holds its rows
         try v.tower.image(eng.r.queue, img.pixels, img.gh, img.gw, .{ .buf = out });
         const src = out.contents();
         const dst = rows.contents();
@@ -108,6 +109,15 @@ pub fn build(v: *Vision, eng: *fx.Engine, a: Allocator, images: []const api.Imag
     const last = spans[spans.len - 1];
     p.* = .{ .rows = rows, .spans = spans, .pos3 = try vp.frame(a, spans), .frame_end = last.at + last.n, .prep = v.prep.prep };
     return p;
+}
+
+/// An image request's cache words: the server's image-keyed ones, the frame (vis_prompt.frameKey) in the first.
+pub fn key(a: Allocator, r: *const api.Request) ![]const u32 {
+    const f = vp.frameKey(r.images);
+    if (f == 0) return r.cacheKey();
+    const k = try a.dupe(u32, r.cacheKey());
+    k[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(f, std.mem.asBytes(&k[0])) & 0x7fff_ffff));
+    return k;
 }
 
 /// The engine's prompt pass is over: its image rows go.

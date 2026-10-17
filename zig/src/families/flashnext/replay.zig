@@ -1454,6 +1454,7 @@ test {
     _ = tpm; // tp.zig's tests: the window layout and the host service's wraps
     _ = @import("drafts.zig"); // the depth rule's tests
     _ = @import("replay_held_test.zig"); // Run.release and the held list (#732)
+    _ = vis_prompt; // an image prompt's frame, its spans and its cache key
 }
 
 test "catch-up slots: every layer's dispatch reads its own first block after the later layers' writes" {
