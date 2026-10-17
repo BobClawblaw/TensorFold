@@ -294,13 +294,13 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
             const clip = clips[kv];
             kv += 1;
             for (clip.groups, clip.times) |g, secs| {
-                if (o.time_first) try appendTime(cx, text, &out_ids, &key, secs, true);
+                if (o.time_first != null) try appendTime(cx, text, &out_ids, &key, secs, true);
                 try out_ids.append(cx.a, o.group_open);
                 try key.append(cx.a, o.group_open);
-                try placeImage(cx.a, &out_ids, &key, &imgs, o.group_token orelse v.image_token, g, true);
+                try placeImage(cx.a, &out_ids, &key, &imgs, o.time_first orelse v.image_token, g, true);
                 try out_ids.append(cx.a, o.group_close);
                 try key.append(cx.a, image_key.close(g.hash));
-                if (!o.time_first) try appendTime(cx, text, &out_ids, &key, secs, false);
+                if (o.time_first == null) try appendTime(cx, text, &out_ids, &key, secs, false);
             }
         } else {
             try out_ids.append(cx.a, t);

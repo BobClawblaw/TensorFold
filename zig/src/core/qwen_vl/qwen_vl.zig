@@ -1,4 +1,4 @@
-//! Image and video input every Qwen3.5-VL checkpoint shares, backend-neutral: settings, geometry, M-RoPE, the tower's tables.
+//! Image and video input every Qwen3.5-VL checkpoint shares, backend-neutral: settings, geometry, M-RoPE, tower tables.
 pub const config = @import("config.zig");
 pub const Config = config.Config;
 pub const geometry = @import("geometry.zig");

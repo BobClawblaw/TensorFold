@@ -18,11 +18,7 @@ const think = @import("think.zig");
 const batch_costs = @import("batch_costs.zig");
 
 /// A stream's images through the host's tower: its prompt pass's rows and frame (in `a`), then their release.
-pub const Images = struct {
-    ctx: *anyopaque,
-    build: *const fn (ctx: *anyopaque, a: std.mem.Allocator, images: []const lanes.stream.Image, prompt_len: usize) anyerror!*fz.vis_prompt.VisPrompt,
-    release: *const fn (ctx: *anyopaque, p: *fz.vis_prompt.VisPrompt) void,
-};
+pub const Images = struct { ctx: *anyopaque, build: *const fn (ctx: *anyopaque, a: std.mem.Allocator, images: []const lanes.stream.Image, prompt_len: usize) anyerror!*fz.vis_prompt.VisPrompt, release: *const fn (ctx: *anyopaque, p: *fz.vis_prompt.VisPrompt) void };
 
 pub const Backend = struct {
     gpa: std.mem.Allocator,
@@ -261,10 +257,8 @@ pub const Backend = struct {
         defer arena.deinit();
         const vis: ?*fz.vis_prompt.VisPrompt = if (stream.images.len > 0) try (b.images orelse return error.NoImageTower).build(b.images.?.ctx, arena.allocator(), stream.images, prompt.len) else null;
         s.m.vis = vis;
-        defer if (vis) |p| {
-            s.m.vis = null;
-            b.images.?.release(b.images.?.ctx, p);
-        };
+        defer s.m.vis = null;
+        defer if (vis) |p| b.images.?.release(b.images.?.ctx, p);
         if (stream.reuse.saved) |saved| {
             const state: *snap.State = @ptrCast(@alignCast(saved));
             if (state.at < prompt.len and state.at < s.m.cap) {

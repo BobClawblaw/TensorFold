@@ -145,7 +145,7 @@ pub fn prepare(a: std.mem.Allocator, s: Source, c: Config, max_tokens: u32, most
     return .{ .groups = try patchify(a, p, frames, c), .times = p.times };
 }
 
-/// Each pair's patches in merge order, [channel, frame, y, x], normalized as the fused rescale; an odd last frame repeated.
+/// Each pair's patches in merge order, [channel, frame, y, x], normalized by the fused rescale; odd last frame twice.
 pub fn patchify(a: std.mem.Allocator, p: Plan, frames: []const u8, c: Config) Error![]Pair {
     const P = c.patch;
     const M = c.merge;

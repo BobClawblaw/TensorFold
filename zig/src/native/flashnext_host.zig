@@ -458,7 +458,7 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
     return openWarmed(gpa, io, eng, window, cache_gib, over_cap, learn, null, vis, a, why);
 }
 
-/// Takes an already warmed engine (and its image tower, if any) without loading or warming again; the caller retains ownership on error.
+/// Takes a warmed engine and its image tower, if any, without loading or warming; the caller keeps both on error.
 pub fn openWarmed(gpa: Allocator, io: std.Io, eng: *fx.Engine, window: i64, cache_gib: ?f64, over_cap: bool, learn: ?Learn, limit: ?u64, vis: ?*images.Vision, a: Allocator, why: *[]const u8) !*Host {
     const cache_plan = try cacheBudget(eng, cache_gib, over_cap, limit, a, why);
     const budget = cache_plan.budget_bytes;

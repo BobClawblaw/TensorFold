@@ -65,7 +65,7 @@ pub fn open(gpa: Allocator, io: std.Io, eng: *fx.Engine, dir: []const u8, o: api
     errdefer gpa.destroy(v);
     const videos = c.video_token != null;
     v.* = .{ .gpa = gpa, .c = c, .tower = undefined, .prep = undefined, .capacity = o.image_tokens + if (videos) o.video_tokens else 0, .max_images = o.max_images, .markers = .{ c.vision_start, c.image_token, c.vision_end }, .video_markers = .{ c.vision_start, c.video_token orelse 0, c.vision_end }, .video = o };
-    // one image a pass: the tower's scratch holds the largest image, or video pair, the processors make under the budgets
+    // one image a pass: the scratch holds the largest image or video pair the processors make under the budgets
     const per = @as(u64, c.factor()) * c.factor();
     const image_most = @min(@as(u64, o.image_tokens), c.max_pixels / per);
     const pair_most = if (videos) @min(@as(u64, o.video_tokens), c.max_pixels / (vl.video.min_frames * per)) else 0;
@@ -119,7 +119,7 @@ pub fn release(eng: *fx.Engine, p: ?*vp.VisPrompt) void {
 /// Info.vision for a host: images, and videos when the checkpoint names a video token.
 pub fn offer(v: *Vision, ctx: *anyopaque, prepare_image: @FieldType(api.Vision, "prepare"), prepare_video: @FieldType(api.VideoOffer, "prepare")) api.Vision {
     var o: api.Vision = .{ .ctx = ctx, .prepare = prepare_image, .image_token = v.c.image_token, .markers = &v.markers, .image_tokens = v.video.image_tokens, .max_images = v.max_images };
-    if (v.c.video_token) |t| o.video = .{ .prepare = prepare_video, .video_token = t, .group_open = v.c.vision_start, .group_close = v.c.vision_end, .group_token = t, .time_first = true, .markers = &v.video_markers, .video_tokens = v.video.video_tokens, .max_videos = v.video.max_videos, .max_frames = v.video.max_frames };
+    if (v.c.video_token) |t| o.video = .{ .prepare = prepare_video, .video_token = t, .group_open = v.c.vision_start, .group_close = v.c.vision_end, .time_first = t, .markers = &v.video_markers, .video_tokens = v.video.video_tokens, .max_videos = v.video.max_videos, .max_frames = v.video.max_frames };
     return o;
 }
 

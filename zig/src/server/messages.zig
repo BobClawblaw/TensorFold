@@ -37,7 +37,7 @@ pub const Media = struct {
     }
 };
 
-/// One video part as the template and video path read it: {"type": "video_url", "video_url": {"url": string}, "video": null}.
+/// One video part as the template and video path read it: {"type": "video_url", "video_url": {"url"}, "video": null}.
 fn videoPart(cx: *Cx, part: Value) errors.Refused!Value {
     const vu = part.get("video_url") orelse return cx.refuse("video_url must contain a non-empty url string");
     const u = if (vu == .object) vu.get("url") else null;
