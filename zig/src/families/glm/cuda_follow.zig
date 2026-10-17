@@ -6,9 +6,10 @@ const engine = @import("cuda_engine.zig");
 const images_mod = @import("cuda_images.zig");
 const vcfg = @import("vision_config.zig");
 const sampler = @import("cuda_sampler.zig");
+const prompts = @import("cuda_prompts.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, many };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -210,6 +211,22 @@ pub const Leader = struct {
         try x.e.verifyShared(parts);
     }
 
+    /// Whole prompts in one prompt pass on every rank (Engine.prefillMany): their slots and lengths, then the ids.
+    pub fn prefillMany(x: Leader, parts: []const engine.Prompt, firsts: []u32) !void {
+        if (!prompts.fits(parts, x.e.capacity)) return error.BadPrompts;
+        try x.flush();
+        var buf: [2 * engine.max_together + engine.prompt_rows]u32 = undefined;
+        var n: usize = 2 * parts.len;
+        for (parts, 0..) |p, i| {
+            buf[2 * i] = p.slot;
+            buf[2 * i + 1] = @intCast(p.ids.len);
+            @memcpy(buf[n..][0..p.ids.len], p.ids);
+            n += p.ids.len;
+        }
+        try x.send(.{ .kind = @backingInt(Kind.many), .depth = @intCast(parts.len) }, buf[0..n]);
+        try x.e.prefillMany(parts, firsts);
+    }
+
     pub fn keep(x: Leader, n: usize) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
@@ -236,7 +253,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared) try e.bind(h.slot);
+        if (kind != .end and kind != .drop and kind != .shared and kind != .many) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
             .prefill => {
@@ -273,6 +290,20 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     row += n;
                 }
                 try e.verifyShared(parts[0..k]);
+            },
+            .many => {
+                const k = h.depth;
+                if (k == 0 or k > engine.max_together or step.ids.len < 2 * k) return error.BadStep;
+                var parts: [engine.max_together]engine.Prompt = undefined;
+                var at: usize = 2 * k;
+                for (parts[0..k], 0..) |*p, i| {
+                    const n = step.ids[2 * i + 1];
+                    if (at + n > step.ids.len) return error.BadStep;
+                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n] };
+                    at += n;
+                }
+                var firsts: [engine.max_together]u32 = undefined;
+                try e.prefillMany(parts[0..k], &firsts);
             },
             .keep => try e.keep(@intCast(h.a)),
             .draft => {

@@ -32,6 +32,10 @@ const pair_bytes = 16;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
+/// Whole prompts one prompt pass takes together (cuda_prompts).
+pub const max_together = @import("cuda_state.zig").prompt_heads;
+/// One of them: its stream's slot and its ids.
+pub const Prompt = struct { slot: u32, ids: []const u32 };
 
 /// A shared verify's max rows and streams: under hc_pre's 64-row block change, 8 streams of 4 rows.
 pub const shared_rows = 32;
@@ -49,6 +53,7 @@ const Seq = struct {
     sampling: ?sampler.Sampling = null, // null: greedy
     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
+    held_at: u64 = 0, // its prompt's last row's hidden (a row of `hold`), which the first draft reads
 };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
@@ -82,7 +87,7 @@ pub const Engine = struct {
     bd: fw.Buffers, // verify windows
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
-    hold: cuda.DeviceBuffer, // the prompt's last row's hidden (decode's e.last_hidden), the first draft's source
+    hold: cuda.DeviceBuffer, // prompts' last rows' hidden (decode's e.last_hidden), a row a prompt pass's prompt
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
@@ -161,7 +166,7 @@ pub const Engine = struct {
         errdefer e.bm.deinit();
         if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
-        e.hold = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
+        e.hold = try cuda.DeviceBuffer.alloc(d, max_together * c.hidden * 2);
         errdefer e.hold.free();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
         errdefer e.pairs.free();
@@ -205,7 +210,7 @@ pub const Engine = struct {
         gpa.destroy(e);
     }
 
-    fn exchange(e: *const Engine) fw.Exchange {
+    pub fn exchange(e: *const Engine) fw.Exchange {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm, .group = e.group } };
     }
 
@@ -310,6 +315,7 @@ pub const Engine = struct {
         if (f.prof) |p| p.mark(e.stream, .draw);
         if (e.mtp) {
             if (last) try e.copy(e.hold.ptr, e.bp.fnormed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
+            if (last) e.cur.held_at = e.hold.ptr;
             const nxt = as_i32[1..];
             if (nxt.len > 0) { // decode._absorb_rows
                 const mp = f.prof;
@@ -326,7 +332,7 @@ pub const Engine = struct {
     }
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
-    fn gate(e: *Engine, cancel: ?Cancel) !void {
+    pub fn gate(e: *Engine, cancel: ?Cancel) !void {
         const kept = try e.shared(@floatFromInt(e.announce));
         e.announce = 0;
         if (kept > 0 and e.share.rank != 0) try e.keepAs(@intFromFloat(kept));
@@ -476,6 +482,9 @@ pub const Engine = struct {
         }
     }
 
+    /// Whole prompts on their slots in one prompt pass (cuda_prompts); `firsts[k]`: prompt k's first token.
+    pub const prefillMany = @import("cuda_prompts.zig").prefillMany;
+
     /// forward.commit of the last window's first `n` rows (the KDA replay when fewer than it ran).
     pub fn keep(e: *Engine, n: usize) !void {
         var one: [1]fw.Rank = undefined;
@@ -490,7 +499,7 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bm, &one);
         const D = e.c.hidden;
-        const hidden = if (from_prompt) e.hold.ptr else e.cur.rows_at;
+        const hidden = if (from_prompt) e.cur.held_at else e.cur.rows_at;
         try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len - e.cur.in_head);
         e.cur.in_head = 0;
         const next: []const i32 = @ptrCast(follow);
@@ -511,7 +520,7 @@ pub const Engine = struct {
     }
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
-    fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
+    pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
         if (e.cur.sampling) |s| {
             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
             return e.checkGathers(); // the draw read rows the forward's gathers made
@@ -560,7 +569,7 @@ pub const Engine = struct {
         return if (s.len == 0) heat.default_root else s;
     }
 
-    fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
+    pub fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
         try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
     }
 };

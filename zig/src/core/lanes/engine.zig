@@ -80,6 +80,7 @@ pub const Engine = struct {
 
     pub const addStream = open.add;
     pub const addStreams = open.addStreams;
+    pub const batchable = open.batchable;
     pub const max_together = open.max_together;
 
     /// Whether the backend prefills several prompts in one pass (addStreams batches them).

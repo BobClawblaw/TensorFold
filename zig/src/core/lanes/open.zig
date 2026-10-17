@@ -40,6 +40,12 @@ pub fn addStreams(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
     };
 }
 
+/// Whether `s` may join a batched prompt pass beside chunked fills: short, text only, nothing kept to resume from.
+pub fn batchable(e: *const Engine, s: *const Stream) bool {
+    const n = e.backend.vtable.many_rows;
+    return n > 0 and s.prompt_len <= n and s.images.len == 0 and s.reuse.saved == null;
+}
+
 fn addEach(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
     for (ss, errs) |s, *x| add(e, s) catch |err| {
         x.* = err;

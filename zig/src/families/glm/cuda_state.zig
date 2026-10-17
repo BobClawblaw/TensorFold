@@ -19,6 +19,8 @@ const kda_block = @import("cuda_kda_block.zig");
 pub const prefill_rows = 2048;
 /// A decode window's rows (Engine's max_rows).
 pub const window_rows = 8;
+/// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
+pub const prompt_heads = 16;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
 pub const dense_reach = 2560;
 
@@ -161,7 +163,7 @@ pub const Buffers = struct {
             rows * sh * 2,
             rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
             rows * D * 2,         rows * D * 2,
-            rows * (D / 64) * 4,  (if (prefill) 1 else rows) * s.vocab.len() * 2,
+            rows * (D / 64) * 4,  (if (prefill) prompt_heads else rows) * s.vocab.len() * 2,
             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
