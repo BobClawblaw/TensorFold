@@ -12,6 +12,9 @@ pub const ring = 4096;
 pub const max_rows = ring - c.window;
 /// Compressed picks a row: the indexer's top-k.
 pub const picks = c.index_topk;
+/// Rows that take the split attention (decode, windows, drafts), and its chunks of 64 keys at most a row.
+pub const split_rows = 16;
+pub const split_chunks = (c.window + picks + 63) / 64;
 /// Scores a prompt call's indexer holds at once (f32): rows are taken in slices of this many keys' worth.
 pub const score_budget = 64 << 20;
 
@@ -126,6 +129,9 @@ pub const Scratch = struct {
     iw: mtl.Buffer,
     ik: mtl.Buffer,
     scores: mtl.Buffer,
+    /// Split attention's chunk partials for up to `split_rows` rows: outputs f32 [rows, 64, chunks, 512], (max, sum).
+    attn_po: mtl.Buffer,
+    attn_ml: mtl.Buffer,
     blocks: mtl.Buffer,
     keep: mtl.Buffer, // i32 [rows, 2048]: the candidate blocks, in order
     picks: mtl.Buffer, // i32 [rows, 512]
@@ -191,6 +197,8 @@ pub const Scratch = struct {
         out.iw = try m.alloc(rows * c.index_heads * 2);
         out.ik = try m.alloc(rows * c.index_dim * 2);
         out.scores = try m.alloc(score_budget);
+        out.attn_po = try m.alloc(@min(rows, split_rows) * @as(usize, c.heads) * split_chunks * c.head_dim * 4);
+        out.attn_ml = try m.alloc(@min(rows, split_rows) * @as(usize, c.heads) * split_chunks * 8);
         out.blocks = try m.alloc(score_budget);
         out.keep = try m.alloc(rows * c.candidate_blocks * 4);
         out.picks = try m.alloc(rows * picks * 4);

@@ -46,6 +46,8 @@ pub fn main(init: std.process.Init) !void {
 
     var sections: [q.forward.sections.len]f64 = @splat(0);
     if (std.c.getenv("DS_PROFILE") != null) q.forward.profile = &sections;
+    var timing: [3]f64 = @splat(0);
+    if (std.c.getenv("DS_TIMING") != null) q.forward.timing = &timing;
     var calls: usize = 0;
     var wall: f64 = 0;
     const logits = try gpa.alloc(u8, ids.len * c.vocab * 2);
@@ -76,6 +78,10 @@ pub fn main(init: std.process.Init) !void {
     };
     std.debug.print("native DeepSeek-V4.1 forward: {d} rows, bf16 logits\n", .{ids.len});
     if (calls > 0) std.debug.print("after the first call: {d:.2} ms a call ({d} calls)\n", .{ wall * 1e3 / @as(f64, @floatFromInt(calls)), calls });
+    if (q.forward.timing != null) {
+        const k: f64 = @floatFromInt(calls + 1);
+        std.debug.print("a call: encode {d:.2} ms, GPU {d:.2} ms, all {d:.2} ms\n", .{ timing[0] * 1e3 / k, timing[1] * 1e3 / k, timing[2] * 1e3 / k });
+    }
     if (q.forward.profile != null) {
         const k: f64 = @floatFromInt(calls + 1);
         std.debug.print("GPU ms a call:", .{});

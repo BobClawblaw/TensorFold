@@ -719,6 +719,96 @@ inline const device bfloat* attn_key(const device bfloat* RING, const device bfl
   for (int h = 0; h < AH; h++) O[(size_t(r) * 64 + h0 + h) * HD + t] = bfloat(acc[h] / den[h]);
 }
 
+constant constexpr int SPLIT = 64;  // keys a split threadgroup takes
+
+// Decode and window rows' attention, split by keys: one threadgroup (8 simdgroups, a head each) a (8 heads, 64-key
+// chunk, row); each tile of 8 keys is read once into threadgroup memory for the 8 heads. Writes each head's chunk
+// partial (its max score, its sum of exps, its unnormalized output); ds_attend_merge folds the chunks and the sink.
+[[kernel]] void ds_attend_split(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
+                                const device bfloat* COMP [[buffer(2)]], const device int* PICKS [[buffer(3)]],
+                                device float* PO [[buffer(4)]], device float2* PML [[buffer(5)]],
+                                constant AttnArgs& a [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],
+                                uint3 tgn [[threadgroups_per_grid]], uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]], uint3 tpos [[thread_position_in_threadgroup]]) {
+  const uint t = tpos.x;
+  const int h = int(tg.x) * 8 + int(sg), chunk = int(tg.y), r = int(tg.z), chunks = int(tgn.y);
+  const int pos = a.window_end >= 0 ? a.window_end : a.first_pos + r;
+  const int nwin = min(a.window, pos + 1);
+  const int nkeys = nwin + a.picks;
+  const int k0 = chunk * SPLIT, k1 = min(nkeys, k0 + SPLIT);
+  const device int* picks = PICKS + size_t(r) * a.picks;
+  threadgroup bfloat ks[8][HD];
+  threadgroup float sc[8][SPLIT];
+  float q[16];
+  const device bfloat* qr = Q + (size_t(r) * 64 + h) * HD;
+  for (int i = 0; i < 16; i++) q[i] = float(qr[int(lane) * 16 + i]);
+  // scores: simdgroup sg's head against each key of the chunk (lane: 16 dims)
+  for (int j0 = k0; j0 < k1; j0 += 8) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(t); i < 8 * HD; i += 256) {
+      const int kk = i / HD, j = j0 + kk;
+      ks[kk][i % HD] = j < k1 ? attn_key(RING, COMP, picks, pos, nwin, a.ring, j)[i % HD] : bfloat(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < 8 && j0 + kk < k1; kk++) {
+      float d = 0.0f;
+      for (int i = 0; i < 16; i++) d += q[i] * float(ks[kk][int(lane) * 16 + i]);
+      d = simd_sum(d);
+      const int j = j0 + kk;
+      const bool valid = j < nwin || picks[j - nwin] >= 0;
+      if (lane == 0) sc[sg][j - k0] = valid ? d * a.scale : -INFINITY;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  float m = -1e30f;
+  for (int j = int(lane); j < k1 - k0; j += 32) m = max(m, sc[sg][j]);
+  m = simd_max(m);
+  float l = 0.0f;
+  for (int j = int(lane); j < k1 - k0; j += 32) {
+    const float p = precise::exp(sc[sg][j] - m);
+    sc[sg][j] = p;
+    l += p;
+  }
+  l = simd_sum(l);
+  // outputs: the chunk's keys again, a tile at a time (lane: 16 dims of its head)
+  float o[16];
+  for (int i = 0; i < 16; i++) o[i] = 0.0f;
+  for (int j0 = k0; j0 < k1; j0 += 8) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(t); i < 8 * HD; i += 256) {
+      const int kk = i / HD, j = j0 + kk;
+      ks[kk][i % HD] = j < k1 ? attn_key(RING, COMP, picks, pos, nwin, a.ring, j)[i % HD] : bfloat(0);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < 8 && j0 + kk < k1; kk++) {
+      const float p = sc[sg][j0 + kk - k0];
+      for (int i = 0; i < 16; i++) o[i] += p * float(ks[kk][int(lane) * 16 + i]);
+    }
+  }
+  const size_t part = (size_t(r) * 64 + h) * chunks + chunk;
+  for (int i = 0; i < 16; i++) PO[part * HD + int(lane) * 16 + i] = o[i];
+  if (lane == 0) PML[part] = float2(m, l);
+}
+
+// The chunks' partials of a (row, head) folded with the head's sink: the softmax over every key and the sink.
+[[kernel]] void ds_attend_merge(const device float* PO [[buffer(0)]], const device float2* PML [[buffer(1)]],
+                                const device float* SINK [[buffer(2)]], device bfloat* O [[buffer(3)]],
+                                constant int& chunks [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                                uint2 tpos [[thread_position_in_threadgroup]]) {
+  const uint t = tpos.x;
+  const int h = int(tg.x), r = int(tg.y);
+  const size_t base = (size_t(r) * 64 + h) * chunks;
+  float m = SINK[h];
+  for (int c = 0; c < chunks; c++) m = max(m, PML[base + c].x);
+  float denom = precise::exp(SINK[h] - m);
+  for (int c = 0; c < chunks; c++) denom += PML[base + c].y * precise::exp(PML[base + c].x - m);
+  for (int d = int(t); d < HD; d += 256) {
+    float acc = 0.0f;
+    for (int c = 0; c < chunks; c++) acc += PO[(base + c) * HD + d] * precise::exp(PML[base + c].x - m);
+    O[(size_t(r) * 64 + h) * HD + d] = bfloat(acc / denom);
+  }
+}
+
 // ---------------------------------------------------------------- MoE
 
 struct RouteArgs {

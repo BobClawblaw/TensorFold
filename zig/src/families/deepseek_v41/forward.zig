@@ -57,6 +57,8 @@ fn matrix(w: row.Weights) struct { w: Ref, s: Ref, b: Ref, n: u32, k: u32 } {
 /// GPU seconds by section when set (`sections` names them): each section then runs in its own command buffer,
 /// waited for (a profile, not a served speed).
 pub var profile: ?*[sections.len]f64 = null;
+/// Seconds a call spends encoding (to its commit), on the GPU, and in all, summed over calls when set.
+pub var timing: ?*[3]f64 = null;
 pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
 
 const Enc = struct {
@@ -146,6 +148,42 @@ const Enc = struct {
         self.buf(y, y_off, 2);
         self.args(GemvArgs{ .rows = @intCast(rows), .n = @intCast(n), .k = @intCast(k), .group_n = @intCast(group_n), .x_stride = @intCast(x_stride), .y_stride = @intCast(n) }, 3);
         self.groups(.{ (n + 7) / 8, (rows + 7) / 8, 1 }, .{ 256, 1, 1 });
+    }
+
+    /// Attention over each row's window (ending at `window_end`, or the row's own position when negative) and its
+    /// `picks` compressed keys: split by keys for decode-sized calls, the shared-tile kernel for prompt chunks.
+    fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32) void {
+        const s = self.s;
+        const aa = AttnArgs{ .first_pos = @intCast(self.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = window_end };
+        if (self.rows >= nax_rows) {
+            self.pipe("ds_attend_rows");
+            self.buf(q, 0, 0);
+            self.buf(ring, 0, 1);
+            self.buf(comp, 0, 2);
+            self.buf(picks_buf, 0, 3);
+            self.tensor(sink, 4);
+            self.buf(o, 0, 5);
+            self.args(aa, 6);
+            self.groups(.{ c.heads / 8, self.rows, 1 }, .{ 512, 1, 1 });
+            return;
+        }
+        const chunks: usize = (c.window + picks + 63) / 64;
+        self.pipe("ds_attend_split");
+        self.buf(q, 0, 0);
+        self.buf(ring, 0, 1);
+        self.buf(comp, 0, 2);
+        self.buf(picks_buf, 0, 3);
+        self.buf(s.attn_po, 0, 4);
+        self.buf(s.attn_ml, 0, 5);
+        self.args(aa, 6);
+        self.groups(.{ c.heads / 8, chunks, self.rows }, .{ 256, 1, 1 });
+        self.pipe("ds_attend_merge");
+        self.buf(s.attn_po, 0, 0);
+        self.buf(s.attn_ml, 0, 1);
+        self.tensor(sink, 2);
+        self.buf(o, 0, 3);
+        self.args(@as(i32, @intCast(chunks)), 4);
+        self.groups(.{ c.heads, self.rows, 1 }, .{ 256, 1, 1 });
     }
 
     fn rms(self: Enc, x: Buffer, x_off: usize, w: wts.Tensor, y: Buffer, y_off: usize, rows: usize, n: usize) void {
@@ -281,6 +319,8 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
     }
     for (s.pre[0].slice(f32, rows * c.hc), 0..) |*v, i| v.* = if (i % c.hc == 0) 1 else 0;
 
+    var t_start: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_start);
     var cb = m.queue.commandBuffer();
     const w = &m.weights;
     var e = cb.compute(.serial);
@@ -332,9 +372,18 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
         .all => x.linear(w.head, s.normed, 0, s.logits, 0, rows),
     }
     e.end();
+    var t_commit: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &t_commit);
     cb.commit();
     cb.wait();
     if (profile) |p| p[9] += cb.gpuSeconds();
+    if (timing) |t| {
+        var t_end: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &t_end);
+        t[0] += secs(t_start, t_commit);
+        t[1] += cb.gpuSeconds();
+        t[2] += secs(t_start, t_end);
+    }
     if (cb.status() != .completed) {
         if (cb.failure()) |why| std.log.err("deepseek_v41: the forward failed: {s}", .{why});
         return error.DeepseekGpuFailed;
@@ -439,19 +488,15 @@ fn stageAttention(x: Enc, l: *const wts.Layer, ring: Buffer, layer: usize, at: u
     x.rms(s.kv, 0, a.kv_norm, s.kv, 0, n, c.head_dim);
     x.rope(s.kv, n, 1, c.head_dim, s.pos, freq, false);
     x.fp8(s.kv, n * c.head_dim);
-    x.pipe("ds_attend");
-    x.buf(s.q, 0, 0);
-    x.buf(ring, 0, 1);
-    x.buf(s.kv, 0, 2);
-    x.buf(s.draft_picks, 0, 3);
-    x.tensor(a.sink, 4);
-    x.buf(s.o, 0, 5);
-    x.args(AttnArgs{ .first_pos = @intCast(x.base), .ring = st.ring, .window = c.window, .picks = c.draft_block, .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = @intCast(at) }, 6);
-    x.groups(.{ c.heads, n, 1 }, .{ 256, 1, 1 });
+    x.attend(s.q, ring, s.kv, s.draft_picks, c.draft_block, a.sink, s.o, @intCast(at));
     x.rope(s.o, n, c.heads, c.head_dim, s.pos, freq, true);
     x.fp8(s.o, n * c.heads * c.head_dim);
     x.gemv(false, a.wo_a, s.o, 0, c.heads * c.head_dim, s.oa, 0, n, c.o_groups * c.o_rank, c.group_in, c.o_rank);
     x.linear(a.wo_b, s.oa, 0, s.branch, 0, n);
+}
+
+fn secs(a: std.c.timespec, b: std.c.timespec) f64 {
+    return @as(f64, @floatFromInt(b.sec - a.sec)) + @as(f64, @floatFromInt(b.nsec - a.nsec)) / 1e9;
 }
 
 /// One block: the engram lookup (layers 1 and 14), attention and the MoE, each between its boundaries.
@@ -512,16 +557,7 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     }
     try x.cut(2);
     // sparse attention over the window and the picks, then the output's RoPE taken back
-    const wide = rows >= nax_rows; // prompt chunks: 8 heads a threadgroup share each key tile
-    if (wide) x.pipe("ds_attend_rows") else x.pipe("ds_attend");
-    x.buf(s.q, 0, 0);
-    x.buf(cache.windows[layer], 0, 1);
-    x.buf(comp, 0, 2);
-    x.buf(s.picks, 0, 3);
-    x.tensor(a.sink, 4);
-    x.buf(s.o, 0, 5);
-    x.args(AttnArgs{ .first_pos = @intCast(x.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)) }, 6);
-    if (wide) x.groups(.{ c.heads / 8, rows, 1 }, .{ 512, 1, 1 }) else x.groups(.{ c.heads, rows, 1 }, .{ 256, 1, 1 });
+    x.attend(s.q, cache.windows[layer], comp, s.picks, picks, a.sink, s.o, -1);
     x.rope(s.o, rows, c.heads, c.head_dim, s.pos, freq, true);
     try x.cut(3);
     // the grouped low-rank output: fp8-rounded heads, block-diagonal wo_a (bf16), wo_b
