@@ -36,6 +36,7 @@ pub const glm_dsa_mla = @embedFile("glm_dsa/mla.metal");
 pub const glm_dsa_index = @embedFile("glm_dsa/index.metal");
 pub const glm_dsa_glue = @embedFile("glm_dsa/glue.metal");
 pub const glm_dsa_moe_jobs = @embedFile("glm_dsa/moe_jobs.metal");
+pub const deepseek_v41 = @embedFile("deepseek/v41.metal");
 pub const core_grammar_mask = @embedFile("core/grammar_mask.metal");
 pub const counter_probe = @embedFile("core/counter_probe.metal");
 

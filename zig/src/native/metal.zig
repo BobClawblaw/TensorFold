@@ -43,6 +43,7 @@ pub const families: []const api.Family = &.{
     .{ .model_type = "gemma4", .formats = gemma4_widths },
     .{ .model_type = "gemma4_unified", .formats = gemma4_widths },
     .{ .model_type = "step5_vl", .formats = &.{"mlx-q2g128"} },
+    .{ .model_type = "deepseek_v41", .formats = affine_widths },
 };
 
 /// Gemma 4 31B (gemma4) and 12B (gemma4_unified, its text model): one native family, gemma4.zig's host.
@@ -166,6 +167,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     if (std.mem.eql(u8, o.model_type, "qwen3_5")) return @import("qwen35.zig").open(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "step5_vl")) return @import("step5.zig").open(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "lfm2_moe")) return @import("lfm2_moe.zig").open(a, gpa, io, o, problem);
+    if (std.mem.eql(u8, o.model_type, "deepseek_v41")) return @import("deepseek_v41.zig").open(a, gpa, io, o, problem);
     if (!std.mem.eql(u8, o.model_type, "nemotron_h")) {
         problem.* = try std.fmt.allocPrint(a, "the native engine has no backend for {s} checkpoints yet; the Python engine 0.6.6 may serve them: python -m pip install git+https://github.com/ashhart/TensorFold.git@v0.6.6", .{o.model_type});
         return null;
