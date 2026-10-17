@@ -141,7 +141,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     if (std.mem.eql(u8, o.model_type, "qwen4_exp")) return openFlashNext(a, gpa, io, o, problem);
     if (std.mem.eql(u8, o.model_type, "glm5_next")) return openGlm(a, gpa, io, o, problem);
     if (o.vision != null) {
-        problem.* = try std.fmt.allocPrint(a, "--vision: the native engine reads images for GLM-5.3-Flash and Qwen3.8-27B only, not {s} checkpoints", .{o.model_type});
+        problem.* = try std.fmt.allocPrint(a, "--vision: the native engine reads images for GLM-5.3-Flash, Qwen3.8-27B and Qwen3.8-Flash-Next only, not {s} checkpoints", .{o.model_type});
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "glm_moe_dsa")) return openGlmDsa(a, gpa, io, o, problem);
@@ -405,8 +405,8 @@ fn openFlashNext(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem:
     defer pool.pop();
     var why: []const u8 = "";
     const learn: ?flashnext.Learn = if (o.learn) |root| .{ .root = root, .cap = gibBytes(o.learn_gib), .floor = gibBytes(o.learn_min_free_gib), .daily = gibBytes(o.learn_daily_gib), .conversations = o.learn_conversations } else null;
-    const h = flashnext.open(gpa, io, o.dir, dump, window, o.speed_up, o.prompt_cache_gib, o.prompt_cache_over_cap, learn, a, &why) catch |e| {
-        problem.* = tf.flashnext_engine.quantizationProblem(e) orelse if (e == error.CacheOverCap or e == error.LearnOnPair) why else if (linkProblem(e)) |link| try std.fmt.allocPrint(a, "the native Flash Next engine cannot load {s}: {s}", .{ o.dir, link }) else try std.fmt.allocPrint(a, "the native Flash Next engine cannot load {s} with {s} ({s})", .{ o.dir, dump orelse "(none: the checked-in kernels)", @errorName(e) });
+    const h = flashnext.open(gpa, io, o.dir, dump, window, o.speed_up, o.prompt_cache_gib, o.prompt_cache_over_cap, learn, o.vision, a, &why) catch |e| {
+        problem.* = tf.flashnext_engine.quantizationProblem(e) orelse if (e == error.CacheOverCap or e == error.LearnOnPair or why.len > 0) why else if (linkProblem(e)) |link| try std.fmt.allocPrint(a, "the native Flash Next engine cannot load {s}: {s}", .{ o.dir, link }) else try std.fmt.allocPrint(a, "the native Flash Next engine cannot load {s} with {s} ({s})", .{ o.dir, dump orelse "(none: the checked-in kernels)", @errorName(e) });
         return null;
     };
     return .{ .engine = h.engine(), .close = flashnext.close, .ctx = h };
