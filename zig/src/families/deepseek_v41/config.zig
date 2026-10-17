@@ -197,7 +197,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .{ "hc_mult", hc },                      .{ "hc_sinkhorn_iters", sinkhorn },             .{ "engram_n_heads", engram_heads },
         .{ "engram_head_dim", engram_dim },      .{ "engram_max_ngram_size", engram_ngram },     .{ "num_nextn_predict_layers", stages },
         .{ "dspark_block_size", draft_block },   .{ "dspark_n_routed_experts", draft_experts },  .{ "dspark_num_experts_per_tok", draft_topk },
-        .{ "dspark_markov_rank", markov_rank },
+        .{ "dspark_markov_rank", markov_rank },  .{ "dspark_noise_token_id", 128799 },
     };
     inline for (dims) |d| if (try integer(root, d[0]) != d[1]) {
         std.log.err("deepseek_v41: {s} is not DeepSeek-V4.1-Flash's {d}", .{ d[0], d[1] });

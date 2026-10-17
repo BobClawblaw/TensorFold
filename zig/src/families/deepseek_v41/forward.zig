@@ -25,11 +25,14 @@ const ScoreArgs = extern struct { rows: i32, groups: i32, ratio: i32, first_pos:
 const MaskArgs = extern struct { groups: i32, stride: i32, block: i32, kept: i32 };
 const BlockArgs = extern struct { rows: i32, groups: i32, block: i32, first_pos: i32, ratio: i32, stride: i32 };
 const TopkArgs = extern struct { n: i32, k: i32, stride: i32, offset: i32 };
-const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: i32, scale: f32 };
+const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: i32, scale: f32, window_end: i32 = -1 };
 const RouteArgs = extern struct { experts: i32, topk: i32, scale: f32 };
 const GluArgs = extern struct { width: i32, weighted: i32, limit: f32 };
 const EngramArgs = extern struct { eps: f32, text_rows: i32 };
 const SortArgs = extern struct { slots: i32, experts: i32 };
+const MarkovArgs = extern struct { vocab: i32, rank: i32, step: i32 };
+/// The draft block's filler after its first token (dspark_noise_token_id).
+const noise_token: u32 = 128799;
 /// Rows from which a call's projections take the tensor units (core/affine_mm), on GPUs that have them.
 const nax_rows = 16;
 /// A buffer and byte offset as core/affine_mm binds them.
@@ -264,7 +267,16 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
     x.tensor(w.embed, 1);
     x.buf(s.x, 0, 2);
     x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+    const drafting = w.stages != null and cache.stage_rings != null;
     for (&w.layers, 0..) |*l, i| {
+        if (drafting) if (std.mem.indexOfScalar(usize, &c.draft_targets, i)) |t| {
+            // the draft head reads its target layers' attention inputs: the mean of the four streams
+            x.pipe("ds_stream_mean");
+            x.buf(s.x, 0, 0);
+            x.buf(s.mh, 0, 1);
+            x.args([2]i32{ @intCast(t * c.hidden), @intCast(c.draft_targets.len * c.hidden) }, 2);
+            x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+        };
         try block(x, cache, i, l);
         if (dump) |d| { // the streams after each block: the buffers are untracked, so each block completes first
             e.end();
@@ -276,6 +288,7 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
             e = cb.compute(.serial);
         }
     }
+    if (drafting) condition(x, cache);
     try x.cut(0);
     // the last block's FFN pre collapses the streams for the head
     x.boundary(null, s.pre[0], s.pre[1], w.norm);
@@ -297,6 +310,113 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
         const last = if (head == .last) 0 else rows - 1;
         @memcpy(cache.logits.contents()[0 .. c.vocab * 2], (s.logits.contents() + last * c.vocab * 2)[0 .. c.vocab * 2]);
     }
+    cache.last_start = base;
+    cache.last_rows = rows;
+}
+
+/// The draft head's view of this call's rows: main_norm(main_proj(the target layers' means)), and each stage's window
+/// key of every row (its kv_norm(wkv(...)), RoPE'd at the row's position, fp8-rounded) into the stage's ring.
+fn condition(x: Enc, cache: *st.Cache) void {
+    const s = x.s;
+    const stages = &x.m.weights.stages.?;
+    x.linear(stages[0].main_proj.?, s.mh, 0, s.mainx, 0, x.rows);
+    x.rms(s.mainx, 0, stages[0].main_norm.?, s.mainx, 0, x.rows, c.hidden);
+    for (stages, cache.stage_rings.?, 0..) |*stage, ring, k| {
+        const a = &stage.block.attn;
+        x.linear(a.wkv, s.mainx, 0, s.kv, 0, x.rows);
+        x.rms(s.kv, 0, a.kv_norm, s.kv, 0, x.rows, c.head_dim);
+        x.rope(s.kv, x.rows, 1, c.head_dim, s.pos, x.m.freq(c.layers + k), false);
+        x.fp8(s.kv, x.rows * c.head_dim);
+        x.put(s.kv, s.pos, ring, x.rows, c.head_dim, st.ring);
+    }
+}
+
+/// One DSpark round from position `at` (the last committed row): the pending `token` at at + 1 and four noise
+/// tokens after it through the three stages, the head over the five rows, then five Markov-biased greedy picks.
+/// The drafts land in `out` (the tokens for positions at + 2 .. at + 6). `ds` is the draft call's own scratch.
+pub fn draft(m: *Model, ds: *st.Scratch, cache: *st.Cache, token: u32, at: usize, out: *[c.draft_block]u32) !void {
+    const n = c.draft_block;
+    const stages = &(m.weights.stages orelse return error.NoDraftHead);
+    const pool = mtl.objc.Pool.push();
+    defer pool.pop();
+    const ids = ds.ids.slice(u32, n);
+    ids[0] = token;
+    for (ids[1..]) |*v| v.* = noise_token;
+    for (ds.pos.slice(i32, n), 0..) |*p, i| p.* = @intCast(at + 1 + i);
+    for (ds.pre[0].slice(f32, n * c.hc), 0..) |*v, i| v.* = if (i % c.hc == 0) 1 else 0;
+    ds.draft_ids.slice(u32, n + 1)[0] = token;
+
+    var cb = m.queue.commandBuffer();
+    var e = cb.compute(.serial);
+    const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = ds, .rows = n, .base = at + 1 };
+    x.pipe("ds_embed");
+    x.buf(ds.ids, 0, 0);
+    x.tensor(m.weights.embed, 1);
+    x.buf(ds.x, 0, 2);
+    x.threads(.{ c.hidden, n, 1 }, .{ 256, 1, 1 });
+    for (stages, cache.stage_rings.?, 0..) |*stage, ring, k| {
+        const l = &stage.block;
+        x.boundary(l.hc_attn, ds.pre[0], ds.pre[1], l.attn_norm);
+        stageAttention(x, l, ring, c.layers + k, at);
+        x.expand();
+        x.boundary(l.hc_ffn, ds.pre[1], ds.pre[0], l.ffn_norm);
+        try moe(x, &l.moe, c.draft_topk, c.draft_experts);
+        x.expand();
+    }
+    x.boundary(null, ds.pre[0], ds.pre[1], stages[c.stages - 1].norm.?);
+    x.linear(m.weights.head, ds.normed, 0, ds.logits, 0, n);
+    // forward_head's chain: each row's logits plus the Markov bias of the token before, its argmax the next token
+    const groups = (c.vocab + 255) / 256;
+    for (0..n) |k| {
+        x.pipe("ds_markov");
+        x.buf(ds.logits, 0, 0);
+        x.tensor(stages[c.stages - 1].markov_embed.?, 1);
+        x.tensor(stages[c.stages - 1].markov_head.?, 2);
+        x.buf(ds.draft_ids, 0, 3);
+        x.buf(ds.markov_part, 0, 4);
+        x.args(MarkovArgs{ .vocab = c.vocab, .rank = c.markov_rank, .step = @intCast(k) }, 5);
+        x.groups(.{ groups, 1, 1 }, .{ 256, 1, 1 });
+        x.pipe("ds_markov_pick");
+        x.buf(ds.markov_part, 0, 0);
+        x.buf(ds.draft_ids, 0, 1);
+        x.args([2]i32{ @intCast(groups), @intCast(k) }, 2);
+        x.threads(.{ 1, 1, 1 }, .{ 1, 1, 1 });
+    }
+    e.end();
+    cb.commit();
+    cb.wait();
+    if (cb.status() != .completed) return error.DeepseekGpuFailed;
+    @memcpy(out, ds.draft_ids.slice(u32, n + 1)[1..]);
+}
+
+/// A draft stage's attention: its five rows' queries and keys, over the stage's window of target keys ending at
+/// `at` and the five rows' own keys (every row sees all five, as get_dspark_topk_idxs lists them).
+fn stageAttention(x: Enc, l: *const wts.Layer, ring: Buffer, layer: usize, at: usize) void {
+    const s = x.s;
+    const a = &l.attn;
+    const n = x.rows;
+    const freq = x.m.freq(layer);
+    x.linear(a.wq_a, s.normed, 0, s.qr, 0, n);
+    x.rms(s.qr, 0, a.q_norm, s.qr, 0, n, c.q_rank);
+    x.linear(a.wq_b, s.qr, 0, s.q, 0, n);
+    x.rope(s.q, n, c.heads, c.head_dim, s.pos, freq, false);
+    x.linear(a.wkv, s.normed, 0, s.kv, 0, n);
+    x.rms(s.kv, 0, a.kv_norm, s.kv, 0, n, c.head_dim);
+    x.rope(s.kv, n, 1, c.head_dim, s.pos, freq, false);
+    x.fp8(s.kv, n * c.head_dim);
+    x.pipe("ds_attend");
+    x.buf(s.q, 0, 0);
+    x.buf(ring, 0, 1);
+    x.buf(s.kv, 0, 2);
+    x.buf(s.draft_picks, 0, 3);
+    x.tensor(a.sink, 4);
+    x.buf(s.o, 0, 5);
+    x.args(AttnArgs{ .first_pos = @intCast(x.base), .ring = st.ring, .window = c.window, .picks = c.draft_block, .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = @intCast(at) }, 6);
+    x.groups(.{ c.heads, n, 1 }, .{ 256, 1, 1 });
+    x.rope(s.o, n, c.heads, c.head_dim, s.pos, freq, true);
+    x.fp8(s.o, n * c.heads * c.head_dim);
+    x.gemv(false, a.wo_a, s.o, 0, c.heads * c.head_dim, s.oa, 0, n, c.o_groups * c.o_rank, c.group_in, c.o_rank);
+    x.linear(a.wo_b, s.oa, 0, s.branch, 0, n);
 }
 
 /// One block: the engram lookup (layers 1 and 14), attention and the MoE, each between its boundaries.

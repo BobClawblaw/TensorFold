@@ -565,6 +565,7 @@ struct AttnArgs {
   int window;
   int picks;      // compressed picks a row (0: window only)
   float scale;
+  int window_end; // >= 0: every row's window ends at this position (a draft block's), else at the row's own
 };
 
 // One threadgroup (256) a (row, head): the row's window of raw keys from the ring plus its compressed picks, keys
@@ -577,7 +578,7 @@ struct AttnArgs {
                           uint sg [[simdgroup_index_in_threadgroup]]) {
   const uint t = tpos.x;
   const int h = int(tg.x), r = int(tg.y);
-  const int pos = a.first_pos + r;
+  const int pos = a.window_end >= 0 ? a.window_end : a.first_pos + r;
   const int nwin = min(a.window, pos + 1);
   const int nkeys = nwin + a.picks;
   threadgroup float sc[1024];
@@ -870,6 +871,86 @@ struct SortArgs {
                                device bfloat* Y [[buffer(2)]], constant int2& wk [[buffer(3)]],
                                uint2 g [[thread_position_in_grid]]) {
   Y[size_t(g.y) * wk.x + g.x] = X[size_t(ORDER[g.y] / wk.y) * wk.x + g.x];
+}
+
+// The mean of a row's four streams (h.mean(dim=2), bf16) into Y at column `col` of rows `ld` wide: a DSpark
+// target layer's attention input.
+[[kernel]] void ds_stream_mean(const device bfloat* X [[buffer(0)]], device bfloat* Y [[buffer(1)]],
+                               constant int2& col_ld [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
+  const device bfloat* x = X + size_t(g.y) * F;
+  const float v = (float(x[g.x]) + float(x[D + g.x]) + float(x[2 * D + g.x]) + float(x[3 * D + g.x])) / 4.0f;
+  Y[size_t(g.y) * col_ld.y + col_ld.x + g.x] = bfloat(v);
+}
+
+struct MarkovArgs {
+  int vocab;
+  int rank;
+  int step;   // which draft row's logits, and IDS[step] the token whose Markov embedding biases them
+};
+
+// One draft step's logits plus the Markov head's bias from the previous token (embed[tok] . head[v], fp32), and
+// the threadgroup's best (value, lower id) into PART: phase one of the step's argmax.
+[[kernel]] void ds_markov(const device bfloat* LOGITS [[buffer(0)]], const device bfloat* EMB [[buffer(1)]],
+                          const device bfloat* HEAD [[buffer(2)]], const device uint* IDS [[buffer(3)]],
+                          device float2* PART [[buffer(4)]], constant MarkovArgs& a [[buffer(5)]],
+                          uint tg [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float e[256];
+  threadgroup float bv[8];
+  threadgroup int bi[8];
+  const uint tok = IDS[a.step];
+  for (int j = int(t); j < a.rank; j += 256) e[j] = float(EMB[size_t(tok) * a.rank + j]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int v = int(tg) * 256 + int(t);
+  float val = -INFINITY;
+  int id = 0x7fffffff;
+  if (v < a.vocab) {
+    const device bfloat* h = HEAD + size_t(v) * a.rank;
+    float bias = 0.0f;
+    for (int j = 0; j < a.rank; j++) bias += e[j] * float(h[j]);
+    val = float(LOGITS[size_t(a.step) * a.vocab + v]) + bias;
+    id = v;
+  }
+  for (ushort o = 16; o > 0; o >>= 1) {
+    const float ov = simd_shuffle_down(val, o);
+    const int oi = simd_shuffle_down(id, o);
+    if (ov > val || (ov == val && oi < id)) {
+      val = ov;
+      id = oi;
+    }
+  }
+  if (lane == 0) {
+    bv[sg] = val;
+    bi[sg] = id;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t == 0) {
+    float m = bv[0];
+    int mi = bi[0];
+    for (int k = 1; k < 8; k++)
+      if (bv[k] > m || (bv[k] == m && bi[k] < mi)) {
+        m = bv[k];
+        mi = bi[k];
+      }
+    PART[tg] = float2(m, as_type<float>(mi));
+  }
+}
+
+// Phase two: the step's token, the best of the threadgroups' bests, into IDS[step + 1].
+[[kernel]] void ds_markov_pick(const device float2* PART [[buffer(0)]], device uint* IDS [[buffer(1)]],
+                               constant int2& n_step [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+  if (t != 0) return;
+  float m = -INFINITY;
+  int mi = 0x7fffffff;
+  for (int k = 0; k < n_step.x; k++) {
+    const float v = PART[k].x;
+    const int i = as_type<int>(PART[k].y);
+    if (v > m || (v == m && i < mi)) {
+      m = v;
+      mi = i;
+    }
+  }
+  IDS[n_step.y + 1] = uint(mi);
 }
 
 // ---------------------------------------------------------------- engram

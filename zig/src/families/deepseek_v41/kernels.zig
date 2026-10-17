@@ -12,7 +12,7 @@ pub const names = [_][:0]const u8{
     "ds_put_rows",       "ds_put_rows_f32", "ds_pool2",       "ds_index_scores", "ds_candidate_mask",
     "ds_block_max",      "ds_topk",         "ds_attend",      "ds_route",       "ds_swiglu",
     "ds_moe_combine",    "ds_engram",       "ds_scale",       "ds_hc_mix_part", "ds_sort_slots",
-    "ds_gather_rows",    "ds_attend_rows",
+    "ds_gather_rows",    "ds_attend_rows",  "ds_stream_mean", "ds_markov",      "ds_markov_pick",
 };
 
 pub const Kernels = struct {

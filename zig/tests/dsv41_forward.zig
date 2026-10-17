@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
     const out_dir = args[3];
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
+    if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
     const m = try q.Model.load(gpa, init.io, args[1], false);
@@ -85,4 +86,80 @@ pub fn main(init: std.process.Init) !void {
 
 fn seconds(a: std.c.timespec, b: std.c.timespec) f64 {
     return @as(f64, @floatFromInt(b.sec - a.sec)) + @as(f64, @floatFromInt(b.nsec - a.nsec)) / 1e9;
+}
+
+fn argmax(logits: []const u16) u32 {
+    var best: usize = 0;
+    for (logits, 0..) |v, i| if (bf(v) > bf(logits[best])) {
+        best = i;
+    };
+    return @intCast(best);
+}
+
+fn bf(v: u16) f32 {
+    return @bitCast(@as(u32, v) << 16);
+}
+
+/// `n` greedy tokens after the prompt, one row a step and then with the DSpark head's drafts verified in windows of
+/// six rows: the two replies must be the same tokens; prints the acceptance and both speeds.
+fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, n: usize) !void {
+    const m = try q.Model.load(gpa, io, dir, true);
+    defer m.deinit();
+    var scratch = try q.state.Scratch.init(gpa, m.device, 256);
+    defer scratch.deinit();
+    var ds = try q.state.Scratch.init(gpa, m.device, 8);
+    defer ds.deinit();
+    var replies: [2][]u32 = undefined;
+    var times: [2]f64 = undefined;
+    var rounds: usize = 0;
+    for (0..2) |mode| {
+        var cache = try q.state.Cache.initWith(gpa, m.device, ids.len + n + 16, true);
+        defer cache.deinit();
+        var at: usize = 0;
+        while (at < ids.len) : (at += 256) {
+            const end = @min(ids.len, at + 256);
+            try q.forward.run(m, &scratch, &cache, ids[at..end], .last, null);
+        }
+        const out = try gpa.alloc(u32, n);
+        var got: usize = 0;
+        var pending = argmax(cache.logits.slice(u16, c.vocab));
+        var t0: std.c.timespec = undefined;
+        var t1: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &t0);
+        while (got < n) {
+            out[got] = pending;
+            got += 1;
+            if (got == n) break;
+            if (mode == 0) {
+                try q.forward.run(m, &scratch, &cache, &.{pending}, .last, null);
+                pending = argmax(cache.logits.slice(u16, c.vocab));
+                continue;
+            }
+            // draft from the last committed row, verify pending + drafts, keep the matching prefix
+            var held: [c.draft_block]u32 = undefined;
+            try q.forward.draft(m, &ds, &cache, pending, cache.len - 1, &held);
+            var window: [1 + c.draft_block]u32 = undefined;
+            window[0] = pending;
+            @memcpy(window[1..], &held);
+            const len0 = cache.len;
+            try q.forward.run(m, &scratch, &cache, &window, .all, null);
+            rounds += 1;
+            var kept: usize = 1;
+            var next = argmax(scratch.logits.slice(u16, c.vocab));
+            const rows = scratch.logits.slice(u16, window.len * c.vocab);
+            while (kept < window.len and window[kept] == next and got < n) : (kept += 1) {
+                out[got] = window[kept];
+                got += 1;
+                next = argmax(rows[kept * c.vocab ..][0..c.vocab]);
+            }
+            cache.len = len0 + kept; // the rejected rows' cache entries are rewritten by the next call
+            pending = next;
+        }
+        _ = std.c.clock_gettime(.MONOTONIC, &t1);
+        replies[mode] = out;
+        times[mode] = seconds(t0, t1);
+    }
+    var same: usize = 0;
+    while (same < n and replies[0][same] == replies[1][same]) same += 1;
+    std.debug.print("plain {d:.1} tok/s, drafted {d:.1} tok/s; {d} rounds, {d:.2} tokens a round; replies equal for {d}/{d} tokens\n", .{ @as(f64, @floatFromInt(n)) / times[0], @as(f64, @floatFromInt(n)) / times[1], rounds, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(rounds)), same, n });
 }

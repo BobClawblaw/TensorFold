@@ -50,8 +50,21 @@ pub const Cache = struct {
     /// Compressed token ids by position, for the engram hashes.
     engram_ids: std.ArrayList(i32) = .empty,
     logits: mtl.Buffer,
+    /// With the DSpark head: each stage's window keys of the target's positions (bf16 [ring, 512] by position).
+    stage_rings: ?[c.stages]mtl.Buffer = null,
+    /// Where the last call started and its rows (a window's keep takes back to a prefix of them).
+    last_start: usize = 0,
+    last_rows: usize = 0,
+    /// The drafts held for the next window (the head's greedy chain).
+    held: [c.draft_block]u32 = @splat(0),
+    held_n: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, device: mtl.Device, capacity: usize) !Cache {
+        return initWith(gpa, device, capacity, false);
+    }
+
+    /// `drafts`: the DSpark head's rings.
+    pub fn initWith(gpa: std.mem.Allocator, device: mtl.Device, capacity: usize, drafts: bool) !Cache {
         var out: Cache = .{ .gpa = gpa, .memory = .{ .gpa = gpa, .device = device }, .capacity = capacity, .windows = undefined, .sources = undefined, .proj_kv = @splat(null), .proj_score = @splat(null), .logits = undefined };
         errdefer out.memory.deinit();
         out.logits = try out.memory.alloc(c.vocab * 2);
@@ -65,6 +78,11 @@ pub const Cache = struct {
             }
         }
         try out.engram_ids.ensureTotalCapacity(gpa, capacity);
+        if (drafts) {
+            var rings: [c.stages]mtl.Buffer = undefined;
+            for (&rings) |*r| r.* = try out.memory.alloc(ring * c.head_dim * 2);
+            out.stage_rings = rings;
+        }
         return out;
     }
 
@@ -133,6 +151,14 @@ pub const Scratch = struct {
     gidx: [c.kv_sources.len]mtl.Buffer,
     engram_kv: mtl.Buffer,
     logits: mtl.Buffer,
+    /// DSpark: the target layers' stream means (bf16 [rows, 3 x 5120]) and their conditioning rows; a draft call's
+    /// token ids (the pending token, then the drafts as the Markov steps pick them), its picks of its own five keys,
+    /// and the argmax partials.
+    mh: mtl.Buffer,
+    mainx: mtl.Buffer,
+    draft_ids: mtl.Buffer,
+    draft_picks: mtl.Buffer,
+    markov_part: mtl.Buffer,
 
     pub fn init(gpa: std.mem.Allocator, device: mtl.Device, rows: usize) !Scratch {
         var out: Scratch = undefined;
@@ -185,6 +211,12 @@ pub const Scratch = struct {
         }
         out.engram_kv = try m.alloc(rows * (c.hc + 1) * c.hidden * 2);
         out.logits = try m.alloc(rows * c.vocab * 2);
+        out.mh = try m.alloc(rows * c.draft_targets.len * c.hidden * 2);
+        out.mainx = try m.alloc(rows * c.hidden * 2);
+        out.draft_ids = try m.alloc((c.draft_block + 1) * 4);
+        out.draft_picks = try m.alloc(c.draft_block * c.draft_block * 4);
+        for (out.draft_picks.slice(i32, c.draft_block * c.draft_block), 0..) |*v, i| v.* = @intCast(i % c.draft_block);
+        out.markov_part = try m.alloc((c.vocab + 255) / 256 * 8);
         return out;
     }
 
