@@ -1,6 +1,7 @@
 //! HIP: mock-backed admission tests join `zig build test`; GPU builds and runs are opt-in steps (-Dhipcc, -Dhip-include, -Dhip-arch).
 
 const std = @import("std");
+const vision_build = @import("vision.zig");
 const caps = @import("../src/hip/caps.zig");
 const exlr8_build = @import("exlr8.zig");
 
@@ -141,7 +142,7 @@ fn engineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         hip.addCSourceFile(.{ .file = b.path("zig/src/hip/device_arch.c"), .flags = &.{"-D__HIP_PLATFORM_AMD__"} });
     }
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "qwen_image", .module = vision_build.module(b, target, optimize) } } });
     const serve = b.createModule(.{
         .root_source_file = b.path("zig/src/hip_serve/serve.zig"),
         .target = target,
