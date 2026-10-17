@@ -8,9 +8,11 @@ pub const state = @import("state.zig");
 pub const model = @import("model.zig");
 pub const forward = @import("forward.zig");
 pub const backend = @import("backend.zig");
+pub const snapshot = @import("snapshot.zig");
 pub const Model = model.Model;
 
 test {
     _ = config;
     _ = engram;
+    _ = snapshot;
 }

@@ -7,6 +7,7 @@ const lanes = @import("lanes");
 const c = @import("config.zig");
 const st = @import("state.zig");
 const fwd = @import("forward.zig");
+const snapshot = @import("snapshot.zig");
 const Model = @import("model.zig").Model;
 const draw = @import("../lfm2_moe/backend.zig").draw;
 const be = lanes.backend;
@@ -121,12 +122,29 @@ pub const Metal = struct {
         errdefer cache.deinit();
         try self.caches.put(self.gpa, stream, cache);
         errdefer _ = self.caches.remove(stream);
-        stream.cached = 0;
         var at: usize = 0;
+        stream.cached = 0;
+        if (stream.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
+            const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+            if (snap.at < ids.len) if (snapshot.restore(cache, snap)) |_| {
+                at = snap.at;
+            } else |_| {};
+            stream.cached = @intCast(at);
+            stream.reuse_failed = at == 0;
+        }
+        var mark: usize = 0;
         while (at < ids.len) {
-            const end = @min(ids.len, at + self.scratch.rows);
+            var end: usize = @min(ids.len, at + self.scratch.rows);
+            for (stream.chunks) |boundary| if (boundary > at) {
+                end = @min(end, boundary);
+                break;
+            };
+            while (mark < stream.reuse.marks.len and stream.reuse.marks[mark] <= at) mark += 1;
+            if (mark < stream.reuse.marks.len) end = @min(end, stream.reuse.marks[mark]);
             try fwd.run(self.model, &self.scratch, cache, ids[at..end], if (end == ids.len) .last else .none, null);
             at = end;
+            if (stream.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(at)) != null)
+                hk.at(hk.ptr, stream, @intCast(at));
         }
     }
 
@@ -227,6 +245,27 @@ pub const Metal = struct {
             entry.value.deinit();
             self.gpa.destroy(entry.value);
         }
+    }
+};
+
+/// The prompt cache's view of the streams: kept states copied at chunk ends, restored by the prompt pass.
+pub const Snaps = struct {
+    fn metal(ptr: *anyopaque) *Metal {
+        return @ptrCast(@alignCast(ptr));
+    }
+    pub fn bytes(ptr: *anyopaque, at: u32) u64 {
+        return snapshot.bytes(at, metal(ptr).drafts != null);
+    }
+    pub fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+        const self = metal(ptr);
+        const cache = try self.cacheOf(@ptrCast(@alignCast(owner orelse return error.NoStream)));
+        return @ptrCast(try snapshot.save(self.gpa, cache, at));
+    }
+    pub fn restore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+        return error.RestoredInPrefill; // the prompt pass restores, before its first chunk
+    }
+    pub fn drop(ptr: *anyopaque, saved: *anyopaque) void {
+        snapshot.drop(metal(ptr).gpa, @ptrCast(@alignCast(saved)));
     }
 };
 
