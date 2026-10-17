@@ -9,8 +9,7 @@ const fn_ext = @import("fn_ext.zig");
 const Gpu = check.Gpu;
 
 pub const CACHE = ".cache/tensorfold-qwen38-int4mixed/cb2ebf0540f42604e2759b2ddef497861e928248";
-pub const SIZE = std.StaticStringMap(usize).initComptime(.{ .{ "bfloat16", 2 }, .{ "float16", 2 }, .{ "float32", 4 },
-    .{ "int32", 4 }, .{ "int64", 8 }, .{ "uint8", 1 }, .{ "int8", 1 }, .{ "bool", 1 }, .{ "int16", 2 }, .{ "float8_e4m3fn", 1 } });
+pub const SIZE = std.StaticStringMap(usize).initComptime(.{ .{ "bfloat16", 2 }, .{ "float16", 2 }, .{ "float32", 4 }, .{ "int32", 4 }, .{ "int64", 8 }, .{ "uint8", 1 }, .{ "int8", 1 }, .{ "bool", 1 }, .{ "int16", 2 }, .{ "float8_e4m3fn", 1 } });
 
 pub fn openRead(gpu: Gpu, path: []const u8) !std.Io.File {
     return std.Io.Dir.cwd().openFile(gpu.io, path, .{});
@@ -121,7 +120,7 @@ pub fn kernelFor(run: *Run, hash: []const u8) !cuda.triton.Kernel {
     try run.images.append(gpa, img);
     const mtext = try std.Io.Dir.cwd().readFileAlloc(run.gpu.io, jp, gpa, .limited(1 << 22));
     defer gpa.free(mtext);
-    const meta = try cuda.triton.parseMeta(gpa, mtext);       // kept alive with the kernel (its name)
+    const meta = try cuda.triton.parseMeta(gpa, mtext); // kept alive with the kernel (its name)
     const name_z = try gpa.dupeSentinel(u8, meta.value.name, 0);
     const k = try cuda.triton.Kernel.load(run.gpu.d, run.gpu.ctx.device, img, meta.value, name_z);
     try run.kernels.put(try gpa.dupe(u8, hash), k);
@@ -155,7 +154,9 @@ pub fn loadStorages(run: *Run, pack_path: []const u8, reset_path: []const u8) !v
                     const n = @min(left, host.len);
                     if (try pack.readPositionalAll(io, host[0..n], src) != n) return error.ShortRead;
                     try buf.upload(at, host[0..n]);
-                    left -= n; src += n; at += n;
+                    left -= n;
+                    src += n;
+                    at += n;
                 }
             }
         } else if (std.mem.eql(u8, init, "reset")) {
@@ -166,7 +167,9 @@ pub fn loadStorages(run: *Run, pack_path: []const u8, reset_path: []const u8) !v
                 const n = @min(left, host.len);
                 if (try reset.readPositionalAll(io, host[0..n], src) != n) return error.ShortRead;
                 try buf.upload(at, host[0..n]);
-                left -= n; src += n; at += n;
+                left -= n;
+                src += n;
+                at += n;
             }
         } else {
             try run.gpu.d.check(run.gpu.d.api.cuMemsetD8_v2(buf.ptr, 0, bytes), "cuMemsetD8");
@@ -175,14 +178,12 @@ pub fn loadStorages(run: *Run, pack_path: []const u8, reset_path: []const u8) !v
     check.pass("storages: {d} on the device, {d} MiB", .{ run.store.items.len, total >> 20 });
 }
 
-fn runOps(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, nccl: *cuda.nccl.Library,
-          comm: cuda.nccl.Comm, inputs: anytype, pos: i64) !void {
+fn runOps(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype, pos: i64) !void {
     return runOpsKeys(run, ops, k, stream, nccl, comm, inputs, pos, -1);
 }
 
 /// ``keys``: the attended keys of a decode step (position + 1), which size two attention grids; -1 keeps the trace's.
-fn runOpsKeys(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, nccl: *cuda.nccl.Library,
-          comm: cuda.nccl.Comm, inputs: anytype, pos: i64, keys: i64) !void {
+fn runOpsKeys(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm, inputs: anytype, pos: i64, keys: i64) !void {
     const d = run.gpu.d;
     for (ops) |ov| {
         const o = ov.object;
@@ -212,7 +213,11 @@ fn runOpsKeys(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda
                 if (ty[0] == '*') {
                     a.add(@as(u64, if (v == .null) 0 else run.addr(v)));
                 } else if (std.mem.eql(u8, ty, "i32")) {
-                    a.add(@as(i32, @intCast(switch (v) { .integer => |x| x, .bool => |b| @as(i64, @intFromBool(b)), else => unreachable })));
+                    a.add(@as(i32, @intCast(switch (v) {
+                        .integer => |x| x,
+                        .bool => |b| @as(i64, @intFromBool(b)),
+                        else => unreachable,
+                    })));
                 } else if (std.mem.eql(u8, ty, "fp32")) {
                     a.add(@as(f32, @bitCast(@as(u32, @intCast(v.object.get("bits").?.integer)))));
                 } else return check.expect(false, "{s}: argument type {s}", .{ name, ty });
@@ -226,17 +231,11 @@ fn runOpsKeys(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda
                 if (std.mem.eql(u8, name, "_chunks")) dims.z = @intCast(@divFloor(@min(keys, 2051) + 511, 512));
             }
             try check.expect(kern.globalScratchBytes(dims) <= run.scratch.len, "{s}: scratch", .{name});
-            try kern.launchOn(dims, stream, &a, .{ .global = if (kern.meta.global_scratch_size > 0) run.scratch.ptr else 0,
-                .profile = if (kern.meta.profile_scratch_size > 0) run.scratch.ptr else 0 }, &.{});
+            try kern.launchOn(dims, stream, &a, .{ .global = if (kern.meta.global_scratch_size > 0) run.scratch.ptr else 0, .profile = if (kern.meta.profile_scratch_size > 0) run.scratch.ptr else 0 }, &.{});
         } else if (std.mem.eql(u8, kind, "ext")) {
             const items = o.get("args").?.array.items;
             const short = name[std.mem.indexOfScalar(u8, name, '.').? + 1 ..];
-            const full = try std.fmt.allocPrint(run.gpu.gpa, "tensorfold_{s}", .{
-                if (std.mem.startsWith(u8, name, "experts.")) try std.fmt.allocPrint(run.gpu.gpa, "experts_v7.{s}", .{short})
-                else if (std.mem.startsWith(u8, name, "gdn_v2.")) name
-                else if (std.mem.startsWith(u8, name, "qmm.")) try std.fmt.allocPrint(run.gpu.gpa, "qmm_v5.{s}", .{short})
-                else if (std.mem.startsWith(u8, name, "gdn_io.")) try std.fmt.allocPrint(run.gpu.gpa, "qwen4_exp_gdn_io.{s}", .{short})
-                else name });
+            const full = try std.fmt.allocPrint(run.gpu.gpa, "tensorfold_{s}", .{if (std.mem.startsWith(u8, name, "experts.")) try std.fmt.allocPrint(run.gpu.gpa, "experts_v7.{s}", .{short}) else if (std.mem.startsWith(u8, name, "gdn_v2.")) name else if (std.mem.startsWith(u8, name, "qmm.")) try std.fmt.allocPrint(run.gpu.gpa, "qmm_v5.{s}", .{short}) else if (std.mem.startsWith(u8, name, "gdn_io.")) try std.fmt.allocPrint(run.gpu.gpa, "qwen4_exp_gdn_io.{s}", .{short}) else name});
             const ret: u64 = if (o.get("ret")) |r| run.addr(r) else 0;
             try fn_ext.launchExt(k, run.gpu, full, OpArgs{ .run = run, .items = items }, ret, stream);
         } else if (std.mem.eql(u8, kind, "comm")) {
@@ -278,7 +277,11 @@ fn runOpsKeys(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cuda
                     const v: i32 = if (pos_fill) @intCast(pos) else @intCast(items[1].integer);
                     bits = @bitCast(v);
                 } else if (std.mem.eql(u8, dt, "float32")) {
-                    const v: f32 = switch (items[1]) { .integer => |x| @floatFromInt(x), .object => |ob| @bitCast(@as(u32, @intCast(ob.get("bits").?.integer))), else => unreachable };
+                    const v: f32 = switch (items[1]) {
+                        .integer => |x| @floatFromInt(x),
+                        .object => |ob| @bitCast(@as(u32, @intCast(ob.get("bits").?.integer))),
+                        else => unreachable,
+                    };
                     bits = @bitCast(v);
                 } else return check.expect(false, "a fill of {s}", .{dt});
                 try d.check(d.api.cuMemsetD32Async(dst, bits, count, stream.handle), "fill");
@@ -405,19 +408,21 @@ fn lastHeadOut(ops: []std.json.Value) std.json.Value {
 
 /// Greedy over both ranks' vocabulary shards: each rank's best (global id, value), exchanged; the larger value wins,
 /// a tie goes to the lower id.
-fn greedy(run: *Run, outv: std.json.Value, vocab_offset: i64, xbuf: cuda.DeviceBuffer, stream: cuda.Stream,
-          nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm) !i64 {
+fn greedy(run: *Run, outv: std.json.Value, vocab_offset: i64, xbuf: cuda.DeviceBuffer, stream: cuda.Stream, nccl: *cuda.nccl.Library, comm: cuda.nccl.Comm) !i64 {
     const gpa = run.gpu.gpa;
     const vr: usize = @intCast(outv.object.get("shape").?.array.items[1].integer);
     const row = try gpa.alloc(u16, vr);
     defer gpa.free(row);
-    try stream.synchronize();                // the head ran on the decode stream; the copy below does not wait for it
+    try stream.synchronize(); // the head ran on the decode stream; the copy below does not wait for it
     try run.gpu.d.check(run.gpu.d.api.cuMemcpyDtoH_v2(@ptrCast(row.ptr), run.addr(outv), vr * 2), "logits row");
     var best: usize = 0;
     var bv: f32 = -std.math.inf(f32);
     for (row, 0..) |b, i| {
         const v: f32 = @bitCast(@as(u32, b) << 16);
-        if (v > bv) { bv = v; best = i; }
+        if (v > bv) {
+            bv = v;
+            best = i;
+        }
     }
     var mine = [2]i32{ @intCast(@as(i64, @intCast(best)) + vocab_offset), @bitCast(bv) };
     try xbuf.upload(0, std.mem.asBytes(&mine));
@@ -485,7 +490,7 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
     const xbuf = try cuda.DeviceBuffer.alloc(gpu.d, 64);
     var consts: Consts = .{};
     var cp_pre: Compiled = .{};
-    var cp_dec: [2]Compiled = .{ .{}, .{} };       // even, odd
+    var cp_dec: [2]Compiled = .{ .{}, .{} }; // even, odd
     var graphs: [2]DecodeGraph = .{ .{}, .{} };
     var selects: []Select = &.{};
     var prof: Profile = .{ .totals = .init(gpa) };
@@ -495,9 +500,7 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
         for ([_][]const u8{ "even", "odd" }, 0..) |p, i| cp_dec[i] = try compile(&run, progs.get(p).?.object.get("forward").?.array.items, &k, stream, &consts);
         try finishConsts(&run, &consts, &.{ &cp_pre, &cp_dec[0], &cp_dec[1] });
         selects = try selectTable(&run);
-        std.debug.print("compiled: prefill {d} ops, decode {d} + {d} ops ({d} keyed), {d} constants, {d} selector widths, {d:.0} ms\n", .{
-            cp_pre.ops.items.len, cp_dec[0].ops.items.len, cp_dec[1].ops.items.len, cp_dec[0].keyed.items.len, consts.host.items.len, selects.len,
-            @as(f64, @floatFromInt(tc.durationTo(std.Io.Timestamp.now(gpu.io, .awake)).toNanoseconds())) / 1e6 });
+        std.debug.print("compiled: prefill {d} ops, decode {d} + {d} ops ({d} keyed), {d} constants, {d} selector widths, {d:.0} ms\n", .{ cp_pre.ops.items.len, cp_dec[0].ops.items.len, cp_dec[1].ops.items.len, cp_dec[0].keyed.items.len, consts.host.items.len, selects.len, @as(f64, @floatFromInt(tc.durationTo(std.Io.Timestamp.now(gpu.io, .awake)).toNanoseconds())) / 1e6 });
     }
 
     // the prompt: chunks of 2048 rows, each chunk's ids and n-gram rows staged here
@@ -515,7 +518,7 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
         try ng.gather(rows, vals);
         try inputs.put(2 * chunks, std.mem.sliceAsBytes(idb));
         try inputs.put(2 * chunks + 1, std.mem.sliceAsBytes(vals));
-        if (args.len > 7) {               // the Python engine's staging of the same chunk
+        if (args.len > 7) { // the Python engine's staging of the same chunk
             const pf = try std.fmt.allocPrint(gpa, "{s}/c{d}_ple_v.bin", .{ args[7], chunks });
             const py = try std.Io.Dir.cwd().readFileAlloc(gpu.io, pf, gpa, .limited(1 << 30));
             const mine = std.mem.sliceAsBytes(vals);
@@ -527,11 +530,10 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
     }
     const pre = progs.get("prefill").?.object.get("forward").?.array.items;
     const t0 = std.Io.Timestamp.now(gpu.io, .awake);
-    if (mode == .interp) try runOps(&run, pre, &k, stream, &nccl, comm, inputs, -1)
-    else try runCompiled(&run, cp_pre.ops.items, stream, &nccl, comm, inputs, -1);
+    if (mode == .interp) try runOps(&run, pre, &k, stream, &nccl, comm, inputs, -1) else try runCompiled(&run, cp_pre.ops.items, stream, &nccl, comm, inputs, -1);
     try stream.synchronize();
     const t1 = std.Io.Timestamp.now(gpu.io, .awake);
-    if (args.len > 8) {                  // the state after Python's prefill, storage by storage (args[8]: path prefix)
+    if (args.len > 8) { // the state after Python's prefill, storage by storage (args[8]: path prefix)
         const jf = try std.fmt.allocPrint(gpa, "{s}.json", .{args[8]});
         const bf = try std.fmt.allocPrint(gpa, "{s}.bin", .{args[8]});
         const ents = (try std.json.parseFromSlice(std.json.Value, gpa, try std.Io.Dir.cwd().readFileAlloc(gpu.io, jf, gpa, .limited(1 << 24)), .{})).value.array.items;
@@ -542,7 +544,10 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
             const base = e.get("base").?.integer;
             var sid: ?usize = null;
             for (run.prog.value.object.get("storages").?.array.items, 0..) |sv, i| {
-                if (sv.object.get("base").?.integer == base) { sid = i; break; }
+                if (sv.object.get("base").?.integer == base) {
+                    sid = i;
+                    break;
+                }
             }
             const nm = e.get("name").?.string;
             if (sid == null) continue;
@@ -562,8 +567,7 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
     }
     var got: std.ArrayList(i64) = .empty;
     try got.append(gpa, try greedy(&run, lastHeadOut(pre), ng.vocab_offset, xbuf, stream, &nccl, comm));
-    std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len,
-        @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6, got.items[0], want[0] });
+    std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len, @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6, got.items[0], want[0] });
     // decode: one token a step, greedy over both ranks
     var dec_ms: f64 = 0;
     var step: usize = 0;
@@ -586,8 +590,7 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
             .interp => try runOpsKeys(&run, fwd, &k, stream, &nccl, comm, din, -1, keys),
             .profile => {
                 _ = try refresh(&run, &cp_dec[par], selects, keys);
-                if (step >= 8 and step < 16) try prof.step(&run, cp_dec[par].ops.items, stream, &nccl, comm, din)
-                else try runCompiled(&run, cp_dec[par].ops.items, stream, &nccl, comm, din, -1);
+                if (step >= 8 and step < 16) try prof.step(&run, cp_dec[par].ops.items, stream, &nccl, comm, din) else try runCompiled(&run, cp_dec[par].ops.items, stream, &nccl, comm, din, -1);
             },
             .compiled => {
                 _ = try refresh(&run, &cp_dec[par], selects, keys);
@@ -607,8 +610,7 @@ pub fn generate(gpu: Gpu, args: []const [:0]const u8, mode: Mode) !void {
                 const pf = try std.fmt.allocPrint(gpa, "{s}/d{d:0>2}_ple_v.bin", .{ args[9], step });
                 const wp = try std.Io.Dir.cwd().readFileAlloc(gpu.io, pf, gpa, .limited(1 << 26));
                 const mine = std.mem.sliceAsBytes(vals);
-                std.debug.print("decode step {d} (token {d}): logits {s}, staged rows {s}\n", .{ step, tok,
-                    if (std.mem.eql(u8, gl, wl)) "equal" else "DIFFER", if (std.mem.eql(u8, wp[0..mine.len], mine)) "equal" else "DIFFER" });
+                std.debug.print("decode step {d} (token {d}): logits {s}, staged rows {s}\n", .{ step, tok, if (std.mem.eql(u8, gl, wl)) "equal" else "DIFFER", if (std.mem.eql(u8, wp[0..mine.len], mine)) "equal" else "DIFFER" });
             } else |_| {}
         }
         dec_ms += @as(f64, @floatFromInt(a.durationTo(std.Io.Timestamp.now(gpu.io, .awake)).toNanoseconds())) / 1e6;
@@ -691,7 +693,7 @@ pub const Launch = struct {
     cfg: cuda.Config,
     args: cuda.Args,
     key: Keyed = .none,
-    kern: ?cuda.triton.Kernel = null,     // Triton launches: the kernel (its config follows the grid)
+    kern: ?cuda.triton.Kernel = null, // Triton launches: the kernel (its config follows the grid)
     dims: cuda.Dim3 = .{},
     name: []const u8 = "",
 };
@@ -711,12 +713,12 @@ pub const Select = struct { block: u64, kern: cuda.triton.Kernel };
 pub const Range = struct {
     a: u64,
     b: u64,
-    w: bool = true,                       // written (else only read)
-    col0: u64 = 0,                        // a write of columns [col0, col1) of a row-major buffer (col1 > 0)
+    w: bool = true, // written (else only read)
+    col0: u64 = 0, // a write of columns [col0, col1) of a row-major buffer (col1 > 0)
     col1: u64 = 0,
 };
-const WILD: Range = .{ .a = 0, .b = std.math.maxInt(u64) };     // an operand whose extent is unknown: everything
-const COMM: Range = .{ .a = 1, .b = 2 };                        // the communicator: its calls keep their order
+const WILD: Range = .{ .a = 0, .b = std.math.maxInt(u64) }; // an operand whose extent is unknown: everything
+const COMM: Range = .{ .a = 1, .b = 2 }; // the communicator: its calls keep their order
 
 /// Extension calls' written arguments (by position); a name not listed writes every argument.
 const EXT_WRITES = std.StaticStringMap([]const u8).initComptime(.{
@@ -729,11 +731,11 @@ const EXT_WRITES = std.StaticStringMap([]const u8).initComptime(.{
 
 pub const Compiled = struct {
     ops: std.ArrayList(COp) = .empty,
-    ranges: std.ArrayList([]const Range) = .empty,   // per op
-    deps: [][]const u32 = &.{},                       // per op from ``lead``: earlier ops it must follow (``analyze``)
-    keyed: std.ArrayList(usize) = .empty,     // indices of the launches ``refresh`` re-derives
-    lead: usize = 0,                          // the leading uploads (the step's inputs), run before a graph
-    sig: [3]u64 = .{ 0, 0, 0 },               // the geometry ``refresh`` last set
+    ranges: std.ArrayList([]const Range) = .empty, // per op
+    deps: [][]const u32 = &.{}, // per op from ``lead``: earlier ops it must follow (``analyze``)
+    keyed: std.ArrayList(usize) = .empty, // indices of the launches ``refresh`` re-derives
+    lead: usize = 0, // the leading uploads (the step's inputs), run before a graph
+    sig: [3]u64 = .{ 0, 0, 0 }, // the geometry ``refresh`` last set
 };
 
 /// 64-bit constants (int64 fills, pointer fills) staged once on the device; a fill becomes an 8-byte copy from here.
@@ -743,18 +745,13 @@ pub const Consts = struct {
 
     fn put(self: *Consts, gpa: std.mem.Allocator, v: u64) !u64 {
         try self.host.append(gpa, v);
-        return (self.host.items.len - 1) * 8;      // an offset until ``finish`` knows the buffer
+        return (self.host.items.len - 1) * 8; // an offset until ``finish`` knows the buffer
     }
 };
 
 fn extName(gpa: std.mem.Allocator, name: []const u8) ![]const u8 {
     const short = name[std.mem.indexOfScalar(u8, name, '.').? + 1 ..];
-    return std.fmt.allocPrint(gpa, "tensorfold_{s}", .{
-        if (std.mem.startsWith(u8, name, "experts.")) try std.fmt.allocPrint(gpa, "experts_v7.{s}", .{short})
-        else if (std.mem.startsWith(u8, name, "gdn_v2.")) name
-        else if (std.mem.startsWith(u8, name, "qmm.")) try std.fmt.allocPrint(gpa, "qmm_v5.{s}", .{short})
-        else if (std.mem.startsWith(u8, name, "gdn_io.")) try std.fmt.allocPrint(gpa, "qwen4_exp_gdn_io.{s}", .{short})
-        else name });
+    return std.fmt.allocPrint(gpa, "tensorfold_{s}", .{if (std.mem.startsWith(u8, name, "experts.")) try std.fmt.allocPrint(gpa, "experts_v7.{s}", .{short}) else if (std.mem.startsWith(u8, name, "gdn_v2.")) name else if (std.mem.startsWith(u8, name, "qmm.")) try std.fmt.allocPrint(gpa, "qmm_v5.{s}", .{short}) else if (std.mem.startsWith(u8, name, "gdn_io.")) try std.fmt.allocPrint(gpa, "qwen4_exp_gdn_io.{s}", .{short}) else name});
 }
 
 fn tritonLaunch(run: *Run, kern: cuda.triton.Kernel, dims: cuda.Dim3, args: cuda.Args, key: Keyed, name: []const u8) !Launch {
@@ -782,7 +779,7 @@ fn tensorRange(run: *Run, v: std.json.Value, out: *std.ArrayList(Range), gpa: st
 
 fn written(list: ?std.json.Value, i: usize) bool {
     const l = list orelse return true;
-    if (l != .array) return true;                    // "all"
+    if (l != .array) return true; // "all"
     for (l.array.items) |x| if (x.integer == @as(i64, @intCast(i))) return true;
     return false;
 }
@@ -809,7 +806,10 @@ fn opRanges(run: *Run, o: std.json.ObjectMap, kern: ?cuda.triton.Kernel) ![]cons
         if (std.mem.eql(u8, name, "_q8slices") and writes != null and writes.? == .array) {
             const col0: u64 = @intCast(args[6].object.get("v").?.integer);
             const n: u64 = @intCast(kinfo.get("consts").?.object.get("N").?.integer);
-            for (out.items) |*r| if (r.w) { r.col0 = col0; r.col1 = col0 + n; };
+            for (out.items) |*r| if (r.w) {
+                r.col0 = col0;
+                r.col1 = col0 + n;
+            };
         }
         if (kern) |kk| if (kk.meta.global_scratch_size > 0 or kk.meta.profile_scratch_size > 0)
             try out.append(gpa, .{ .a = run.scratch.ptr, .b = run.scratch.ptr + run.scratch.len });
@@ -861,7 +861,7 @@ pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cud
     const gpa = run.gpu.gpa;
     var c: Compiled = .{};
     var leading = true;
-    var pending64: std.ArrayList(usize) = .empty;      // copy ops whose source is a Consts offset
+    var pending64: std.ArrayList(usize) = .empty; // copy ops whose source is a Consts offset
     defer pending64.deinit(gpa);
     for (ops) |ov| {
         const o = ov.object;
@@ -884,15 +884,21 @@ pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cud
                 if (ty[0] == '*') {
                     a.add(@as(u64, if (v == .null) 0 else run.addr(v)));
                 } else if (std.mem.eql(u8, ty, "i32")) {
-                    a.add(@as(i32, @intCast(switch (v) { .integer => |x| x, .bool => |b| @as(i64, @intFromBool(b)), else => unreachable })));
+                    a.add(@as(i32, @intCast(switch (v) {
+                        .integer => |x| x,
+                        .bool => |b| @as(i64, @intFromBool(b)),
+                        else => unreachable,
+                    })));
                 } else if (std.mem.eql(u8, ty, "fp32")) {
                     a.add(@as(f32, @bitCast(@as(u32, @intCast(v.object.get("bits").?.integer)))));
-                } else { try check.expect(false, "{s}: argument type {s}", .{ name, ty }); unreachable; }
+                } else {
+                    try check.expect(false, "{s}: argument type {s}", .{ name, ty });
+                    unreachable;
+                }
             }
             const g = o.get("grid").?.array.items;
             const dims: cuda.Dim3 = .{ .x = @intCast(g[0].integer), .y = @intCast(g[1].integer), .z = @intCast(g[2].integer) };
-            const key: Keyed = if (std.mem.eql(u8, name, "_scores")) .scores else if (std.mem.eql(u8, name, "_chunks")) .chunks
-                else if (std.mem.eql(u8, name, "_select")) .select else .none;
+            const key: Keyed = if (std.mem.eql(u8, name, "_scores")) .scores else if (std.mem.eql(u8, name, "_chunks")) .chunks else if (std.mem.eql(u8, name, "_select")) .select else .none;
             if (key != .none) try c.keyed.append(gpa, c.ops.items.len);
             try c.ops.append(gpa, .{ .launch = try tritonLaunch(run, kern, dims, a, key, name) });
         } else if (std.mem.eql(u8, kind, "ext")) {
@@ -908,8 +914,7 @@ pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cud
             try check.expect(std.mem.eql(u8, name, "all_gather"), "comm {s}", .{name});
             var count: usize = 1;
             for (items[0].object.get("shape").?.array.items) |s| count *= @intCast(s.integer);
-            try c.ops.append(gpa, .{ .gather = .{ .send = run.addr(items[0]), .recv = run.addr(items[1]), .count = count,
-                .dt = if (std.mem.eql(u8, items[0].object.get("dtype").?.string, "float32")) .f32 else .bf16 } });
+            try c.ops.append(gpa, .{ .gather = .{ .send = run.addr(items[0]), .recv = run.addr(items[1]), .count = count, .dt = if (std.mem.eql(u8, items[0].object.get("dtype").?.string, "float32")) .f32 else .bf16 } });
         } else if (std.mem.eql(u8, kind, "upload")) {
             const dst = o.get("args").?.array.items[0];
             try c.ops.append(gpa, .{ .upload = .{ .dst = run.addr(dst), .seq = @intCast(o.get("seq").?.integer), .n = extent(dst.object) } });
@@ -936,15 +941,25 @@ pub fn compile(run: *Run, ops: []std.json.Value, k: *fn_ext.Kernels, stream: cud
                 if (std.mem.eql(u8, dt, "int32")) {
                     bits = @bitCast(@as(i32, @intCast(items[1].integer)));
                 } else if (std.mem.eql(u8, dt, "float32")) {
-                    const v: f32 = switch (items[1]) { .integer => |x| @floatFromInt(x), .object => |ob| @bitCast(@as(u32, @intCast(ob.get("bits").?.integer))), else => unreachable };
+                    const v: f32 = switch (items[1]) {
+                        .integer => |x| @floatFromInt(x),
+                        .object => |ob| @bitCast(@as(u32, @intCast(ob.get("bits").?.integer))),
+                        else => unreachable,
+                    };
                     bits = @bitCast(v);
-                } else { try check.expect(false, "a fill of {s}", .{dt}); unreachable; }
+                } else {
+                    try check.expect(false, "a fill of {s}", .{dt});
+                    unreachable;
+                }
                 try c.ops.append(gpa, .{ .set32 = .{ .dst = dst, .bits = bits, .count = count, .pos = pos_fill } });
             }
         } else if (std.mem.eql(u8, name, "aten.zero_.default")) {
             const items = o.get("args").?.array.items;
             try c.ops.append(gpa, .{ .zero = .{ .dst = run.addr(items[0]), .n = extent(items[0].object) } });
-        } else { try check.expect(false, "no compiler for {s} {s}", .{ kind, name }); unreachable; }
+        } else {
+            try check.expect(false, "no compiler for {s} {s}", .{ kind, name });
+            unreachable;
+        }
     }
     // the constants' sources become device addresses once the buffer exists (``finishConsts``)
     for (pending64.items) |i| c.ops.items[i].copy.src |= 1 << 63;
@@ -956,7 +971,9 @@ pub fn finishConsts(run: *Run, consts: *Consts, progs: []const *Compiled) !void 
     consts.dev = try cuda.DeviceBuffer.alloc(run.gpu.d, @max(8, consts.host.items.len * 8));
     if (consts.host.items.len > 0) try consts.dev.upload(0, std.mem.sliceAsBytes(consts.host.items));
     for (progs) |p| for (p.ops.items) |*op| switch (op.*) {
-        .copy => |*cp| if (cp.src & (1 << 63) != 0) { cp.src = consts.dev.ptr + (cp.src & ~(@as(u64, 1) << 63)); },
+        .copy => |*cp| if (cp.src & (1 << 63) != 0) {
+            cp.src = consts.dev.ptr + (cp.src & ~(@as(u64, 1) << 63));
+        },
         else => {},
     };
 }
@@ -995,7 +1012,9 @@ pub fn refresh(run: *Run, c: *Compiled, selects: []const Select, keys: i64) !boo
             .chunks => l.dims.z = @intCast(sig[1]),
             .select => {
                 var found: ?cuda.triton.Kernel = null;
-                for (selects) |s| if (s.block == sig[2]) { found = s.kern; };
+                for (selects) |s| if (s.block == sig[2]) {
+                    found = s.kern;
+                };
                 l.kern = found orelse {
                     try check.expect(false, "no _select compiled for BLOCK {d}", .{sig[2]});
                     unreachable;
@@ -1032,12 +1051,11 @@ pub fn runCompiled(run: *Run, ops: []COp, stream: cuda.Stream, nccl: *cuda.nccl.
 pub const Par = struct {
     streams: [4]cuda.Stream,
     events: []cuda.Event,
-    on: []u8,                 // the stream each op went to
+    on: []u8, // the stream each op went to
     start: cuda.Event,
 
     pub fn init(run: *Run, main: cuda.Stream, max_ops: usize) !Par {
-        var p: Par = .{ .streams = undefined, .events = try run.gpu.gpa.alloc(cuda.Event, max_ops),
-                        .on = try run.gpu.gpa.alloc(u8, max_ops), .start = try cuda.Event.init(run.gpu.d, false) };
+        var p: Par = .{ .streams = undefined, .events = try run.gpu.gpa.alloc(cuda.Event, max_ops), .on = try run.gpu.gpa.alloc(u8, max_ops), .start = try cuda.Event.init(run.gpu.d, false) };
         p.streams[0] = main;
         for (1..4) |i| p.streams[i] = try cuda.Stream.init(run.gpu.d, true);
         for (p.events) |*e| e.* = try cuda.Event.init(run.gpu.d, false);
@@ -1102,7 +1120,10 @@ pub const DecodeGraph = struct {
             const t0 = std.Io.Timestamp.now(run.gpu.io, .awake);
             try cuda.graph.beginCapture(stream, .thread_local);
             (if (self.par) |p| p.issue(run, c, nccl, comm, inputs) else runCompiled(run, c.ops.items[c.lead..], stream, nccl, comm, inputs, -1)) catch |e| {
-                if (cuda.graph.endCapture(stream)) |g| { var gg = g; gg.deinit(); } else |_| {}
+                if (cuda.graph.endCapture(stream)) |g| {
+                    var gg = g;
+                    gg.deinit();
+                } else |_| {}
                 return e;
             };
             var g = try cuda.graph.endCapture(stream);
@@ -1110,7 +1131,11 @@ pub const DecodeGraph = struct {
             var reused = false;
             if (self.exec) |ex| {
                 reused = (ex.update(g) catch .@"error") == .success;
-                if (!reused) { var old = ex; old.deinit(); self.exec = null; }
+                if (!reused) {
+                    var old = ex;
+                    old.deinit();
+                    self.exec = null;
+                }
             }
             if (!reused) {
                 self.exec = try g.instantiate();
@@ -1153,13 +1178,16 @@ pub const Profile = struct {
             gop.value_ptr.ms += ms;
             gop.value_ptr.n += 1;
         }
-        if (self.steps == 3) {            // the last profiled step, op by op, for offline attribution
+        if (self.steps == 3) { // the last profiled step, op by op, for offline attribution
             const fname = try std.fmt.allocPrint(gpa, "flashnext-zig/prof_ops_{d}.txt", .{ops.len});
             const f = try std.Io.Dir.cwd().createFile(run.gpu.io, fname, .{});
             defer f.close(run.gpu.io);
             var at: u64 = 0;
             for (ops, 0..) |op, i| {
-                const line = try std.fmt.allocPrint(gpa, "{d} {s} {d:.4}\n", .{ i, switch (op) { .launch => |l| l.name, else => @tagName(op) }, try cuda.Event.elapsedMs(evs[i], evs[i + 1]) });
+                const line = try std.fmt.allocPrint(gpa, "{d} {s} {d:.4}\n", .{ i, switch (op) {
+                    .launch => |l| l.name,
+                    else => @tagName(op),
+                }, try cuda.Event.elapsedMs(evs[i], evs[i + 1]) });
                 try f.writePositionalAll(run.gpu.io, line, at);
                 at += line.len;
             }
@@ -1173,7 +1201,11 @@ pub const Profile = struct {
         var list: std.ArrayList(E) = .empty;
         var it = self.totals.iterator();
         while (it.next()) |e| try list.append(gpa, .{ .name = e.key_ptr.*, .ms = e.value_ptr.ms, .n = e.value_ptr.n });
-        std.mem.sort(E, list.items, {}, struct { fn lt(_: void, a: E, b: E) bool { return a.ms > b.ms; } }.lt);
+        std.mem.sort(E, list.items, {}, struct {
+            fn lt(_: void, a: E, b: E) bool {
+                return a.ms > b.ms;
+            }
+        }.lt);
         const st: f64 = @floatFromInt(self.steps);
         std.debug.print("profile: {d} steps, {d:.2} ms a step on the GPU (events after every op)\n", .{ self.steps, self.step_ms / st });
         for (list.items[0..@min(40, list.items.len)]) |e|

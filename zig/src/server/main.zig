@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (problem.len > 0) fail(problem) else e;
     };
     if (record) |r| if (!up.engine.engine.attachRecall(r)) return fail(not_lanes);
-    if (up.engine.follow) |follow| {        // rank 1 of two: rank 0 serves, this rank replays its engine calls
+    if (up.engine.follow) |follow| { // rank 1 of two: rank 0 serves, this rank replays its engine calls
         follow(up.engine.ctx) catch |e| return fail(@errorName(e));
         return 0;
     }

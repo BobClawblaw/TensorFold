@@ -158,7 +158,6 @@ pub fn smartResize(height: u32, width: u32, factor: u32, min_pixels: u64, max_pi
     return .{ @intFromFloat(hb), @intFromFloat(wb) };
 }
 
-
 fn bicubic(x0: f64) f64 {
     const a = -0.5;
     const x = @abs(x0);

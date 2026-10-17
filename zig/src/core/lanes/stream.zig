@@ -151,7 +151,6 @@ pub const Stream = struct {
     think_close: []const u32,
     think_end: i64,
     think_open: bool,
-    images: []const Image = &.{},
     loop_guard: bool,
     loop_period: ?u32 = null,
     chunks: []const u32,
@@ -168,6 +167,7 @@ pub const Stream = struct {
     decide: ?u32 = null,
     untaught: bool = false,
     images: []const Image = &.{},
+    qimages: []const QImage = &.{}, // Flash Next's image inputs (its backend encodes them at prefill)
     key: []const u32 = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     fill_at: std.atomic.Value(u32) = .init(0), // prompt tokens the pass has prefilled; the engine thread writes
@@ -219,7 +219,6 @@ pub const Stream = struct {
             .cancel_check = spec.cancel_check,
             .yield_check = spec.yield_check,
             .think_budget = spec.think_budget,
-            .images = spec.images,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
@@ -236,6 +235,7 @@ pub const Stream = struct {
             .grammar = spec.grammar,
             .decode_spans = spec.decode_spans,
             .images = spec.images,
+            .qimages = spec.qimages,
             .key = spec.key,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token

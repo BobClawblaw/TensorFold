@@ -40,8 +40,7 @@ pub fn fatbins(gpu: Gpu) !void {
 pub fn tpLink(gpu: Gpu, rank_s: []const u8, host: []const u8, port_s: []const u8) !void {
     const rank = try std.fmt.parseInt(u8, rank_s, 10);
     const port = try std.fmt.parseInt(u16, port_s, 10);
-    var link = if (rank == 0) try cuda.tp_link.Link.lead(port, 120_000)
-        else try cuda.tp_link.Link.follow(gpu.io, try std.Io.net.IpAddress.parse(host, port), 120_000);
+    var link = if (rank == 0) try cuda.tp_link.Link.lead(port, 120_000) else try cuda.tp_link.Link.follow(gpu.io, try std.Io.net.IpAddress.parse(host, port), 120_000);
     defer link.close();
     // a framed request one way, an acknowledgement back
     if (rank == 0) {
@@ -86,8 +85,7 @@ pub fn weightsCheck(gpu: Gpu, dir: []const u8, rank_s: []const u8, pack: []const
     var store = try fw.load(gpa, gpu.io, &ctx, &kernels, dir, rank);
     defer store.deinit();
     const secs = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(gpu.io, .awake)).toNanoseconds())) / 1e9;
-    std.debug.print("loaded {d} tensors, {d:.2} GiB (planned {d:.2} GiB) in {d:.1} s\n", .{ store.map.count(),
-        @as(f64, @floatFromInt(store.ints.get("device_bytes").?)) / (1 << 30), @as(f64, @floatFromInt(planned)) / (1 << 30), secs });
+    std.debug.print("loaded {d} tensors, {d:.2} GiB (planned {d:.2} GiB) in {d:.1} s\n", .{ store.map.count(), @as(f64, @floatFromInt(store.ints.get("device_bytes").?)) / (1 << 30), @as(f64, @floatFromInt(planned)) / (1 << 30), secs });
     const jp = try std.fs.path.join(gpa, &.{ pack, "weights.json" });
     const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, jp, gpa, .limited(1 << 26));
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
@@ -148,8 +146,7 @@ pub fn weightsCheck(gpu: Gpu, dir: []const u8, rank_s: []const u8, pack: []const
                 for (e.value_ptr.array.items, h.array.items) |x, y| {
                     try check.expect(x.object.get("offset").?.integer == y.object.get("offset").?.integer and
                         x.object.get("rows").?.integer == y.object.get("rows").?.integer and
-                        std.mem.eql(u8, std.fs.path.basename(x.object.get("file").?.string), std.fs.path.basename(y.object.get("file").?.string)),
-                        "ngram.json shard differs", .{});
+                        std.mem.eql(u8, std.fs.path.basename(x.object.get("file").?.string), std.fs.path.basename(y.object.get("file").?.string)), "ngram.json shard differs", .{});
                 }
                 continue;
             }

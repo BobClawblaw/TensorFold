@@ -13,9 +13,9 @@ const R = @import("fn_run.zig");
 const Gpu = check.Gpu;
 
 const DEPTH = 6;
-pub var parallel = false;           // capture independent branches on side streams (fn-mtp-parallel); measured slower so far
+pub var parallel = false; // capture independent branches on side streams (fn-mtp-parallel); measured slower so far
 const CONFIDENCE = 0.7;
-const ROW = 10240 * 2;          // one residual-stream row (bf16), the MTP head's input
+const ROW = 10240 * 2; // one residual-stream row (bf16), the MTP head's input
 
 /// Upload sources by sequence number (the programs' ``seq``), at most eight a program.
 const Inputs = struct {
@@ -79,9 +79,9 @@ const Ctx = struct {
     selects: []R.Select,
     graphs: bool,
     xbuf: cuda.DeviceBuffer,
-    host: cuda.HostBuffer,                // logits rows read back here (pinned, reused)
-    device_sampling: bool = false,        // candidates from fn_rows_top inside each program, exchanged there too
-    gathered: u64 = 0,                    // [2 ranks][rows][4] words: id, max, log-sum-exp, 0
+    host: cuda.HostBuffer, // logits rows read back here (pinned, reused)
+    device_sampling: bool = false, // candidates from fn_rows_top inside each program, exchanged there too
+    gathered: u64 = 0, // [2 ranks][rows][4] words: id, max, log-sum-exp, 0
 
     fn launch(self: *Ctx, p: *Prog, keys: i64, in: *const Inputs) !void {
         _ = try R.refresh(self.run, &p.c, self.selects, keys);
@@ -246,7 +246,7 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
     try nccl.check(nccl.api.ncclCommInitRank(&comm, 2, uid, rank), "ncclCommInitRank");
     var stream = try cuda.Stream.init(gpu.d, true);
     defer stream.deinit();
-    {   // NCCL connects (and registers its buffers) before the tables take the memory
+    { // NCCL connects (and registers its buffers) before the tables take the memory
         const warm = try cuda.DeviceBuffer.alloc(gpu.d, 4096);
         try nccl.check(nccl.api.ncclAllGather(warm.ptr, warm.ptr + 2048, 256, .i32, comm, stream.handle), "warm gather");
         try stream.synchronize();
@@ -264,14 +264,16 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
     while (pit.next()) |e| {
         const p = try gpa.create(Prog);
         p.* = .{ .c = try R.compile(&run, e.value_ptr.object.get("forward").?.array.items, &k, stream, &consts) };
-        if (markAddr(&run, e.value_ptr.object, "logits")) |m| { p.logits = m.addr; p.rows = m.rows; p.cols = m.cols; }
+        if (markAddr(&run, e.value_ptr.object, "logits")) |m| {
+            p.logits = m.addr;
+            p.rows = m.rows;
+            p.cols = m.cols;
+        }
         try table.put(e.key_ptr.*, p);
         try all.append(gpa, &p.c);
     }
     try R.finishConsts(&run, &consts, all.items);
-    var cx: Ctx = .{ .run = &run, .stream = stream, .nccl = &nccl, .comm = comm, .selects = try R.selectTable(&run),
-                     .graphs = graphs, .xbuf = try cuda.DeviceBuffer.alloc(gpu.d, 4096),
-                     .host = try cuda.HostBuffer.alloc(gpu.d, 8 * 131072 * 2) };
+    var cx: Ctx = .{ .run = &run, .stream = stream, .nccl = &nccl, .comm = comm, .selects = try R.selectTable(&run), .graphs = graphs, .xbuf = try cuda.DeviceBuffer.alloc(gpu.d, 4096), .host = try cuda.HostBuffer.alloc(gpu.d, 8 * 131072 * 2) };
     if (device_sampling) {
         const raw = try std.Io.Dir.cwd().readFileAlloc(io, "flashnext-zig/cubins/fn_sample.cubin", gpa, .limited(1 << 24));
         const img = try gpa.alignedAlloc(u8, .@"16", raw.len);
@@ -291,17 +293,20 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
             const head = std.mem.startsWith(u8, nm, "fwd_");
             if (!head and !std.mem.startsWith(u8, nm, "mtp_")) continue;
             var a: cuda.Args = .{};
-            a.add(p.logits); a.add(@as(i32, @intCast(p.cols))); a.add(@as(i32, @intCast(p.cols)));
-            a.add(@as(u64, if (head) 0 else idmap.ptr)); a.add(@as(i32, @intCast(if (head) ng.vocab_offset else 0))); a.add(cand.ptr);
+            a.add(p.logits);
+            a.add(@as(i32, @intCast(p.cols)));
+            a.add(@as(i32, @intCast(p.cols)));
+            a.add(@as(u64, if (head) 0 else idmap.ptr));
+            a.add(@as(i32, @intCast(if (head) ng.vocab_offset else 0)));
+            a.add(cand.ptr);
             try p.c.ops.append(gpa, .{ .launch = .{ .f = top, .cfg = .{ .grid = .{ .x = @intCast(p.rows) }, .block = .{ .x = 1024 } }, .args = a, .name = "fn_rows_top" } });
             try p.c.ops.append(gpa, .{ .gather = .{ .send = cand.ptr, .recv = gath.ptr, .count = 4 * p.rows, .dt = .i32 } });
-            const lr = try gpa.dupe(R.Range, &.{ .{ .a = p.logits, .b = p.logits + p.rows * p.cols * 2, .w = false }, .{ .a = cand.ptr, .b = cand.ptr + cand.len },
-                .{ .a = idmap.ptr, .b = idmap.ptr + idmap.len, .w = false } });
+            const lr = try gpa.dupe(R.Range, &.{ .{ .a = p.logits, .b = p.logits + p.rows * p.cols * 2, .w = false }, .{ .a = cand.ptr, .b = cand.ptr + cand.len }, .{ .a = idmap.ptr, .b = idmap.ptr + idmap.len, .w = false } });
             try p.c.ranges.append(gpa, lr);
             try p.c.ranges.append(gpa, try gpa.dupe(R.Range, &.{ .{ .a = cand.ptr, .b = cand.ptr + cand.len, .w = false }, .{ .a = gath.ptr, .b = gath.ptr + gath.len }, .{ .a = 1, .b = 2 } }));
         }
     }
-    if (parallel) {             // verify windows and head steps: independent branches captured on side streams
+    if (parallel) { // verify windows and head steps: independent branches captured on side streams
         var most: usize = 0;
         var tit = table.iterator();
         while (tit.next()) |e| most = @max(most, e.value_ptr.*.c.ops.items.len);
@@ -313,7 +318,7 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
             if (!std.mem.startsWith(u8, nm, "fwd_") and !std.mem.startsWith(u8, nm, "mtp_")) continue;
             try R.analyze(gpa, &e.value_ptr.*.c);
             e.value_ptr.*.g.par = par;
-            if (std.mem.eql(u8, nm, "fwd_R3_p0") or std.mem.eql(u8, nm, "mtp_n1")) {        // how parallel the program is: its longest dependency chain
+            if (std.mem.eql(u8, nm, "fwd_R3_p0") or std.mem.eql(u8, nm, "mtp_n1")) { // how parallel the program is: its longest dependency chain
                 const c = &e.value_ptr.*.c;
                 const depth = try gpa.alloc(u32, c.ops.items.len);
                 @memset(depth, 0);
@@ -331,8 +336,7 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
             }
         }
     }
-    std.debug.print("compiled {d} programs, {d:.0} ms\n", .{ table.count(),
-        @as(f64, @floatFromInt(tc.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6 });
+    std.debug.print("compiled {d} programs, {d:.0} ms\n", .{ table.count(), @as(f64, @floatFromInt(tc.durationTo(std.Io.Timestamp.now(io, .awake)).toNanoseconds())) / 1e6 });
     var name_buf_init: [64]u8 = undefined;
     var mbuf_streams: u64 = 0;
     var mtp_pos: u64 = 0;
@@ -388,17 +392,16 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
     try gpu.d.check(gpu.d.api.cuMemcpyDtoD_v2(lastbuf.ptr, ls.addr, ROW), "last streams");
     var first: [1]i64 = undefined;
     const dev = cx.device_sampling;
-    cx.device_sampling = false;               // the prompt's program has no candidate step: its row is read here
+    cx.device_sampling = false; // the prompt's program has no candidate step: its row is read here
     try greedyRows(&cx, pre.logits, 1, pre.cols, ng.vocab_offset, &first);
     cx.device_sampling = dev;
-    std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len,
-        @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6, first[0], want[0] });
+    std.debug.print("prefill {d} tokens in {d:.1} ms; first token {d} (Python {d})\n", .{ prompt.len, @as(f64, @floatFromInt(t0.durationTo(t1).toNanoseconds())) / 1e6, first[0], want[0] });
 
     // rounds
     var pos: i64 = @intCast(prompt.len);
     var mtp_len: i64 = @intCast(prompt.len - 1);
-    var chained: i64 = 0;                         // MTP entries of chained drafts, trimmed by the next absorb
-    var cur: usize = chunks % 2;                  // the DeltaNet state half (flips each prompt chunk and commit)
+    var chained: i64 = 0; // MTP entries of chained drafts, trimmed by the next absorb
+    var cur: usize = chunks % 2; // the DeltaNet state half (flips each prompt chunk and commit)
     const count = want.len;
     var out: std.ArrayList(i64) = .empty;
     try out.append(gpa, first[0]);
@@ -417,7 +420,7 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
             var in: Inputs = .{};
             in.a[0] = std.mem.sliceAsBytes(ids[0..next.len]);
             in.a[1] = std.mem.asBytes(&last);
-            p.c.ops.items[2].copy.src = src;          // the head's input rows: kept main streams or its own last row
+            p.c.ops.items[2].copy.src = src; // the head's input rows: kept main streams or its own last row
             const d = c.run.gpu.d;
             try d.check(d.api.cuMemsetD32Async(posbuf, @bitCast(@as(i32, @intCast(len_at))), 1, c.stream.handle), "mtp_pos");
             try c.launch(p, len_at + @as(i64, @intCast(next.len)), &in);
@@ -540,13 +543,10 @@ pub fn generateP(gpu: Gpu, args: []const [:0]const u8, graphs: bool, device_samp
         same += 1;
     }
     std.debug.print("tokens: {any}\n", .{out.items[0..@min(12, out.items.len)]});
-    std.debug.print("MTP decode ({s}): {d} tokens in {d:.3} s = {d:.1} tok/s; {d} rounds, {d} drafted, {d} accepted (Python: {d}, {d}, {d})\n", .{
-        if (graphs) "graphs" else "eager", count - 1, secs, @as(f64, @floatFromInt(count - 1)) / secs, rounds, drafted, accepted,
-        ref.get("rounds").?.integer, ref.get("drafted").?.integer, ref.get("accepted").?.integer });
-    std.debug.print("time: verify {d:.1} ms ({d:.2} a round), commit {d:.1} ms, MTP head {d:.1} ms over {d} steps ({d:.2} a step, sampling included)\n", .{
-        tm.verify, tm.verify / @as(f64, @floatFromInt(rounds)), tm.commit, tm.mtp, tm.mtp_steps, tm.mtp / @as(f64, @floatFromInt(tm.mtp_steps)) });
+    std.debug.print("MTP decode ({s}): {d} tokens in {d:.3} s = {d:.1} tok/s; {d} rounds, {d} drafted, {d} accepted (Python: {d}, {d}, {d})\n", .{ if (graphs) "graphs" else "eager", count - 1, secs, @as(f64, @floatFromInt(count - 1)) / secs, rounds, drafted, accepted, ref.get("rounds").?.integer, ref.get("drafted").?.integer, ref.get("accepted").?.integer });
+    std.debug.print("time: verify {d:.1} ms ({d:.2} a round), commit {d:.1} ms, MTP head {d:.1} ms over {d} steps ({d:.2} a step, sampling included)\n", .{ tm.verify, tm.verify / @as(f64, @floatFromInt(rounds)), tm.commit, tm.mtp, tm.mtp_steps, tm.mtp / @as(f64, @floatFromInt(tm.mtp_steps)) });
     std.debug.print("verify split: staging {d:.1} ms, GPU {d:.1} ms, greedy {d:.1} ms; draft sampling {d:.1} ms\n", .{ tm.stage, tm.gpu, tm.greedy, tm.pick });
-    if (profile) {          // after the reply: each verify width's ops timed one by one (the state is not used again)
+    if (profile) { // after the reply: each verify width's ops timed one by one (the state is not used again)
         for ([_]usize{ 1, 3, 7 }) |rows| {
             var prof: R.Profile = .{ .totals = .init(gpa) };
             const fp = table.get(try std.fmt.bufPrint(&name_buf, "fwd_R{d}_p{d}", .{ rows, cur })).?;

@@ -4,7 +4,6 @@
 
 const std = @import("std");
 
-
 pub const NGram = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -20,8 +19,8 @@ pub const NGram = struct {
     lut: [256]u16,
     files: []std.Io.File,
     offs: []u64,
-    tables: [][]const u8 = &.{},        // each shard's rows, memory-mapped (``map``)
-    locked: usize = 0,                  // bytes of the tables mlock kept resident
+    tables: [][]const u8 = &.{}, // each shard's rows, memory-mapped (``map``)
+    locked: usize = 0, // bytes of the tables mlock kept resident
     history: [8]i64 = undefined,
     hlen: usize = 0,
     vocab_offset: i64 = 0,
@@ -37,17 +36,13 @@ pub const NGram = struct {
     pub fn open(gpa: std.mem.Allocator, io: std.Io, text: []const u8, root: []const u8) !NGram {
         const p = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
         const o = p.value.object;
-        var g: NGram = .{ .gpa = gpa, .io = io, .n = @intCast(o.get("n").?.integer), .per = @intCast(o.get("per_ngram").?.integer),
-            .heads = @intCast(o.get("heads").?.integer), .eos = o.get("eos").?.integer, .width = @intCast(o.get("width").?.integer),
-            .sizes = try ints(gpa, o.get("head_sizes").?), .offsets = try ints(gpa, o.get("head_offsets").?),
-            .mult = try ints(gpa, o.get("multipliers").?), .starts = try ints(gpa, o.get("starts").?), .lut = undefined,
-            .files = undefined, .offs = undefined, .vocab_offset = o.get("vocab_offset").?.integer };
+        var g: NGram = .{ .gpa = gpa, .io = io, .n = @intCast(o.get("n").?.integer), .per = @intCast(o.get("per_ngram").?.integer), .heads = @intCast(o.get("heads").?.integer), .eos = o.get("eos").?.integer, .width = @intCast(o.get("width").?.integer), .sizes = try ints(gpa, o.get("head_sizes").?), .offsets = try ints(gpa, o.get("head_offsets").?), .mult = try ints(gpa, o.get("multipliers").?), .starts = try ints(gpa, o.get("starts").?), .lut = undefined, .files = undefined, .offs = undefined, .vocab_offset = o.get("vocab_offset").?.integer };
         for (o.get("lut").?.array.items, 0..) |x, i| g.lut[i] = @intCast(x.integer);
         const shards = o.get("shards").?.array.items;
         g.files = try gpa.alloc(std.Io.File, shards.len);
         g.offs = try gpa.alloc(u64, shards.len);
         for (shards, 0..) |s, i| {
-            const f = s.object.get("file").?.string;           // as given (the checkpoint loader's), or a pack's container path
+            const f = s.object.get("file").?.string; // as given (the checkpoint loader's), or a pack's container path
             g.files[i] = std.Io.Dir.cwd().openFile(io, f, .{}) catch |err| blk: {
                 if (!std.mem.startsWith(u8, f, "/cache/tf/")) return err;
                 // a pack recorded inside the container, read on the host: its /cache/tf/ paths resolve under ``root``
@@ -122,7 +117,7 @@ pub const NGram = struct {
         @memcpy(seq[hist.len..], tokens);
         const seg = try gpa.alloc(i64, w);
         defer gpa.free(seg);
-        var last_eos: i64 = -1;                     // the latest EOS strictly before p
+        var last_eos: i64 = -1; // the latest EOS strictly before p
         for (0..w) |p| {
             seg[p] = @as(i64, @intCast(p)) - (last_eos + 1);
             if (seq[p] == self.eos) last_eos = @intCast(p);
@@ -165,8 +160,6 @@ pub const NGram = struct {
             for (0..self.width) |j| out[i * self.width + j] = self.lut[row[j]];
         }
     }
-
-
 };
 
 /// One stream's n-gram history: the last n - 1 committed tokens.

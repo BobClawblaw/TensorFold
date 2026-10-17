@@ -20,8 +20,7 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     const io = gpu.io;
     const rank = try std.fmt.parseInt(u8, args[0], 10);
     const port = try std.fmt.parseInt(u16, args[2], 10);
-    var link = if (rank == 0) try cuda.tp_link.Link.lead(port, 300_000)
-        else try cuda.tp_link.Link.follow(io, try std.Io.net.IpAddress.parse(args[1], port), 300_000);
+    var link = if (rank == 0) try cuda.tp_link.Link.lead(port, 300_000) else try cuda.tp_link.Link.follow(io, try std.Io.net.IpAddress.parse(args[1], port), 300_000);
     defer link.close();
     var nccl = try cuda.nccl.Library.open();
     defer nccl.close();
@@ -46,11 +45,16 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
     for (args[@min(9, args.len)..]) |a| if (std.mem.eql(u8, a, "kv4")) {
         kv_bits = 4;
     };
-    const e = try fwd.init(gpa, io, &ctx, &kernels, &store, .{ .context = 16384, .max_rows = rows: {
-        // "rows=<n>": the shared rounds' rows at most (the server's batch_rows)
-        for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "rows=")) break :rows try std.fmt.parseInt(u32, a[5..], 10);
-        break :rows 16;
-    }, .depth = 15, .kv_bits = kv_bits });
+    const e = try fwd.init(gpa, io, &ctx, &kernels, &store, .{
+        .context = 16384,
+        .max_rows = rows: {
+            // "rows=<n>": the shared rounds' rows at most (the server's batch_rows)
+            for (args[@min(9, args.len)..]) |a| if (std.mem.startsWith(u8, a, "rows=")) break :rows try std.fmt.parseInt(u32, a[5..], 10);
+            break :rows 16;
+        },
+        .depth = 15,
+        .kv_bits = kv_bits,
+    });
     try fwd.prefetchTables(e);
     e.k.sync_each = std.mem.indexOf(u8, args[1], "sync") != null or (args.len > 9 and std.mem.eql(u8, args[args.len - 1], "sync"));
     // "nographs" among the trailing words: verify and draft steps eager (the graphs' A/B)
@@ -145,9 +149,7 @@ pub fn native(gpu: Gpu, args: []const [:0]const u8) !void {
         same += 1;
     }
     std.debug.print("tokens: {any}\n", .{out.items[0..@min(12, out.items.len)]});
-    std.debug.print("MTP decode (native forward, {s}): {d} tokens in {d:.3} s = {d:.1} tok/s; {d} rounds, {d} drafted, {d} accepted (Python: {d}, {d}, {d})\n", .{
-        if (e.use_graphs) "graphs" else "eager", count - 1, secs, @as(f64, @floatFromInt(count - 1)) / secs, rounds, drafted, accepted,
-        ref.get("rounds").?.integer, ref.get("drafted").?.integer, ref.get("accepted").?.integer });
+    std.debug.print("MTP decode (native forward, {s}): {d} tokens in {d:.3} s = {d:.1} tok/s; {d} rounds, {d} drafted, {d} accepted (Python: {d}, {d}, {d})\n", .{ if (e.use_graphs) "graphs" else "eager", count - 1, secs, @as(f64, @floatFromInt(count - 1)) / secs, rounds, drafted, accepted, ref.get("rounds").?.integer, ref.get("drafted").?.integer, ref.get("accepted").?.integer });
     std.debug.print("time: verify {d:.1} ms ({d:.2} a round, staging {d:.1} ms, GPU {d:.1} ms), keep {d:.1} ms, draft {d:.1} ms\n", .{ t_verify, t_verify / @as(f64, @floatFromInt(rounds)), e.stage_ms, e.gpu_ms, t_keep, t_draft });
     std.debug.print("staging split: ids upload {d:.1} ms, n-gram ids {d:.1} ms, table rows {d:.1} ms\n", .{ e.split[0], e.split[1], e.split[2] });
     fwd.freeSeq(e, s);
@@ -268,7 +270,9 @@ fn probesDecode(e: *fwd.Engine, gpu: Gpu, rank: u8, dir: []const u8) !void {
         const sources = [_][]const u8{ "gpu", "ours", "cpu" };
         for (sources, 0..) |src, si| {
             const path = if (si == 0) try std.fmt.bufPrint(&nb, "{s}/{s}.features.bf16", .{ dir, name }) else if (si == 1)
-                try std.fmt.bufPrint(&nb, "{s}/{s}.got.bf16", .{ dir, name }) else try std.fmt.bufPrint(&nb, "{s}_cpu/{s}.features.bf16", .{ dir[0 .. dir.len - "_cuda".len], name });
+                try std.fmt.bufPrint(&nb, "{s}/{s}.got.bf16", .{ dir, name })
+            else
+                try std.fmt.bufPrint(&nb, "{s}_cpu/{s}.features.bf16", .{ dir[0 .. dir.len - "_cuda".len], name });
             const fbytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 28)) catch continue;
             var fdev = try cuda.DeviceBuffer.alloc(gpu.d, fbytes.len);
             defer fdev.free();
@@ -366,9 +370,7 @@ fn visionCheck(e: *fwd.Engine, gpu: Gpu, rank: u8, dir: []const u8) !void {
         for (out.items[0..count], want) |a, b| {
             if (a == b) same += 1 else break;
         }
-        std.debug.print("rank {d}: {s}+{d} ({d} tokens): {d} of {d} tokens equal Python's; rounds {d} drafted {d} accepted {d} (Python {d}, {d}, {d})\n", .{
-            rank, name, o.get("extra").?.integer, prompt.len, same, count, rounds, drafted, accepted,
-            o.get("rounds").?.integer, o.get("drafted").?.integer, o.get("accepted").?.integer });
+        std.debug.print("rank {d}: {s}+{d} ({d} tokens): {d} of {d} tokens equal Python's; rounds {d} drafted {d} accepted {d} (Python {d}, {d}, {d})\n", .{ rank, name, o.get("extra").?.integer, prompt.len, same, count, rounds, drafted, accepted, o.get("rounds").?.integer, o.get("drafted").?.integer, o.get("accepted").?.integer });
         if (same == count) all_same += 1;
     }
     try check.expect(all_same == refs.value.array.items.len, "{d} of {d} image prompts equal Python's", .{ all_same, refs.value.array.items.len });
@@ -686,8 +688,7 @@ fn benchShared(e: *fwd.Engine, prompt: []const u32, rank: u8, spec: []const u8) 
     const wall = ms(io, tw);
     const fr: f64 = @floatFromInt(rounds);
     std.debug.print("rank {d}: bench {d} streams depth {d}: {d} rounds, {d:.1} rows and {d:.1} tokens a round; {d:.1} ms a round " ++
-        "(verify {d:.1}, keep {d:.1}, draft {d:.1}); {d:.0} tok/s\n", .{ rank, n, depth, rounds, @as(f64, @floatFromInt(rows_total)) / fr,
-        @as(f64, @floatFromInt(tokens)) / fr, wall / fr, t_verify / fr, t_keep / fr, t_draft / fr, @as(f64, @floatFromInt(tokens)) / (wall / 1000) });
+        "(verify {d:.1}, keep {d:.1}, draft {d:.1}); {d:.0} tok/s\n", .{ rank, n, depth, rounds, @as(f64, @floatFromInt(rows_total)) / fr, @as(f64, @floatFromInt(tokens)) / fr, wall / fr, t_verify / fr, t_keep / fr, t_draft / fr, @as(f64, @floatFromInt(tokens)) / (wall / 1000) });
     std.debug.print("rank {d}: shared attention layers so far: {d} in one launch a kernel, {d} stream by stream (no variant)\n", .{ rank, e.multi_layers[0], e.multi_layers[1] });
 }
 

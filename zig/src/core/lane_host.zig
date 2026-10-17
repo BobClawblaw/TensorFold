@@ -429,7 +429,6 @@ pub const LaneHost = struct {
         return true;
     }
 
-
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
     fn fillOne(h: *LaneHost) void {
         if (h.filling.items.len == 0) return;

@@ -42,7 +42,12 @@ pub const Tower = struct {
     patch_w: u64 = 0,
     patch_b: u64 = 0,
     pos_table: u64 = 0,
-    mn_w: u64 = 0, mn_b: u64 = 0, m1_w: u64 = 0, m1_b: u64 = 0, m2_w: u64 = 0, m2_b: u64 = 0,
+    mn_w: u64 = 0,
+    mn_b: u64 = 0,
+    m1_w: u64 = 0,
+    m1_b: u64 = 0,
+    m2_w: u64 = 0,
+    m2_b: u64 = 0,
     inv_freq: cuda.DeviceBuffer,
     linears: std.AutoHashMap(LinKey, cuda.cublaslt.Linear),
     ws: cuda.DeviceBuffer,
@@ -75,8 +80,7 @@ pub const Tower = struct {
             const offs = e.value_ptr.object.get("data_offsets").?.array.items;
             total += std.mem.alignForward(u64, @intCast(offs[1].integer - offs[0].integer), 256);
         }
-        var t: Tower = .{ .gpa = gpa, .d = d, .lt = try cuda.cublaslt.Library.open(), .mem = try cuda.DeviceBuffer.alloc(d, total),
-            .inv_freq = try cuda.DeviceBuffer.alloc(d, 18 * 4), .linears = .init(gpa), .ws = undefined };
+        var t: Tower = .{ .gpa = gpa, .d = d, .lt = try cuda.cublaslt.Library.open(), .mem = try cuda.DeviceBuffer.alloc(d, total), .inv_freq = try cuda.DeviceBuffer.alloc(d, 18 * 4), .linears = .init(gpa), .ws = undefined };
         if (std.c.getenv("TENSORFOLD_VISION_FP32")) |v| if (v[0] == '1') {
             t.mode = .fp32;
         };
@@ -119,12 +123,18 @@ pub const Tower = struct {
         t.m2_w = try get(&names, "merger.linear_fc2.weight", .{});
         t.m2_b = try get(&names, "merger.linear_fc2.bias", .{});
         for (&t.blocks, 0..) |*bl, i| bl.* = .{
-            .n1w = try get(&names, "blocks.{d}.norm1.weight", .{i}), .n1b = try get(&names, "blocks.{d}.norm1.bias", .{i}),
-            .qkv_w = try get(&names, "blocks.{d}.attn.qkv.weight", .{i}), .qkv_b = try get(&names, "blocks.{d}.attn.qkv.bias", .{i}),
-            .proj_w = try get(&names, "blocks.{d}.attn.proj.weight", .{i}), .proj_b = try get(&names, "blocks.{d}.attn.proj.bias", .{i}),
-            .n2w = try get(&names, "blocks.{d}.norm2.weight", .{i}), .n2b = try get(&names, "blocks.{d}.norm2.bias", .{i}),
-            .fc1_w = try get(&names, "blocks.{d}.mlp.linear_fc1.weight", .{i}), .fc1_b = try get(&names, "blocks.{d}.mlp.linear_fc1.bias", .{i}),
-            .fc2_w = try get(&names, "blocks.{d}.mlp.linear_fc2.weight", .{i}), .fc2_b = try get(&names, "blocks.{d}.mlp.linear_fc2.bias", .{i}),
+            .n1w = try get(&names, "blocks.{d}.norm1.weight", .{i}),
+            .n1b = try get(&names, "blocks.{d}.norm1.bias", .{i}),
+            .qkv_w = try get(&names, "blocks.{d}.attn.qkv.weight", .{i}),
+            .qkv_b = try get(&names, "blocks.{d}.attn.qkv.bias", .{i}),
+            .proj_w = try get(&names, "blocks.{d}.attn.proj.weight", .{i}),
+            .proj_b = try get(&names, "blocks.{d}.attn.proj.bias", .{i}),
+            .n2w = try get(&names, "blocks.{d}.norm2.weight", .{i}),
+            .n2b = try get(&names, "blocks.{d}.norm2.bias", .{i}),
+            .fc1_w = try get(&names, "blocks.{d}.mlp.linear_fc1.weight", .{i}),
+            .fc1_b = try get(&names, "blocks.{d}.mlp.linear_fc1.bias", .{i}),
+            .fc2_w = try get(&names, "blocks.{d}.mlp.linear_fc2.weight", .{i}),
+            .fc2_b = try get(&names, "blocks.{d}.mlp.linear_fc2.bias", .{i}),
         };
         // the 2-D rotary's frequencies: 1 / 10000^(2i / 36), i < 18 (TensorFold sets them on the tower)
         var inv: [18]f32 = undefined;
@@ -170,21 +180,33 @@ pub const Tower = struct {
         try t.linear(k, x, w, acc, m, n, kk, true);
         const f = try k.ext(.vision, "fn_vis_bias_act");
         var a: cuda.Args = .{};
-        a.add(acc); a.add(bias); a.add(out); a.add(@as(i64, m * n)); a.add(@as(i32, @intCast(n))); a.add(act);
+        a.add(acc);
+        a.add(bias);
+        a.add(out);
+        a.add(@as(i64, m * n));
+        a.add(@as(i32, @intCast(n)));
+        a.add(act);
         try k.go(f, grid1(m * n), 256, 0, &a);
     }
 
     fn layernorm(k: *kern.K, x: u64, w: u64, bias: u64, y: u64, rows: i64, cols: i64) !void {
         const f = try k.ext(.vision, "fn_vis_layernorm");
         var a: cuda.Args = .{};
-        a.add(x); a.add(w); a.add(bias); a.add(y); a.add(@as(i32, @intCast(cols))); a.add(EPS);
+        a.add(x);
+        a.add(w);
+        a.add(bias);
+        a.add(y);
+        a.add(@as(i32, @intCast(cols)));
+        a.add(EPS);
         try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
     }
 
     fn add(k: *kern.K, x: u64, y: u64, n: i64) !void {
         const f = try k.ext(.vision, "fn_vis_add");
         var a: cuda.Args = .{};
-        a.add(x); a.add(y); a.add(n);
+        a.add(x);
+        a.add(y);
+        a.add(n);
         try k.go(f, grid1(n), 256, 0, &a);
     }
 
@@ -266,14 +288,21 @@ pub const Tower = struct {
         {
             const f = try k.ext(.vision, "fn_vis_to_bf16");
             var a: cuda.Args = .{};
-            a.add(acc); a.add(big16); a.add(@as(i64, N * PATCH));
+            a.add(acc);
+            a.add(big16);
+            a.add(@as(i64, N * PATCH));
             try k.go(f, grid1(N * PATCH), 256, 0, &a);
         }
         try t.dense(k, big16, t.patch_w, t.patch_b, x, acc, N, H, PATCH, 0);
         {
             const f = try k.ext(.vision, "fn_vis_pos_embed");
             var a: cuda.Args = .{};
-            a.add(x); a.add(t.pos_table); a.add(didx); a.add(dwts); a.add(@as(i32, @intCast(N))); a.add(@as(i32, @intCast(H)));
+            a.add(x);
+            a.add(t.pos_table);
+            a.add(didx);
+            a.add(dwts);
+            a.add(@as(i32, @intCast(N)));
+            a.add(@as(i32, @intCast(H)));
             try k.go(f, grid1(N * H), 256, 0, &a);
         }
         const scale: f32 = 1.0 / @sqrt(@as(f32, HD));
@@ -284,8 +313,15 @@ pub const Tower = struct {
             {
                 const f = try k.ext(.vision, "fn_vis_rope_split");
                 var a: cuda.Args = .{};
-                a.add(big16); a.add(dpos); a.add(t.inv_freq.ptr); a.add(qh); a.add(kh); a.add(vt);
-                a.add(@as(i32, @intCast(N))); a.add(@as(i32, @intCast(HEADS))); a.add(@as(i32, @intCast(HD)));
+                a.add(big16);
+                a.add(dpos);
+                a.add(t.inv_freq.ptr);
+                a.add(qh);
+                a.add(kh);
+                a.add(vt);
+                a.add(@as(i32, @intCast(N)));
+                a.add(@as(i32, @intCast(HEADS)));
+                a.add(@as(i32, @intCast(HD)));
                 try k.go(f, grid1(N * H), 256, 0, &a);
             }
             // each image attends within itself (a segment of rows); per head, chunks of queries
@@ -304,15 +340,24 @@ pub const Tower = struct {
                         {
                             const f = try k.ext(.vision, "fn_vis_softmax");
                             var a: cuda.Args = .{};
-                            a.add(sc); a.add(pr); a.add(sums); a.add(@as(i32, @intCast(n))); a.add(scale);
+                            a.add(sc);
+                            a.add(pr);
+                            a.add(sums);
+                            a.add(@as(i32, @intCast(n)));
+                            a.add(scale);
                             try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
                         }
                         try t.valuesProduct(k, pr, vt, h, s0, n, N, rows, oh);
                         {
                             const f = try k.ext(.vision, "fn_vis_head_out");
                             var a: cuda.Args = .{};
-                            a.add(oh); a.add(sums); a.add(att + @as(u64, @intCast((s0 + c) * H * 2))); a.add(@as(i32, @intCast(rows)));
-                            a.add(@as(i32, @intCast(HEADS))); a.add(@as(i32, @intCast(HD))); a.add(@as(i32, @intCast(h)));
+                            a.add(oh);
+                            a.add(sums);
+                            a.add(att + @as(u64, @intCast((s0 + c) * H * 2)));
+                            a.add(@as(i32, @intCast(rows)));
+                            a.add(@as(i32, @intCast(HEADS)));
+                            a.add(@as(i32, @intCast(HD)));
+                            a.add(@as(i32, @intCast(h)));
                             try k.go(f, grid1(rows * HD), 256, 0, &a);
                         }
                     }
@@ -337,7 +382,9 @@ pub const Tower = struct {
         _ = t;
         const f = try k.ext(.vision, name);
         var a: cuda.Args = .{};
-        a.add(a0); a.add(a1); a.add(n);
+        a.add(a0);
+        a.add(a1);
+        a.add(n);
         try k.go(f, grid1(n), 256, 0, &a);
     }
 
@@ -345,7 +392,12 @@ pub const Tower = struct {
         _ = t;
         const f = try k.ext(.vision, "fn_vis_layernorm32");
         var a: cuda.Args = .{};
-        a.add(x); a.add(w); a.add(bias); a.add(y); a.add(@as(i32, @intCast(H))); a.add(EPS);
+        a.add(x);
+        a.add(w);
+        a.add(bias);
+        a.add(y);
+        a.add(@as(i32, @intCast(H)));
+        a.add(EPS);
         try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
     }
 
@@ -394,7 +446,12 @@ pub const Tower = struct {
     fn ln32f(k: *kern.K, x: u64, w: u64, bias: u64, y: u64, rows: i64) !void {
         const f = try k.ext(.vision, "fn_vis32_ln");
         var a: cuda.Args = .{};
-        a.add(x); a.add(w); a.add(bias); a.add(y); a.add(@as(i32, @intCast(H))); a.add(EPS);
+        a.add(x);
+        a.add(w);
+        a.add(bias);
+        a.add(y);
+        a.add(@as(i32, @intCast(H)));
+        a.add(EPS);
         try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
     }
 
@@ -470,7 +527,11 @@ pub const Tower = struct {
                         {
                             const f = try k.ext(.vision, "fn_vis32_softmax");
                             var a: cuda.Args = .{};
-                            a.add(sc); a.add(pr); a.add(sums); a.add(@as(i32, @intCast(n))); a.add(scale);
+                            a.add(sc);
+                            a.add(pr);
+                            a.add(sums);
+                            a.add(@as(i32, @intCast(n)));
+                            a.add(scale);
                             try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
                         }
                         try t.valuesProduct32(k, pr, vt, h, s0, n, N, rows, oh);

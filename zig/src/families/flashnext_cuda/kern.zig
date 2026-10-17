@@ -157,16 +157,16 @@ pub const K = struct {
 
     /// An extension kernel whose mangled name contains ``frag`` (one match only).
     pub fn ext(self: *K, m: Ext, frag: []const u8) !cuda.Function {
-        const key = std.hash.Wyhash.hash(@intFromEnum(m), frag);
+        const key = std.hash.Wyhash.hash(@backingInt(m), frag);
         if (self.cache.get(key)) |f| return f;
         var found: ?cuda.Function = null;
-        for (self.names[@intFromEnum(m)], 0..) |n, j| {
+        for (self.names[@backingInt(m)], 0..) |n, j| {
             if (std.mem.indexOf(u8, n, frag) != null) {
                 if (found != null) {
                     std.log.err("flash next: two kernels in {s} match {s}", .{ @tagName(m), frag });
                     return error.AmbiguousKernel;
                 }
-                found = self.funcs[@intFromEnum(m)][j];
+                found = self.funcs[@backingInt(m)][j];
             }
         }
         const f = found orelse {
@@ -267,32 +267,25 @@ pub fn embed(k: *K, ids: u64, table: u64, out: u64, R: i64, copies: i64) !void {
 /// mode 0: no branch (every optional pointer is h); mode 3: gathered fp32 partials ``br`` with ``inj``.
 pub fn hcWriteback(k: *K, h: u64, pss: u64, br: u64, inj: u64, R: i64, mode: i64) !void {
     const world: i64 = if (mode == 3) 2 else 1;
-    try k.tri("_hc_writeback", .{ R, D / 256, 1 }, &.{ P("H", h), P("HOUT", h), P("PSS", pss), P("BR", if (mode == 0) h else br),
-        P("INJ", if (mode == 0) h else inj), P("Y", h), P("WTS", h), I("RS", R * D) },
-        &.{ ci("D", D), ci("S", S), ci("MODE", mode), ci("TOPK", 1), ci("SLOTS", 1), ci("BLOCK", 256), ci("WORLD", world) });
+    try k.tri("_hc_writeback", .{ R, D / 256, 1 }, &.{ P("H", h), P("HOUT", h), P("PSS", pss), P("BR", if (mode == 0) h else br), P("INJ", if (mode == 0) h else inj), P("Y", h), P("WTS", h), I("RS", R * D) }, &.{ ci("D", D), ci("S", S), ci("MODE", mode), ci("TOPK", 1), ci("SLOTS", 1), ci("BLOCK", 256), ci("WORLD", world) });
 }
 
 pub fn hcNormed(k: *K, h: u64, pss: u64, scale: u64, normed: u64, xs: u64, R: i64) !void {
-    try k.tri("_hc_normed", .{ R, WIDE / 512, 1 }, &.{ P("H", h), P("PSS", pss), P("SCALE", scale), P("NORMED", normed), P("XS", xs), F("eps", EPS) },
-        &.{ ci("D", D), ci("S", S), ci("NC", D / 256), ci("BLOCK", 512) });
+    try k.tri("_hc_normed", .{ R, WIDE / 512, 1 }, &.{ P("H", h), P("PSS", pss), P("SCALE", scale), P("NORMED", normed), P("XS", xs), F("eps", EPS) }, &.{ ci("D", D), ci("S", S), ci("NC", D / 256), ci("BLOCK", 512) });
 }
 
 /// The prompt's fused write-back and norm (hc_check's fuser).
 pub fn writeNorm(k: *K, h: u64, pss: u64, scale: u64, normed: u64, xs: u64, br: u64, inj: u64, R: i64, mode: i64) !void {
     const world: i64 = if (mode == 3) 2 else 1;
-    try k.tri("_write_norm", .{ R, 1, 1 }, &.{ P("H", h), P("PSS", pss), P("SCALE", scale), P("NORMED", normed), P("XS", xs),
-        P("BR", if (mode == 0) h else br), P("INJ", if (mode == 0) h else inj), P("Y", h), P("WTS", h), I("RS", R * D), F("eps", EPS) },
-        &.{ ci("D", D), ci("S", S), ci("MODE", mode), ci("SLOTS", 1), ci("WORLD", world), ci("PAD", 4096) });
+    try k.tri("_write_norm", .{ R, 1, 1 }, &.{ P("H", h), P("PSS", pss), P("SCALE", scale), P("NORMED", normed), P("XS", xs), P("BR", if (mode == 0) h else br), P("INJ", if (mode == 0) h else inj), P("Y", h), P("WTS", h), I("RS", R * D), F("eps", EPS) }, &.{ ci("D", D), ci("S", S), ci("MODE", mode), ci("SLOTS", 1), ci("WORLD", world), ci("PAD", 4096) });
 }
 
 pub fn hcReduceAct(k: *K, part: u64, act: u64, xs: u64, inj: ?u64, R: i64, ndn: i64) !void {
-    try k.tri("_hc_reduce_act", .{ R, 1, 1 }, &.{ P("PART", part), P("ACT", act), P("XS", xs), P("INJ", inj orelse act), I("M", R) },
-        &.{ ci("SK", 8), ci("S", S), ci("LOW", LOW), ci("LOWP", 512), ci("HAS_INJ", @intFromBool(inj != null)), ci("NDN", ndn) });
+    try k.tri("_hc_reduce_act", .{ R, 1, 1 }, &.{ P("PART", part), P("ACT", act), P("XS", xs), P("INJ", inj orelse act), I("M", R) }, &.{ ci("SK", 8), ci("S", S), ci("LOW", LOW), ci("LOWP", 512), ci("HAS_INJ", @intFromBool(inj != null)), ci("NDN", ndn) });
 }
 
 pub fn hcAct(k: *K, dn: u64, act: u64, xs: u64, inj: ?u64, R: i64, ndn: i64) !void {
-    try k.tri("_hc_act", .{ R, 1, 1 }, &.{ P("DN", dn), P("ACT", act), P("XS", xs), P("INJ", inj orelse act) },
-        &.{ ci("S", S), ci("LOW", LOW), ci("LOWP", 512), ci("HAS_INJ", @intFromBool(inj != null)), ci("NDN", ndn) });
+    try k.tri("_hc_act", .{ R, 1, 1 }, &.{ P("DN", dn), P("ACT", act), P("XS", xs), P("INJ", inj orelse act) }, &.{ ci("S", S), ci("LOW", LOW), ci("LOWP", 512), ci("HAS_INJ", @intFromBool(inj != null)), ci("NDN", ndn) });
 }
 
 pub fn hcMix(k: *K, up: u64, normed: u64, mixed: u64, xs: u64, R: i64) !void {
@@ -300,8 +293,7 @@ pub fn hcMix(k: *K, up: u64, normed: u64, mixed: u64, xs: u64, R: i64) !void {
 }
 
 pub fn rmsnorm(k: *K, x: u64, w: u64, out: u64, xs: u64, x_stride: i64, R: i64, d: i64) !void {
-    try k.tri("_rmsnorm", .{ R, 1, 1 }, &.{ P("X", x), P("W", w), P("OUT", out), P("XS", xs), F("eps", EPS), I("x_stride", x_stride) },
-        &.{ ci("D", d), ci("G", d), ci("BLOCK", @intCast(nextPow2(@intCast(d)))) });
+    try k.tri("_rmsnorm", .{ R, 1, 1 }, &.{ P("X", x), P("W", w), P("OUT", out), P("XS", xs), F("eps", EPS), I("x_stride", x_stride) }, &.{ ci("D", d), ci("G", d), ci("BLOCK", @intCast(nextPow2(@intCast(d)))) });
 }
 
 pub fn addStreams(k: *K, e: u64, hs: u64, out: u64, R: i64) !void {
@@ -318,13 +310,11 @@ pub fn pleEmbedBf16(k: *K, v: u64, out: u64, xs: u64, R: i64) !void {
 }
 
 pub fn pleGate(k: *K, keys: u64, vals: u64, h: u64, nk: u64, nq: u64, gated: u64, pss: u64, R: i64) !void {
-    try k.tri("_ple_gate", .{ R, 1, 1 }, &.{ P("KEYS", keys), P("VALS", vals), P("H", h), P("NK", nk), P("NQ", nq), P("GATED", gated), P("PSS", pss), F("eps", EPS) },
-        &.{ ci("D", D), ci("S", S), ci("BLOCK", 512) });
+    try k.tri("_ple_gate", .{ R, 1, 1 }, &.{ P("KEYS", keys), P("VALS", vals), P("H", h), P("NK", nk), P("NQ", nq), P("GATED", gated), P("PSS", pss), F("eps", EPS) }, &.{ ci("D", D), ci("S", S), ci("BLOCK", 512) });
 }
 
 pub fn pleConv(k: *K, gated: u64, pss: u64, nc: u64, tail: u64, cw: u64, h: u64, nrow: u64, R: i64) !void {
-    try k.tri("_ple_conv", .{ R, WIDE / 512, 1 }, &.{ P("GATED", gated), P("PSS", pss), P("NC", nc), P("TAIL", tail), P("CW", cw), P("H", h), P("HOUT", h),
-        P("NROW", nrow), F("eps", EPS), I("R", R) }, &.{ ci("D", D), ci("S", S), ci("TAPS", 4), ci("DIL", 3), ci("BLOCK", 512) });
+    try k.tri("_ple_conv", .{ R, WIDE / 512, 1 }, &.{ P("GATED", gated), P("PSS", pss), P("NC", nc), P("TAIL", tail), P("CW", cw), P("H", h), P("HOUT", h), P("NROW", nrow), F("eps", EPS), I("R", R) }, &.{ ci("D", D), ci("S", S), ci("TAPS", 4), ci("DIL", 3), ci("BLOCK", 512) });
 }
 
 /// A sequence's image positions (rotary MODE 2): ``table`` [length, 3] (t, h, w) int32 for the prompt's rows, and the
@@ -335,9 +325,7 @@ pub fn attnPrep(k: *K, p: u64, pos: u64, qw: u64, kw: u64, iw: u64, inv: u64, q:
     const table = if (rope) |r| r.table else pos;
     const delta = if (rope) |r| r.delta else pos;
     const length = if (rope) |r| r.length else 0;
-    try k.tri("_attn_prep", .{ R, 12 + 1 + 4 + 1, 1 }, &.{ P("P", p), P("POS0", pos), P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q),
-        P("KC", kc), P("VC", vc), P("KS", ks), P("VS", vs), P("IQ", iq), P("IKC", ikc), P("ROPE", table), P("DELTA", delta), I("length", length), F("eps", EPS) },
-        &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
+    try k.tri("_attn_prep", .{ R, 12 + 1 + 4 + 1, 1 }, &.{ P("P", p), P("POS0", pos), P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q), P("KC", kc), P("VC", vc), P("KS", ks), P("VS", vs), P("IQ", iq), P("IKC", ikc), P("ROPE", table), P("DELTA", delta), I("length", length), F("eps", EPS) }, &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("MODE", if (rope != null) 2 else 0), ci("S1", 11), ci("S2", 10) });
 }
 
 pub fn attnGate(k: *K, o: u64, p: u64, out: u64, xs: u64, R: i64) !void {
@@ -353,18 +341,14 @@ pub const NCH: i64 = 5;
 pub const KEYS_MAX: i64 = 2051; // (budget / ratio + 1) * ratio - 1
 
 pub fn pool(k: *K, ikc: u64, pooled: u64, pos: u64, w: u64, inv: u64, R: i64, rope: ?Rope) !void {
-    if (rope) |r| return k.tri("_pool", .{ @divFloor(R, RATIO) + 2, 1, 1 }, &.{ P("IKC", ikc), P("POOLED", pooled), P("POS0", pos), P("W", w), P("INV", inv),
-        P("ROPE", r.table), P("DELTA", r.delta), F("eps", EPS), I("R", R), I("length", r.length) },
-        &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), ci("MODE", 2), ci("S1", 11), ci("S2", 10) });
-    try k.tri("_pool", .{ @divFloor(R, RATIO) + 2, 1, 1 }, &.{ P("IKC", ikc), P("POOLED", pooled), P("POS0", pos), P("W", w), P("INV", inv), F("eps", EPS), I("R", R), I("length", 0) },
-        &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), cnone("ROPE"), cnone("DELTA"), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
+    if (rope) |r| return k.tri("_pool", .{ @divFloor(R, RATIO) + 2, 1, 1 }, &.{ P("IKC", ikc), P("POOLED", pooled), P("POS0", pos), P("W", w), P("INV", inv), P("ROPE", r.table), P("DELTA", r.delta), F("eps", EPS), I("R", R), I("length", r.length) }, &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), ci("MODE", 2), ci("S1", 11), ci("S2", 10) });
+    try k.tri("_pool", .{ @divFloor(R, RATIO) + 2, 1, 1 }, &.{ P("IKC", ikc), P("POOLED", pooled), P("POS0", pos), P("W", w), P("INV", inv), F("eps", EPS), I("R", R), I("length", 0) }, &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), cnone("ROPE"), cnone("DELTA"), ci("MODE", 0), ci("S1", 11), ci("S2", 10) });
 }
 
 /// qsa_rows: score and select the rows' blocks (``context`` keys bound the launches).
 pub fn qsaRows(k: *K, iq: u64, pooled: u64, pos: u64, sc: u64, ids: u64, nkr: u64, spr: u64, nb: i64, rows: i64, context: i64) !void {
     const blocks = @min(nb, @max(1, cdiv(context, RATIO)));
-    try k.tri("_scores", .{ rows, cdiv(blocks, 64), 1 }, &.{ P("IQ", iq), P("POOLED", pooled), P("POS0", pos), P("SC", sc), I("NB", nb) },
-        &.{ ci("HI", 4), ci("DI", 128), ci("RATIO", RATIO), ci("TOP", TOP), ci("BB", 64) });
+    try k.tri("_scores", .{ rows, cdiv(blocks, 64), 1 }, &.{ P("IQ", iq), P("POOLED", pooled), P("POS0", pos), P("SC", sc), I("NB", nb) }, &.{ ci("HI", 4), ci("DI", 128), ci("RATIO", RATIO), ci("TOP", TOP), ci("BB", 64) });
     const width: i64 = @intCast(nextPow2(@intCast(blocks)));
     const sargs = [_]Arg{ P("SC", sc), P("POS0", pos), P("IDS", ids), P("NKR", nkr), P("SPR", spr), I("NB", nb) };
     if (width <= 32768) {
@@ -379,11 +363,8 @@ pub fn qsaRows(k: *K, iq: u64, pooled: u64, pos: u64, sc: u64, ids: u64, nkr: u6
 pub fn attention(k: *K, q: u64, kc: u64, vc: u64, ks: u64, vs: u64, pos: u64, po: u64, pm: u64, pl: u64, ids: u64, nkr: u64, spr: u64, out: u64, rows: i64, context: i64, bits: u8) !void {
     const keys = @min(context, KEYS_MAX);
     const chunks = @min(NCH, cdiv(keys, CHUNK));
-    try k.tri("_chunks", .{ rows, 1, chunks }, &.{ P("Q", q), P("KC", kc), P("VC", vc), P("KSC", ks), P("VSC", vs), P("POS0", pos), P("PO", po), P("PM", pm), P("PL", pl),
-        P("IDS", ids), P("NKR", nkr), P("SPR", spr) }, &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH),
-        cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", bits) });
-    try k.tri("_merge", .{ rows, 1, 1 }, &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POS0", pos), P("OUT", out), P("NKR", nkr), P("SPR", spr) },
-        &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits) });
+    try k.tri("_chunks", .{ rows, 1, chunks }, &.{ P("Q", q), P("KC", kc), P("VC", vc), P("KSC", ks), P("VSC", vs), P("POS0", pos), P("PO", po), P("PM", pm), P("PL", pl), P("IDS", ids), P("NKR", nkr), P("SPR", spr) }, &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", bits) });
+    try k.tri("_merge", .{ rows, 1, 1 }, &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POS0", pos), P("OUT", out), P("NKR", nkr), P("SPR", spr) }, &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits) });
 }
 
 // -- attn_multi.py: a shared round's attention, one launch a kernel for every stream ---------------------------------
@@ -406,19 +387,10 @@ pub fn attentionMulti(k: *K, t: MultiTab, p: u64, qw: u64, kw: u64, iw: u64, ikw
     const kt: i64 = if (bits == 4) KT_UINT8 else KT_INT8;
     const chunks = @min(NCH, cdiv(@min(t.keys, KEYS_MAX), CHUNK));
     const launches = [_]Launch{
-        .{ .name = "_prep_multi", .grid = .{ t.rows, 12 + 1 + 4 + 1, 1 }, .args = &.{ P("P", p), P("POSR", t.posr), P("SID", t.sid), P("CP", t.cp), P("VP", t.cp),
-            P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q), P("IQ", iq), F("eps", EPS), I("N", t.streams) },
-            .consts = &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("KT", kt),
-            ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
-        .{ .name = "_pool_multi", .grid = .{ t.streams, @divFloor(t.most, RATIO) + 2, 1 }, .args = &.{ P("CP", t.cp), P("VP", t.cp), P("P0", t.first), P("RS", t.counts),
-            P("W", ikw), P("INV", inv), F("eps", EPS), I("N", t.streams) },
-            .consts = &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
-        .{ .name = "_chunks_multi", .grid = .{ t.rows, 1, chunks }, .args = &.{ P("Q", q), P("CP", t.cp), P("POSR", t.posr), P("SID", t.sid), P("PO", po), P("PM", pm),
-            P("PL", pl), P("IDS", ids), P("NKR", nkr), I("N", t.streams) },
-            .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1),
-            ci("BITS", bits), ci("KT", kt), ci("RATIO", RATIO), ci("TOP", TOP) } },
-        .{ .name = "_merge_multi", .grid = .{ t.rows, 1, 1 }, .args = &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POSR", t.posr), P("OUT", out), P("NKR", nkr) },
-            .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits), ci("RATIO", RATIO), ci("TOP", TOP) } },
+        .{ .name = "_prep_multi", .grid = .{ t.rows, 12 + 1 + 4 + 1, 1 }, .args = &.{ P("P", p), P("POSR", t.posr), P("SID", t.sid), P("CP", t.cp), P("VP", t.cp), P("QW", qw), P("KW", kw), P("IW", iw), P("INV", inv), P("Q", q), P("IQ", iq), F("eps", EPS), I("N", t.streams) }, .consts = &.{ ci("PW", 7296), ci("NQ", 12), ci("NKV", 1), ci("HD", 256), ci("NI", 4), ci("IHD", 128), ci("HALF", 32), ci("BITS", bits), ci("KT", kt), ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
+        .{ .name = "_pool_multi", .grid = .{ t.streams, @divFloor(t.most, RATIO) + 2, 1 }, .args = &.{ P("CP", t.cp), P("VP", t.cp), P("P0", t.first), P("RS", t.counts), P("W", ikw), P("INV", inv), F("eps", EPS), I("N", t.streams) }, .consts = &.{ ci("DI", 128), ci("HALF", 32), ci("RATIO", RATIO), ci("VISION", 0), ci("S1", 11), ci("S2", 10) } },
+        .{ .name = "_chunks_multi", .grid = .{ t.rows, 1, chunks }, .args = &.{ P("Q", q), P("CP", t.cp), P("POSR", t.posr), P("SID", t.sid), P("PO", po), P("PM", pm), P("PL", pl), P("IDS", ids), P("NKR", nkr), I("N", t.streams) }, .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), cf("SCALE", 0.0625), ci("IDW", IDW), ci("QSA", 1), ci("BITS", bits), ci("KT", kt), ci("RATIO", RATIO), ci("TOP", TOP) } },
+        .{ .name = "_merge_multi", .grid = .{ t.rows, 1, 1 }, .args = &.{ P("PO", po), P("PM", pm), P("PL", pl), P("POSR", t.posr), P("OUT", out), P("NKR", nkr) }, .consts = &.{ ci("H", 12), ci("HK", 1), ci("D", 256), ci("G", 12), ci("CH", CHUNK), ci("NCH", NCH), ci("QSA", 1), ci("BITS", bits), ci("RATIO", RATIO), ci("TOP", TOP) } },
     };
     for (launches) |l| if (!try k.has(l.name, l.args, l.consts)) return false;
     for (launches) |l| try k.tri(l.name, l.grid, l.args, l.consts);
@@ -435,13 +407,11 @@ pub fn hasMulti(k: *const K) bool {
 pub fn router(k: *K, x: u64, w: u64, out: u64, m: i64, x_stride: i64) !void {
     const bm: i64 = if (m <= 16) 16 else if (m <= 32) 32 else if (m <= 64) 64 else 128;
     const be: i64, const bk: i64 = if (bm == 16) .{ 32, 256 } else .{ 64, 64 };
-    try k.tri("_router", .{ cdiv(m, bm), cdiv(513, be), 1 }, &.{ P("X", x), P("W", w), P("OUT", out), I("M", m), I("x_stride", x_stride) },
-        &.{ ci("D", D), ci("NE", 513), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
+    try k.tri("_router", .{ cdiv(m, bm), cdiv(513, be), 1 }, &.{ P("X", x), P("W", w), P("OUT", out), I("M", m), I("x_stride", x_stride) }, &.{ ci("D", D), ci("NE", 513), ci("BM", bm), ci("BLOCK_E", be), ci("BK", bk) });
 }
 
 pub fn topkRows(k: *K, l: u64, pick: u64, wts: u64, R: i64) !void {
-    try k.tri("_topk_rows", .{ R, 1, 1 }, &.{ P("L", l), P("PICK", pick), P("WTS", wts) },
-        &.{ ci("NE", 512), ci("NL", 513), ci("TOPK", 10), ci("SLOTS", 11), ci("BLOCK", 1024), ci("SLOTP", 16) });
+    try k.tri("_topk_rows", .{ R, 1, 1 }, &.{ P("L", l), P("PICK", pick), P("WTS", wts) }, &.{ ci("NE", 512), ci("NL", 513), ci("TOPK", 10), ci("SLOTS", 11), ci("BLOCK", 1024), ci("SLOTP", 16) });
 }
 
 pub fn swiglu(k: *K, g: u64, out: u64, g_stride: i64, out_stride: i64, R: i64) !void {
@@ -460,17 +430,37 @@ pub fn expertsPlan(k: *K, picks: u64, pairs: i64, plan: Plan) !void {
     var a: cuda.Args = .{};
     const E: i32 = 512;
     if (pairs <= 1024) {
-        a.add(picks); a.add(@as(i32, @intCast(pairs))); a.add(E); a.add(@as(i32, @intCast(plan.tile))); a.add(plan.members); a.add(plan.items); a.add(plan.counts);
+        a.add(picks);
+        a.add(@as(i32, @intCast(pairs)));
+        a.add(E);
+        a.add(@as(i32, @intCast(plan.tile)));
+        a.add(plan.members);
+        a.add(plan.items);
+        a.add(plan.counts);
         try k.go(try k.ext(.experts, "11plan_kernelE"), .{ .x = 1 }, 1024, 0, &a);
     } else {
         const nblk = cdiv(pairs, 1024);
-        a.add(picks); a.add(@as(i32, @intCast(pairs))); a.add(E); a.add(plan.rank); a.add(plan.hist);
+        a.add(picks);
+        a.add(@as(i32, @intCast(pairs)));
+        a.add(E);
+        a.add(plan.rank);
+        a.add(plan.hist);
         try k.go(try k.ext(.experts, "9plan_rankE"), .{ .x = @intCast(nblk) }, 1024, 0, &a);
         var b: cuda.Args = .{};
-        b.add(@as(i32, @intCast(nblk))); b.add(E); b.add(@as(i32, @intCast(plan.tile))); b.add(plan.hist); b.add(plan.items); b.add(plan.counts);
+        b.add(@as(i32, @intCast(nblk)));
+        b.add(E);
+        b.add(@as(i32, @intCast(plan.tile)));
+        b.add(plan.hist);
+        b.add(plan.items);
+        b.add(plan.counts);
         try k.go(try k.ext(.experts, "12plan_offsetsE"), .{ .x = 1 }, 1024, 0, &b);
         var s: cuda.Args = .{};
-        s.add(picks); s.add(@as(i32, @intCast(pairs))); s.add(E); s.add(plan.rank); s.add(plan.hist); s.add(plan.members);
+        s.add(picks);
+        s.add(@as(i32, @intCast(pairs)));
+        s.add(E);
+        s.add(plan.rank);
+        s.add(plan.hist);
+        s.add(plan.members);
         try k.go(try k.ext(.experts, "12plan_scatterE"), .{ .x = @intCast(cdiv(pairs, 256)) }, 256, 0, &s);
     }
 }
@@ -479,8 +469,17 @@ pub fn expertsPlan(k: *K, picks: u64, pairs: i64, plan: Plan) !void {
 pub fn expertsCall(k: *K, prefill: bool, gs: i64, epi: i64, x: u64, x_stride: i64, slots: i64, w: u64, kb: i64, nb: i64, plan: Plan, out: u64, width: i64, items: i64) !void {
     const m: i64 = if (epi == 2) 2 else 1;
     var a: cuda.Args = .{};
-    a.add(x); a.add(@as(i32, @intCast(x_stride))); a.add(@as(i32, @intCast(slots))); a.add(w); a.add(@as(i32, @intCast(kb)));
-    a.add(@as(i32, @intCast(nb))); a.add(plan.items); a.add(plan.counts); a.add(plan.members); a.add(out); a.add(@as(i32, @intCast(width)));
+    a.add(x);
+    a.add(@as(i32, @intCast(x_stride)));
+    a.add(@as(i32, @intCast(slots)));
+    a.add(w);
+    a.add(@as(i32, @intCast(kb)));
+    a.add(@as(i32, @intCast(nb)));
+    a.add(plan.items);
+    a.add(plan.counts);
+    a.add(plan.members);
+    a.add(out);
+    a.add(@as(i32, @intCast(width)));
     a.add(@as(f32, 0.0));
     var buf: [128]u8 = undefined;
     if (prefill) {
@@ -539,13 +538,9 @@ pub fn matmul(k: *K, x: u64, x_stride: i64, face: Face, out: u64, out_stride: i6
             c.bn = 128;
         }
         const tgt = if (c.sk > 1) part else out;
-        try k.tri("_q8mm", .{ cdiv(m, c.bm), cdiv(p.n, c.bn), c.sk }, &.{ P("X", x), P("W", p.w), P("S", if (p.gs != 0) p.s else p.w), P("OUT", out), P("PART", tgt),
-            I("M", m), I("x_stride", x_stride), I("out_stride", out_stride), I("col0", col0) },
-            &.{ ci("N", p.n), ci("K", face.k), ci("GS", @max(p.gs, 1)), ci("SK", c.sk), ci("BM", c.bm), ci("BLOCK_N", c.bn), ci("BLOCK_K", c.bk),
-            ci("SCALED", @intFromBool(p.gs != 0)), ci("F32", @intFromBool(fp32)), ci("INLINE", inline_) });
+        try k.tri("_q8mm", .{ cdiv(m, c.bm), cdiv(p.n, c.bn), c.sk }, &.{ P("X", x), P("W", p.w), P("S", if (p.gs != 0) p.s else p.w), P("OUT", out), P("PART", tgt), I("M", m), I("x_stride", x_stride), I("out_stride", out_stride), I("col0", col0) }, &.{ ci("N", p.n), ci("K", face.k), ci("GS", @max(p.gs, 1)), ci("SK", c.sk), ci("BM", c.bm), ci("BLOCK_N", c.bn), ci("BLOCK_K", c.bk), ci("SCALED", @intFromBool(p.gs != 0)), ci("F32", @intFromBool(fp32)), ci("INLINE", inline_) });
         if (c.sk > 1) {
-            try k.tri("_reduce", .{ cdiv(m * p.n, 1024), 1, 1 }, &.{ P("PART", part), P("OUT", out), I("M", m), I("out_stride", out_stride), I("col0", col0) },
-                &.{ ci("N", p.n), ci("SK", c.sk), ci("BLOCK", 1024), ci("F32", @intFromBool(fp32)) });
+            try k.tri("_reduce", .{ cdiv(m * p.n, 1024), 1, 1 }, &.{ P("PART", part), P("OUT", out), I("M", m), I("out_stride", out_stride), I("col0", col0) }, &.{ ci("N", p.n), ci("SK", c.sk), ci("BLOCK", 1024), ci("F32", @intFromBool(fp32)) });
         }
         col0 += p.n;
     }
@@ -563,9 +558,7 @@ pub fn partials(k: *K, x: u64, x_stride: i64, face: Face, part: u64, m: i64) !bo
     var col0: i64 = 0;
     for (face.parts[0..face.count], 0..) |p, i| {
         const c = cfgs[i];
-        try k.tri("_q8slices", .{ cdiv(m, c.bm), cdiv(p.n, c.bn), sk }, &.{ P("X", x), P("W", p.w), P("S", if (p.gs != 0) p.s else p.w), P("PART", part),
-            I("M", m), I("x_stride", x_stride), I("col0", col0) }, &.{ ci("N", p.n), ci("NALL", n_all), ci("K", face.k), ci("GS", @max(p.gs, 1)),
-            ci("SK", sk), ci("BM", c.bm), ci("BLOCK_N", c.bn), ci("BLOCK_K", c.bk), ci("SCALED", @intFromBool(p.gs != 0)) });
+        try k.tri("_q8slices", .{ cdiv(m, c.bm), cdiv(p.n, c.bn), sk }, &.{ P("X", x), P("W", p.w), P("S", if (p.gs != 0) p.s else p.w), P("PART", part), I("M", m), I("x_stride", x_stride), I("col0", col0) }, &.{ ci("N", p.n), ci("NALL", n_all), ci("K", face.k), ci("GS", @max(p.gs, 1)), ci("SK", sk), ci("BM", c.bm), ci("BLOCK_N", c.bn), ci("BLOCK_K", c.bk), ci("SCALED", @intFromBool(p.gs != 0)) });
         col0 += p.n;
     }
     return true;
@@ -574,8 +567,7 @@ pub fn partials(k: *K, x: u64, x_stride: i64, face: Face, part: u64, m: i64) !bo
 /// q8.hc_upmix for prompt rows (m > 128): the up projection and the mix in one pass.
 pub fn upmix(k: *K, act: u64, face: Face, normed: u64, mixed: u64, xs: u64, m: i64) !void {
     const p = face.parts[0];
-    try k.tri("_q8upmix", .{ cdiv(m, 32), @divExact(D, 64), 1 }, &.{ P("A", act), P("W", p.w), P("S", p.s), P("NORMED", normed), P("MIXED", mixed), P("XS", xs),
-        I("M", m), I("a_stride", face.k) }, &.{ ci("D", D), ci("K", face.k), ci("GS", p.gs), ci("STREAMS", S), ci("BM", 32), ci("BLOCK_N", 64), ci("BLOCK_K", 64) });
+    try k.tri("_q8upmix", .{ cdiv(m, 32), @divExact(D, 64), 1 }, &.{ P("A", act), P("W", p.w), P("S", p.s), P("NORMED", normed), P("MIXED", mixed), P("XS", xs), I("M", m), I("a_stride", face.k) }, &.{ ci("D", D), ci("K", face.k), ci("GS", p.gs), ci("STREAMS", S), ci("BM", 32), ci("BLOCK_N", 64), ci("BLOCK_K", 64) });
 }
 
 // -- gdn.py, gdn_io.py, kernels/gdn.py ------------------------------------------------------------------------------
@@ -588,7 +580,8 @@ pub fn gdnChain(k: *K, p: u64, conv: u64, conv_w: u64, state_in: u64, a_log: u64
     const f = try k.ext(.gdn, try std.fmt.bufPrint(&buf, "12chain_kernelILi{d}ELi{d}ELb{d}E", .{ NK, NV, @intFromBool(rows > 1) }));
     var a: cuda.Args = .{};
     for ([_]u64{ p, conv, conv_w, state_in, a_log, dt_bias, norm }) |x| a.add(x);
-    a.add(EPS); a.add(@as(i32, @intCast(rows)));
+    a.add(EPS);
+    a.add(@as(i32, @intCast(rows)));
     for ([_]u64{ out, xs, state_out, sk, sv, sg, sb }) |x| a.add(x);
     try k.go(f, .{ .x = @intCast(NV) }, 1024, 0, &a);
 }
@@ -598,7 +591,8 @@ pub fn gdnReplay(k: *K, state_in: u64, sk: u64, sv: u64, sg: u64, sb: u64, rows:
     const f = try k.ext(.gdn, try std.fmt.bufPrint(&buf, "13replay_kernelILi{d}ELi{d}E", .{ NK, NV }));
     var a: cuda.Args = .{};
     for ([_]u64{ state_in, sk, sv, sg, sb }) |x| a.add(x);
-    a.add(@as(i32, @intCast(rows))); a.add(state_out);
+    a.add(@as(i32, @intCast(rows)));
+    a.add(state_out);
     try k.go(f, .{ .x = @intCast(NV) }, 1024, 0, &a);
 }
 
@@ -608,7 +602,14 @@ pub fn gdnChainMulti(k: *K, tab: u64, streams: i64, conv_w: u64, a_log: u64, dt_
     var buf: [96]u8 = undefined;
     const f = try k.ext(.gdn_multi, try std.fmt.bufPrint(&buf, "18chain_multi_kernelILi{d}ELi{d}E", .{ NK, NV }));
     var a: cuda.Args = .{};
-    a.add(tab); a.add(conv_w); a.add(a_log); a.add(dt_bias); a.add(norm); a.add(@as(f32, EPS)); a.add(out); a.add(xs);
+    a.add(tab);
+    a.add(conv_w);
+    a.add(a_log);
+    a.add(dt_bias);
+    a.add(norm);
+    a.add(@as(f32, EPS));
+    a.add(out);
+    a.add(xs);
     try k.go(f, .{ .x = @intCast(NV), .y = @intCast(streams) }, 1024, 0, &a);
 }
 
@@ -618,7 +619,8 @@ pub fn gdnReplayMulti(k: *K, tab: u64, streams: i64) !void {
     var buf: [96]u8 = undefined;
     const f = try k.ext(.gdn_multi, try std.fmt.bufPrint(&buf, "19replay_multi_kernelILi{d}ELi{d}E", .{ NK, NV }));
     var a: cuda.Args = .{};
-    a.add(tab); a.add(@as(i32, @intCast(streams)));
+    a.add(tab);
+    a.add(@as(i32, @intCast(streams)));
     try k.go(f, .{ .x = @intCast(NV), .y = @intCast(streams), .z = 36 }, 1024, 0, &a);
 }
 
@@ -639,7 +641,9 @@ pub fn gdnPrefill(k: *K, q: u64, kk: u64, v: u64, g: u64, beta: u64, state_in: u
     const f = try k.ext(.gdn_prefill, try std.fmt.bufPrint(&buf, "12chain_kernelIfLi{d}ELi32E", .{rows}));
     var a: cuda.Args = .{};
     for ([_]u64{ q, kk, v, g, beta, state_in, state_out, y }) |x| a.add(x);
-    a.add(@as(i32, @intCast(n))); a.add(@as(i32, @intCast(NK))); a.add(@as(i32, @intCast(NV)));
+    a.add(@as(i32, @intCast(n)));
+    a.add(@as(i32, @intCast(NK)));
+    a.add(@as(i32, @intCast(NV)));
     try k.go(f, .{ .x = @intCast(NV), .y = @intCast(@divExact(128, rows)) }, @intCast(2 * rows), 0, &a);
 }
 
@@ -647,14 +651,18 @@ pub fn gdnBack(k: *K, y: u64, p: u64, norm: u64, out: u64, xs: u64, n: i64) !voi
     var buf: [96]u8 = undefined;
     const f = try k.ext(.gdn_io, try std.fmt.bufPrint(&buf, "11back_kernelILi{d}ELi{d}E", .{ NK, NV }));
     var a: cuda.Args = .{};
-    a.add(y); a.add(p); a.add(norm); a.add(EPS); a.add(out); a.add(xs);
+    a.add(y);
+    a.add(p);
+    a.add(norm);
+    a.add(EPS);
+    a.add(out);
+    a.add(xs);
     try k.go(f, .{ .x = @intCast(n), .y = @intCast(NV) }, 128, 0, &a);
 }
 
 /// forward.shift_windows: old [L, T, C] keeps the last T rows of (old, the kept ``keep`` rows of new).
 pub fn shiftWindows(k: *K, old: u64, new: u64, keep: i64, old_l: i64, new_l: i64, new_row: i64, layers: i64, channels: i64, taps: i64) !void {
-    try k.tri("_shift_windows", .{ layers, cdiv(channels, 256), 1 }, &.{ P("OLD", old), P("NEW", new), I("keep", keep), I("OLD_L", old_l), I("NEW_L", new_l), I("NEW_ROW", new_row) },
-        &.{ ci("C", channels), ci("T", taps), ci("TP", @intCast(nextPow2(@intCast(taps)))), ci("BLOCK", 256) });
+    try k.tri("_shift_windows", .{ layers, cdiv(channels, 256), 1 }, &.{ P("OLD", old), P("NEW", new), I("keep", keep), I("OLD_L", old_l), I("NEW_L", new_l), I("NEW_ROW", new_row) }, &.{ ci("C", channels), ci("T", taps), ci("TP", @intCast(nextPow2(@intCast(taps)))), ci("BLOCK", 256) });
 }
 
 // -- qmm.py: the MTP draft head (4-bit rows of the draft vocabulary) ------------------------------------------------
@@ -674,9 +682,20 @@ pub fn qmmDecode(k: *K, x: u64, xs: u64, h: DraftHead, out: u64, part: u64) !voi
     const rows_t = cdiv(M, bm);
     const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K_ * 2)));
     var a: cuda.Args = .{};
-    a.add(x); a.add(xs); a.add(h.w); a.add(h.scales); a.add(h.biases); a.add(out); a.add(@as(u64, 0));
-    a.add(@as(i32, @intCast(M))); a.add(@as(i32, @intCast(h.n))); a.add(@as(i32, @intCast(K_))); a.add(@as(i32, 1)); a.add(@as(i32, @intCast(h.npad)));
-    a.add(@as(i32, @intCast(K_))); a.add(@as(i32, @intCast(group)));
+    a.add(x);
+    a.add(xs);
+    a.add(h.w);
+    a.add(h.scales);
+    a.add(h.biases);
+    a.add(out);
+    a.add(@as(u64, 0));
+    a.add(@as(i32, @intCast(M)));
+    a.add(@as(i32, @intCast(h.n)));
+    a.add(@as(i32, @intCast(K_)));
+    a.add(@as(i32, 1));
+    a.add(@as(i32, @intCast(h.npad)));
+    a.add(@as(i32, @intCast(K_)));
+    a.add(@as(i32, @intCast(group)));
     _ = part;
     try k.go(f, .{ .x = @intCast(rows_t * cdiv(h.n, 64)), .y = 1, .z = 1 }, 128, smem, &a);
 }
@@ -695,9 +714,17 @@ pub fn qmmPrefill(k: *K, x: u64, h: DraftHead, out: u64) !void {
     const rows_t = cdiv(M, bm);
     const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K_ * 2)));
     var a: cuda.Args = .{};
-    a.add(x); a.add(h.w); a.add(h.scales); a.add(h.biases); a.add(out);
-    a.add(@as(i32, @intCast(M))); a.add(@as(i32, @intCast(h.n))); a.add(@as(i32, @intCast(K_))); a.add(@as(i32, @intCast(h.npad)));
-    a.add(@as(i32, @intCast(K_))); a.add(@as(i32, @intCast(group)));
+    a.add(x);
+    a.add(h.w);
+    a.add(h.scales);
+    a.add(h.biases);
+    a.add(out);
+    a.add(@as(i32, @intCast(M)));
+    a.add(@as(i32, @intCast(h.n)));
+    a.add(@as(i32, @intCast(K_)));
+    a.add(@as(i32, @intCast(h.npad)));
+    a.add(@as(i32, @intCast(K_)));
+    a.add(@as(i32, @intCast(group)));
     try k.go(f, .{ .x = @intCast(rows_t * cdiv(h.n, bn)) }, @intCast(tl[2] * tl[3] * 32), smem, &a);
 }
 
@@ -710,6 +737,11 @@ pub fn rowsTop(k: *K, logits: u64, cols: i64, id_map: u64, offset: i64, out: u64
 pub fn rowsTopStrided(k: *K, logits: u64, cols: i64, stride: i64, id_map: u64, offset: i64, out: u64, rows: i64) !void {
     const f = try k.ext(.sample, "fn_rows_top");
     var a: cuda.Args = .{};
-    a.add(logits); a.add(@as(i32, @intCast(cols))); a.add(@as(i32, @intCast(stride))); a.add(id_map); a.add(@as(i32, @intCast(offset))); a.add(out);
+    a.add(logits);
+    a.add(@as(i32, @intCast(cols)));
+    a.add(@as(i32, @intCast(stride)));
+    a.add(id_map);
+    a.add(@as(i32, @intCast(offset)));
+    a.add(out);
     try k.go(f, .{ .x = @intCast(rows) }, 1024, 0, &a);
 }

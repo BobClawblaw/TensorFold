@@ -78,9 +78,7 @@ fn ptr(store: *const api.Store, comptime fmt: []const u8, args: anytype) !u64 {
 fn hcw(store: *const api.Store, prefix: []const u8) !HCW {
     var b1: [128]u8 = undefined;
     var b2: [128]u8 = undefined;
-    return .{ .scale = (try store.get(try std.fmt.bufPrint(&b1, "{s}.scale", .{prefix}))).ptr,
-        .down = try face(store, try std.fmt.bufPrint(&b1, "{s}.down", .{prefix})),
-        .up = try face(store, try std.fmt.bufPrint(&b2, "{s}.up", .{prefix})) };
+    return .{ .scale = (try store.get(try std.fmt.bufPrint(&b1, "{s}.scale", .{prefix}))).ptr, .down = try face(store, try std.fmt.bufPrint(&b1, "{s}.down", .{prefix})), .up = try face(store, try std.fmt.bufPrint(&b2, "{s}.up", .{prefix})) };
 }
 
 fn layerW(store: *const api.Store, p: []const u8, linear: bool, li: usize) !LayerW {
@@ -88,26 +86,17 @@ fn layerW(store: *const api.Store, p: []const u8, linear: bool, li: usize) !Laye
     var l: LayerW = .{
         .attn_hc = try hcw(store, try std.fmt.bufPrint(&b, "{s}.attn_hc", .{p})),
         .mlp_hc = try hcw(store, try std.fmt.bufPrint(&b, "{s}.mlp_hc", .{p})),
-        .moe = .{ .router = try ptr(store, "{s}.moe.router", .{p}), .up = try ptr(store, "{s}.moe.experts.routed_experts.up", .{p}),
-            .down = try ptr(store, "{s}.moe.experts.routed_experts.down", .{p}),
-            .sgu = try face(store, try std.fmt.bufPrint(&b, "{s}.moe.experts.shared_gu", .{p})),
-            .sdown = try face(store, try std.fmt.bufPrint(&b, "{s}.moe.experts.shared_down", .{p})) },
+        .moe = .{ .router = try ptr(store, "{s}.moe.router", .{p}), .up = try ptr(store, "{s}.moe.experts.routed_experts.up", .{p}), .down = try ptr(store, "{s}.moe.experts.routed_experts.down", .{p}), .sgu = try face(store, try std.fmt.bufPrint(&b, "{s}.moe.experts.shared_gu", .{p})), .sdown = try face(store, try std.fmt.bufPrint(&b, "{s}.moe.experts.shared_down", .{p})) },
         .linear = linear,
         .li = li,
     };
     if (linear) {
-        l.gdn = .{ .proj = try face(store, try std.fmt.bufPrint(&b, "{s}.gdn.proj", .{p})), .conv = try ptr(store, "{s}.gdn.conv", .{p}),
-            .a_log = try ptr(store, "{s}.gdn.a_log", .{p}), .dt_bias = try ptr(store, "{s}.gdn.dt_bias", .{p}), .norm = try ptr(store, "{s}.gdn.norm", .{p}),
-            .out = try face(store, try std.fmt.bufPrint(&b, "{s}.gdn.out", .{p})) };
+        l.gdn = .{ .proj = try face(store, try std.fmt.bufPrint(&b, "{s}.gdn.proj", .{p})), .conv = try ptr(store, "{s}.gdn.conv", .{p}), .a_log = try ptr(store, "{s}.gdn.a_log", .{p}), .dt_bias = try ptr(store, "{s}.gdn.dt_bias", .{p}), .norm = try ptr(store, "{s}.gdn.norm", .{p}), .out = try face(store, try std.fmt.bufPrint(&b, "{s}.gdn.out", .{p})) };
     } else {
-        l.attn = .{ .proj = try face(store, try std.fmt.bufPrint(&b, "{s}.attn.proj", .{p})), .q_scale = try ptr(store, "{s}.attn.q_scale", .{p}),
-            .k_scale = try ptr(store, "{s}.attn.k_scale", .{p}), .iq_scale = try ptr(store, "{s}.attn.iq_scale", .{p}),
-            .ik_scale = try ptr(store, "{s}.attn.ik_scale", .{p}), .o = try face(store, try std.fmt.bufPrint(&b, "{s}.attn.o", .{p})) };
+        l.attn = .{ .proj = try face(store, try std.fmt.bufPrint(&b, "{s}.attn.proj", .{p})), .q_scale = try ptr(store, "{s}.attn.q_scale", .{p}), .k_scale = try ptr(store, "{s}.attn.k_scale", .{p}), .iq_scale = try ptr(store, "{s}.attn.iq_scale", .{p}), .ik_scale = try ptr(store, "{s}.attn.ik_scale", .{p}), .o = try face(store, try std.fmt.bufPrint(&b, "{s}.attn.o", .{p})) };
     }
     if (store.map.get(try std.fmt.bufPrint(&b, "{s}.ple.conv", .{p}))) |_| {
-        l.ple = .{ .key = try face(store, try std.fmt.bufPrint(&b, "{s}.ple.key", .{p})), .value = try face(store, try std.fmt.bufPrint(&b, "{s}.ple.value", .{p})),
-            .norm_key = try ptr(store, "{s}.ple.norm_key", .{p}), .norm_query = try ptr(store, "{s}.ple.norm_query", .{p}),
-            .norm_conv = try ptr(store, "{s}.ple.norm_conv", .{p}), .conv = try ptr(store, "{s}.ple.conv", .{p}) };
+        l.ple = .{ .key = try face(store, try std.fmt.bufPrint(&b, "{s}.ple.key", .{p})), .value = try face(store, try std.fmt.bufPrint(&b, "{s}.ple.value", .{p})), .norm_key = try ptr(store, "{s}.ple.norm_key", .{p}), .norm_query = try ptr(store, "{s}.ple.norm_query", .{p}), .norm_conv = try ptr(store, "{s}.ple.norm_conv", .{p}), .conv = try ptr(store, "{s}.ple.conv", .{p}) };
     }
     return l;
 }
@@ -130,26 +119,83 @@ pub const Buffers = struct {
     moe_prefill: bool, // the experts' prompt arithmetic (bf16 slots) also for windows: the main window's buffers
     nb: i64, // key blocks of the context (the indexer's scores row)
     mem: cuda.DeviceBuffer = undefined,
-    ids: u64 = 0, h: u64 = 0, pss: u64 = 0, normed: u64 = 0, xs_normed: u64 = 0, act: u64 = 0, xs_act: u64 = 0,
-    inj_a: u64 = 0, inj_m: u64 = 0, up: u64 = 0, mixed: u64 = 0, xs_mixed: u64 = 0,
-    pa: u64 = 0, q: u64 = 0, iq: u64 = 0,
-    a_po: u64 = 0, a_pm: u64 = 0, a_pl: u64 = 0, a_out: u64 = 0, a_ids: u64 = 0, a_nk: u64 = 0, a_sparse: u64 = 0, a_scores: u64 = 0,
-    gated: u64 = 0, xs_gated: u64 = 0,
-    m_logits: u64 = 0, m_pick: u64 = 0, m_wts: u64 = 0, m_act: u64 = 0, m_y: u64 = 0, plan: kern.Plan = undefined,
-    proj: u64 = 0, windows: u64 = 0, sid: u64 = 0, pos_blk: u64 = 0,
-    gout: u64 = 0, gxs: u64 = 0, attn_o: u64 = 0, streams: u64 = 0, logits: u64 = 0,
-    part_branch: u64 = 0, part_moe: u64 = 0, g_branch: u64 = 0, g_moe: u64 = 0,
-    cand: u64 = 0, gath: u64 = 0,
-    ple_v: u64 = 0, ple_emb: u64 = 0, xs_ple: u64 = 0, ple_keys: u64 = 0, ple_vals: u64 = 0, ple_gated: u64 = 0, ple_pss: u64 = 0, ple_nrow: u64 = 0,
-    mtp_e: u64 = 0, mtp_eo: u64 = 0, mtp_hn: u64 = 0, mtp_xh: u64 = 0, mtp_hs: u64 = 0, mtp_in: u64 = 0,
-    kpart: u64 = 0, hcpart: u64 = 0, dnf: u64 = 0, sgu: u64 = 0,
-    seg_nk: u64 = 0, seg_sparse: u64 = 0, // a shared round's per-stream key counts, 64 bytes a stream (16-aligned)
+    ids: u64 = 0,
+    h: u64 = 0,
+    pss: u64 = 0,
+    normed: u64 = 0,
+    xs_normed: u64 = 0,
+    act: u64 = 0,
+    xs_act: u64 = 0,
+    inj_a: u64 = 0,
+    inj_m: u64 = 0,
+    up: u64 = 0,
+    mixed: u64 = 0,
+    xs_mixed: u64 = 0,
+    pa: u64 = 0,
+    q: u64 = 0,
+    iq: u64 = 0,
+    a_po: u64 = 0,
+    a_pm: u64 = 0,
+    a_pl: u64 = 0,
+    a_out: u64 = 0,
+    a_ids: u64 = 0,
+    a_nk: u64 = 0,
+    a_sparse: u64 = 0,
+    a_scores: u64 = 0,
+    gated: u64 = 0,
+    xs_gated: u64 = 0,
+    m_logits: u64 = 0,
+    m_pick: u64 = 0,
+    m_wts: u64 = 0,
+    m_act: u64 = 0,
+    m_y: u64 = 0,
+    plan: kern.Plan = undefined,
+    proj: u64 = 0,
+    windows: u64 = 0,
+    sid: u64 = 0,
+    pos_blk: u64 = 0,
+    gout: u64 = 0,
+    gxs: u64 = 0,
+    attn_o: u64 = 0,
+    streams: u64 = 0,
+    logits: u64 = 0,
+    part_branch: u64 = 0,
+    part_moe: u64 = 0,
+    g_branch: u64 = 0,
+    g_moe: u64 = 0,
+    cand: u64 = 0,
+    gath: u64 = 0,
+    ple_v: u64 = 0,
+    ple_emb: u64 = 0,
+    xs_ple: u64 = 0,
+    ple_keys: u64 = 0,
+    ple_vals: u64 = 0,
+    ple_gated: u64 = 0,
+    ple_pss: u64 = 0,
+    ple_nrow: u64 = 0,
+    mtp_e: u64 = 0,
+    mtp_eo: u64 = 0,
+    mtp_hn: u64 = 0,
+    mtp_xh: u64 = 0,
+    mtp_hs: u64 = 0,
+    mtp_in: u64 = 0,
+    kpart: u64 = 0,
+    hcpart: u64 = 0,
+    dnf: u64 = 0,
+    sgu: u64 = 0,
+    seg_nk: u64 = 0,
+    seg_sparse: u64 = 0, // a shared round's per-stream key counts, 64 bytes a stream (16-aligned)
     gdn_tab: u64 = 0, // a shared round's DeltaNet table: each layer's streams (ChainSeg), or each layer's replays at a keep
-    attn_ints: u64 = 0, attn_ptrs: u64 = 0, // a shared round's attention tables (attnTable)
+    attn_ints: u64 = 0,
+    attn_ptrs: u64 = 0, // a shared round's attention tables (attnTable)
     attn: ?kern.MultiTab = null, // set while a forward's streams attend through the tables
-    tk: u64 = 0, gtk: u64 = 0, invt: u64 = 0, // sampled rows: each row's candidates, both ranks' gathered, 1 / temperature
+    tk: u64 = 0,
+    gtk: u64 = 0,
+    invt: u64 = 0, // sampled rows: each row's candidates, both ranks' gathered, 1 / temperature
     // several prompts in one pass (prefillMany): each row's conv taps and sequence, each DeltaNet layer's conv windows
-    mwindows: u64 = 0, msid: u64 = 0, conv_tab: u64 = 0,
+    mwindows: u64 = 0,
+    msid: u64 = 0,
+    conv_tab: u64 = 0,
     multi_prompts: bool = false,
     chains_staged: bool = false, // gdn_tab holds this forward's chains (a shared round of the main forward)
 
@@ -186,9 +232,7 @@ pub const Buffers = struct {
         b.m_pick = c.take(R * SLOTS * 4);
         b.m_wts = c.take(R * SLOTS * 4);
         const wide = pairs > 1024;
-        b.plan = .{ .members = c.take(pairs * 4), .items = c.take(kern.maxItems(pairs, 512, 16) * 3 * 4), .counts = c.take(2 * 4),
-            .rank = c.take(if (wide) pairs * 4 else 4), .hist = c.take(if (wide) cdiv(pairs, 1024) * 512 * 4 else 4),
-            .tile = @as(i64, if (b.moe_prefill) 64 else 16) };
+        b.plan = .{ .members = c.take(pairs * 4), .items = c.take(kern.maxItems(pairs, 512, 16) * 3 * 4), .counts = c.take(2 * 4), .rank = c.take(if (wide) pairs * 4 else 4), .hist = c.take(if (wide) cdiv(pairs, 1024) * 512 * 4 else 4), .tile = @as(i64, if (b.moe_prefill) 64 else 16) };
         b.m_act = c.take(pairs * kern.LOW * 2);
         b.m_y = c.take(pairs * D * @as(i64, if (b.moe_prefill) 2 else 4));
         b.proj = c.take(@as(i64, if (b.prefill) 1 else LIN) * R * PROJ_W * 2);
@@ -295,11 +339,21 @@ pub const Snap = struct {
 pub const Seq = struct {
     capacity: i64,
     mem: cuda.DeviceBuffer = undefined,
-    pos_dev: u64 = 0, mtp_pos: u64 = 0,
-    conv: u64 = 0, rec: u64 = 0, conv_ptrs: u64 = 0,
-    sc_k: [LIN]u64 = undefined, sc_v: [LIN]u64 = undefined, sc_g: [LIN]u64 = undefined, sc_b: [LIN]u64 = undefined,
-    kc_k: [ATT + 1]u64 = undefined, kc_v: [ATT + 1]u64 = undefined, kc_ks: [ATT + 1]u64 = undefined, kc_vs: [ATT + 1]u64 = undefined,
-    ikc: [ATT + 1]u64 = undefined, pooled: [ATT + 1]u64 = undefined,
+    pos_dev: u64 = 0,
+    mtp_pos: u64 = 0,
+    conv: u64 = 0,
+    rec: u64 = 0,
+    conv_ptrs: u64 = 0,
+    sc_k: [LIN]u64 = undefined,
+    sc_v: [LIN]u64 = undefined,
+    sc_g: [LIN]u64 = undefined,
+    sc_b: [LIN]u64 = undefined,
+    kc_k: [ATT + 1]u64 = undefined,
+    kc_v: [ATT + 1]u64 = undefined,
+    kc_ks: [ATT + 1]u64 = undefined,
+    kc_vs: [ATT + 1]u64 = undefined,
+    ikc: [ATT + 1]u64 = undefined,
+    pooled: [ATT + 1]u64 = undefined,
     ple_tail: u64 = 0,
     last_streams: u64 = 0,
     first_logits: u64 = 0, // the prompt's last head row (firstAgain draws the first token again under a mask)
@@ -427,7 +481,6 @@ pub fn detach(e: *Engine, s: *Seq) void {
     }
     s.img = null;
 }
-
 
 /// One sequence's rows of a forward: rows ``row0 .. row0 + rows`` of the buffers belong to ``s`` (a shared round
 /// packs several streams' windows; a lone window or a prompt chunk is one segment from row 0).
@@ -621,14 +674,12 @@ pub fn logGraphs(e: *Engine) void {
         shared += 1;
     } else seqs.put(k.seq, {}) catch {};
     const per = if (e.launches > 0) e.launch_ms / @as(f64, @floatFromInt(e.launches)) else 0;
-    std.log.info("flash next graphs: {d} held, {d} shared and the rest over {d} sequences; {d} captures ({d:.1} ms), {d} launches ({d:.3} ms each)", .{
-        e.graphs.count(), shared, seqs.count(), e.captures, e.capture_ms, e.launches, per });
+    std.log.info("flash next graphs: {d} held, {d} shared and the rest over {d} sequences; {d} captures ({d:.1} ms), {d} launches ({d:.3} ms each)", .{ e.graphs.count(), shared, seqs.count(), e.captures, e.capture_ms, e.launches, per });
     e.captures = 0;
     e.capture_ms = 0;
     e.launches = 0;
     e.launch_ms = 0;
 }
-
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Kernels, store: *const api.Store, opts: Options) !*Engine {
     const e = try gpa.create(Engine);
@@ -656,8 +707,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *api.Ctx, kernels: *api.Ker
         if (linear) li += 1 else ai += 1;
     }
     e.mixer = try hcw(store, "mixer");
-    e.mtp = .{ .norm_e = try ptr(store, "mtp.norm_e", .{}), .norm_h = try ptr(store, "mtp.norm_h", .{}), .fc_e = try face(store, "mtp.fc_e"),
-        .fc_h = try face(store, "mtp.fc_h"), .layer = try layerW(store, "mtp.layer", false, ATT), .mixer = try hcw(store, "mtp.mixer") };
+    e.mtp = .{ .norm_e = try ptr(store, "mtp.norm_e", .{}), .norm_h = try ptr(store, "mtp.norm_h", .{}), .fc_e = try face(store, "mtp.fc_e"), .fc_h = try face(store, "mtp.fc_h"), .layer = try layerW(store, "mtp.layer", false, ATT), .mixer = try hcw(store, "mtp.mixer") };
     e.embed = try ptr(store, "embed.0", .{});
     e.head = try face(store, "head");
     e.inv_freq = try ptr(store, "inv_freq", .{});
@@ -963,8 +1013,7 @@ fn gdnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64) !u64 
     for (segs) |sg| { // each stream's chain on its own state, over its rows
         const s = sg.s;
         const cur = s.cur[li];
-        try kern.gdnChain(k, rowAt(proj, sg.row0, PROJ_W * 2), s.conv + li * 3 * CONV_DIM * 2, g.conv, s.recAt(cur, li), g.a_log, g.dt_bias, g.norm, sg.rows,
-            rowAt(b.gout, sg.row0, 3072 * 2), rowAt(b.gxs, sg.row0, 96 * 4), s.recAt(1 - cur, li), s.sc_k[li], s.sc_v[li], s.sc_g[li], s.sc_b[li]);
+        try kern.gdnChain(k, rowAt(proj, sg.row0, PROJ_W * 2), s.conv + li * 3 * CONV_DIM * 2, g.conv, s.recAt(cur, li), g.a_log, g.dt_bias, g.norm, sg.rows, rowAt(b.gout, sg.row0, 3072 * 2), rowAt(b.gxs, sg.row0, 96 * 4), s.recAt(1 - cur, li), s.sc_k[li], s.sc_v[li], s.sc_g[li], s.sc_b[li]);
     }
     return outProj(e, b, b.gout, 3072, g.out, R);
 }
@@ -987,8 +1036,7 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
     for (segs) |sg| { // each stream's rows into its own caches, at its own positions
         const s = sg.s;
         const pos = if (mtp) s.mtp_pos else s.pos_dev;
-        try kern.attnPrep(k, rowAt(b.pa, sg.row0, 7296 * 2), pos, a.q_scale, a.k_scale, a.iq_scale, e.inv_freq, rowAt(b.q, sg.row0, 12 * 256 * 2),
-            s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows, if (s.img) |*im| im.rope() else null, e.opts.kv_bits);
+        try kern.attnPrep(k, rowAt(b.pa, sg.row0, 7296 * 2), pos, a.q_scale, a.k_scale, a.iq_scale, e.inv_freq, rowAt(b.q, sg.row0, 12 * 256 * 2), s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], rowAt(b.iq, sg.row0, 4 * 128 * 2), s.ikc[ai], sg.rows, if (s.img) |*im| im.rope() else null, e.opts.kv_bits);
         try kern.pool(k, s.ikc[ai], s.pooled[ai], pos, a.ik_scale, e.inv_freq, sg.rows, if (s.img) |*im| im.rope() else null);
     }
     if (b.prefill) for (segs) |sg| { // a prompt chunk, or several prompts' pieces: each in blocks of ATT_ROWS rows
@@ -1001,8 +1049,7 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
             const ends = host_pos + r0 + n;
             const ro: u64 = @intCast(sg.row0 + r0);
             try kern.qsaRows(k, b.iq + ro * 4 * 128 * 2, s.pooled[ai], b.pos_blk, b.a_scores, b.a_ids, b.a_nk, b.a_sparse, b.nb, n, ends);
-            try kern.attention(k, b.q + ro * 12 * 256 * 2, s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], b.pos_blk, b.a_po, b.a_pm, b.a_pl,
-                b.a_ids, b.a_nk, b.a_sparse, b.attn_o + ro * 12 * 256 * 2, n, ends, e.opts.kv_bits);
+            try kern.attention(k, b.q + ro * 12 * 256 * 2, s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], b.pos_blk, b.a_po, b.a_pm, b.a_pl, b.a_ids, b.a_nk, b.a_sparse, b.attn_o + ro * 12 * 256 * 2, n, ends, e.opts.kv_bits);
         }
     };
     if (b.prefill) {
@@ -1016,11 +1063,8 @@ fn attnBlock(e: *Engine, b: *Buffers, segs: []const Seg, l: LayerW, R: i64, mtp:
             // per-row counts at row0 * 4 bytes would break the captured variants' 16-byte alignment: a slot per stream
             const nk = if (segs.len == 1) b.a_nk else b.seg_nk + j * 64;
             const sp = if (segs.len == 1) b.a_sparse else b.seg_sparse + j * 64;
-            try kern.qsaRows(k, rowAt(b.iq, r0, 4 * 128 * 2), s.pooled[ai], pos, rowAt(b.a_scores, r0, b.nb * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk,
-                sp, b.nb, sg.rows, keys);
-            try kern.attention(k, rowAt(b.q, r0, 12 * 256 * 2), s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], pos, rowAt(b.a_po, r0, kern.NCH * 12 * 256 * 4),
-                rowAt(b.a_pm, r0, kern.NCH * 12 * 4), rowAt(b.a_pl, r0, kern.NCH * 12 * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk, sp,
-                rowAt(b.a_out, r0, 12 * 256 * 2), sg.rows, keys, e.opts.kv_bits);
+            try kern.qsaRows(k, rowAt(b.iq, r0, 4 * 128 * 2), s.pooled[ai], pos, rowAt(b.a_scores, r0, b.nb * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk, sp, b.nb, sg.rows, keys);
+            try kern.attention(k, rowAt(b.q, r0, 12 * 256 * 2), s.kc_k[ai], s.kc_v[ai], s.kc_ks[ai], s.kc_vs[ai], pos, rowAt(b.a_po, r0, kern.NCH * 12 * 256 * 4), rowAt(b.a_pm, r0, kern.NCH * 12 * 4), rowAt(b.a_pl, r0, kern.NCH * 12 * 4), rowAt(b.a_ids, r0, kern.IDW * 4), nk, sp, rowAt(b.a_out, r0, 12 * 256 * 2), sg.rows, keys, e.opts.kv_bits);
         }
         try kern.attnGate(k, b.a_out, b.pa, b.gated, b.xs_gated, R);
     }
@@ -1034,8 +1078,7 @@ fn pleBlock(e: *Engine, b: *Buffers, segs: []const Seg, p: PleW, R: i64) !void {
     try kern.matmul(k, b.ple_emb, D, p.value, b.ple_vals, D, false, R, b.kpart);
     try kern.pleGate(k, b.ple_keys, b.ple_vals, b.h, p.norm_key, p.norm_query, b.ple_gated, b.ple_pss, R);
     for (segs) |sg| // the causal conv over each stream's own tail
-        try kern.pleConv(k, rowAt(b.ple_gated, sg.row0, WIDE * 2), rowAt(b.ple_pss, sg.row0, 4 * 4), p.norm_conv, sg.s.ple_tail, p.conv, rowAt(b.h, sg.row0, WIDE * 2),
-            rowAt(b.ple_nrow, sg.row0, WIDE * 2), sg.rows);
+        try kern.pleConv(k, rowAt(b.ple_gated, sg.row0, WIDE * 2), rowAt(b.ple_pss, sg.row0, 4 * 4), p.norm_conv, sg.s.ple_tail, p.conv, rowAt(b.h, sg.row0, WIDE * 2), rowAt(b.ple_nrow, sg.row0, WIDE * 2), sg.rows);
 }
 
 fn moeBlock(e: *Engine, b: *Buffers, m: MoEW, R: i64) !u64 {
@@ -1156,7 +1199,11 @@ fn splice(e: *Engine, b: *Buffers, sg: Seg) !void {
     try e.k.upload(dp.ptr, std.mem.sliceAsBytes(pairs.items));
     const f = try e.k.ext(.vision, "fn_vis_splice");
     var a: cuda.Args = .{};
-    a.add(b.h); a.add(fb.ptr); a.add(dp.ptr); a.add(@as(i32, @intCast(D))); a.add(@as(i32, 4));
+    a.add(b.h);
+    a.add(fb.ptr);
+    a.add(dp.ptr);
+    a.add(@as(i32, @intCast(D)));
+    a.add(@as(i32, 4));
     try e.k.go(f, .{ .x = @intCast(pairs.items.len / 2) }, 256, 0, &a);
     try e.k.stream.synchronize(); // the pairs' buffer is freed on return
     try e.ctx.gathered();
@@ -1194,9 +1241,7 @@ fn chainTable(e: *Engine, b: *Buffers, segs: []const Seg) !void {
         for (segs, 0..) |sg, j| {
             const s = sg.s;
             const cur = s.cur[li];
-            tab[li * max_parts + j] = .{ .p = rowAt(proj, sg.row0, PROJ_W * 2), .cs = s.conv + li * 3 * CONV_DIM * 2, .state_in = s.recAt(cur, li),
-                .state_out = s.recAt(1 - cur, li), .k_save = s.sc_k[li], .v_save = s.sc_v[li], .g_save = s.sc_g[li], .b_save = s.sc_b[li],
-                .rows = sg.rows, .row0 = sg.row0 };
+            tab[li * max_parts + j] = .{ .p = rowAt(proj, sg.row0, PROJ_W * 2), .cs = s.conv + li * 3 * CONV_DIM * 2, .state_in = s.recAt(cur, li), .state_out = s.recAt(1 - cur, li), .k_save = s.sc_k[li], .v_save = s.sc_v[li], .g_save = s.sc_g[li], .b_save = s.sc_b[li], .rows = sg.rows, .row0 = sg.row0 };
         }
     }
     try e.k.upload(b.gdn_tab, std.mem.sliceAsBytes(&tab));
@@ -1242,8 +1287,7 @@ fn attnTable(e: *Engine, b: *Buffers, segs: []const Seg, R: i64, mtp: bool) !?ke
     if (mtp) {
         try e.k.upload(b.attn_ptrs + ATT * 6 * max_parts * 8, std.mem.sliceAsBytes(ptrs[ATT * 6 * max_parts ..][0 .. 6 * n]));
     } else try e.k.upload(b.attn_ptrs, std.mem.sliceAsBytes(ptrs[0 .. ATT * 6 * max_parts]));
-    return .{ .posr = b.attn_ints, .sid = b.attn_ints + rows * 4, .first = b.attn_ints + 2 * rows * 4, .counts = b.attn_ints + (2 * rows + n) * 4,
-        .cp = b.attn_ptrs, .streams = @intCast(n), .rows = R, .most = most, .keys = keys };
+    return .{ .posr = b.attn_ints, .sid = b.attn_ints + rows * 4, .first = b.attn_ints + 2 * rows * 4, .counts = b.attn_ints + (2 * rows + n) * 4, .cp = b.attn_ptrs, .streams = @intCast(n), .rows = R, .most = most, .keys = keys };
 }
 
 fn mainForward(e: *Engine, b: *Buffers, segs: []const Seg, R: i64) !Pending {
@@ -1610,8 +1654,12 @@ fn applyMasks(e: *Engine, logits: u64, segs: []const Seg) !bool {
     try k.upload(e.grows.ptr, std.mem.sliceAsBytes(rows[0..n]));
     const f = try k.ext(.sample, "fn_grammar_rows");
     var a: cuda.Args = .{};
-    a.add(logits); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(HEAD_N)));
-    a.add(e.gbits.ptr); a.add(@as(i32, @intCast(MASK_WORDS))); a.add(e.grows.ptr);
+    a.add(logits);
+    a.add(@as(i32, @intCast(HEAD_N)));
+    a.add(@as(i32, @intCast(HEAD_N)));
+    a.add(e.gbits.ptr);
+    a.add(@as(i32, @intCast(MASK_WORDS)));
+    a.add(e.grows.ptr);
     try k.go(f, .{ .x = @intCast(n) }, 256, 0, &a);
     return true;
 }
@@ -1635,8 +1683,12 @@ fn drawRows(e: *Engine, b: *Buffers, logits: u64, rows: i64, want: []const Want,
     {
         const f = try k.ext(.sample, "fn_cand_topk");
         var a: cuda.Args = .{};
-        a.add(logits); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(HEAD_N))); a.add(@as(i32, @intCast(e.vocab_offset)));
-        a.add(b.invt); a.add(b.tk);
+        a.add(logits);
+        a.add(@as(i32, @intCast(HEAD_N)));
+        a.add(@as(i32, @intCast(HEAD_N)));
+        a.add(@as(i32, @intCast(e.vocab_offset)));
+        a.add(b.invt);
+        a.add(b.tk);
         try k.go(f, .{ .x = @intCast(rows) }, 256, 0, &a);
     }
     const n: usize = @intCast(rows * draw_mod.W);
@@ -1820,8 +1872,7 @@ pub fn keepMany(e: *Engine, items: []const Keep) !void {
         any = any or replay > 0;
         for (0..LIN) |li| {
             const cur = s.cur[li];
-            tab[li * items.len + j] = .{ .state_in = s.recAt(cur, li), .k_save = s.sc_k[li], .v_save = s.sc_v[li], .g_save = s.sc_g[li], .b_save = s.sc_b[li],
-                .state_out = s.recAt(1 - cur, li), .rows = replay };
+            tab[li * items.len + j] = .{ .state_in = s.recAt(cur, li), .k_save = s.sc_k[li], .v_save = s.sc_v[li], .g_save = s.sc_g[li], .b_save = s.sc_b[li], .state_out = s.recAt(1 - cur, li), .rows = replay };
         }
     }
     const b = &e.buf;

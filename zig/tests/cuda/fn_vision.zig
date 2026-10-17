@@ -77,8 +77,7 @@ pub fn run(gpu: Gpu, model: []const u8, refdir: []const u8, triton: []const u8) 
         const rel = @sqrt(diff2 / ref2);
         worst_rel = @max(worst_rel, rel);
         worst_median = @min(worst_median, median);
-        std.debug.print("{s}: grid {any}, {d} features in {d:.1} ms: relative error {d:.4}, median row cosine {d:.5}, worst {d:.4}, max |diff| {d:.4}, mean |diff| {d:.5}\n",
-            .{ name, grid, rows, ms, rel, median, min_cos, max_abs, sum_abs / @as(f64, @floatFromInt(rows * 2560)) });
+        std.debug.print("{s}: grid {any}, {d} features in {d:.1} ms: relative error {d:.4}, median row cosine {d:.5}, worst {d:.4}, max |diff| {d:.4}, mean |diff| {d:.5}\n", .{ name, grid, rows, ms, rel, median, min_cos, max_abs, sum_abs / @as(f64, @floatFromInt(rows * 2560)) });
     }
     try check.expect(worst_rel <= 0.15 and worst_median >= 0.999, "relative error {d:.4}, median row cosine {d:.5} against the torch tower", .{ worst_rel, worst_median });
     check.pass("vision tower: features within torch's own CPU/CUDA noise (relative error at most {d:.4}, median row cosine at least {d:.5})", .{ worst_rel, worst_median });
@@ -123,8 +122,7 @@ pub fn prep(gpu: Gpu, refdir: []const u8) !void {
         }
         const bytes: u32 = @intFromFloat(@round(max_d * 127.5));
         worst_bytes = @max(worst_bytes, bytes);
-        std.debug.print("{s}: {d}x{d} -> grid {any} (Python {d},{d},{d}); {d} of {d} values differ, at most {d} pixel levels\n",
-            .{ name, im.w, im.h, p.grid, g[0].integer, g[1].integer, g[2].integer, differ, p.patches.len, bytes });
+        std.debug.print("{s}: {d}x{d} -> grid {any} (Python {d},{d},{d}); {d} of {d} values differ, at most {d} pixel levels\n", .{ name, im.w, im.h, p.grid, g[0].integer, g[1].integer, g[2].integer, differ, p.patches.len, bytes });
     }
     try check.expect(grids_equal and worst_bytes <= 1, "grids equal and patches within one pixel level", .{});
     check.pass("image preparation: grids equal Python's, patches within {d} pixel level(s)", .{worst_bytes});
@@ -165,8 +163,7 @@ pub fn videoPrep(gpu: Gpu, refdir: []const u8) !void {
         if (x.integer != v.indices.?[i]) same_idx = false;
     };
     const fshape = meta.get("frames").?.array.items;
-    std.debug.print("frames {d} of {d}x{d} at {d:.3} fps, indices {any} (Python {d} of {d}x{d}, same indices: {})\n",
-        .{ frames, h, w, v.fps, v.indices.?[0..frames], fshape[0].integer, fshape[1].integer, fshape[2].integer, same_idx });
+    std.debug.print("frames {d} of {d}x{d} at {d:.3} fps, indices {any} (Python {d} of {d}x{d}, same indices: {})\n", .{ frames, h, w, v.fps, v.indices.?[0..frames], fshape[0].integer, fshape[1].integer, fshape[2].integer, same_idx });
     try check.expect(same_idx and h == fshape[1].integer and w == fshape[2].integer, "sampled frames and size equal Python's", .{});
     const want_rgb = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&nb, "{s}/video.frames.u8", .{refdir}), gpa, .limited(1 << 30));
     var px_diff: usize = 0;
@@ -197,8 +194,7 @@ pub fn videoPrep(gpu: Gpu, refdir: []const u8) !void {
     }
     try text.appendSlice(gpa, "What moves in this video?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
     const same_text = std.mem.eql(u8, text.items, meta.get("expanded").?.string);
-    std.debug.print("decoded RGB: {d} of {d} bytes differ (at most {d}); patches: {d} of {d} values differ; groups {d} of {d}x{d}; expanded text equal: {}\n",
-        .{ px_diff, frames * h * w * 3, px_max, p_diff, vid.patches.len, vid.groups, vid.gh, vid.gw, same_text });
+    std.debug.print("decoded RGB: {d} of {d} bytes differ (at most {d}); patches: {d} of {d} values differ; groups {d} of {d}x{d}; expanded text equal: {}\n", .{ px_diff, frames * h * w * 3, px_max, p_diff, vid.patches.len, vid.groups, vid.gh, vid.gw, same_text });
     try check.expect(same_text, "the expanded prompt text equals Python's", .{});
     check.pass("video preparation: sampling, size and prompt text equal Python's; RGB differs in {d} bytes (at most {d} levels)", .{ px_diff, px_max });
 }

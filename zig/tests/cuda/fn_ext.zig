@@ -28,8 +28,7 @@ pub const Kernels = struct {
     pub fn init(gpu: Gpu) !Kernels {
         const text = try readPath(gpu, CUBINS ++ "/symbols.json", 1 << 22);
         defer gpu.gpa.free(text);
-        return .{ .gpu = gpu, .symbols = try std.json.parseFromSlice(std.json.Value, gpu.gpa, text, .{}),
-                  .modules = .init(gpu.gpa), .images = .empty };
+        return .{ .gpu = gpu, .symbols = try std.json.parseFromSlice(std.json.Value, gpu.gpa, text, .{}), .modules = .init(gpu.gpa), .images = .empty };
     }
 
     pub fn deinit(self: *Kernels) void {
@@ -228,17 +227,37 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const E = i32of(c.int(2));
         const T = i32of(c.int(3));
         if (P <= 1024) {
-            a.add(c.ptr(0)); a.add(i32of(P)); a.add(E); a.add(T); a.add(c.ptr(4)); a.add(c.ptr(5)); a.add(c.ptr(6));
+            a.add(c.ptr(0));
+            a.add(i32of(P));
+            a.add(E);
+            a.add(T);
+            a.add(c.ptr(4));
+            a.add(c.ptr(5));
+            a.add(c.ptr(6));
             try go(try k.find("_10_experts_cu_", "11plan_kernelE"), d1(1), 1024, 0, stream, &a);
         } else {
             const nblk = cdiv(P, 1024);
-            a.add(c.ptr(0)); a.add(i32of(P)); a.add(E); a.add(c.ptr(7)); a.add(c.ptr(8));
+            a.add(c.ptr(0));
+            a.add(i32of(P));
+            a.add(E);
+            a.add(c.ptr(7));
+            a.add(c.ptr(8));
             try go(try k.find("_10_experts_cu_", "9plan_rankE"), d1(nblk), 1024, 0, stream, &a);
             var b: cuda.Args = .{};
-            b.add(i32of(nblk)); b.add(E); b.add(T); b.add(c.ptr(8)); b.add(c.ptr(5)); b.add(c.ptr(6));
+            b.add(i32of(nblk));
+            b.add(E);
+            b.add(T);
+            b.add(c.ptr(8));
+            b.add(c.ptr(5));
+            b.add(c.ptr(6));
             try go(try k.find("_10_experts_cu_", "12plan_offsetsE"), d1(1), 1024, 0, stream, &b);
             var s: cuda.Args = .{};
-            s.add(c.ptr(0)); s.add(i32of(P)); s.add(E); s.add(c.ptr(7)); s.add(c.ptr(8)); s.add(c.ptr(4));
+            s.add(c.ptr(0));
+            s.add(i32of(P));
+            s.add(E);
+            s.add(c.ptr(7));
+            s.add(c.ptr(8));
+            s.add(c.ptr(4));
             try go(try k.find("_10_experts_cu_", "12plan_scatterE"), d1(cdiv(P, 256)), 256, 0, stream, &s);
         }
     } else if (std.mem.endsWith(u8, name, "experts_v7.run") or std.mem.endsWith(u8, name, "experts_v7.prefill")) {
@@ -247,8 +266,17 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const epi = c.int(1);
         const m: i64 = if (epi == 2) 2 else 1;
         const nb = c.int(6);
-        a.add(c.ptr(2)); a.add(i32of(c.stride(2, 0))); a.add(i32of(c.int(3))); a.add(c.ptr(4)); a.add(i32of(c.int(5)));
-        a.add(i32of(nb)); a.add(c.ptr(7)); a.add(c.ptr(8)); a.add(c.ptr(9)); a.add(c.ptr(10)); a.add(i32of(c.int(11)));
+        a.add(c.ptr(2));
+        a.add(i32of(c.stride(2, 0)));
+        a.add(i32of(c.int(3)));
+        a.add(c.ptr(4));
+        a.add(i32of(c.int(5)));
+        a.add(i32of(nb));
+        a.add(c.ptr(7));
+        a.add(c.ptr(8));
+        a.add(c.ptr(9));
+        a.add(c.ptr(10));
+        a.add(i32of(c.int(11)));
         a.add(c.float(12));
         if (prefill) {
             const t = try std.fmt.bufPrint(&tmpl_buf, "14prefill_kernelILi{d}ELi{d}ELi{d}ELi2ELi2ELi4E", .{ gs, m, epi });
@@ -278,7 +306,10 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const t = try std.fmt.bufPrint(&tmpl_buf, "12chain_kernelI{s}Li{d}ELi32E", .{ qk, rows });
         const f = try k.find("_14_gdn_prefill_cu_", t);
         for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |i| a.add(c.ptr(i));
-        a.add(ret_ptr); a.add(i32of(W)); a.add(i32of(hk)); a.add(i32of(hv));
+        a.add(ret_ptr);
+        a.add(i32of(W));
+        a.add(i32of(hk));
+        a.add(i32of(hv));
         if (W > 0) try go(f, .{ .x = @intCast(hv), .y = @intCast(@divExact(128, rows)) }, @intCast(2 * rows), 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qwen4_exp_gdn.chain")) {
         const nv = c.numel(4);
@@ -286,7 +317,8 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const t = try std.fmt.bufPrint(&tmpl_buf, "12chain_kernelILi{d}ELi{d}ELb{d}E", .{ @divExact(nv, 3), nv, @intFromBool(rows > 1) });
         const f = try k.find("_6_gdn_cu_", t);
         for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |i| a.add(c.ptr(i));
-        a.add(c.float(7)); a.add(i32of(rows));
+        a.add(c.float(7));
+        a.add(i32of(rows));
         for ([_]usize{ 9, 10, 11, 12, 13, 14, 15 }) |i| a.add(c.ptr(i));
         try go(f, d1(nv), 1024, 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qwen4_exp_gdn.replay")) {
@@ -294,7 +326,8 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const t = try std.fmt.bufPrint(&tmpl_buf, "13replay_kernelILi{d}ELi{d}E", .{ @divExact(nv, 3), nv });
         const f = try k.find("_6_gdn_cu_", t);
         for ([_]usize{ 0, 1, 2, 3, 4 }) |i| a.add(c.ptr(i));
-        a.add(i32of(c.int(5))); a.add(c.ptr(6));
+        a.add(i32of(c.int(5)));
+        a.add(c.ptr(6));
         try go(f, d1(nv), 1024, 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "gdn_io.front")) {
         const nv = c.numel(5);
@@ -307,7 +340,12 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const nv = c.dim(0, 1);
         const t = try std.fmt.bufPrint(&tmpl_buf, "11back_kernelILi{d}ELi{d}E", .{ @divExact(nv, 3), nv });
         const f = try k.find("_9_gdn_io_cu_", t);
-        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.float(3)); a.add(c.ptr(4)); a.add(c.ptr(5));
+        a.add(c.ptr(0));
+        a.add(c.ptr(1));
+        a.add(c.ptr(2));
+        a.add(c.float(3));
+        a.add(c.ptr(4));
+        a.add(c.ptr(5));
         try go(f, .{ .x = @intCast(c.dim(0, 0)), .y = @intCast(nv) }, 128, 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qmm_v5.qmm")) {
         const M = c.dim(0, 0);
@@ -328,9 +366,20 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         try f.allowDynamicShared(smem);
         const rows_t = cdiv(M, bm);
         const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K * 2)));
-        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.ptr(3)); a.add(c.ptr(4)); a.add(c.ptr(5));
-        a.add(@as(u64, 0)); a.add(i32of(M)); a.add(i32of(N)); a.add(i32of(K)); a.add(i32of(sk)); a.add(i32of(c.stride(3, 0)));
-        a.add(i32of(if (M == 1) K else c.stride(0, 0))); a.add(i32of(group));
+        a.add(c.ptr(0));
+        a.add(c.ptr(1));
+        a.add(c.ptr(2));
+        a.add(c.ptr(3));
+        a.add(c.ptr(4));
+        a.add(c.ptr(5));
+        a.add(@as(u64, 0));
+        a.add(i32of(M));
+        a.add(i32of(N));
+        a.add(i32of(K));
+        a.add(i32of(sk));
+        a.add(i32of(c.stride(3, 0)));
+        a.add(i32of(if (M == 1) K else c.stride(0, 0)));
+        a.add(i32of(group));
         try go(f, .{ .x = @intCast(rows_t * cdiv(N, 64)), .y = 1, .z = @intCast(sk) }, 128, smem, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qmm_v5.qmm_prefill")) {
         const M = c.dim(0, 0);
@@ -338,9 +387,7 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         const N = c.int(5);
         const gs = c.int(6);
         const fp32 = c.int(7) != 0;
-        const tiles = [_][5]i64{ .{ 128, 128, 2, 4, 3 }, .{ 64, 128, 1, 4, 4 }, .{ 128, 64, 2, 2, 4 }, .{ 64, 64, 1, 4, 4 },
-            .{ 128, 128, 2, 4, 4 }, .{ 128, 128, 2, 2, 3 }, .{ 128, 128, 2, 2, 4 }, .{ 128, 256, 2, 4, 3 },
-            .{ 64, 256, 1, 4, 4 }, .{ 128, 128, 2, 2, 2 }, .{ 64, 128, 1, 2, 2 }, .{ 128, 256, 2, 4, 2 } };
+        const tiles = [_][5]i64{ .{ 128, 128, 2, 4, 3 }, .{ 64, 128, 1, 4, 4 }, .{ 128, 64, 2, 2, 4 }, .{ 64, 64, 1, 4, 4 }, .{ 128, 128, 2, 4, 4 }, .{ 128, 128, 2, 2, 3 }, .{ 128, 128, 2, 2, 4 }, .{ 128, 256, 2, 4, 3 }, .{ 64, 256, 1, 4, 4 }, .{ 128, 128, 2, 2, 2 }, .{ 64, 128, 1, 2, 2 }, .{ 128, 256, 2, 4, 2 } };
         const tl = tiles[@intCast(c.int(8))];
         const bm = tl[0];
         const bn = tl[1];
@@ -350,9 +397,17 @@ pub fn launchExt(k: *Kernels, gpu: Gpu, name: []const u8, c: anytype, ret_ptr: u
         try f.allowDynamicShared(smem);
         const rows_t = cdiv(M, bm);
         const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K * 2)));
-        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.ptr(3)); a.add(c.ptr(4));
-        a.add(i32of(M)); a.add(i32of(N)); a.add(i32of(K)); a.add(i32of(c.dim(2, 1)));
-        a.add(i32of(if (M == 1) K else c.stride(0, 0))); a.add(i32of(group));
+        a.add(c.ptr(0));
+        a.add(c.ptr(1));
+        a.add(c.ptr(2));
+        a.add(c.ptr(3));
+        a.add(c.ptr(4));
+        a.add(i32of(M));
+        a.add(i32of(N));
+        a.add(i32of(K));
+        a.add(i32of(c.dim(2, 1)));
+        a.add(i32of(if (M == 1) K else c.stride(0, 0)));
+        a.add(i32of(group));
         try go(f, d1(rows_t * cdiv(N, bn)), @intCast(tl[2] * tl[3] * 32), smem, stream, &a);
     } else {
         return check.expect(false, "no launcher for {s}", .{name});
@@ -376,17 +431,37 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const E = i32of(c.int(2));
         const T = i32of(c.int(3));
         if (P <= 1024) {
-            a.add(c.ptr(0)); a.add(i32of(P)); a.add(E); a.add(T); a.add(c.ptr(4)); a.add(c.ptr(5)); a.add(c.ptr(6));
+            a.add(c.ptr(0));
+            a.add(i32of(P));
+            a.add(E);
+            a.add(T);
+            a.add(c.ptr(4));
+            a.add(c.ptr(5));
+            a.add(c.ptr(6));
             try go(try k.find("_10_experts_cu_", "11plan_kernelE"), d1(1), 1024, 0, stream, &a);
         } else {
             const nblk = cdiv(P, 1024);
-            a.add(c.ptr(0)); a.add(i32of(P)); a.add(E); a.add(c.ptr(7)); a.add(c.ptr(8));
+            a.add(c.ptr(0));
+            a.add(i32of(P));
+            a.add(E);
+            a.add(c.ptr(7));
+            a.add(c.ptr(8));
             try go(try k.find("_10_experts_cu_", "9plan_rankE"), d1(nblk), 1024, 0, stream, &a);
             var b: cuda.Args = .{};
-            b.add(i32of(nblk)); b.add(E); b.add(T); b.add(c.ptr(8)); b.add(c.ptr(5)); b.add(c.ptr(6));
+            b.add(i32of(nblk));
+            b.add(E);
+            b.add(T);
+            b.add(c.ptr(8));
+            b.add(c.ptr(5));
+            b.add(c.ptr(6));
             try go(try k.find("_10_experts_cu_", "12plan_offsetsE"), d1(1), 1024, 0, stream, &b);
             var s: cuda.Args = .{};
-            s.add(c.ptr(0)); s.add(i32of(P)); s.add(E); s.add(c.ptr(7)); s.add(c.ptr(8)); s.add(c.ptr(4));
+            s.add(c.ptr(0));
+            s.add(i32of(P));
+            s.add(E);
+            s.add(c.ptr(7));
+            s.add(c.ptr(8));
+            s.add(c.ptr(4));
             try go(try k.find("_10_experts_cu_", "12plan_scatterE"), d1(cdiv(P, 256)), 256, 0, stream, &s);
         }
     } else if (std.mem.endsWith(u8, name, "experts_v7.run") or std.mem.endsWith(u8, name, "experts_v7.prefill")) {
@@ -395,8 +470,17 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const epi = c.int(1);
         const m: i64 = if (epi == 2) 2 else 1;
         const nb = c.int(6);
-        a.add(c.ptr(2)); a.add(i32of(c.stride(2, 0))); a.add(i32of(c.int(3))); a.add(c.ptr(4)); a.add(i32of(c.int(5)));
-        a.add(i32of(nb)); a.add(c.ptr(7)); a.add(c.ptr(8)); a.add(c.ptr(9)); a.add(c.ptr(10)); a.add(i32of(c.int(11)));
+        a.add(c.ptr(2));
+        a.add(i32of(c.stride(2, 0)));
+        a.add(i32of(c.int(3)));
+        a.add(c.ptr(4));
+        a.add(i32of(c.int(5)));
+        a.add(i32of(nb));
+        a.add(c.ptr(7));
+        a.add(c.ptr(8));
+        a.add(c.ptr(9));
+        a.add(c.ptr(10));
+        a.add(i32of(c.int(11)));
         a.add(c.float(12));
         if (prefill) {
             const t = try std.fmt.bufPrint(&tmpl_buf, "14prefill_kernelILi{d}ELi{d}ELi{d}ELi2ELi2ELi4E", .{ gs, m, epi });
@@ -426,7 +510,10 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const t = try std.fmt.bufPrint(&tmpl_buf, "12chain_kernelI{s}Li{d}ELi32E", .{ qk, rows });
         const f = try k.find("_14_gdn_prefill_cu_", t);
         for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |i| a.add(c.ptr(i));
-        a.add(c.ret.?.ptr); a.add(i32of(W)); a.add(i32of(hk)); a.add(i32of(hv));
+        a.add(c.ret.?.ptr);
+        a.add(i32of(W));
+        a.add(i32of(hk));
+        a.add(i32of(hv));
         if (W > 0) try go(f, .{ .x = @intCast(hv), .y = @intCast(@divExact(128, rows)) }, @intCast(2 * rows), 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qwen4_exp_gdn.chain")) {
         const nv = c.numel(4);
@@ -434,7 +521,8 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const t = try std.fmt.bufPrint(&tmpl_buf, "12chain_kernelILi{d}ELi{d}ELb{d}E", .{ @divExact(nv, 3), nv, @intFromBool(rows > 1) });
         const f = try k.find("_6_gdn_cu_", t);
         for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |i| a.add(c.ptr(i));
-        a.add(c.float(7)); a.add(i32of(rows));
+        a.add(c.float(7));
+        a.add(i32of(rows));
         for ([_]usize{ 9, 10, 11, 12, 13, 14, 15 }) |i| a.add(c.ptr(i));
         try go(f, d1(nv), 1024, 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qwen4_exp_gdn.replay")) {
@@ -442,7 +530,8 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const t = try std.fmt.bufPrint(&tmpl_buf, "13replay_kernelILi{d}ELi{d}E", .{ @divExact(nv, 3), nv });
         const f = try k.find("_6_gdn_cu_", t);
         for ([_]usize{ 0, 1, 2, 3, 4 }) |i| a.add(c.ptr(i));
-        a.add(i32of(c.int(5))); a.add(c.ptr(6));
+        a.add(i32of(c.int(5)));
+        a.add(c.ptr(6));
         try go(f, d1(nv), 1024, 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "gdn_io.front")) {
         const nv = c.numel(5);
@@ -455,7 +544,12 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const nv = c.dim(0, 1);
         const t = try std.fmt.bufPrint(&tmpl_buf, "11back_kernelILi{d}ELi{d}E", .{ @divExact(nv, 3), nv });
         const f = try k.find("_9_gdn_io_cu_", t);
-        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.float(3)); a.add(c.ptr(4)); a.add(c.ptr(5));
+        a.add(c.ptr(0));
+        a.add(c.ptr(1));
+        a.add(c.ptr(2));
+        a.add(c.float(3));
+        a.add(c.ptr(4));
+        a.add(c.ptr(5));
         try go(f, .{ .x = @intCast(c.dim(0, 0)), .y = @intCast(nv) }, 128, 0, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qmm_v5.qmm")) {
         const M = c.dim(0, 0);
@@ -476,9 +570,20 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         try f.allowDynamicShared(smem);
         const rows_t = cdiv(M, bm);
         const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K * 2)));
-        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.ptr(3)); a.add(c.ptr(4)); a.add(c.ptr(5));
-        a.add(@as(u64, 0)); a.add(i32of(M)); a.add(i32of(N)); a.add(i32of(K)); a.add(i32of(sk)); a.add(i32of(c.stride(3, 0)));
-        a.add(i32of(if (M == 1) K else c.stride(0, 0))); a.add(i32of(group));
+        a.add(c.ptr(0));
+        a.add(c.ptr(1));
+        a.add(c.ptr(2));
+        a.add(c.ptr(3));
+        a.add(c.ptr(4));
+        a.add(c.ptr(5));
+        a.add(@as(u64, 0));
+        a.add(i32of(M));
+        a.add(i32of(N));
+        a.add(i32of(K));
+        a.add(i32of(sk));
+        a.add(i32of(c.stride(3, 0)));
+        a.add(i32of(if (M == 1) K else c.stride(0, 0)));
+        a.add(i32of(group));
         try go(f, .{ .x = @intCast(rows_t * cdiv(N, 64)), .y = 1, .z = @intCast(sk) }, 128, smem, stream, &a);
     } else if (std.mem.endsWith(u8, name, "qmm_v5.qmm_prefill")) {
         const M = c.dim(0, 0);
@@ -486,9 +591,7 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         const N = c.int(5);
         const gs = c.int(6);
         const fp32 = c.int(7) != 0;
-        const tiles = [_][5]i64{ .{ 128, 128, 2, 4, 3 }, .{ 64, 128, 1, 4, 4 }, .{ 128, 64, 2, 2, 4 }, .{ 64, 64, 1, 4, 4 },
-            .{ 128, 128, 2, 4, 4 }, .{ 128, 128, 2, 2, 3 }, .{ 128, 128, 2, 2, 4 }, .{ 128, 256, 2, 4, 3 },
-            .{ 64, 256, 1, 4, 4 }, .{ 128, 128, 2, 2, 2 }, .{ 64, 128, 1, 2, 2 }, .{ 128, 256, 2, 4, 2 } };
+        const tiles = [_][5]i64{ .{ 128, 128, 2, 4, 3 }, .{ 64, 128, 1, 4, 4 }, .{ 128, 64, 2, 2, 4 }, .{ 64, 64, 1, 4, 4 }, .{ 128, 128, 2, 4, 4 }, .{ 128, 128, 2, 2, 3 }, .{ 128, 128, 2, 2, 4 }, .{ 128, 256, 2, 4, 3 }, .{ 64, 256, 1, 4, 4 }, .{ 128, 128, 2, 2, 2 }, .{ 64, 128, 1, 2, 2 }, .{ 128, 256, 2, 4, 2 } };
         const tl = tiles[@intCast(c.int(8))];
         const bm = tl[0];
         const bn = tl[1];
@@ -498,9 +601,17 @@ pub fn extCall(gpu: Gpu, dir: []const u8) !void {
         try f.allowDynamicShared(smem);
         const rows_t = cdiv(M, bm);
         const group = @max(1, @min(rows_t, @divFloor(@as(i64, 12 << 20), bm * K * 2)));
-        a.add(c.ptr(0)); a.add(c.ptr(1)); a.add(c.ptr(2)); a.add(c.ptr(3)); a.add(c.ptr(4));
-        a.add(i32of(M)); a.add(i32of(N)); a.add(i32of(K)); a.add(i32of(c.dim(2, 1)));
-        a.add(i32of(if (M == 1) K else c.stride(0, 0))); a.add(i32of(group));
+        a.add(c.ptr(0));
+        a.add(c.ptr(1));
+        a.add(c.ptr(2));
+        a.add(c.ptr(3));
+        a.add(c.ptr(4));
+        a.add(i32of(M));
+        a.add(i32of(N));
+        a.add(i32of(K));
+        a.add(i32of(c.dim(2, 1)));
+        a.add(i32of(if (M == 1) K else c.stride(0, 0)));
+        a.add(i32of(group));
         try go(f, d1(rows_t * cdiv(N, bn)), @intCast(tl[2] * tl[3] * 32), smem, stream, &a);
     } else {
         return check.expect(false, "no launcher for {s}", .{name});

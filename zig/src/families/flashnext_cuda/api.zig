@@ -21,9 +21,7 @@ pub fn dtypeBytes(t: DType) usize {
 }
 
 pub fn parseDType(s: []const u8) ?DType {
-    const map = std.StaticStringMap(DType).initComptime(.{ .{ "bfloat16", .bf16 }, .{ "float16", .f16 },
-        .{ "float32", .f32 }, .{ "int32", .i32 }, .{ "int64", .i64 }, .{ "uint8", .u8 }, .{ "int8", .i8 },
-        .{ "int16", .i16 }, .{ "float8_e4m3fn", .f8e4m3 }, .{ "bool", .bool_ } });
+    const map = std.StaticStringMap(DType).initComptime(.{ .{ "bfloat16", .bf16 }, .{ "float16", .f16 }, .{ "float32", .f32 }, .{ "int32", .i32 }, .{ "int64", .i64 }, .{ "uint8", .u8 }, .{ "int8", .i8 }, .{ "int16", .i16 }, .{ "float8_e4m3fn", .f8e4m3 }, .{ "bool", .bool_ } });
     return map.get(s);
 }
 
@@ -137,9 +135,7 @@ pub const Kernels = struct {
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, device: cuda.abi.Device, triton_dir: []const u8) !Kernels {
         var k: Kernels = .{ .triton = try cuda.aot.Set.load(gpa, io, d, device, triton_dir), .ext = undefined };
-        const images = [_][]const u8{ cuda.kernels.fn_experts, cuda.kernels.fn_experts_prefill, cuda.kernels.fn_gdn_prefill,
-            cuda.kernels.fn_qmm, cuda.kernels.fn_qmm_prefill, cuda.kernels.fn_gdn, cuda.kernels.fn_gdn_io, cuda.kernels.fn_sample, cuda.kernels.fn_vision,
-            cuda.kernels.fn_gdn_multi };
+        const images = [_][]const u8{ cuda.kernels.fn_experts, cuda.kernels.fn_experts_prefill, cuda.kernels.fn_gdn_prefill, cuda.kernels.fn_qmm, cuda.kernels.fn_qmm_prefill, cuda.kernels.fn_gdn, cuda.kernels.fn_gdn_io, cuda.kernels.fn_sample, cuda.kernels.fn_vision, cuda.kernels.fn_gdn_multi };
         for (images, 0..) |img, i| k.ext[i] = try cuda.Module.load(d, img);
         return k;
     }

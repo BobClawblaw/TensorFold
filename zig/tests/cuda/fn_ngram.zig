@@ -20,7 +20,7 @@ pub const NGram = struct {
     lut: [256]u16,
     files: []std.Io.File,
     offs: []u64,
-    tables: [][]const u8 = &.{},        // each shard's rows, memory-mapped (``map``)
+    tables: [][]const u8 = &.{}, // each shard's rows, memory-mapped (``map``)
     history: [8]i64 = undefined,
     hlen: usize = 0,
     vocab_offset: i64 = 0,
@@ -36,17 +36,13 @@ pub const NGram = struct {
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
         const p = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
         const o = p.value.object;
-        var g: NGram = .{ .gpa = gpa, .io = io, .n = @intCast(o.get("n").?.integer), .per = @intCast(o.get("per_ngram").?.integer),
-            .heads = @intCast(o.get("heads").?.integer), .eos = o.get("eos").?.integer, .width = @intCast(o.get("width").?.integer),
-            .sizes = try ints(gpa, o.get("head_sizes").?), .offsets = try ints(gpa, o.get("head_offsets").?),
-            .mult = try ints(gpa, o.get("multipliers").?), .starts = try ints(gpa, o.get("starts").?), .lut = undefined,
-            .files = undefined, .offs = undefined, .vocab_offset = o.get("vocab_offset").?.integer };
+        var g: NGram = .{ .gpa = gpa, .io = io, .n = @intCast(o.get("n").?.integer), .per = @intCast(o.get("per_ngram").?.integer), .heads = @intCast(o.get("heads").?.integer), .eos = o.get("eos").?.integer, .width = @intCast(o.get("width").?.integer), .sizes = try ints(gpa, o.get("head_sizes").?), .offsets = try ints(gpa, o.get("head_offsets").?), .mult = try ints(gpa, o.get("multipliers").?), .starts = try ints(gpa, o.get("starts").?), .lut = undefined, .files = undefined, .offs = undefined, .vocab_offset = o.get("vocab_offset").?.integer };
         for (o.get("lut").?.array.items, 0..) |x, i| g.lut[i] = @intCast(x.integer);
         const shards = o.get("shards").?.array.items;
         g.files = try gpa.alloc(std.Io.File, shards.len);
         g.offs = try gpa.alloc(u64, shards.len);
         for (shards, 0..) |s, i| {
-            const f = s.object.get("file").?.string;           // a container path under /cache/tf
+            const f = s.object.get("file").?.string; // a container path under /cache/tf
             const host = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ CACHE, f["/cache/tf/".len..] });
             g.files[i] = try std.Io.Dir.cwd().openFile(io, host, .{});
             g.offs[i] = @intCast(s.object.get("offset").?.integer);
@@ -106,7 +102,7 @@ pub const NGram = struct {
         @memcpy(seq[self.hlen..], tokens);
         const seg = try gpa.alloc(i64, w);
         defer gpa.free(seg);
-        var last_eos: i64 = -1;                     // the latest EOS strictly before p
+        var last_eos: i64 = -1; // the latest EOS strictly before p
         for (0..w) |p| {
             seg[p] = @as(i64, @intCast(p)) - (last_eos + 1);
             if (seq[p] == self.eos) last_eos = @intCast(p);

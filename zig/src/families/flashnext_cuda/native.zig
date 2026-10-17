@@ -20,7 +20,6 @@ pub const prompt_rows: u32 = 2048;
 pub const two_ranks = true;
 
 /// Structured output: rank 0 masks each window's grammar rows (gramRows), rank 1 the same rows from its frames.
-
 pub const Options = struct {
     context: usize,
     drafts: bool,
@@ -53,9 +52,9 @@ pub fn deviceWeightBytes(io: std.Io, dir: []const u8) u64 {
     return weights.deviceBytes(io, dir) catch 40 << 30;
 }
 
-const max_rows = 16;            // a verify window's rows at most (pending + 15 drafts)
-const batch_rows = 128;         // a shared round's rows at most, every stream's window together (16 streams x 8)
-const max_streams = 16;         // streams a shared round packs at most
+const max_rows = 16; // a verify window's rows at most (pending + 15 drafts)
+const batch_rows = 128; // a shared round's rows at most, every stream's window together (16 streams x 8)
+const max_streams = 16; // streams a shared round packs at most
 const max_depth = max_rows - 1;
 /// Rows a stream's caches are backed past what its next forward writes before rank 1 hears of it: a verify window,
 /// the kept rows and the head's drafts after it all fall within (so the forwards' own growth finds them mapped).
@@ -120,11 +119,11 @@ const Reader = struct {
 const Lane = struct {
     seq: *forward.Seq,
     id: u64,
-    held: [max_depth]u32 = undefined,   // drafts held for the next window
-    probs: [max_depth]f64 = undefined,  // the head's chance for each (0 past the confidence cut)
+    held: [max_depth]u32 = undefined, // drafts held for the next window
+    probs: [max_depth]f64 = undefined, // the head's chance for each (0 past the confidence cut)
     nheld: u32 = 0,
-    rows: u32 = 0,                      // the last verify's rows, not yet committed (0: nothing pending)
-    first: u64 = 0,                     // the prompt's first token (a handle: readFn)
+    rows: u32 = 0, // the last verify's rows, not yet committed (0: nothing pending)
+    first: u64 = 0, // the prompt's first token (a handle: readFn)
 };
 
 /// A released sequence kept to resume from (multi.py's kept): its prompt to the kept point, rank 1's id for it.
@@ -237,9 +236,9 @@ const Owned = struct {
     store: api.Store,
     e: *forward.Engine,
     lanes_by: std.AutoHashMap(*lanes.Stream, Lane),
-    by_id: std.AutoHashMap(u64, *forward.Seq),    // rank 1's sequences, by rank 0's stream id
-    tower: ?vision.Tower = null,                  // rank 0, with vision: the image encoder
-    images: std.AutoHashMap(u64, []u8),           // rank 1: an image frame waiting for its prefill, by stream id
+    by_id: std.AutoHashMap(u64, *forward.Seq), // rank 1's sequences, by rank 0's stream id
+    tower: ?vision.Tower = null, // rank 0, with vision: the image encoder
+    images: std.AutoHashMap(u64, []u8), // rank 1: an image frame waiting for its prefill, by stream id
     next_id: u64 = 1,
     drawn: [64]u32 = undefined,
     next: u64 = 0,
@@ -284,7 +283,7 @@ const Owned = struct {
     }
 
     fn send(self: *Owned, op: Op, w: *Writer) !void {
-        try self.link.send(@intFromEnum(op), w.buf.items);
+        try self.link.send(@backingInt(op), w.buf.items);
         w.buf.clearRetainingCapacity();
     }
 
@@ -335,10 +334,10 @@ const Owned = struct {
     fn settleGrowth(self: *Owned, grown: ?bool, prompts: []const forward.Prompt) !bool {
         var ok = grown orelse return true;
         while (true) {
-            try self.link.send(@intFromEnum(Op.grow), &.{@intFromBool(ok)});
+            try self.link.send(@backingInt(Op.grow), &.{@intFromBool(ok)});
             const v = try self.link.recv(self.gpa);
             defer self.gpa.free(v.bytes);
-            if (v.tag != @intFromEnum(Op.grow) or v.bytes.len == 0) return error.RankZeroOutOfStep;
+            if (v.tag != @backingInt(Op.grow) or v.bytes.len == 0) return error.RankZeroOutOfStep;
             if (v.bytes[0] != 2) return v.bytes[0] == 1;
             if (v.bytes.len != 9) return error.RankZeroOutOfStep;
             if (self.by_id.fetchRemove(std.mem.readInt(u64, v.bytes[1..9], .little))) |kv| self.retire(kv.value);
@@ -356,13 +355,13 @@ const Owned = struct {
         var b: [9]u8 = undefined;
         b[0] = code;
         if (drop) |id| std.mem.writeInt(u64, b[1..9], id, .little);
-        try self.link.send(@intFromEnum(Op.grow), b[0..if (drop != null) 9 else 1]);
+        try self.link.send(@backingInt(Op.grow), b[0..if (drop != null) 9 else 1]);
     }
 
     /// Rank 1's answer to a growth it was asked for (a .grow frame, or a prompt frame's): 1 a byte where it grew.
     fn answer(self: *Owned, n: usize) ![]u8 {
         const m = try self.link.recv(self.gpa);
-        if (m.tag != @intFromEnum(Op.grow) or m.bytes.len != n) {
+        if (m.tag != @backingInt(Op.grow) or m.bytes.len != n) {
             self.gpa.free(m.bytes);
             return error.RankOneOutOfStep;
         }
@@ -469,15 +468,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.io = io;
     own.rank = o.rank;
     // the link and the communicator first, while memory is fresh (NCCL registers its buffers at its first use)
-    own.link = if (o.rank == 0) try cuda.tp_link.Link.lead(o.master_port, 600_000)
-        else try cuda.tp_link.Link.follow(io, try std.Io.net.IpAddress.parse(o.master orelse return error.NoMaster, o.master_port), 600_000);
+    own.link = if (o.rank == 0) try cuda.tp_link.Link.lead(o.master_port, 600_000) else try cuda.tp_link.Link.follow(io, try std.Io.net.IpAddress.parse(o.master orelse return error.NoMaster, o.master_port), 600_000);
     errdefer own.link.close();
     own.nccl = try cuda.nccl.Library.open();
     errdefer own.nccl.close();
     const comm = try cuda.tp_link.communicator(&own.nccl, own.link);
     own.ctx = .{ .d = ctx.d, .ctx = ctx, .stream = try cuda.Stream.init(ctx.d, true), .nccl = &own.nccl, .comm = comm, .rank = o.rank };
     { // NCCL connects (and registers its buffers) at its first collective: here, before weights and tables take the
-      // memory (a GB10 worker refuses the registration once they are resident)
+        // memory (a GB10 worker refuses the registration once they are resident)
         var warm = try cuda.DeviceBuffer.alloc(ctx.d, 4096);
         defer warm.free();
         try own.nccl.check(own.nccl.api.ncclAllGather(warm.ptr, warm.ptr + 2048, 256, .i32, comm, own.ctx.stream.handle), "warm gather");
@@ -496,7 +494,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer forward.deinit(own.e);
     try forward.prefetchTables(own.e); // the n-gram tables paged in (and locked) before the first request
     { // the sequences' caches grow within what is free now, less the server's reserve and a margin (a GB10 shares
-      // its memory with the host: past this a growth is refused instead of starving the system)
+        // its memory with the host: past this a growth is refused instead of starving the system)
         var free: usize = 0;
         var total: usize = 0;
         try ctx.d.check(ctx.d.api.cuMemGetInfo_v2(&free, &total), "cuMemGetInfo");
@@ -506,10 +504,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // both halves loaded before rank 0 serves: rank 1 says so once its engine is up (it loads more slowly)
     // and with its growth budget: rank 0 grows within the smaller of the two, so rank 1's growth (the same as rank 0's)
     // fits its own budget too
-    if (o.rank == 1) try own.link.send(@intFromEnum(Op.ready), std.mem.asBytes(&own.e.budget.cap)) else {
+    if (o.rank == 1) try own.link.send(@backingInt(Op.ready), std.mem.asBytes(&own.e.budget.cap)) else {
         const m = try own.link.recv(gpa);
         defer gpa.free(m.bytes);
-        if (m.tag != @intFromEnum(Op.ready)) return error.RankOneNotReady;
+        if (m.tag != @backingInt(Op.ready)) return error.RankOneNotReady;
         if (m.bytes.len == 8) forward.setGrowthBudget(own.e, @min(own.e.budget.cap, std.mem.readInt(u64, m.bytes[0..8], .little)));
     }
     own.lanes_by = .init(gpa);
@@ -530,18 +528,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.mtp_ms = 0;
     if (o.rank == 0) { // rank 1 replays it in its follow loop, then hears it ended
         try calibrate(own, o.drafts);
-        try own.link.send(@intFromEnum(Op.ready), "");
+        try own.link.send(@backingInt(Op.ready), "");
         growthLimit(own.e);
     }
     // the calibration's sequence is not kept: the server budgets streams from the memory left after open
     while (own.spares.pop()) |sp| forward.freeSeq(own.e, sp);
     return .{
         .backend = .{ .ptr = own, .vtable = &vtable },
-        .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1,
-                    .hidden_rows = o.drafts, .max_streams = if (o.drafts) max_streams else 1, .batch_rows = batch_rows,
-                    .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms,
-                    .shared_costs = own.shared[0..own.shared_count],
-                    .draft_probabilities = o.drafts, .draft_streams = o.drafts },
+        .facts = .{ .exact_width = max_rows, .mtp = o.drafts, .speculate = o.drafts, .speculate_early = false, .drafts = if (o.drafts) max_depth else 1, .hidden_rows = o.drafts, .max_streams = if (o.drafts) max_streams else 1, .batch_rows = batch_rows, .window_costs = own.costs[0..own.cost_count], .mtp_step_ms = own.mtp_ms, .shared_costs = own.shared[0..own.shared_count], .draft_probabilities = o.drafts, .draft_streams = o.drafts },
         .rows = if (o.drafts) max_rows else 1,
         .stream_bytes = forward.seqBytes(own.e),
         .ctx = own,
@@ -621,8 +615,7 @@ fn calibrate(self: *Owned, drafts: bool) !void {
     }
     self.mtp_ms = @max(0, (at[1] - at[0]) / 7);
     try calibrateShared(self);
-    std.log.info("flash next costs: window 1/4/8/16 rows {d:.1}/{d:.1}/{d:.1}/{d:.1} ms, head step {d:.2} ms", .{
-        self.costs[0].ms, self.costs[3].ms, self.costs[7].ms, self.costs[15].ms, self.mtp_ms });
+    std.log.info("flash next costs: window 1/4/8/16 rows {d:.1}/{d:.1}/{d:.1}/{d:.1} ms, head step {d:.2} ms", .{ self.costs[0].ms, self.costs[3].ms, self.costs[7].ms, self.costs[15].ms, self.mtp_ms });
 }
 
 /// Shared rounds timed on throwaway sequences: 2-row windows over 2, 4, 8 and 16 streams and 4-, 6- and 8-row windows
@@ -686,8 +679,7 @@ fn calibrateShared(self: *Owned) !void {
         self.shared[self.shared_count] = .{ .width = @intCast(n * rows), .ms = best };
         self.shared_count += 1;
     }
-    std.log.info("flash next shared rounds: 4/8/16/32/64/96/128 rows {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} ms", .{
-        self.shared[0].ms, self.shared[1].ms, self.shared[2].ms, self.shared[3].ms, self.shared[4].ms, self.shared[5].ms, self.shared[6].ms });
+    std.log.info("flash next shared rounds: 4/8/16/32/64/96/128 rows {d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1}/{d:.1} ms", .{ self.shared[0].ms, self.shared[1].ms, self.shared[2].ms, self.shared[3].ms, self.shared[4].ms, self.shared[5].ms, self.shared[6].ms });
 }
 
 /// The streams admission budgeted (native/cuda.zig after open): kept prompt states stay within them.
@@ -708,7 +700,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
-    if (own.rank == 0) own.link.send(@intFromEnum(Op.stop), "") catch {};
+    if (own.rank == 0) own.link.send(@backingInt(Op.stop), "") catch {};
     while (own.spares.pop()) |s| forward.freeSeq(own.e, s);
     own.spares.deinit(own.gpa);
     forward.deinit(own.e);
@@ -811,7 +803,7 @@ fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         }
         return error.OutOfDeviceMemory;
     }
-    if (frame) |f| try self.link.send(@intFromEnum(Op.image), f);
+    if (frame) |f| try self.link.send(@backingInt(Op.image), f);
     try self.send(.prefill, &w);
     try agree(self, &.{pr}); // the lane is released as any failed one when either rank is short
     if (pos) |q| try forward.attach(self.e, pr.s, q.rows, feats.?.ptr, q.pos, q.delta);
@@ -916,7 +908,6 @@ fn prefillManyFn(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
     for (ss, 0..) |s, k| self.lanes_by.getPtr(s).?.first = self.take(firsts[k]);
     return true;
 }
-
 
 /// A prompt frame's growth, both ranks at once: rank 0 backs its prompts' caches while rank 1 backs its own from the
 /// frame, then rank 1's answer and rank 0's verdict (rank 1 runs the pass only on a go); error.OutOfDeviceMemory,
@@ -1327,7 +1318,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
         };
         defer self.gpa.free(m.bytes);
         var r: Reader = .{ .bytes = m.bytes };
-        switch (@as(Op, @enumFromInt(m.tag))) {
+        switch (@as(Op, @fromBackingInt(@intCast(m.tag)))) {
             .image => {
                 const id = try r.int();
                 try self.images.put(id, try self.gpa.dupe(u8, m.bytes));
@@ -1414,7 +1405,7 @@ fn followLoop(p: *anyopaque) anyerror!void {
                         else => return err,
                     };
                 }
-                try self.link.send(@intFromEnum(Op.grow), oks[0..n]);
+                try self.link.send(@backingInt(Op.grow), oks[0..n]);
             },
             .drafts => {
                 const n: usize = @intCast(try r.int());

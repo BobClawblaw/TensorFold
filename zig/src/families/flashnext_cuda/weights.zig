@@ -72,8 +72,7 @@ const Ckpt = struct {
             const shape = try a.alloc(i64, shp.len);
             for (shp, 0..) |x, i| shape[i] = x.integer;
             const offs = o.get("data_offsets").?.array.items;
-            try ck.entries.put(e.key_ptr.*, .{ .dtype = o.get("dtype").?.string, .shape = shape,
-                .begin = 8 + n + @as(u64, @intCast(offs[0].integer)), .end = 8 + n + @as(u64, @intCast(offs[1].integer)), .file = f });
+            try ck.entries.put(e.key_ptr.*, .{ .dtype = o.get("dtype").?.string, .shape = shape, .begin = 8 + n + @as(u64, @intCast(offs[0].integer)), .end = 8 + n + @as(u64, @intCast(offs[1].integer)), .file = f });
         }
     }
 
@@ -404,8 +403,7 @@ const Builder = struct {
         }
         for (parts.items, 0..) |p, j| {
             const shape = [_]i64{ @intCast(p.n), @intCast(p.k) };
-            try b.putf("{s}.parts.{d}.weight", .{ prefix, j }, if (p.q8) .i8 else .bf16, &shape,
-                if (p.w) |w| w else null);
+            try b.putf("{s}.parts.{d}.weight", .{ prefix, j }, if (p.q8) .i8 else .bf16, &shape, if (p.w) |w| w else null);
             if (p.q8) {
                 const ss = [_]i64{ @intCast(p.n), @intCast(p.k / p.gs) };
                 try b.putf("{s}.parts.{d}.scale", .{ prefix, j }, .f32, &ss, if (p.s) |s| std.mem.sliceAsBytes(s) else null);
@@ -654,8 +652,7 @@ fn readTriple(b: *Builder, name: []const u8, r0: usize, r1: usize, cols: ?[2]usi
     const nr = r1 - r0;
     const ok8 = (c1 - c0) / 8;
     const okg = (c1 - c0) / gs;
-    var t: Triple = .{ .e = e, .n = nr, .k8 = ok8, .kg = okg, .words = try b.gpa.alloc(u32, e * nr * ok8),
-        .scales = try b.gpa.alloc(u16, e * nr * okg), .biases = try b.gpa.alloc(u16, e * nr * okg) };
+    var t: Triple = .{ .e = e, .n = nr, .k8 = ok8, .kg = okg, .words = try b.gpa.alloc(u32, e * nr * ok8), .scales = try b.gpa.alloc(u16, e * nr * okg), .biases = try b.gpa.alloc(u16, e * nr * okg) };
     errdefer t.free(b.gpa);
     var nb3: [256]u8 = undefined;
     const be = try b.ck.get(try std.fmt.bufPrint(&nb3, "{s}.biases", .{name}));
@@ -793,16 +790,29 @@ const Cfg = struct {
         const head_dim = int.f(t, "head_dim");
         const partial = int.fl(rope.get("partial_rotary_factor") orelse std.json.Value{ .float = 0.25 });
         var c: Cfg = .{
-            .hidden = int.f(t, "hidden_size"), .layers = int.f(t, "num_hidden_layers"), .vocab = int.f(t, "vocab_size"),
-            .heads = int.f(t, "num_attention_heads"), .kv_heads = int.f(t, "num_key_value_heads"), .head_dim = head_dim,
-            .rope_theta = int.fl(rope.get("rope_theta").?), .rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * partial),
-            .nk = int.f(t, "linear_num_key_heads"), .nv = int.f(t, "linear_num_value_heads"),
-            .dk = int.f(t, "linear_key_head_dim"), .dv = int.f(t, "linear_value_head_dim"),
-            .conv_kernel = int.f(t, "linear_conv_kernel_dim"), .conv_dim = 0, .experts = int.f(t, "num_experts"),
-            .moe_width = int.f(t, "moe_intermediate_size"), .streams = int.f(t, "hc_count"),
-            .ple_dim = int.f(t, "ple_embed_dim"), .ngram_size = int.f(t, "ngram_size"),
-            .per_ngram = int.f(t, "heads_per_ngram"), .divisor = int.f(t, "make_ngram_vocab_size_divisible_by"),
-            .shards = int.f(t, "split_ngram_parts"), .ple_eos = t.get("eos_token_id").?.integer,
+            .hidden = int.f(t, "hidden_size"),
+            .layers = int.f(t, "num_hidden_layers"),
+            .vocab = int.f(t, "vocab_size"),
+            .heads = int.f(t, "num_attention_heads"),
+            .kv_heads = int.f(t, "num_key_value_heads"),
+            .head_dim = head_dim,
+            .rope_theta = int.fl(rope.get("rope_theta").?),
+            .rotary_dim = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * partial),
+            .nk = int.f(t, "linear_num_key_heads"),
+            .nv = int.f(t, "linear_num_value_heads"),
+            .dk = int.f(t, "linear_key_head_dim"),
+            .dv = int.f(t, "linear_value_head_dim"),
+            .conv_kernel = int.f(t, "linear_conv_kernel_dim"),
+            .conv_dim = 0,
+            .experts = int.f(t, "num_experts"),
+            .moe_width = int.f(t, "moe_intermediate_size"),
+            .streams = int.f(t, "hc_count"),
+            .ple_dim = int.f(t, "ple_embed_dim"),
+            .ngram_size = int.f(t, "ngram_size"),
+            .per_ngram = int.f(t, "heads_per_ngram"),
+            .divisor = int.f(t, "make_ngram_vocab_size_divisible_by"),
+            .shards = int.f(t, "split_ngram_parts"),
+            .ple_eos = t.get("eos_token_id").?.integer,
             .group_size = @intCast(q.get("group_size").?.integer),
         };
         c.conv_dim = 2 * c.nk * c.dk + c.nv * c.dv;
@@ -813,11 +823,7 @@ const Cfg = struct {
         }
         const kind = if (rope.get("rope_type")) |v| v.string else "default";
         if (std.mem.eql(u8, kind, "yarn")) {
-            c.yarn = .{ .factor = int.fl(rope.get("factor").?), .original = int.fl(rope.get("original_max_position_embeddings").?),
-                .beta_fast = if (rope.get("beta_fast")) |v| int.fl(v) else 32, .beta_slow = if (rope.get("beta_slow")) |v| int.fl(v) else 1,
-                .truncate = if (rope.get("truncate")) |v| v.bool else true,
-                .attention = if (rope.get("attention_factor")) |v| int.fl(v) else null,
-                .mscale = if (rope.get("mscale")) |v| int.fl(v) else null, .mscale_all = if (rope.get("mscale_all_dim")) |v| int.fl(v) else null };
+            c.yarn = .{ .factor = int.fl(rope.get("factor").?), .original = int.fl(rope.get("original_max_position_embeddings").?), .beta_fast = if (rope.get("beta_fast")) |v| int.fl(v) else 32, .beta_slow = if (rope.get("beta_slow")) |v| int.fl(v) else 1, .truncate = if (rope.get("truncate")) |v| v.bool else true, .attention = if (rope.get("attention_factor")) |v| int.fl(v) else null, .mscale = if (rope.get("mscale")) |v| int.fl(v) else null, .mscale_all = if (rope.get("mscale_all_dim")) |v| int.fl(v) else null };
         }
         return c;
     }
@@ -844,7 +850,9 @@ fn rotaryInv(c: *const Cfg, out: []f32) f64 {
         }
     };
     const attention = y.attention orelse if (y.mscale != null and y.mscale_all != null and y.mscale.? != 0 and y.mscale_all.? != 0)
-        mscaleOf.f(y.factor, y.mscale.?) / mscaleOf.f(y.factor, y.mscale_all.?) else mscaleOf.f(y.factor, 1.0);
+        mscaleOf.f(y.factor, y.mscale.?) / mscaleOf.f(y.factor, y.mscale_all.?)
+    else
+        mscaleOf.f(y.factor, 1.0);
     const corr = struct {
         fn f(d: f64, original: f64, base: f64, rot: f64) f64 {
             return (d * @log(original / (rot * 2 * std.math.pi))) / (2 * @log(base));
@@ -939,8 +947,7 @@ fn layer(b: *Builder, c: *const Cfg, out: []const u8, base: []const u8, linear: 
         try b.cscale(try std.fmt.bufPrint(&nb2, "{s}.ple.norm_key", .{out}), try std.fmt.bufPrint(&nb, "{s}.norm_key", .{p}), false);
         try b.cscale(try std.fmt.bufPrint(&nb2, "{s}.ple.norm_query", .{out}), try std.fmt.bufPrint(&nb, "{s}.norm_query", .{p}), false);
         try b.cscale(try std.fmt.bufPrint(&nb2, "{s}.ple.norm_conv", .{out}), try std.fmt.bufPrint(&nb, "{s}.norm_conv", .{p}), false);
-        try b.rawBf16(try std.fmt.bufPrint(&nb2, "{s}.ple.conv", .{out}), try std.fmt.bufPrint(&nb, "{s}.conv1d.weight", .{p}),
-            &.{ @intCast(c.streams * c.hidden), @intCast(c.conv_kernel) });
+        try b.rawBf16(try std.fmt.bufPrint(&nb2, "{s}.ple.conv", .{out}), try std.fmt.bufPrint(&nb, "{s}.conv1d.weight", .{p}), &.{ @intCast(c.streams * c.hidden), @intCast(c.conv_kernel) });
     }
 }
 
@@ -1101,8 +1108,7 @@ fn ngramJson(gpa: std.mem.Allocator, ck: *const Ckpt, c: *const Cfg, rank: usize
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     const w = &out.writer;
-    try w.print("{{\"n\": {d}, \"per_ngram\": {d}, \"heads\": {d}, \"eos\": {d}, \"dims\": {d}, \"head_sizes\": [", .{
-        c.ngram_size, c.per_ngram, heads, c.ple_eos, c.ple_dim / heads });
+    try w.print("{{\"n\": {d}, \"per_ngram\": {d}, \"heads\": {d}, \"eos\": {d}, \"dims\": {d}, \"head_sizes\": [", .{ c.ngram_size, c.per_ngram, heads, c.ple_eos, c.ple_dim / heads });
     for (sizes, 0..) |x, i| try w.print("{s}{d}", .{ if (i > 0) ", " else "", x });
     try w.writeAll("], \"head_offsets\": [");
     for (offsets, 0..) |x, i| try w.print("{s}{d}", .{ if (i > 0) ", " else "", x });
@@ -1124,8 +1130,7 @@ fn ngramJson(gpa: std.mem.Allocator, ck: *const Ckpt, c: *const Cfg, rank: usize
         if (width < 0) width = e.shape[1];
         if (e.shape[1] != width) return error.UnevenNgramShards;
         try starts.append(gpa, starts.items[starts.items.len - 1] + e.shape[0]);
-        try shard_text.writer.print("{s}{{\"file\": \"{s}\", \"offset\": {d}, \"rows\": {d}}}", .{
-            if (i > 0) ", " else "", ck.paths.items[e.file], e.begin, e.shape[0] });
+        try shard_text.writer.print("{s}{{\"file\": \"{s}\", \"offset\": {d}, \"rows\": {d}}}", .{ if (i > 0) ", " else "", ck.paths.items[e.file], e.begin, e.shape[0] });
     }
     if (starts.items[starts.items.len - 1] != rows) return error.NgramRowsMismatch;
     try w.print("], \"width\": {d}, \"rows\": {d}, \"starts\": [", .{ width, rows });
@@ -1158,10 +1163,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const api.Ctx, kernels: *a
     try build(&b, &c);
     const vl = c.vocab / WORLD;
     const facts = [_]struct { []const u8, i64 }{
-        .{ "rank", rank }, .{ "world", WORLD }, .{ "vocab", @intCast(c.vocab) }, .{ "vocab_shard", @intCast(vl) },
-        .{ "vocab_offset", @intCast(rank * vl) }, .{ "around_one", @intFromBool(b.around_one) },
-        .{ "rotary_dim", @intCast(c.rotary_dim) }, .{ "ple_layer", @intCast(c.ple_layers[0]) },
-        .{ "ple_eos", c.ple_eos }, .{ "group_size", @intCast(c.group_size) }, .{ "device_bytes", @intCast(b.bytes) },
+        .{ "rank", rank },                        .{ "world", WORLD },                           .{ "vocab", @intCast(c.vocab) },           .{ "vocab_shard", @intCast(vl) },
+        .{ "vocab_offset", @intCast(rank * vl) }, .{ "around_one", @intFromBool(b.around_one) }, .{ "rotary_dim", @intCast(c.rotary_dim) }, .{ "ple_layer", @intCast(c.ple_layers[0]) },
+        .{ "ple_eos", c.ple_eos },                .{ "group_size", @intCast(c.group_size) },     .{ "device_bytes", @intCast(b.bytes) },
     };
     for (facts) |f| try store.ints.put(try gpa.dupe(u8, f[0]), f[1]);
     try store.host.put(try gpa.dupe(u8, "ngram.json"), try ngramJson(gpa, &ck, &c, rank));

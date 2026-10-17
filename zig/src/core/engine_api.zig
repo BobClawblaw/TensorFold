@@ -100,6 +100,8 @@ pub const Request = struct {
     images: []const Image = &.{},
     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
     cache_key: []const u32 = &.{},
+    /// Flash Next's image inputs in prompt order (Info.qvision engines; the prompt holds their placeholder rows).
+    qimages: []const lanes.QImage = &.{},
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -110,8 +112,6 @@ pub const Request = struct {
     pub fn bornLen(r: *const Request) u32 {
         return if (r.born > 0) r.born else @intCast(r.prompt.len);
     }
-    /// Flash Next's image inputs in prompt order (Info.qvision engines; the prompt holds their placeholder rows).
-    qimages: []const lanes.QImage = &.{},
 };
 
 /// An image prepared for the engine's tower (``Vision.prepare``): patches, patch grid, tokens and a content hash.
