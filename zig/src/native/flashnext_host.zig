@@ -361,6 +361,11 @@ pub const Host = struct {
         var vis: ?*tf.flashnext_replay.vis_prompt.VisPrompt = null;
         defer images.release(h.eng, vis);
         if (r.images.len > 0) { // the tower's rows over the image tokens, in a frame the cache does not name: no reuse
+            if (r.background) { // a next turn's pass would keep nothing: the tower and the prompt pass are skipped
+                emit(job, .{ .prefilled = 0 });
+                fin.reason = .stop;
+                return;
+            }
             const v = h.vis orelse {
                 emit(job, .{ .prefilled = 0 });
                 fin.message = "this server reads no images (start it with --vision)";
