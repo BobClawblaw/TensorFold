@@ -8,6 +8,8 @@ const c = @import("config.zig");
 const st = @import("state.zig");
 const fwd = @import("forward.zig");
 const snapshot = @import("snapshot.zig");
+const vision = @import("vision.zig");
+const image = @import("image.zig");
 const Model = @import("model.zig").Model;
 const draw = @import("../lfm2_moe/backend.zig").draw;
 const be = lanes.backend;
@@ -132,6 +134,12 @@ pub const Metal = struct {
             stream.cached = @intCast(at);
             stream.reuse_failed = at == 0;
         }
+        var vis: ?fwd.Vis = null;
+        defer if (vis) |v| {
+            v.rows.deinit();
+            self.gpa.free(v.codes);
+        };
+        if (stream.images.len > 0) vis = try self.images(stream, ids.len);
         var mark: usize = 0;
         while (at < ids.len) {
             var end: usize = @min(ids.len, at + self.scratch.rows);
@@ -141,11 +149,54 @@ pub const Metal = struct {
             };
             while (mark < stream.reuse.marks.len and stream.reuse.marks[mark] <= at) mark += 1;
             if (mark < stream.reuse.marks.len) end = @min(end, stream.reuse.marks[mark]);
-            try fwd.run(self.model, &self.scratch, cache, ids[at..end], if (end == ids.len) .last else .none, null);
+            try fwd.runWith(self.model, &self.scratch, cache, ids[at..end], if (end == ids.len) .last else .none, null, if (vis) |*v| v else null);
             at = end;
             if (stream.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(at)) != null)
                 hk.at(hk.ptr, stream, @intCast(at));
         }
+    }
+
+    /// The stream's images through the tower: every image's aligner rows in one buffer, and each prompt position's
+    /// code (the span's start, its rows with a line break after each, its end; -1 for text).
+    fn images(self: *Metal, stream: *lanes.Stream, prompt_len: usize) !fwd.Vis {
+        const v = &(self.model.vision orelse return error.DeepseekCheckpointHasNoVisionTower);
+        var total: usize = 0;
+        for (stream.images) |img| {
+            const g = vision.tokenGrid(img.gh, img.gw);
+            if (img.tokens != vision.spanTokens(img.gh, img.gw) or img.at + img.tokens > prompt_len) return error.DeepseekImageOutOfStep;
+            total += @as(usize, g[0]) * g[1];
+        }
+        const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
+        const rows = try self.model.device.buffer(total * c.hidden * 2, opts);
+        errdefer rows.deinit();
+        const codes = try self.gpa.alloc(i32, prompt_len);
+        errdefer self.gpa.free(codes);
+        @memset(codes, -1);
+        var row: usize = 0;
+        for (stream.images) |img| {
+            const g = vision.tokenGrid(img.gh, img.gw);
+            const pixels = try self.model.device.buffer(img.pixels.len * 2, opts);
+            defer pixels.deinit();
+            for (pixels.slice(u16, img.pixels.len), img.pixels) |*d, x| d.* = image.bf16(x);
+            const out = try self.model.device.buffer(@as(usize, g[0]) * g[1] * c.hidden * 2, opts);
+            defer out.deinit();
+            try vision.run(self.model, v, pixels, img.gh, img.gw, out);
+            @memcpy((rows.contents() + row * c.hidden * 2)[0 .. @as(usize, g[0]) * g[1] * c.hidden * 2], out.contents()[0 .. @as(usize, g[0]) * g[1] * c.hidden * 2]);
+            var p: usize = img.at;
+            codes[p] = -2;
+            p += 1;
+            for (0..g[0]) |y| {
+                for (0..g[1]) |x| {
+                    codes[p] = @intCast(row + y * g[1] + x);
+                    p += 1;
+                }
+                codes[p] = -4;
+                p += 1;
+            }
+            codes[p] = -3;
+            row += @as(usize, g[0]) * g[1];
+        }
+        return .{ .codes = codes, .rows = rows };
     }
 
     fn firstFn(ptr: *anyopaque, stream: *lanes.Stream, position: u64) !u64 {

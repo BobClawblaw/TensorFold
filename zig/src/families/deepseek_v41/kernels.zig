@@ -13,6 +13,8 @@ pub const names = [_][:0]const u8{
     "ds_block_max",      "ds_topk",         "ds_attend",      "ds_route",       "ds_swiglu",
     "ds_moe_combine",    "ds_engram",       "ds_scale",       "ds_hc_mix_part", "ds_sort_slots",
     "ds_gather_rows",    "ds_attend_rows",  "ds_stream_mean", "ds_markov",      "ds_markov_pick",
+    "ds_linear_bias",    "ds_bias",         "ds_add",         "ds_vit_rope",    "ds_vit_attend",
+    "ds_vit_glu",        "ds_unfold",       "ds_put_image",
 };
 
 pub const Kernels = struct {

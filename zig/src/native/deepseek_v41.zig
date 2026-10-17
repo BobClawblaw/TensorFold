@@ -17,6 +17,8 @@ const Host = struct {
     core: lanes.Engine,
     host: api.LaneHost,
     cache: ?api.prompt_cache.Store = null, // kept prompt states (engine thread only); null: a zero budget
+    io: std.Io = undefined,
+    markers: [1]u32 = .{image_token}, // the template writes the image token alone (encoding.py's placeholder)
 
     fn close(ctx: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(ctx));
@@ -31,6 +33,16 @@ const Host = struct {
 };
 
 const cannot = "the native DeepSeek-V4.1 engine cannot load this checkpoint ({s})";
+
+/// <｜deepseek_image｜>: the config's image_token_id, each image's place in the rendered prompt.
+const image_token: u32 = 129264;
+
+/// Info.vision's prepare: an image's bytes to the tower's patches (families/deepseek_v41/image.zig), on the HTTP thread.
+fn prepareImage(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
+    const h: *Host = @ptrCast(@alignCast(ctx));
+    const p = try q.image.prepare(h.io, a, bytes, max_tokens);
+    return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+}
 
 pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const pool = mtl.objc.Pool.push();
@@ -62,7 +74,17 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = chunk, .structures = true });
+    h.io = io;
+    h.markers = .{image_token};
+    var offer: ?api.Vision = null;
+    if (o.vision) |v| {
+        if (model.vision == null) {
+            problem.* = try std.fmt.allocPrint(a, "--vision: this DeepSeek-V4.1 checkpoint has no image tower", .{});
+            return null;
+        }
+        offer = .{ .ctx = h, .prepare = prepareImage, .image_token = image_token, .markers = &h.markers, .image_tokens = v.image_tokens, .max_images = v.max_images, .explain = q.image.decoderProblem };
+    }
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = 1, .context_window = @intCast(window), .prefill_step = chunk, .structures = true, .vision = offer });
     h.cache = null;
     var why: []const u8 = "";
     const dev = model.device;

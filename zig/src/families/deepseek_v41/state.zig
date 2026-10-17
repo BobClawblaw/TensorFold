@@ -155,6 +155,9 @@ pub const Scratch = struct {
     /// token ids (the pending token, then the drafts as the Markov steps pick them), its picks of its own five keys,
     /// and the argmax partials.
     mh: mtl.Buffer,
+    /// Each row's image flag (i32: an image span's row) and code (forward.Vis).
+    img: mtl.Buffer,
+    img_code: mtl.Buffer,
     mainx: mtl.Buffer,
     draft_ids: mtl.Buffer,
     draft_picks: mtl.Buffer,
@@ -212,6 +215,8 @@ pub const Scratch = struct {
         out.engram_kv = try m.alloc(rows * (c.hc + 1) * c.hidden * 2);
         out.logits = try m.alloc(rows * c.vocab * 2);
         out.mh = try m.alloc(rows * c.draft_targets.len * c.hidden * 2);
+        out.img = try m.alloc(rows * 4);
+        out.img_code = try m.alloc(rows * 4);
         out.mainx = try m.alloc(rows * c.hidden * 2);
         out.draft_ids = try m.alloc((c.draft_block + 1) * 4);
         out.draft_picks = try m.alloc(c.draft_block * c.draft_block * 4);

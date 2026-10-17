@@ -8,6 +8,7 @@ const shards = @import("../../core/checkpoint.zig");
 const weights = @import("weights.zig");
 const kernels = @import("kernels.zig");
 const engram = @import("engram.zig");
+const vision = @import("vision.zig");
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -18,6 +19,8 @@ pub const Model = struct {
     weights: weights.Weights,
     kernels: kernels.Kernels,
     engram: engram.Engram,
+    /// The image tower and aligner, when the checkpoint has them.
+    vision: ?vision.Weights,
     /// RoPE frequencies (f32 [32]): plain for window-only layers and the draft stages, YaRN at the compressed theta
     /// for every layer that reads compressed keys.
     freq_plain: mtl.Buffer,
@@ -42,6 +45,7 @@ pub const Model = struct {
         for (files) |path| try m.checkpoint.addFile(m.device, path, "");
         // the DSpark head when asked for and the checkpoint has it (mtp.*)
         m.weights = try weights.load(&m.checkpoint, &m.config, drafts and m.checkpoint.has("mtp.0.attn.wq_a.weight"));
+        m.vision = try vision.load(&m.checkpoint, m.config.dense);
         m.kernels = try kernels.load(m.device, &m.config);
         errdefer m.kernels.deinit();
         m.engram = try engram.Engram.open(gpa, io, dir, &m.config);

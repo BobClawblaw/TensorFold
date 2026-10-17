@@ -728,11 +728,13 @@ struct RouteArgs {
 };
 
 // sqrt(softplus(logits)) scores; the top-k of score + bias (ties to the lower id) picked; their unbiased scores
-// normalized and scaled. Picks are written in expert order, the order the reference sums them in. One threadgroup
+// normalized and scaled; image-span rows (IMG) steer by bias_vl. Picks are written in expert order, the order the
+// reference sums them in. One threadgroup
 // (a thread an expert, `experts` <= 512) a row: the scores in parallel, then k rounds of a threadgroup argmax.
 [[kernel]] void ds_route(const device float* LOGITS [[buffer(0)]], const device float* BIAS [[buffer(1)]],
                          device uint* PICK [[buffer(2)]], device float* WEIGHT [[buffer(3)]],
-                         constant RouteArgs& a [[buffer(4)]], uint r [[threadgroup_position_in_grid]],
+                         constant RouteArgs& a [[buffer(4)]], const device int* IMG [[buffer(5)]],
+                         const device float* BIAS_VL [[buffer(6)]], uint r [[threadgroup_position_in_grid]],
                          uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
   threadgroup float best_v[16];
@@ -744,7 +746,7 @@ struct RouteArgs {
   if (int(t) < a.experts) {
     const float x = z[t];
     score = precise::sqrt(x > 20.0f ? x : precise::log(1.0f + precise::exp(x)));
-    key = score + BIAS[t];
+    key = score + (IMG[r] ? BIAS_VL[t] : BIAS[t]);  // an image span's rows steer by their own bias
   }
   for (int k = 0; k < a.topk; k++) {
     // the simdgroup's best (value, then lower id), then the threadgroup's
@@ -957,18 +959,19 @@ struct MarkovArgs {
 
 struct EngramArgs {
   float eps;
-  int text_rows;  // rows past this many are not text (no update): unused, all rows text for now
 };
 
 // One threadgroup (256) a (row, copy): the gate sigmoid(signed sqrt(normalized <h, w * key>)) of the lookup's key
 // against the copy, then h += gate * value.
 [[kernel]] void ds_engram(device bfloat* X [[buffer(0)]], const device bfloat* KV [[buffer(1)]],
                           const device bfloat* QW [[buffer(2)]], const device bfloat* KW [[buffer(3)]],
-                          constant EngramArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          constant EngramArgs& a [[buffer(4)]], const device int* IMG [[buffer(5)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
                           uint2 tpos [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]]) {
   const uint t = tpos.x;
   const int c = int(tg.x), r = int(tg.y);
+  if (IMG[r]) return;  // an image span's rows take no lookup (the reference shuts their gate)
   threadgroup float red[3][8];
   threadgroup float gate_s;
   device bfloat* x = X + (size_t(r) * S + c) * D;
@@ -1005,4 +1008,158 @@ struct EngramArgs {
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int d = int(t); d < D; d += 256) x[d] = bfloat(float(x[d]) + gate_s * float(val[d]));
+}
+
+// ---------------------------------------------------------------- the vision tower (vision.py) and aligner
+
+constant constexpr int VD = 1024;  // the tower's width
+constant constexpr int VH = 16;    // its heads
+constant constexpr int VHD = 64;   // a head's width
+
+struct LinArgs {
+  int rows;
+  int n;
+  int k;
+};
+
+// y[r, j] = bf16(sum_k x[r, k] W[j, k] + b[j]), any k: the patch embedding (588 inputs). 8 simdgroups a group, one
+// output column each, 8 rows a group.
+[[kernel]] void ds_linear_bias(const device bfloat* X [[buffer(0)]], const device bfloat* W [[buffer(1)]],
+                               const device bfloat* B [[buffer(2)]], device bfloat* Y [[buffer(3)]],
+                               constant LinArgs& a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  const int j = int(tg.x) * 8 + int(sg);
+  if (j >= a.n) return;
+  const int r0 = int(tg.y) * 8, nr = min(8, a.rows - r0);
+  const device bfloat* w = W + size_t(j) * a.k;
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int kk = int(lane); kk < a.k; kk += 32) {
+    const float wv = float(w[kk]);
+    for (int i = 0; i < nr; i++) acc[i] += float(X[size_t(r0 + i) * a.k + kk]) * wv;
+  }
+  for (int i = 0; i < nr; i++) {
+    const float s = simd_sum(acc[i]);
+    if (lane == 0) Y[size_t(r0 + i) * a.n + j] = bfloat(s + float(B[j]));
+  }
+}
+
+// erf (Metal has none): Numerical Recipes' erfc, fractional error under 1.2e-7, far inside a bf16 step.
+inline float ds_erf(float x) {
+  const float z = fabs(x);
+  const float t = 1.0f / (1.0f + 0.5f * z);
+  const float r = t * precise::exp(-z * z - 1.26551223f +
+                                   t * (1.00002368f + t * (0.37409196f + t * (0.09678418f + t * (-0.18628806f +
+                                   t * (0.27886807f + t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f)))))))));
+  return x >= 0.0f ? 1.0f - r : r - 1.0f;
+}
+
+// y = bf16(y + b) by column, and with `gelu` then GELU (erf form) on the sum: a Linear's bias, the aligner's w1.
+[[kernel]] void ds_bias(device bfloat* Y [[buffer(0)]], const device bfloat* B [[buffer(1)]],
+                        constant int2& n_gelu [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
+  const size_t i = size_t(g.y) * n_gelu.x + g.x;
+  float v = float(bfloat(float(Y[i]) + float(B[g.x])));
+  if (n_gelu.y) v = 0.5f * v * (1.0f + ds_erf(v * 0.70710678118654752f));
+  Y[i] = bfloat(v);
+}
+
+// x = bf16(x + y): a residual branch.
+[[kernel]] void ds_add(device bfloat* X [[buffer(0)]], const device bfloat* Y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+  X[i] = bfloat(float(X[i]) + float(Y[i]));
+}
+
+// The tower's 2D RoPE on q and k inside qkv [rows, 3 x 1024]: a patch's 32 frequencies are its row's then its
+// column's, each half of a head rotated against the other (apply_rotary's chunk(2)).
+[[kernel]] void ds_vit_rope(device bfloat* QKV [[buffer(0)]], const device float* FREQ [[buffer(1)]],
+                            constant int& n_w [[buffer(2)]], uint3 g [[thread_position_in_grid]]) {
+  const int i = int(g.x), h = int(g.y), r = int(g.z);  // i < 32, h < 32 (q's 16 heads, then k's)
+  const int f = i < 16 ? (r / n_w) : (r % n_w);
+  const float ang = float(f) * FREQ[i % 16];
+  const float cs = precise::cos(ang), sn = precise::sin(ang);
+  device bfloat* x = QKV + size_t(r) * 3 * VD + size_t(h) * VHD;
+  const float x1 = float(x[i]), x2 = float(x[i + 32]);
+  x[i] = bfloat(x1 * cs - x2 * sn);
+  x[i + 32] = bfloat(x2 * cs + x1 * sn);
+}
+
+// Bidirectional attention over the image's patches (scaled_dot_product_attention): one simdgroup a (patch, head),
+// 32 keys a step (each lane one key's dot), an online fp32 softmax, each lane two output dims.
+[[kernel]] void ds_vit_attend(const device bfloat* QKV [[buffer(0)]], device bfloat* O [[buffer(1)]],
+                              constant int& n [[buffer(2)]], uint2 tg [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float qs[8][VHD];
+  const int h = int(tg.x), r = int(tg.y) * 8 + int(sg);
+  const bool live = r < n;
+  const int rr = live ? r : n - 1;
+  const device bfloat* q = QKV + size_t(rr) * 3 * VD + h * VHD;
+  qs[sg][lane] = float(q[lane]);
+  qs[sg][lane + 32] = float(q[lane + 32]);
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  const float scale = 0.125f;  // 1 / sqrt(64)
+  float m = -INFINITY, l = 0.0f, o0 = 0.0f, o1 = 0.0f;
+  for (int k0 = 0; k0 < n; k0 += 32) {
+    const int key = k0 + int(lane);
+    float s = -INFINITY;
+    if (key < n) {
+      const device bfloat* kr = QKV + size_t(key) * 3 * VD + VD + h * VHD;
+      float d = 0.0f;
+      for (int i = 0; i < VHD; i++) d += qs[sg][i] * float(kr[i]);
+      s = d * scale;
+    }
+    const float bm = simd_max(s);
+    const float mn = max(m, bm);
+    const float corr = precise::exp(m - mn);
+    const float p = key < n ? precise::exp(s - mn) : 0.0f;
+    l = l * corr + simd_sum(p);
+    o0 *= corr;
+    o1 *= corr;
+    const int kn = min(32, n - k0);
+    for (int j = 0; j < kn; j++) {
+      const float pj = simd_shuffle(p, ushort(j));
+      const device bfloat* v = QKV + size_t(k0 + j) * 3 * VD + 2 * VD + h * VHD;
+      o0 += pj * float(v[lane]);
+      o1 += pj * float(v[lane + 32]);
+    }
+    m = mn;
+  }
+  if (live) {
+    O[size_t(r) * VD + h * VHD + lane] = bfloat(o0 / l);
+    O[size_t(r) * VD + h * VHD + lane + 32] = bfloat(o1 / l);
+  }
+}
+
+// The tower's MLP gate: [rows, 2 x 2816] -> bf16(bf16(silu(gate)) * up) [rows, 2816].
+[[kernel]] void ds_vit_glu(const device bfloat* H [[buffer(0)]], device bfloat* Y [[buffer(1)]],
+                           constant int& inter [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
+  const device bfloat* h = H + size_t(g.y) * 2 * inter;
+  const float gt = float(h[g.x]);
+  const float sl = float(bfloat(gt / (1.0f + precise::exp(-gt))));
+  Y[size_t(g.y) * inter + g.x] = bfloat(sl * float(h[inter + g.x]));
+}
+
+struct UnfoldArgs {
+  int n_h;
+  int n_w;
+  int out_w;  // ceil(n_w / 3)
+};
+
+// The aligner's 3x3 unfold of the patch grid (zero-padded right and bottom): token (oy, ox)'s input row is
+// feature c x 9 + ky x 3 + kx = tower[(3 oy + ky) * n_w + 3 ox + kx][c].
+[[kernel]] void ds_unfold(const device bfloat* T [[buffer(0)]], device bfloat* Y [[buffer(1)]],
+                          constant UnfoldArgs& a [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
+  const int f = int(g.x), t = int(g.y);
+  const int c = f / 9, ky = (f % 9) / 3, kx = f % 3;
+  const int y = 3 * (t / a.out_w) + ky, x = 3 * (t % a.out_w) + kx;
+  Y[size_t(t) * 9 * VD + f] = (y < a.n_h && x < a.n_w) ? T[size_t(y * a.n_w + x) * VD + c] : bfloat(0);
+}
+
+// An image span's rows into the streams: CODE[r] >= 0 the aligner row, -2 / -3 / -4 the span's start, end and
+// line-break embeddings, -1 a text row (left as embedded). Every copy of the stream takes the row.
+[[kernel]] void ds_put_image(device bfloat* X [[buffer(0)]], const device int* CODE [[buffer(1)]],
+                             const device bfloat* ROWS [[buffer(2)]], const device bfloat* START [[buffer(3)]],
+                             const device bfloat* END [[buffer(4)]], const device bfloat* NL [[buffer(5)]],
+                             uint2 g [[thread_position_in_grid]]) {
+  const int code = CODE[g.y];
+  if (code == -1) return;
+  const bfloat v = code >= 0 ? ROWS[size_t(code) * D + g.x] : (code == -2 ? START[g.x] : (code == -3 ? END[g.x] : NL[g.x]));
+  for (int s = 0; s < S; s++) X[(size_t(g.y) * S + s) * D + g.x] = v;
 }

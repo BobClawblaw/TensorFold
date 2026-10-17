@@ -15,6 +15,18 @@ pub const Head = enum { last, all, none };
 /// Per-layer outputs a check reads back (the streams after each block), or null.
 pub const Dump = struct { layers: []Buffer };
 
+/// A prompt's image spans: each position's code (-1 text; an aligner row; -2, -3, -4 a span's start, end and line
+/// break) and the aligner rows of its images (bf16 [rows, 5120], image_processor's reading order).
+pub const Vis = struct {
+    codes: []const i32,
+    rows: Buffer,
+
+    fn code(v: ?*const Vis, pos: usize) i32 {
+        const x = v orelse return -1;
+        return if (pos < x.codes.len) x.codes[pos] else -1;
+    }
+};
+
 const HcArgs = extern struct { eps: f32, hc_eps: f32, iters: i32 };
 const RowsArgs = extern struct { n: i32, x_stride: i32, y_stride: i32, eps: f32 };
 const GemvArgs = extern struct { rows: i32, n: i32, k: i32, group_n: i32, x_stride: i32, y_stride: i32 };
@@ -28,7 +40,7 @@ const TopkArgs = extern struct { n: i32, k: i32, stride: i32, offset: i32 };
 const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: i32, scale: f32, window_end: i32 = -1 };
 const RouteArgs = extern struct { experts: i32, topk: i32, scale: f32 };
 const GluArgs = extern struct { width: i32, weighted: i32, limit: f32 };
-const EngramArgs = extern struct { eps: f32, text_rows: i32 };
+const EngramArgs = extern struct { eps: f32 };
 const SortArgs = extern struct { slots: i32, experts: i32 };
 const MarkovArgs = extern struct { vocab: i32, rank: i32, step: i32 };
 /// The draft block's filler after its first token (dspark_noise_token_id).
@@ -234,6 +246,11 @@ fn completed(base: usize, rows: usize, ratio: usize) [2]usize {
 }
 
 pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, head: Head, dump: ?Dump) !void {
+    return runWith(m, s, cache, tokens, head, dump, null);
+}
+
+/// `run` over prompt rows that may lie in image spans (`vis`): their rows are the tower's, not the token embedding.
+pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, head: Head, dump: ?Dump, vis: ?*const Vis) !void {
     const rows = tokens.len;
     if (rows == 0 or rows > s.rows or rows > st.max_rows) return error.DeepseekRowsExceeded;
     const base = cache.len;
@@ -245,7 +262,13 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
     for (s.ids.slice(u32, rows), tokens) |*d, t| d.* = t;
     for (s.pos.slice(i32, rows), 0..) |*p, i| p.* = @intCast(base + i);
     cache.engram_ids.shrinkRetainingCapacity(base);
-    for (tokens) |t| cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, true));
+    var images = false;
+    for (tokens, s.img.slice(i32, rows), s.img_code.slice(i32, rows), 0..) |t, *flag, *code, i| {
+        code.* = Vis.code(vis, base + i);
+        flag.* = @intFromBool(code.* != -1);
+        images = images or code.* != -1;
+        cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, code.* == -1)); // image rows end every n-gram
+    }
     var h0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &h0);
     var dsts: [c.engram_layers.len][]u16 = undefined;
@@ -267,6 +290,17 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
     x.tensor(w.embed, 1);
     x.buf(s.x, 0, 2);
     x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+    if (images) {
+        const v = &(m.vision orelse return error.NoVisionTower);
+        x.pipe("ds_put_image");
+        x.buf(s.x, 0, 0);
+        x.buf(s.img_code, 0, 1);
+        x.buf(vis.?.rows, 0, 2);
+        x.tensor(v.start, 3);
+        x.tensor(v.end, 4);
+        x.tensor(v.newline, 5);
+        x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+    }
     const drafting = w.stages != null and cache.stage_rings != null;
     for (&w.layers, 0..) |*l, i| {
         if (drafting) if (std.mem.indexOfScalar(usize, &c.draft_targets, i)) |t| {
@@ -345,6 +379,7 @@ pub fn draft(m: *Model, ds: *st.Scratch, cache: *st.Cache, token: u32, at: usize
     for (ds.pos.slice(i32, n), 0..) |*p, i| p.* = @intCast(at + 1 + i);
     for (ds.pre[0].slice(f32, n * c.hc), 0..) |*v, i| v.* = if (i % c.hc == 0) 1 else 0;
     ds.draft_ids.slice(u32, n + 1)[0] = token;
+    @memset(ds.img.slice(i32, n), 0); // drafts are text
 
     var cb = m.queue.commandBuffer();
     var e = cb.compute(.serial);
@@ -429,7 +464,8 @@ fn block(x: Enc, cache: *st.Cache, i: usize, l: *const wts.Layer) !void {
         x.buf(s.engram_kv, 0, 1);
         x.tensor(eg.q_weight, 2);
         x.tensor(eg.k_weight, 3);
-        x.args(EngramArgs{ .eps = c.norm_eps, .text_rows = @intCast(x.rows) }, 4);
+        x.args(EngramArgs{ .eps = c.norm_eps }, 4);
+        x.buf(s.img, 0, 5);
         x.groups(.{ c.hc, x.rows, 1 }, .{ 256, 1, 1 });
         try x.cut(8);
     }
@@ -608,6 +644,8 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
     x.buf(s.route_pick, 0, 2);
     x.buf(s.route_weight, 0, 3);
     x.args(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .scale = c.route_scale }, 4);
+    x.buf(s.img, 0, 5);
+    x.tensor(mo.bias_vl, 6);
     x.groups(.{ rows, 1, 1 }, .{ (experts + 31) / 32 * 32, 1, 1 });
     try x.cut(5);
     if (x.nax(mo.w1.one)) |p| {

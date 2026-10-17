@@ -9,10 +9,13 @@ pub const model = @import("model.zig");
 pub const forward = @import("forward.zig");
 pub const backend = @import("backend.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const vision = @import("vision.zig");
+pub const image = @import("image.zig");
 pub const Model = model.Model;
 
 test {
     _ = config;
     _ = engram;
     _ = snapshot;
+    _ = image;
 }
