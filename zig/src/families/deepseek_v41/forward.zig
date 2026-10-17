@@ -59,6 +59,9 @@ fn matrix(w: row.Weights) struct { w: Ref, s: Ref, b: Ref, n: u32, k: u32 } {
 pub var profile: ?*[sections.len]f64 = null;
 /// Seconds a call spends encoding (to its commit), on the GPU, and in all, summed over calls when set.
 pub var timing: ?*[3]f64 = null;
+/// A check's ablation (DS_SKIP): dispatches of the pipeline of this name are left out, to time what each costs.
+pub var skip: ?[]const u8 = null;
+var skipping = false;
 pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
 
 const Enc = struct {
@@ -88,6 +91,7 @@ const Enc = struct {
     }
 
     fn pipe(self: Enc, comptime key: []const u8) void {
+        skipping = if (skip) |k| std.mem.eql(u8, k, key) else false;
         self.ep.*.setPipeline(self.m.kernels.get(key));
     }
     fn buf(self: Enc, b: Buffer, off: usize, slot: usize) void {
@@ -100,9 +104,11 @@ const Enc = struct {
         self.ep.*.setBytes(std.mem.asBytes(&v), slot);
     }
     fn threads(self: Enc, grid: [3]usize, group: [3]usize) void {
+        if (skipping) return;
         self.ep.*.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
     fn groups(self: Enc, grid: [3]usize, group: [3]usize) void {
+        if (skipping) return;
         self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
 
@@ -115,6 +121,8 @@ const Enc = struct {
             am.dense(self.ep.*, p, xr, sums, matrix(w), Ref{ .buf = y, .off = y_off }, @intCast(rows));
             return;
         };
+        skipping = if (skip) |k| std.mem.eql(u8, k, "rows") else false;
+        if (skipping) return;
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
         self.buf(x, x_off, 0);
@@ -128,6 +136,8 @@ const Enc = struct {
 
     /// Slot i takes expert ids[i] on input row i / repeat.
     fn indexed(self: Enc, x: row.Experts, slots: usize, in: Buffer, ids: Buffer, out: Buffer) void {
+        skipping = if (skip) |k| std.mem.eql(u8, k, "indexed") else false;
+        if (skipping) return;
         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
         self.buf(in, 0, 0);

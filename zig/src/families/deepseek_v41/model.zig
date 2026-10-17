@@ -42,7 +42,17 @@ pub const Model = struct {
         errdefer m.checkpoint.deinit();
         const files = try shards.shardFiles(gpa, io, dir);
         defer shards.freeShardFiles(gpa, files);
-        for (files) |path| try m.checkpoint.addFile(m.device, path, "");
+        // Each shard is held resident as soon as it is read: ~190 GiB of fresh, untouched buffers otherwise invite the
+        // compressor to take them while the rest loads, and with little swap jetsam then kills the load.
+        m.resident = m.device.residencySet(files.len) catch null;
+        for (files) |path| {
+            try m.checkpoint.addFile(m.device, path, "");
+            if (m.resident) |set| {
+                set.add(m.checkpoint.shards.items[m.checkpoint.shards.items.len - 1].buffer);
+                set.commit();
+                set.requestResidency();
+            }
+        }
         // the DSpark head when asked for and the checkpoint has it (mtp.*)
         m.weights = try weights.load(&m.checkpoint, &m.config, drafts and m.checkpoint.has("mtp.0.attn.wq_a.weight"));
         m.vision = try vision.load(&m.checkpoint, m.config.dense);
@@ -55,14 +65,7 @@ pub const Model = struct {
         m.freq_compressed = try m.device.buffer(32 * 4, opts);
         frequencies(m.config.rope, false, m.freq_plain.slice(f32, 32));
         frequencies(m.config.rope, true, m.freq_compressed.slice(f32, 32));
-        m.resident = null;
-        if (m.device.residencySet(m.checkpoint.shards.items.len)) |set| {
-            for (m.checkpoint.shards.items) |shard| set.add(shard.buffer);
-            set.commit();
-            set.requestResidency();
-            m.queue.addResidencySet(set);
-            m.resident = set;
-        } else |_| {}
+        if (m.resident) |set| m.queue.addResidencySet(set);
         return m;
     }
 

@@ -25,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
+    if (std.c.getenv("DS_DISPATCH") != null) return dispatchCost(gpa, init.io, args[1]);
+    if (std.c.getenv("DS_ABLATE") != null) return ablate(gpa, init.io, args[1], ids);
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
     const m = try q.Model.load(gpa, init.io, args[1], false);
@@ -48,6 +50,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.c.getenv("DS_PROFILE") != null) q.forward.profile = &sections;
     var timing: [3]f64 = @splat(0);
     if (std.c.getenv("DS_TIMING") != null) q.forward.timing = &timing;
+    if (std.c.getenv("DS_SKIP")) |k| q.forward.skip = std.mem.span(k);
     var calls: usize = 0;
     var wall: f64 = 0;
     const logits = try gpa.alloc(u8, ids.len * c.vocab * 2);
@@ -168,4 +171,48 @@ fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
     var same: usize = 0;
     while (same < n and replies[0][same] == replies[1][same]) same += 1;
     std.debug.print("plain {d:.1} tok/s, drafted {d:.1} tok/s; {d} rounds, {d:.2} tokens a round; replies equal for {d}/{d} tokens\n", .{ @as(f64, @floatFromInt(n)) / times[0], @as(f64, @floatFromInt(n)) / times[1], rounds, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(rounds)), same, n });
+}
+
+/// What a dispatch costs on its own: 2,000 one-thread dispatches in one serial encoder, then in a concurrent one.
+fn dispatchCost(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+    const m = try q.Model.load(gpa, io, dir, false);
+    defer m.deinit();
+    const buf = try m.device.buffer(4096, mtl.ResourceOptions.shared);
+    defer buf.deinit();
+    for ([_]mtl.DispatchType{ .serial, .concurrent }) |kind| {
+        const cb = m.queue.commandBuffer();
+        const e = cb.compute(kind);
+        e.setPipeline(m.kernels.get("ds_scale"));
+        e.setBuffer(buf, 0, 0);
+        e.setValue(@as(f32, 1.0), 1);
+        for (0..2000) |_| e.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
+        e.end();
+        cb.commit();
+        cb.wait();
+        std.debug.print("{s}: {d:.2} us a dispatch on the GPU\n", .{ @tagName(kind), cb.gpuSeconds() * 1e6 / 2000.0 });
+    }
+}
+
+/// GPU ms a decode step with each kernel left out in turn (the outputs are wrong; only the time is read).
+fn ablate(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32) !void {
+    const m = try q.Model.load(gpa, io, dir, false);
+    defer m.deinit();
+    var scratch = try q.state.Scratch.init(gpa, m.device, 8);
+    defer scratch.deinit();
+    const names = [_][]const u8{ "", "rows", "indexed", "ds_hc_mix_part", "ds_hc_boundary", "ds_hc_expand", "ds_rms", "ds_rope", "ds_fp8_qdq", "ds_fp4_qdq", "ds_put_rows", "ds_put_rows_f32", "ds_attend_split", "ds_attend_merge", "ds_gemv_bf_bf", "ds_gemv_bf_f32", "ds_route", "ds_swiglu", "ds_moe_combine", "ds_index_scores", "ds_topk", "ds_pool2", "ds_scale", "ds_engram", "ds_embed" };
+    var base: f64 = 0;
+    for (names) |name| {
+        q.forward.skip = if (name.len == 0) null else name;
+        var timing: [3]f64 = @splat(0);
+        q.forward.timing = &timing;
+        var cache = try q.state.Cache.init(gpa, m.device, ids.len + 8);
+        defer cache.deinit();
+        for (ids, 0..) |t, i| {
+            if (i == 4) timing = @splat(0); // the first steps warm the pipelines
+            try q.forward.run(m, &scratch, &cache, &.{t}, .last, null);
+        }
+        const ms = timing[1] * 1e3 / @as(f64, @floatFromInt(ids.len - 4));
+        if (name.len == 0) base = ms;
+        std.debug.print("{s:<18} {d:6.2} ms ({d:.2})\n", .{ if (name.len == 0) "(all)" else name, ms, ms - base });
+    }
 }

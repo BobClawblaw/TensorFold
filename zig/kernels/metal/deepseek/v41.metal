@@ -142,44 +142,34 @@ template <bool MIXES>
       tot[t] = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
+    // the split on simdgroup 0: lanes 0-3 a pre and a post each, lanes 0-15 a cell of the 4x4 comb (j = lane / 4,
+    // k = lane % 4), its row sums across lanes xor 1 and 2, its column sums across lanes xor 4 and 8
+    if (sg == 0) {
       const float rs = precise::rsqrt(tot[MIX] / float(F) + a.eps);
-      float mixes[MIX];
-      for (int m = 0; m < MIX; m++) mixes[m] = tot[m] * rs;
-      for (int j = 0; j < S; j++) {
-        PRE_OUT[r * S + j] = 1.0f / (1.0f + precise::exp(-(mixes[j] * SCALE[0] + BASE[j]))) + a.hc_eps;
-        POST_OUT[r * S + j] = 2.0f / (1.0f + precise::exp(-(mixes[j + S] * SCALE[1] + BASE[j + S])));
+      if (lane < uint(S)) {
+        PRE_OUT[r * S + lane] = 1.0f / (1.0f + precise::exp(-(tot[lane] * rs * SCALE[0] + BASE[lane]))) + a.hc_eps;
+        POST_OUT[r * S + lane] = 2.0f / (1.0f + precise::exp(-(tot[S + lane] * rs * SCALE[1] + BASE[S + lane])));
       }
-      float cm[S][S];
-      for (int j = 0; j < S; j++) {
-        float mx = -INFINITY;
-        for (int k = 0; k < S; k++) {
-          cm[j][k] = mixes[2 * S + j * S + k] * SCALE[2] + BASE[2 * S + j * S + k];
-          mx = max(mx, cm[j][k]);
-        }
-        float sum = 0.0f;
-        for (int k = 0; k < S; k++) {
-          cm[j][k] = precise::exp(cm[j][k] - mx);
-          sum += cm[j][k];
-        }
-        for (int k = 0; k < S; k++) cm[j][k] = cm[j][k] / sum + a.hc_eps;
-      }
+      const bool act = lane < uint(S * S);
+      const uint cell = act ? lane : 0;
+      const float v = tot[2 * S + cell] * rs * SCALE[2] + BASE[2 * S + cell];
+      float mx = max(v, simd_shuffle_xor(v, ushort(1)));
+      mx = max(mx, simd_shuffle_xor(mx, ushort(2)));
+      const float e = precise::exp(v - mx);
+      float row = e + simd_shuffle_xor(e, ushort(1));
+      row = row + simd_shuffle_xor(row, ushort(2));
+      float cm = act ? e / row + a.hc_eps : 0.0f;
       for (int it = 0; it < a.iters; it++) {
         if (it > 0) {
-          for (int j = 0; j < S; j++) {
-            float rs2 = 0.0f;
-            for (int k = 0; k < S; k++) rs2 += cm[j][k];
-            for (int k = 0; k < S; k++) cm[j][k] = cm[j][k] / (rs2 + a.hc_eps);
-          }
+          float rsum = cm + simd_shuffle_xor(cm, ushort(1));
+          rsum = rsum + simd_shuffle_xor(rsum, ushort(2));
+          cm = act ? cm / (rsum + a.hc_eps) : 0.0f;
         }
-        for (int k = 0; k < S; k++) {
-          float cs = 0.0f;
-          for (int j = 0; j < S; j++) cs += cm[j][k];
-          for (int j = 0; j < S; j++) cm[j][k] = cm[j][k] / (cs + a.hc_eps);
-        }
+        float csum = cm + simd_shuffle_xor(cm, ushort(4));
+        csum = csum + simd_shuffle_xor(csum, ushort(8));
+        cm = act ? cm / (csum + a.hc_eps) : 0.0f;
       }
-      for (int j = 0; j < S; j++)
-        for (int k = 0; k < S; k++) COMB_OUT[r * S * S + j * S + k] = cm[j][k];
+      if (act) COMB_OUT[r * S * S + lane] = cm;
     }
   }
   if (t < uint(S)) pre_in[t] = PRE_IN[r * S + t];
