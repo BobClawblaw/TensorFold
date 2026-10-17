@@ -781,12 +781,45 @@ constant constexpr int SPLIT = 64;  // keys a split threadgroup takes
 }
 
 // The chunks' partials of a (row, head) folded with the head's sink: the softmax over every key and the sink.
+struct MergeArgs {
+  int chunks;
+  int finish;  // then as ds_rope (inverse) and ds_fp8_qdq would: the head's RoPE taken back, fp8-rounded
+};
+
+// A head's 64 RoPE dims (the last of its 512) rotated, in a threadgroup's bf16 row, as ds_rope does (32 threads).
+static void rope_row(threadgroup bfloat* x, int pos, const device float* FREQ, bool inverse, uint t) {
+  if (t < 32) {
+    threadgroup bfloat* p = x + HD - 64 + 2 * int(t);
+    const float ang = float(pos) * FREQ[t];
+    const float cs = precise::cos(ang);
+    const float sn = inverse ? -precise::sin(ang) : precise::sin(ang);
+    const float re = float(p[0]), im = float(p[1]);
+    p[0] = bfloat(re * cs - im * sn);
+    p[1] = bfloat(re * sn + im * cs);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// A threadgroup's bf16 row of 512 fp8-rounded a block of 32, as ds_fp8_qdq does (16 threads).
+static void fp8_row(threadgroup bfloat* x, uint t) {
+  if (t < HD / 32) {
+    threadgroup bfloat* b = x + int(t) * 32;
+    float amax = 0.0f;
+    for (int i = 0; i < 32; i++) amax = max(amax, fabs(float(b[i])));
+    const float s = pow2_ceil(max(amax, 1e-4f) / 448.0f);
+    for (int i = 0; i < 32; i++) b[i] = bfloat(e4m3_round(clamp(float(b[i]) / s, -448.0f, 448.0f)) * s);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 [[kernel]] void ds_attend_merge(const device float* PO [[buffer(0)]], const device float2* PML [[buffer(1)]],
                                 const device float* SINK [[buffer(2)]], device bfloat* O [[buffer(3)]],
-                                constant int& chunks [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                                constant MergeArgs& ma [[buffer(4)]], const device int* POS [[buffer(5)]],
+                                const device float* FREQ [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
                                 uint2 tpos [[thread_position_in_threadgroup]]) {
   const uint t = tpos.x;
-  const int h = int(tg.x), r = int(tg.y);
+  const int h = int(tg.x), r = int(tg.y), chunks = ma.chunks;
+  threadgroup bfloat row[HD];
   const size_t base = (size_t(r) * 64 + h) * chunks;
   float m = SINK[h];
   for (int c = 0; c < chunks; c++) m = max(m, PML[base + c].x);
@@ -795,7 +828,46 @@ constant constexpr int SPLIT = 64;  // keys a split threadgroup takes
   for (int d = int(t); d < HD; d += 256) {
     float acc = 0.0f;
     for (int c = 0; c < chunks; c++) acc += PO[(base + c) * HD + d] * precise::exp(PML[base + c].x - m);
-    O[(size_t(r) * 64 + h) * HD + d] = bfloat(acc / denom);
+    row[d] = bfloat(acc / denom);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ma.finish) {
+    rope_row(row, POS[r], FREQ, true, t);
+    fp8_row(row, t);
+  }
+  for (int d = int(t); d < HD; d += 256) O[(size_t(r) * 64 + h) * HD + d] = row[d];
+}
+
+// A window key's tail in one threadgroup a row, as ds_rms (kv_norm), ds_rope, ds_fp8_qdq and ds_put_rows would run
+// it: KV is normed, rotated and rounded in place, then put in the ring at its position (when ring > 0).
+[[kernel]] void ds_kv_finish(device bfloat* KV [[buffer(0)]], const device bfloat* W [[buffer(1)]],
+                             const device int* POS [[buffer(2)]], const device float* FREQ [[buffer(3)]],
+                             device bfloat* RING [[buffer(4)]], constant float2& a [[buffer(5)]],
+                             uint r [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float red[8];
+  threadgroup bfloat row[HD];
+  device bfloat* x = KV + size_t(r) * HD;
+  float ss = 0.0f;
+  for (int i = int(t); i < HD; i += 256) {
+    const float v = float(x[i]);
+    ss += v * v;
+  }
+  ss = simd_sum(ss);
+  if (lane == 0) red[sg] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float tot = 0.0f;
+  for (int k = 0; k < 8; k++) tot += red[k];
+  const float inv = precise::rsqrt(tot / float(HD) + a.x);
+  for (int i = int(t); i < HD; i += 256) row[i] = bfloat(float(W[i]) * (float(x[i]) * inv));
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  rope_row(row, POS[r], FREQ, false, t);
+  fp8_row(row, t);
+  const int ring = int(a.y);
+  device bfloat* dst = RING + size_t(ring > 0 ? POS[r] % ring : 0) * HD;
+  for (int i = int(t); i < HD; i += 256) {
+    x[i] = row[i];
+    if (ring > 0) dst[i] = row[i];
   }
 }
 

@@ -14,7 +14,7 @@ pub const names = [_][:0]const u8{
     "ds_moe_combine",    "ds_engram",       "ds_scale",       "ds_hc_mix_part", "ds_sort_slots",
     "ds_gather_rows",    "ds_attend_rows",  "ds_stream_mean", "ds_markov",      "ds_markov_pick",
     "ds_linear_bias",    "ds_bias",         "ds_add",         "ds_vit_rope",    "ds_vit_attend",
-    "ds_vit_glu",        "ds_unfold",       "ds_put_image",   "ds_attend_split", "ds_attend_merge",
+    "ds_vit_glu",        "ds_unfold",       "ds_put_image",   "ds_attend_split", "ds_attend_merge", "ds_kv_finish",
 };
 
 pub const Kernels = struct {
@@ -43,7 +43,7 @@ pub const Kernels = struct {
     }
 };
 
-pub fn load(device: mtl.Device, config: *const cfg.Config) !Kernels {
+pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Width) !Kernels {
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const lib = try mtl.Library.fromSource(device, sources.deepseek_v41, mtl.CompileOptions.mlx());
@@ -60,10 +60,11 @@ pub fn load(device: mtl.Device, config: *const cfg.Config) !Kernels {
     out.nax = @splat(null);
     if (device.tensorUnits()) {
         errdefer for (out.nax) |set| if (set) |pipes| for (pipes) |p| p.deinit();
-        var widths: [cfg.layers + cfg.stages + 1]cfg.Width = undefined;
+        var widths: [cfg.layers + cfg.stages + 2]cfg.Width = undefined;
         widths[0] = config.dense;
-        @memcpy(widths[1..][0..cfg.layers], &config.experts);
-        @memcpy(widths[1 + cfg.layers ..], &config.draft_experts);
+        widths[1] = block_dense; // the blocks' projections, when their own entries differ from the global width
+        @memcpy(widths[2..][0..cfg.layers], &config.experts);
+        @memcpy(widths[2 + cfg.layers ..], &config.draft_experts);
         for (widths) |w| {
             if (w.group != 64 or out.nax[w.bits] != null) continue;
             out.nax[w.bits] = try naxLoad(device, w.bits);

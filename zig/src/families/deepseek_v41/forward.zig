@@ -62,6 +62,12 @@ pub var timing: ?*[3]f64 = null;
 /// A check's ablation (DS_SKIP): dispatches of the pipeline of this name are left out, to time what each costs.
 pub var skip: ?[]const u8 = null;
 var skipping = false;
+/// Dispatches encoded, counted for a check.
+pub var dispatches: usize = 0;
+pub var trace = false;
+/// The next dispatch runs alongside the one before it (`Enc.with`): no barrier between them.
+var joined = false;
+var last_pipe: []const u8 = "";
 pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
 
 const Enc = struct {
@@ -87,11 +93,26 @@ const Enc = struct {
         if (self.cbp.*.status() != .completed) return error.DeepseekGpuFailed;
         p[section] += self.cbp.*.gpuSeconds();
         self.cbp.* = self.m.queue.commandBuffer();
-        self.ep.* = self.cbp.*.compute(.serial);
+        self.ep.* = self.cbp.*.compute(.concurrent);
+    }
+
+    /// Calls encode into a concurrent encoder: every dispatch waits for all before it (a barrier), unless `with` was
+    /// called just before it, for a dispatch that touches nothing the one before it writes or reads.
+    fn fence(self: Enc) void {
+        if (joined) {
+            joined = false;
+            return;
+        }
+        self.ep.*.barrier();
+    }
+    fn with(self: Enc) void {
+        _ = self;
+        joined = true;
     }
 
     fn pipe(self: Enc, comptime key: []const u8) void {
         skipping = if (skip) |k| std.mem.eql(u8, k, key) else false;
+        last_pipe = key;
         self.ep.*.setPipeline(self.m.kernels.get(key));
     }
     fn buf(self: Enc, b: Buffer, off: usize, slot: usize) void {
@@ -105,10 +126,16 @@ const Enc = struct {
     }
     fn threads(self: Enc, grid: [3]usize, group: [3]usize) void {
         if (skipping) return;
+        dispatches += 1;
+        self.fence();
+        if (trace) std.debug.print("{s} {d}x{d}x{d}\n", .{ last_pipe, grid[0], grid[1], grid[2] });
         self.ep.*.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
     fn groups(self: Enc, grid: [3]usize, group: [3]usize) void {
         if (skipping) return;
+        dispatches += 1;
+        self.fence();
+        if (trace) std.debug.print("{s} {d}x{d}x{d}\n", .{ last_pipe, grid[0], grid[1], grid[2] });
         self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
 
@@ -117,11 +144,14 @@ const Enc = struct {
         if (rows >= nax_rows) if (self.nax(w)) |p| {
             const xr = Ref{ .buf = x, .off = x_off };
             const sums = Ref{ .buf = self.s.sums };
+            self.fence();
             am.rowSums(self.ep.*, p, @intCast(w.group), xr, sums, @intCast(rows), @intCast(w.k));
+            self.fence();
             am.dense(self.ep.*, p, xr, sums, matrix(w), Ref{ .buf = y, .off = y_off }, @intCast(rows));
             return;
         };
         skipping = if (skip) |k| std.mem.eql(u8, k, "rows") else false;
+        last_pipe = "rows";
         if (skipping) return;
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
@@ -137,6 +167,7 @@ const Enc = struct {
     /// Slot i takes expert ids[i] on input row i / repeat.
     fn indexed(self: Enc, x: row.Experts, slots: usize, in: Buffer, ids: Buffer, out: Buffer) void {
         skipping = if (skip) |k| std.mem.eql(u8, k, "indexed") else false;
+        last_pipe = "indexed";
         if (skipping) return;
         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
@@ -150,6 +181,27 @@ const Enc = struct {
         self.threads(.{ call.groups * call.threads, call.slots, 1 }, .{ call.threads, 1, 1 });
     }
 
+    /// s.oa [rows, 8 x 1024] = each group's 4,096 of s.o [rows, 64 x 512] times its block of wo_a.
+    fn woA(self: Enc, w: wts.WoA, rows: usize) void {
+        const s = self.s;
+        switch (w) {
+            .bf16 => |t| self.gemv(false, t, s.o, 0, c.heads * c.head_dim, s.oa, 0, rows, c.o_groups * c.o_rank, c.group_in, c.o_rank),
+            .affine => |x| {
+                if (rows >= nax_rows) if (self.nax(x.one)) |p| {
+                    const g: i32 = c.o_groups;
+                    const xr = Ref{ .buf = s.o };
+                    const sums = Ref{ .buf = s.sums };
+                    self.fence();
+                    am.rowSums(self.ep.*, p, @intCast(x.one.group), xr, sums, @intCast(rows * c.o_groups), c.group_in);
+                    self.fence();
+                    am.denseBatch(self.ep.*, p, xr, sums, matrix(x.one), Ref{ .buf = s.oa }, @intCast(rows), c.o_groups, .{ .x_row = g * c.group_in, .y_row = g * c.o_rank, .sums_row = g, .x_batch = c.group_in, .y_batch = c.o_rank, .sums_batch = 1, .w_batch = c.o_rank });
+                    return;
+                };
+                self.indexed(x, rows * c.o_groups, s.o, s.wo_ids, s.oa);
+            },
+        }
+    }
+
     /// y = x W^T with a bf16 W [n, k]; `group_n` outputs share one k-wide slice of each x row.
     fn gemv(self: Enc, comptime out_f32: bool, w: wts.Tensor, x: Buffer, x_off: usize, x_stride: usize, y: Buffer, y_off: usize, rows: usize, n: usize, k: usize, group_n: usize) void {
         if (out_f32) self.pipe("ds_gemv_bf_f32") else self.pipe("ds_gemv_bf_bf");
@@ -161,8 +213,9 @@ const Enc = struct {
     }
 
     /// Attention over each row's window (ending at `window_end`, or the row's own position when negative) and its
-    /// `picks` compressed keys: split by keys for decode-sized calls, the shared-tile kernel for prompt chunks.
-    fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32) void {
+    /// `picks` compressed keys, each head's RoPE then taken back (`freq`) and the heads fp8-rounded: split by keys for
+    /// decode-sized calls (the finish inside the merge), the shared-tile kernel for prompt chunks.
+    fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32, freq: Buffer) void {
         const s = self.s;
         const aa = AttnArgs{ .first_pos = @intCast(self.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = window_end };
         if (self.rows >= nax_rows) {
@@ -175,6 +228,8 @@ const Enc = struct {
             self.buf(o, 0, 5);
             self.args(aa, 6);
             self.groups(.{ c.heads / 8, self.rows, 1 }, .{ 512, 1, 1 });
+            self.rope(o, self.rows, c.heads, c.head_dim, s.pos, freq, true);
+            self.fp8(o, self.rows * c.heads * c.head_dim);
             return;
         }
         const chunks: usize = (c.window + picks + 63) / 64;
@@ -192,7 +247,9 @@ const Enc = struct {
         self.buf(s.attn_ml, 0, 1);
         self.tensor(sink, 2);
         self.buf(o, 0, 3);
-        self.args(@as(i32, @intCast(chunks)), 4);
+        self.args([2]i32{ @intCast(chunks), 1 }, 4);
+        self.buf(s.pos, 0, 5);
+        self.buf(freq, 0, 6);
         self.groups(.{ c.heads, self.rows, 1 }, .{ 256, 1, 1 });
     }
 
@@ -225,6 +282,18 @@ const Enc = struct {
         self.buf(x, 0, 0);
         self.args(@as(i32, @intFromBool(e4m3_scale)), 1);
         self.threads(.{ values / @as(usize, if (e4m3_scale) 16 else 32), 1, 1 }, .{ 64, 1, 1 });
+    }
+
+    /// The window keys' tail in place (kv_norm, RoPE, fp8), then into `ring` at their positions when given.
+    fn kvFinish(self: Enc, kv: Buffer, norm: wts.Tensor, freq: Buffer, ring: ?Buffer) void {
+        self.pipe("ds_kv_finish");
+        self.buf(kv, 0, 0);
+        self.tensor(norm, 1);
+        self.buf(self.s.pos, 0, 2);
+        self.buf(freq, 0, 3);
+        self.buf(ring orelse kv, 0, 4);
+        self.args([2]f32{ c.norm_eps, if (ring != null) @floatFromInt(st.ring) else 0 }, 5);
+        self.groups(.{ self.rows, 1, 1 }, .{ 256, 1, 1 });
     }
 
     fn put(self: Enc, src: Buffer, positions: Buffer, dst: Buffer, rows: usize, width: usize, ring: usize) void {
@@ -333,7 +402,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
     _ = std.c.clock_gettime(.MONOTONIC, &t_start);
     var cb = m.queue.commandBuffer();
     const w = &m.weights;
-    var e = cb.compute(.serial);
+    var e = cb.compute(.concurrent);
     const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = s, .rows = rows, .base = base };
     x.pipe("ds_embed");
     x.buf(s.ids, 0, 0);
@@ -369,7 +438,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
             if (cb.status() != .completed) return error.DeepseekGpuFailed;
             @memcpy(d.layers[i].contents()[0 .. rows * c.hc * c.hidden * 2], s.x.contents()[0 .. rows * c.hc * c.hidden * 2]);
             cb = m.queue.commandBuffer();
-            e = cb.compute(.serial);
+            e = cb.compute(.concurrent);
         }
     }
     if (drafting) condition(x, cache);
@@ -441,7 +510,7 @@ pub fn draft(m: *Model, ds: *st.Scratch, cache: *st.Cache, token: u32, at: usize
     @memset(ds.img.slice(i32, n), 0); // drafts are text
 
     var cb = m.queue.commandBuffer();
-    var e = cb.compute(.serial);
+    var e = cb.compute(.concurrent);
     const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = ds, .rows = n, .base = at + 1 };
     x.pipe("ds_embed");
     x.buf(ds.ids, 0, 0);
@@ -491,17 +560,15 @@ fn stageAttention(x: Enc, l: *const wts.Layer, ring: Buffer, layer: usize, at: u
     const n = x.rows;
     const freq = x.m.freq(layer);
     x.linear(a.wq_a, s.normed, 0, s.qr, 0, n);
+    x.with();
+    x.linear(a.wkv, s.normed, 0, s.kv, 0, n);
     x.rms(s.qr, 0, a.q_norm, s.qr, 0, n, c.q_rank);
+    x.with();
+    x.kvFinish(s.kv, a.kv_norm, freq, null);
     x.linear(a.wq_b, s.qr, 0, s.q, 0, n);
     x.rope(s.q, n, c.heads, c.head_dim, s.pos, freq, false);
-    x.linear(a.wkv, s.normed, 0, s.kv, 0, n);
-    x.rms(s.kv, 0, a.kv_norm, s.kv, 0, n, c.head_dim);
-    x.rope(s.kv, n, 1, c.head_dim, s.pos, freq, false);
-    x.fp8(s.kv, n * c.head_dim);
-    x.attend(s.q, ring, s.kv, s.draft_picks, c.draft_block, a.sink, s.o, @intCast(at));
-    x.rope(s.o, n, c.heads, c.head_dim, s.pos, freq, true);
-    x.fp8(s.o, n * c.heads * c.head_dim);
-    x.gemv(false, a.wo_a, s.o, 0, c.heads * c.head_dim, s.oa, 0, n, c.o_groups * c.o_rank, c.group_in, c.o_rank);
+    x.attend(s.q, ring, s.kv, s.draft_picks, c.draft_block, a.sink, s.o, @intCast(at), freq);
+    x.woA(a.wo_a, n);
     x.linear(a.wo_b, s.oa, 0, s.branch, 0, n);
 }
 
@@ -541,16 +608,15 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     const a = &l.attn;
     const freq = m.freq(layer);
     // queries: q = wq_b(q_norm(wq_a(x))), RoPE on each head's last 64
+    // and the window key: kv_norm(wkv(x)), RoPE'd, fp8-rounded, into the ring; the two chains side by side
     x.linear(a.wq_a, s.normed, 0, s.qr, 0, rows);
+    x.with();
+    x.linear(a.wkv, s.normed, 0, s.kv, 0, rows);
     x.rms(s.qr, 0, a.q_norm, s.qr, 0, rows, c.q_rank);
+    x.with();
+    x.kvFinish(s.kv, a.kv_norm, freq, cache.windows[layer]);
     x.linear(a.wq_b, s.qr, 0, s.q, 0, rows);
     x.rope(s.q, rows, c.heads, c.head_dim, s.pos, freq, false);
-    // the window key: kv_norm(wkv(x)), RoPE'd, fp8-rounded, into the ring
-    x.linear(a.wkv, s.normed, 0, s.kv, 0, rows);
-    x.rms(s.kv, 0, a.kv_norm, s.kv, 0, rows, c.head_dim);
-    x.rope(s.kv, rows, 1, c.head_dim, s.pos, freq, false);
-    x.fp8(s.kv, rows * c.head_dim);
-    x.put(s.kv, s.pos, cache.windows[layer], rows, c.head_dim, st.ring);
     try x.cut(1);
 
     var picks: usize = 0;
@@ -567,12 +633,10 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     }
     try x.cut(2);
     // sparse attention over the window and the picks, then the output's RoPE taken back
-    x.attend(s.q, cache.windows[layer], comp, s.picks, picks, a.sink, s.o, -1);
-    x.rope(s.o, rows, c.heads, c.head_dim, s.pos, freq, true);
+    x.attend(s.q, cache.windows[layer], comp, s.picks, picks, a.sink, s.o, -1, freq);
     try x.cut(3);
-    // the grouped low-rank output: fp8-rounded heads, block-diagonal wo_a (bf16), wo_b
-    x.fp8(s.o, rows * c.heads * c.head_dim);
-    x.gemv(false, a.wo_a, s.o, 0, c.heads * c.head_dim, s.oa, 0, rows, c.o_groups * c.o_rank, c.group_in, c.o_rank);
+    // the grouped low-rank output: block-diagonal wo_a, wo_b
+    x.woA(a.wo_a, rows);
     x.linear(a.wo_b, s.oa, 0, s.branch, 0, rows);
     try x.cut(4);
 }
@@ -683,7 +747,14 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
     const s = x.s;
     const rows = x.rows;
     const slots = rows * topk;
+    const side = x.rows < nax_rows; // decode-sized: the shared expert runs beside the routed path
     x.gemv(true, mo.router, s.normed, 0, c.hidden, s.router, 0, rows, experts, c.hidden, experts);
+    if (side) {
+        x.with();
+        x.linear(mo.shared.w1, s.normed, 0, s.sh_gate, 0, rows);
+        x.with();
+        x.linear(mo.shared.w3, s.normed, 0, s.sh_up, 0, rows);
+    }
     x.pipe("ds_route");
     x.buf(s.router, 0, 0);
     x.tensor(mo.bias, 1);
@@ -693,6 +764,10 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
     x.buf(s.img, 0, 5);
     x.tensor(mo.bias_vl, 6);
     x.groups(.{ rows, 1, 1 }, .{ (experts + 31) / 32 * 32, 1, 1 });
+    if (side) {
+        x.with();
+        gluTo(x, rows, false, s.route_weight, s.sh_gate, s.sh_up, s.sh_act);
+    }
     try x.cut(5);
     if (x.nax(mo.w1.one)) |p| {
         // a prompt chunk: slots sorted by expert, each expert's rows through its weights once on the tensor units
@@ -713,23 +788,34 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
         x.threads(.{ c.hidden, slots, 1 }, .{ 256, 1, 1 });
         const sums = Ref{ .buf = s.sums };
         const offs = Ref{ .buf = s.offs };
+        x.fence();
         am.rowSums(e, p, 64, Ref{ .buf = s.xsort }, sums, @intCast(slots), c.hidden);
+        x.fence();
         am.gather(e, p, Ref{ .buf = s.xsort }, sums, matrix(mo.w1.one), offs, Ref{ .buf = s.gate }, @intCast(slots), @intCast(experts));
+        x.with();
+        x.fence();
         am.gather(e, p, Ref{ .buf = s.xsort }, sums, matrix(mo.w3.one), offs, Ref{ .buf = s.up }, @intCast(slots), @intCast(experts));
         gluWith(x, slots, true, s.wsort);
+        x.fence();
         am.rowSums(e, p, 64, Ref{ .buf = s.act }, sums, @intCast(slots), c.moe_inter);
+        x.fence();
         am.gatherTo(e, p, Ref{ .buf = s.act }, sums, matrix(mo.w2.one), offs, Ref{ .buf = s.experts }, Ref{ .buf = s.order }, @intCast(slots), @intCast(experts));
     } else {
         x.indexed(mo.w1, slots, s.normed, s.route_pick, s.gate);
+        x.with();
         x.indexed(mo.w3, slots, s.normed, s.route_pick, s.up);
+        x.with();
+        x.linear(mo.shared.w2, s.sh_act, 0, s.shared, 0, rows);
         glu(x, slots, true);
         x.indexed(mo.w2, slots, s.act, s.route_pick, s.experts);
     }
     try x.cut(6);
-    x.linear(mo.shared.w1, s.normed, 0, s.gate, 0, rows);
-    x.linear(mo.shared.w3, s.normed, 0, s.up, 0, rows);
-    glu(x, rows, false);
-    x.linear(mo.shared.w2, s.act, 0, s.shared, 0, rows);
+    if (!side) {
+        x.linear(mo.shared.w1, s.normed, 0, s.gate, 0, rows);
+        x.linear(mo.shared.w3, s.normed, 0, s.up, 0, rows);
+        glu(x, rows, false);
+        x.linear(mo.shared.w2, s.act, 0, s.shared, 0, rows);
+    }
     x.pipe("ds_moe_combine");
     x.buf(s.experts, 0, 0);
     x.buf(s.shared, 0, 1);
@@ -744,12 +830,15 @@ fn glu(x: Enc, n: usize, weighted: bool) void {
 }
 
 fn gluWith(x: Enc, n: usize, weighted: bool, weights: Buffer) void {
-    const s = x.s;
+    gluTo(x, n, weighted, weights, x.s.gate, x.s.up, x.s.act);
+}
+
+fn gluTo(x: Enc, n: usize, weighted: bool, weights: Buffer, gate: Buffer, up: Buffer, act: Buffer) void {
     x.pipe("ds_swiglu");
-    x.buf(s.gate, 0, 0);
-    x.buf(s.up, 0, 1);
+    x.buf(gate, 0, 0);
+    x.buf(up, 0, 1);
     x.buf(weights, 0, 2);
-    x.buf(s.act, 0, 3);
+    x.buf(act, 0, 3);
     x.args(GluArgs{ .width = c.moe_inter, .weighted = @intFromBool(weighted), .limit = c.swiglu_limit }, 4);
     x.threads(.{ c.moe_inter, n, 1 }, .{ 256, 1, 1 });
 }

@@ -56,7 +56,8 @@ pub const Model = struct {
         // the DSpark head when asked for and the checkpoint has it (mtp.*)
         m.weights = try weights.load(&m.checkpoint, &m.config, drafts and m.checkpoint.has("mtp.0.attn.wq_a.weight"));
         m.vision = try vision.load(&m.checkpoint, m.config.dense);
-        m.kernels = try kernels.load(m.device, &m.config);
+        const wq_b = m.weights.layers[0].attn.wq_b;
+        m.kernels = try kernels.load(m.device, &m.config, .{ .bits = @intCast(wq_b.bits), .group = @intCast(wq_b.group) });
         errdefer m.kernels.deinit();
         m.engram = try engram.Engram.open(gpa, io, dir, &m.config);
         errdefer m.engram.deinit();

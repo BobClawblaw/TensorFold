@@ -137,6 +137,12 @@ pub const Scratch = struct {
     picks: mtl.Buffer, // i32 [rows, 512]
     router: mtl.Buffer,
     route_pick: mtl.Buffer,
+    /// The shared expert's own gate, up and activation rows (bf16 [rows, 2304]) when it runs beside the routed ones.
+    sh_gate: mtl.Buffer,
+    sh_up: mtl.Buffer,
+    sh_act: mtl.Buffer,
+    /// u32 [rows * 8]: slot i's wo_a group (i % 8), the decode path's expert ids for the stacked wo_a.
+    wo_ids: mtl.Buffer,
     route_weight: mtl.Buffer,
     gate: mtl.Buffer,
     up: mtl.Buffer,
@@ -204,6 +210,11 @@ pub const Scratch = struct {
         out.picks = try m.alloc(rows * picks * 4);
         out.router = try m.alloc(rows * c.experts * 4);
         out.route_pick = try m.alloc(slots * 4);
+        out.sh_gate = try m.alloc(rows * c.moe_inter * 2);
+        out.sh_up = try m.alloc(rows * c.moe_inter * 2);
+        out.sh_act = try m.alloc(rows * c.moe_inter * 2);
+        out.wo_ids = try m.alloc(rows * c.o_groups * 4);
+        for (out.wo_ids.slice(u32, rows * c.o_groups), 0..) |*v, i| v.* = @intCast(i % c.o_groups);
         out.route_weight = try m.alloc(slots * 4);
         out.gate = try m.alloc(slots * c.moe_inter * 2);
         out.up = try m.alloc(slots * c.moe_inter * 2);
@@ -214,7 +225,7 @@ pub const Scratch = struct {
         out.order = try m.alloc(slots * 4);
         out.wsort = try m.alloc(slots * 4);
         out.xsort = try m.alloc(slots * c.hidden * 2);
-        out.sums = try m.alloc(@max(rows * (c.o_groups * c.o_rank) / 64, slots * c.hidden / 64) * 4);
+        out.sums = try m.alloc(@max(rows * (c.heads * c.head_dim) / 64, slots * c.hidden / 64) * 4);
         for (&out.engram_rows) |*b| b.* = try m.alloc(rows * c.engram_cols * c.engram_dim * 2);
         for (&out.gpos, &out.gidx) |*p, *g| {
             p.* = try m.alloc(rows * 4);

@@ -32,7 +32,7 @@ pub const Attention = struct {
     wkv: Linear,
     kv_norm: Tensor,
     /// [8 x 1024, 4096] bf16: group g projects heads 8g..8g+7 (block diagonal).
-    wo_a: Tensor,
+    wo_a: WoA,
     wo_b: Linear,
     sink: Tensor, // f32 [64]
     compressor: ?Compressor,
@@ -73,6 +73,17 @@ pub const Stage = struct {
     confidence: ?Tensor,
 };
 
+/// The block-diagonal wo_a: affine, stacked by group (convert.py now), or bf16 [8192, 4096] (older checkpoints).
+pub const WoA = union(enum) { affine: row.Experts, bf16: Tensor };
+
+fn woA(ckpt: *const ck.Checkpoint, p: []const u8, dense: c.Width) !WoA {
+    var buf: [256]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, "{s}attn.wo_a.weight", .{p});
+    const t = try ckpt.get(name);
+    if (t.dtype == .bf16) return .{ .bf16 = try tensor(ckpt, p, "attn.wo_a.weight", .bf16, &.{ c.o_groups * c.o_rank, c.group_in }) };
+    return .{ .affine = try stack(ckpt, p, "attn.wo_a", c.o_groups, c.o_rank, c.group_in, dense, 1) };
+}
+
 pub const Weights = struct {
     embed: Tensor, // bf16 [vocab, 5120]
     norm: Tensor,
@@ -105,10 +116,24 @@ fn optional(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, 
     return try expect(ckpt, name, dtype, shape);
 }
 
-/// `count` matrices [n, k] (count 0: one matrix of rank 2) of `w`-wide codes as the row kernels read them.
-fn affine(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, count: usize, n: usize, k: usize, w: c.Width) !Linear {
+/// `count` matrices [n, k] (count 0: one matrix of rank 2) of affine codes as the row kernels read them. The width
+/// is the tensors' own (codes [.., n, k * bits / 32], scales [.., n, k / group]); `expected` is the config's, which a
+/// module may differ from (a per-module quantization entry).
+fn affine(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, count: usize, n: usize, k: usize, expected: c.Width) !Linear {
     var buf: [256]u8 = undefined;
     const name = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });
+    var w = expected;
+    {
+        var nb: [272]u8 = undefined;
+        const qt = ckpt.get(try std.fmt.bufPrint(&nb, "{s}.weight", .{name})) catch null;
+        const st_ = ckpt.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{name})) catch null;
+        if (qt != null and st_ != null and qt.?.rank >= 2 and st_.?.rank >= 2) {
+            const words = qt.?.shape[qt.?.rank - 1];
+            const groups = st_.?.shape[st_.?.rank - 1];
+            if (groups > 0 and k % groups == 0 and (words * 32) % k == 0)
+                w = .{ .bits = @intCast(words * 32 / k), .group = @intCast(k / groups) };
+        }
+    }
     const lead: []const usize = if (count == 0) &.{} else &.{count};
     var shape: [3]usize = undefined;
     @memcpy(shape[0..lead.len], lead);
@@ -153,7 +178,7 @@ fn block(ckpt: *const ck.Checkpoint, p: []const u8, layer: usize, dense: c.Width
         .wq_b = try affine(ckpt, p, "attn.wq_b", 0, c.heads * c.head_dim, c.q_rank, dense),
         .wkv = try affine(ckpt, p, "attn.wkv", 0, c.head_dim, c.hidden, dense),
         .kv_norm = try tensor(ckpt, p, "attn.kv_norm.weight", .bf16, &.{c.head_dim}),
-        .wo_a = try tensor(ckpt, p, "attn.wo_a.weight", .bf16, &.{ c.o_groups * c.o_rank, c.group_in }),
+        .wo_a = try woA(ckpt, p, dense),
         .wo_b = try affine(ckpt, p, "attn.wo_b", 0, c.hidden, c.o_groups * c.o_rank, dense),
         .sink = try tensor(ckpt, p, "attn.attn_sink", .f32, &.{c.heads}),
         .compressor = null,

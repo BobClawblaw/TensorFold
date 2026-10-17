@@ -191,6 +191,30 @@ fn dispatchCost(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
         cb.wait();
         std.debug.print("{s}: {d:.2} us a dispatch on the GPU\n", .{ @tagName(kind), cb.gpuSeconds() * 1e6 / 2000.0 });
     }
+    // concurrent, a barrier after each (a chain of dependent dispatches)
+    const cb = m.queue.commandBuffer();
+    const e = cb.compute(.concurrent);
+    e.setPipeline(m.kernels.get("ds_scale"));
+    e.setBuffer(buf, 0, 0);
+    e.setValue(@as(f32, 1.0), 1);
+    for (0..2000) |_| {
+        e.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
+        e.barrier();
+    }
+    e.end();
+    cb.commit();
+    cb.wait();
+    std.debug.print("concurrent, barrier each: {d:.2} us a dispatch on the GPU\n", .{cb.gpuSeconds() * 1e6 / 2000.0});
+    var scratch = try q.state.Scratch.init(gpa, m.device, 8);
+    defer scratch.deinit();
+    var cache = try q.state.Cache.init(gpa, m.device, 16);
+    defer cache.deinit();
+    try q.forward.run(m, &scratch, &cache, &.{0}, .last, null);
+    q.forward.dispatches = 0;
+    q.forward.trace = true;
+    try q.forward.run(m, &scratch, &cache, &.{1}, .last, null);
+    q.forward.trace = false;
+    std.debug.print("a decode step: {d} dispatches\n", .{q.forward.dispatches});
 }
 
 /// GPU ms a decode step with each kernel left out in turn (the outputs are wrong; only the time is read).
