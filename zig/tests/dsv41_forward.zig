@@ -43,6 +43,10 @@ pub fn main(init: std.process.Init) !void {
     };
     defer if (dumping) for (dump_bufs) |b| b.deinit();
 
+    var sections: [q.forward.sections.len]f64 = @splat(0);
+    if (std.c.getenv("DS_PROFILE") != null) q.forward.profile = &sections;
+    var calls: usize = 0;
+    var wall: f64 = 0;
     const logits = try gpa.alloc(u8, ids.len * c.vocab * 2);
     defer gpa.free(logits);
     var at: usize = 0;
@@ -52,6 +56,10 @@ pub fn main(init: std.process.Init) !void {
         try q.forward.run(m, &scratch, &cache, ids[at..][0..n], .all, if (dumping) .{ .layers = &dump_bufs } else null);
         _ = std.c.clock_gettime(.MONOTONIC, &t1);
         if (at == 0 or n > 1) std.debug.print("rows {d}..{d}: {d:.1} ms\n", .{ at, at + n, seconds(t0, t1) * 1e3 });
+        if (at > 0) {
+            calls += 1;
+            wall += seconds(t0, t1);
+        }
         @memcpy(logits[at * c.vocab * 2 ..][0 .. n * c.vocab * 2], scratch.logits.contents()[0 .. n * c.vocab * 2]);
         at += n;
     }
@@ -64,6 +72,13 @@ pub fn main(init: std.process.Init) !void {
         try dir.writeFile(init.io, .{ .sub_path = n, .data = b.contents()[0 .. ids.len * c.hc * c.hidden * 2] });
     };
     std.debug.print("native DeepSeek-V4.1 forward: {d} rows, bf16 logits\n", .{ids.len});
+    if (calls > 0) std.debug.print("after the first call: {d:.2} ms a call ({d} calls)\n", .{ wall * 1e3 / @as(f64, @floatFromInt(calls)), calls });
+    if (q.forward.profile != null) {
+        const k: f64 = @floatFromInt(calls + 1);
+        std.debug.print("GPU ms a call:", .{});
+        for (q.forward.sections, sections) |name, v| std.debug.print(" {s} {d:.2},", .{ name, v * 1e3 / k });
+        std.debug.print("\n", .{});
+    }
 }
 
 fn seconds(a: std.c.timespec, b: std.c.timespec) f64 {

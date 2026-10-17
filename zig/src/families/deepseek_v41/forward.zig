@@ -29,41 +29,59 @@ const RouteArgs = extern struct { experts: i32, topk: i32, scale: f32 };
 const GluArgs = extern struct { width: i32, weighted: i32, limit: f32 };
 const EngramArgs = extern struct { eps: f32, text_rows: i32 };
 
+/// GPU seconds by section when set (`sections` names them): each section then runs in its own command buffer,
+/// waited for (a profile, not a served speed).
+pub var profile: ?*[sections.len]f64 = null;
+pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head" };
+
 const Enc = struct {
-    e: mtl.ComputeEncoder,
+    ep: *mtl.ComputeEncoder,
+    cbp: *mtl.CommandBuffer,
     m: *Model,
     s: *st.Scratch,
     rows: usize,
     base: usize, // the first row's position
 
+    /// With `profile`, everything encoded since the last cut runs now and its GPU time counts for `section`.
+    fn cut(self: Enc, section: usize) !void {
+        const p = profile orelse return;
+        self.ep.*.end();
+        self.cbp.*.commit();
+        self.cbp.*.wait();
+        if (self.cbp.*.status() != .completed) return error.DeepseekGpuFailed;
+        p[section] += self.cbp.*.gpuSeconds();
+        self.cbp.* = self.m.queue.commandBuffer();
+        self.ep.* = self.cbp.*.compute(.serial);
+    }
+
     fn pipe(self: Enc, comptime key: []const u8) void {
-        self.e.setPipeline(self.m.kernels.get(key));
+        self.ep.*.setPipeline(self.m.kernels.get(key));
     }
     fn buf(self: Enc, b: Buffer, off: usize, slot: usize) void {
-        self.e.setBuffer(b, off, slot);
+        self.ep.*.setBuffer(b, off, slot);
     }
     fn tensor(self: Enc, t: wts.Tensor, slot: usize) void {
-        self.e.setBuffer(t.buffer, t.offset, slot);
+        self.ep.*.setBuffer(t.buffer, t.offset, slot);
     }
     fn args(self: Enc, v: anytype, slot: usize) void {
-        self.e.setBytes(std.mem.asBytes(&v), slot);
+        self.ep.*.setBytes(std.mem.asBytes(&v), slot);
     }
     fn threads(self: Enc, grid: [3]usize, group: [3]usize) void {
-        self.e.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
+        self.ep.*.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
     fn groups(self: Enc, grid: [3]usize, group: [3]usize) void {
-        self.e.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
+        self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
 
     /// y[rows, n] = x[rows, k] W^T on the row kernels.
     fn linear(self: Enc, w: wts.Linear, x: Buffer, x_off: usize, y: Buffer, y_off: usize, rows: usize) void {
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
-        self.e.setPipeline(call.pipeline);
+        self.ep.*.setPipeline(call.pipeline);
         self.buf(x, x_off, 0);
         self.buf(w.w, w.w_off, 1);
         self.buf(w.scales, w.s_off, 2);
         self.buf(w.biases, w.b_off, 3);
-        self.e.setBytes(std.mem.asBytes(&call.dims), 4);
+        self.ep.*.setBytes(std.mem.asBytes(&call.dims), 4);
         self.buf(y, y_off, 5);
         self.threads(.{ call.groups * call.threads, 1, 1 }, .{ call.threads, 1, 1 });
     }
@@ -71,12 +89,12 @@ const Enc = struct {
     /// Slot i takes expert ids[i] on input row i / repeat.
     fn indexed(self: Enc, x: row.Experts, slots: usize, in: Buffer, ids: Buffer, out: Buffer) void {
         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
-        self.e.setPipeline(call.pipeline);
+        self.ep.*.setPipeline(call.pipeline);
         self.buf(in, 0, 0);
         self.buf(x.one.w, x.one.w_off, 1);
         self.buf(x.one.scales, x.one.s_off, 2);
         self.buf(x.one.biases, x.one.b_off, 3);
-        self.e.setBytes(std.mem.asBytes(&call.dims), 4);
+        self.ep.*.setBytes(std.mem.asBytes(&call.dims), 4);
         self.buf(out, 0, 5);
         self.buf(ids, 0, 6);
         self.threads(.{ call.groups * call.threads, call.slots, 1 }, .{ call.threads, 1, 1 });
@@ -204,7 +222,7 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
     var cb = m.queue.commandBuffer();
     const w = &m.weights;
     var e = cb.compute(.serial);
-    var x: Enc = .{ .e = e, .m = m, .s = s, .rows = rows, .base = base };
+    const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = s, .rows = rows, .base = base };
     x.pipe("ds_embed");
     x.buf(s.ids, 0, 0);
     x.tensor(w.embed, 1);
@@ -220,9 +238,9 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
             @memcpy(d.layers[i].contents()[0 .. rows * c.hc * c.hidden * 2], s.x.contents()[0 .. rows * c.hc * c.hidden * 2]);
             cb = m.queue.commandBuffer();
             e = cb.compute(.serial);
-            x.e = e;
         }
     }
+    try x.cut(0);
     // the last block's FFN pre collapses the streams for the head
     x.boundary(null, s.pre[0], s.pre[1], w.norm);
     switch (head) {
@@ -233,6 +251,7 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
     e.end();
     cb.commit();
     cb.wait();
+    if (profile) |p| p[9] += cb.gpuSeconds();
     if (cb.status() != .completed) {
         if (cb.failure()) |why| std.log.err("deepseek_v41: the forward failed: {s}", .{why});
         return error.DeepseekGpuFailed;
@@ -256,12 +275,15 @@ fn block(x: Enc, cache: *st.Cache, i: usize, l: *const wts.Layer) !void {
         x.tensor(eg.k_weight, 3);
         x.args(EngramArgs{ .eps = c.norm_eps, .text_rows = @intCast(x.rows) }, 4);
         x.groups(.{ c.hc, x.rows, 1 }, .{ 256, 1, 1 });
+        try x.cut(8);
     }
     x.boundary(l.hc_attn, s.pre[0], s.pre[1], l.attn_norm);
+    try x.cut(0);
     try attention(x, cache, i, l);
     x.expand();
     x.boundary(l.hc_ffn, s.pre[1], s.pre[0], l.ffn_norm);
-    moe(x, &l.moe, c.topk, c.experts);
+    try x.cut(0);
+    try moe(x, &l.moe, c.topk, c.experts);
     x.expand();
 }
 
@@ -282,6 +304,7 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     x.rope(s.kv, rows, 1, c.head_dim, s.pos, freq, false);
     x.fp8(s.kv, rows * c.head_dim);
     x.put(s.kv, s.pos, cache.windows[layer], rows, c.head_dim, st.ring);
+    try x.cut(1);
 
     var picks: usize = 0;
     var comp = cache.windows[layer]; // unread without picks
@@ -295,6 +318,7 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
         picks = st.picks;
         if (a.indexer) |ix| try index(x, src, layer, ratio, ix, freq);
     }
+    try x.cut(2);
     // sparse attention over the window and the picks, then the output's RoPE taken back
     x.pipe("ds_attend");
     x.buf(s.q, 0, 0);
@@ -306,10 +330,12 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     x.args(AttnArgs{ .first_pos = @intCast(x.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)) }, 6);
     x.groups(.{ c.heads, rows, 1 }, .{ 256, 1, 1 });
     x.rope(s.o, rows, c.heads, c.head_dim, s.pos, freq, true);
+    try x.cut(3);
     // the grouped low-rank output: fp8-rounded heads, block-diagonal wo_a (bf16), wo_b
     x.fp8(s.o, rows * c.heads * c.head_dim);
     x.gemv(false, a.wo_a, s.o, 0, c.heads * c.head_dim, s.oa, 0, rows, c.o_groups * c.o_rank, c.group_in, c.o_rank);
     x.linear(a.wo_b, s.oa, 0, s.branch, 0, rows);
+    try x.cut(4);
 }
 
 /// A KV source's compressor: this call's completed groups pooled (ratio 2) or projected (ratio 1), normed, the index
@@ -414,7 +440,7 @@ fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.Inde
 }
 
 /// Routed experts (row kernels by id) and the shared expert, summed in expert order as the reference does.
-fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) void {
+fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
     const s = x.s;
     const rows = x.rows;
     const slots = rows * topk;
@@ -425,11 +451,13 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) void {
     x.buf(s.route_pick, 0, 2);
     x.buf(s.route_weight, 0, 3);
     x.args(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .scale = c.route_scale }, 4);
-    x.threads(.{ rows, 1, 1 }, .{ @min(rows, 64), 1, 1 });
+    x.groups(.{ rows, 1, 1 }, .{ (experts + 31) / 32 * 32, 1, 1 });
+    try x.cut(5);
     x.indexed(mo.w1, slots, s.normed, s.route_pick, s.gate);
     x.indexed(mo.w3, slots, s.normed, s.route_pick, s.up);
     glu(x, slots, true);
     x.indexed(mo.w2, slots, s.act, s.route_pick, s.experts);
+    try x.cut(6);
     x.linear(mo.shared.w1, s.normed, 0, s.gate, 0, rows);
     x.linear(mo.shared.w3, s.normed, 0, s.up, 0, rows);
     glu(x, rows, false);
@@ -440,6 +468,7 @@ fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) void {
     x.buf(s.branch, 0, 2);
     x.args(@as(i32, @intCast(topk)), 3);
     x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
+    try x.cut(7);
 }
 
 fn glu(x: Enc, n: usize, weighted: bool) void {

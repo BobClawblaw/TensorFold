@@ -247,9 +247,16 @@ template <typename XT, typename YT>
   const device bfloat* w = W + size_t(j) * a.k;
   const int xo = (j / a.group_n) * a.k;
   float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  for (int kk = int(lane); kk < a.k; kk += 32) {
-    const float wv = float(w[kk]);
-    for (int i = 0; i < nr; i++) acc[i] += float(X[size_t(r0 + i) * a.x_stride + xo + kk]) * wv;
+  // 8 consecutive inputs a lane a step (k is a multiple of 256 at every shape this family multiplies)
+  for (int kk = int(lane) * 8; kk < a.k; kk += 256) {
+    float wv[8];
+    for (int u = 0; u < 8; u++) wv[u] = float(w[kk + u]);
+    for (int i = 0; i < nr; i++) {
+      const device XT* xr = X + size_t(r0 + i) * a.x_stride + xo + kk;
+      float part = 0.0f;
+      for (int u = 0; u < 8; u++) part += float(xr[u]) * wv[u];
+      acc[i] += part;
+    }
   }
   for (int i = 0; i < nr; i++) {
     const float s = simd_sum(acc[i]);
@@ -620,48 +627,81 @@ struct RouteArgs {
 };
 
 // sqrt(softplus(logits)) scores; the top-k of score + bias (ties to the lower id) picked; their unbiased scores
-// normalized and scaled. Picks are written in expert order, the order the reference sums them in.
+// normalized and scaled. Picks are written in expert order, the order the reference sums them in. One threadgroup
+// (a thread an expert, `experts` <= 512) a row: the scores in parallel, then k rounds of a threadgroup argmax.
 [[kernel]] void ds_route(const device float* LOGITS [[buffer(0)]], const device float* BIAS [[buffer(1)]],
                          device uint* PICK [[buffer(2)]], device float* WEIGHT [[buffer(3)]],
-                         constant RouteArgs& a [[buffer(4)]], uint r [[thread_position_in_grid]]) {
+                         constant RouteArgs& a [[buffer(4)]], uint r [[threadgroup_position_in_grid]],
+                         uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+  threadgroup float best_v[16];
+  threadgroup int best_i[16];
+  threadgroup int sel[16];
+  threadgroup float w[16];
   const device float* z = LOGITS + size_t(r) * a.experts;
-  int sel[16];
-  float w[16];
+  float score = 0.0f, key = -INFINITY;
+  if (int(t) < a.experts) {
+    const float x = z[t];
+    score = precise::sqrt(x > 20.0f ? x : precise::log(1.0f + precise::exp(x)));
+    key = score + BIAS[t];
+  }
   for (int k = 0; k < a.topk; k++) {
-    int best = -1;
-    float bv = -INFINITY;
-    for (int e = 0; e < a.experts; e++) {
-      bool used = false;
-      for (int j = 0; j < k; j++) used = used || sel[j] == e;
-      if (used) continue;
-      const float x = z[e];
-      const float sp = x > 20.0f ? x : precise::log(1.0f + precise::exp(x));
-      const float v = precise::sqrt(sp) + BIAS[e];
-      if (best < 0 || v > bv) {
-        best = e;
-        bv = v;
+    // the simdgroup's best (value, then lower id), then the threadgroup's
+    float v = key;
+    int id = int(t) < a.experts ? int(t) : 0x7fffffff;
+    for (ushort o = 16; o > 0; o >>= 1) {
+      const float ov = simd_shuffle_down(v, o);
+      const int oi = simd_shuffle_down(id, o);
+      if (ov > v || (ov == v && oi < id)) {
+        v = ov;
+        id = oi;
       }
     }
-    sel[k] = best;
-    const float x = z[best];
-    w[k] = precise::sqrt(x > 20.0f ? x : precise::log(1.0f + precise::exp(x)));
-  }
-  float sum = 0.0f;
-  for (int k = 0; k < a.topk; k++) sum += w[k];
-  for (int k = 0; k < a.topk; k++) w[k] = w[k] / (sum + 1e-20f) * a.scale;
-  // expert order
-  for (int i = 1; i < a.topk; i++)
-    for (int j = i; j > 0 && sel[j - 1] > sel[j]; j--) {
-      const int ts = sel[j];
-      sel[j] = sel[j - 1];
-      sel[j - 1] = ts;
-      const float tw = w[j];
-      w[j] = w[j - 1];
-      w[j - 1] = tw;
+    if (lane == 0) {
+      best_v[sg] = v;
+      best_i[sg] = id;
     }
-  for (int k = 0; k < a.topk; k++) {
-    PICK[r * a.topk + k] = uint(sel[k]);
-    WEIGHT[r * a.topk + k] = w[k];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+      float bv = best_v[0];
+      int bi = best_i[0];
+      for (uint g = 1; g < nsg; g++)
+        if (best_v[g] > bv || (best_v[g] == bv && best_i[g] < bi)) {
+          bv = best_v[g];
+          bi = best_i[g];
+        }
+      sel[k] = bi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (int(t) == sel[k]) {
+      w[k] = score;
+      key = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (t == 0) {
+    int s2[16];
+    float w2[16];
+    float sum = 0.0f;
+    for (int k = 0; k < a.topk; k++) {
+      s2[k] = sel[k];
+      w2[k] = w[k];
+      sum += w[k];
+    }
+    for (int k = 0; k < a.topk; k++) w2[k] = w2[k] / (sum + 1e-20f) * a.scale;
+    for (int i = 1; i < a.topk; i++)
+      for (int j = i; j > 0 && s2[j - 1] > s2[j]; j--) {
+        const int ts = s2[j];
+        s2[j] = s2[j - 1];
+        s2[j - 1] = ts;
+        const float tw = w2[j];
+        w2[j] = w2[j - 1];
+        w2[j - 1] = tw;
+      }
+    for (int k = 0; k < a.topk; k++) {
+      PICK[r * a.topk + k] = uint(s2[k]);
+      WEIGHT[r * a.topk + k] = w2[k];
+    }
   }
 }
 
