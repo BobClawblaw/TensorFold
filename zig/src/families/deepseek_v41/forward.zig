@@ -62,9 +62,20 @@ pub var timing: ?*[3]f64 = null;
 /// A check's ablation (DS_SKIP): dispatches of the pipeline of this name are left out, to time what each costs.
 pub var skip: ?[]const u8 = null;
 var skipping = false;
+
+/// Whether DS_SKIP names `key`: a comma-separated list, or "!a,b" for everything but those.
+fn skips(key: []const u8) bool {
+    const k = skip orelse return false;
+    const but = k.len > 0 and k[0] == '!';
+    var it = std.mem.splitScalar(u8, if (but) k[1..] else k, ',');
+    while (it.next()) |name| if (std.mem.eql(u8, name, key)) return !but;
+    return but;
+}
 /// Dispatches encoded, counted for a check.
 pub var dispatches: usize = 0;
 pub var trace = false;
+/// Heads a split-attention threadgroup takes (v41.metal's HG).
+const split_heads = 16;
 /// The next dispatch runs alongside the one before it (`Enc.with`): no barrier between them.
 var joined = false;
 /// A sublayer's branch waits to be expanded into the streams (`Enc.expand`): the next boundary that mixes does it in
@@ -116,7 +127,7 @@ const Enc = struct {
     }
 
     fn pipe(self: Enc, comptime key: []const u8) void {
-        skipping = if (skip) |k| std.mem.eql(u8, k, key) else false;
+        skipping = skips(key);
         last_pipe = key;
         self.ep.*.setPipeline(self.m.kernels.get(key));
     }
@@ -155,7 +166,7 @@ const Enc = struct {
             am.dense(self.ep.*, p, xr, sums, matrix(w), Ref{ .buf = y, .off = y_off }, @intCast(rows));
             return;
         };
-        skipping = if (skip) |k| std.mem.eql(u8, k, "rows") else false;
+        skipping = skips("rows");
         last_pipe = "rows";
         if (skipping) return;
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
@@ -171,7 +182,7 @@ const Enc = struct {
 
     /// Slot i takes expert ids[i] on input row i / repeat.
     fn indexed(self: Enc, x: row.Experts, slots: usize, in: Buffer, ids: Buffer, out: Buffer) void {
-        skipping = if (skip) |k| std.mem.eql(u8, k, "indexed") else false;
+        skipping = skips("indexed");
         last_pipe = "indexed";
         if (skipping) return;
         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
@@ -218,12 +229,14 @@ const Enc = struct {
     }
 
     /// Attention over each row's window (ending at `window_end`, or the row's own position when negative) and its
-    /// `picks` compressed keys, each head's RoPE then taken back (`freq`) and the heads fp8-rounded: split by keys for
-    /// decode-sized calls (the finish inside the merge), the shared-tile kernel for prompt chunks.
+    /// `picks` compressed keys, the queries RoPE'd first and each head's RoPE taken back after (`freq`), the heads
+    /// fp8-rounded: split by keys for decode-sized calls (the RoPE in the split, the finish in the merge), the
+    /// shared-tile kernel for prompt chunks.
     fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32, freq: Buffer) void {
         const s = self.s;
         const aa = AttnArgs{ .first_pos = @intCast(self.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = window_end };
         if (self.rows >= nax_rows) {
+            self.rope(q, self.rows, c.heads, c.head_dim, s.pos, freq, false);
             self.pipe("ds_attend_rows");
             self.buf(q, 0, 0);
             self.buf(ring, 0, 1);
@@ -237,7 +250,7 @@ const Enc = struct {
             self.fp8(o, self.rows * c.heads * c.head_dim);
             return;
         }
-        const chunks: usize = (c.window + picks + 63) / 64;
+        const chunks: usize = (c.window + picks + 31) / 32;
         self.pipe("ds_attend_split");
         self.buf(q, 0, 0);
         self.buf(ring, 0, 1);
@@ -246,7 +259,9 @@ const Enc = struct {
         self.buf(s.attn_po, 0, 4);
         self.buf(s.attn_ml, 0, 5);
         self.args(aa, 6);
-        self.groups(.{ c.heads / 8, chunks, self.rows }, .{ 256, 1, 1 });
+        self.buf(s.pos, 0, 7);
+        self.buf(freq, 0, 8);
+        self.groups(.{ c.heads / split_heads, chunks, self.rows }, .{ split_heads * 32, 1, 1 });
         self.pipe("ds_attend_merge");
         self.buf(s.attn_po, 0, 0);
         self.buf(s.attn_ml, 0, 1);
@@ -605,7 +620,6 @@ fn stageAttention(x: Enc, l: *const wts.Layer, ring: Buffer, layer: usize, at: u
     x.with();
     x.kvFinish(s.kv, a.kv_norm, freq, null);
     x.linear(a.wq_b, s.qr, 0, s.q, 0, n);
-    x.rope(s.q, n, c.heads, c.head_dim, s.pos, freq, false);
     x.attend(s.q, ring, s.kv, s.draft_picks, c.draft_block, a.sink, s.o, @intCast(at), freq);
     x.woA(a.wo_a, n);
     x.linear(a.wo_b, s.oa, 0, s.branch, 0, n);
@@ -656,7 +670,6 @@ fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void 
     x.with();
     x.kvFinish(s.kv, a.kv_norm, freq, cache.windows[layer]);
     x.linear(a.wq_b, s.qr, 0, s.q, 0, rows);
-    x.rope(s.q, rows, c.heads, c.head_dim, s.pos, freq, false);
     try x.cut(1);
 
     var picks: usize = 0;

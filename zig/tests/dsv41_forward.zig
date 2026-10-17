@@ -26,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
     if (std.c.getenv("DS_DISPATCH") != null) return dispatchCost(gpa, init.io, args[1]);
+    if (std.c.getenv("DS_BW") != null) return bandwidth(gpa, init.io, args[1]);
     if (std.c.getenv("DS_ABLATE") != null) return ablate(gpa, init.io, args[1], ids);
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
@@ -223,20 +224,104 @@ fn ablate(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32)
     defer m.deinit();
     var scratch = try q.state.Scratch.init(gpa, m.device, 8);
     defer scratch.deinit();
-    const names = [_][]const u8{ "", "rows", "indexed", "ds_hc_mix_part", "ds_hc_boundary", "ds_hc_expand", "ds_rms", "ds_rope", "ds_fp8_qdq", "ds_fp4_qdq", "ds_put_rows", "ds_put_rows_f32", "ds_attend_split", "ds_attend_merge", "ds_gemv_bf_bf", "ds_gemv_bf_f32", "ds_route", "ds_swiglu", "ds_moe_combine", "ds_index_scores", "ds_topk", "ds_pool2", "ds_scale", "ds_engram", "ds_embed" };
+    const names = [_][]const u8{ "", "rows", "indexed", "ds_hc_expand_mix", "ds_hc_mix_part", "ds_hc_boundary", "ds_hc_expand", "ds_kv_finish", "ds_rms", "ds_rope", "ds_fp8_qdq", "ds_fp4_qdq", "ds_put_rows", "ds_put_rows_f32", "ds_attend_split", "ds_attend_merge", "ds_gemv_bf_bf", "ds_gemv_bf_f32", "ds_route", "ds_swiglu", "ds_index_scores", "ds_topk", "ds_pool2", "ds_scale", "ds_engram", "ds_embed" };
     var base: f64 = 0;
-    for (names) |name| {
+    const only_all = std.mem.eql(u8, std.mem.span(std.c.getenv("DS_ABLATE").?), "all");
+    for (names[0..if (only_all) 1 else names.len]) |name| {
         q.forward.skip = if (name.len == 0) null else name;
         var timing: [3]f64 = @splat(0);
         q.forward.timing = &timing;
         var cache = try q.state.Cache.init(gpa, m.device, ids.len + 8);
         defer cache.deinit();
-        for (ids, 0..) |t, i| {
-            if (i == 4) timing = @splat(0); // the first steps warm the pipelines
-            try q.forward.run(m, &scratch, &cache, &.{t}, .last, null);
+        const w: usize = if (std.c.getenv("DS_ROWS")) |r| try std.fmt.parseInt(usize, std.mem.span(r), 10) else 1;
+        var calls: usize = 0;
+        var at: usize = 0;
+        while (at + w <= ids.len) : (at += w) {
+            if (calls == 2) timing = @splat(0); // the first calls warm the pipelines
+            try q.forward.run(m, &scratch, &cache, ids[at..][0..w], .last, null);
+            calls += 1;
         }
-        const ms = timing[1] * 1e3 / @as(f64, @floatFromInt(ids.len - 4));
+        const ms = timing[1] * 1e3 / @as(f64, @floatFromInt(calls - 2));
         if (name.len == 0) base = ms;
         std.debug.print("{s:<18} {d:6.2} ms ({d:.2})\n", .{ if (name.len == 0) "(all)" else name, ms, ms - base });
+    }
+}
+
+/// GB/s the row kernels reach on one decode row: the head, a layer's wq_b and wo_b, 6 of a layer's experts; and a
+/// blit copy of the head's codes (read + write) for the bus.
+fn bandwidth(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+    const row = tf.row_projection;
+    const m = try q.Model.load(gpa, io, dir, false);
+    defer m.deinit();
+    const opts = mtl.ResourceOptions.shared;
+    const x = try m.device.buffer(64 << 20, opts);
+    defer x.deinit();
+    const y = try m.device.buffer(64 << 20, opts);
+    defer y.deinit();
+    const ids = try m.device.buffer(64, opts);
+    defer ids.deinit();
+    for (ids.slice(u32, 6), 0..) |*v, i| v.* = @intCast(i * 61 + 7);
+    const reps = 20;
+    const W = struct { name: []const u8, w: row.Weights };
+    const l = &m.weights.layers[12];
+    const list = [_]W{ .{ .name = "head", .w = m.weights.head }, .{ .name = "wq_b", .w = l.attn.wq_b }, .{ .name = "wo_b", .w = l.attn.wo_b }, .{ .name = "shared w1", .w = l.moe.shared.w1 } };
+    for (list) |it| {
+        const call = try row.call(&m.kernels.rows, it.w, 1, false);
+        const cb = m.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        for (0..reps) |_| {
+            e.setPipeline(call.pipeline);
+            e.setBuffer(x, 0, 0);
+            e.setBuffer(it.w.w, it.w.w_off, 1);
+            e.setBuffer(it.w.scales, it.w.s_off, 2);
+            e.setBuffer(it.w.biases, it.w.b_off, 3);
+            e.setBytes(std.mem.asBytes(&call.dims), 4);
+            e.setBuffer(y, 0, 5);
+            e.dispatchThreads(mtl.Size.of(call.groups * call.threads, 1, 1), mtl.Size.of(call.threads, 1, 1));
+        }
+        e.end();
+        cb.commit();
+        cb.wait();
+        const bytes: f64 = @floatFromInt(it.w.n * it.w.k * it.w.bits / 8 + it.w.n * (it.w.k / it.w.group) * 4);
+        const t = cb.gpuSeconds() / reps;
+        std.debug.print("{s:<10} {d}-bit {d:7.1} MB {d:7.1} us {d:6.0} GB/s\n", .{ it.name, it.w.bits, bytes / 1e6, t * 1e6, bytes / t / 1e9 });
+    }
+    {
+        const ex = l.moe.w1;
+        const call = try row.callIndexed(&m.kernels.rows, ex, 6, false);
+        const cb = m.queue.commandBuffer();
+        const e = cb.compute(.serial);
+        for (0..reps) |_| {
+            e.setPipeline(call.pipeline);
+            e.setBuffer(x, 0, 0);
+            e.setBuffer(ex.one.w, ex.one.w_off, 1);
+            e.setBuffer(ex.one.scales, ex.one.s_off, 2);
+            e.setBuffer(ex.one.biases, ex.one.b_off, 3);
+            e.setBytes(std.mem.asBytes(&call.dims), 4);
+            e.setBuffer(y, 0, 5);
+            e.setBuffer(ids, 0, 6);
+            e.dispatchThreads(mtl.Size.of(call.groups * call.threads, call.slots, 1), mtl.Size.of(call.threads, 1, 1));
+        }
+        e.end();
+        cb.commit();
+        cb.wait();
+        const one = ex.one;
+        const bytes: f64 = @floatFromInt(6 * (one.n * one.k * one.bits / 8 + one.n * (one.k / one.group) * 4));
+        const t = cb.gpuSeconds() / reps;
+        std.debug.print("experts6   {d}-bit {d:7.1} MB {d:7.1} us {d:6.0} GB/s\n", .{ one.bits, bytes / 1e6, t * 1e6, bytes / t / 1e9 });
+    }
+    {
+        const h = m.weights.head;
+        const n = h.n * h.k * h.bits / 8;
+        const dst = try m.device.buffer(n, opts);
+        defer dst.deinit();
+        const cb = m.queue.commandBuffer();
+        const b = cb.blit();
+        for (0..4) |_| b.copy(h.w, h.w_off, dst, 0, n);
+        b.end();
+        cb.commit();
+        cb.wait();
+        const t = cb.gpuSeconds() / 4;
+        std.debug.print("blit copy  {d:7.1} MB {d:7.1} us {d:6.0} GB/s read+write\n", .{ @as(f64, @floatFromInt(n)) / 1e6, t * 1e6, 2 * @as(f64, @floatFromInt(n)) / t / 1e9 });
     }
 }

@@ -193,46 +193,15 @@ template <bool MIXES>
   threadgroup float tot[MIX + 1];
   threadgroup float pre_in[S];
   const device bfloat* x = X + size_t(r) * F;
-  if (MIXES) {
-    if (int(t) <= MIX) {
-      float s = 0.0f;
-      for (int j = 0; j < SLICES; j++) s += PART[(size_t(r) * SLICES + j) * (MIX + 1) + t];
-      tot[t] = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // the split on simdgroup 0: lanes 0-3 a pre and a post each, lanes 0-15 a cell of the 4x4 comb (j = lane / 4,
-    // k = lane % 4), its row sums across lanes xor 1 and 2, its column sums across lanes xor 4 and 8
-    if (sg == 0) {
-      const float rs = precise::rsqrt(tot[MIX] / float(F) + a.eps);
-      if (lane < uint(S)) {
-        PRE_OUT[r * S + lane] = 1.0f / (1.0f + precise::exp(-(tot[lane] * rs * SCALE[0] + BASE[lane]))) + a.hc_eps;
-        POST_OUT[r * S + lane] = 2.0f / (1.0f + precise::exp(-(tot[S + lane] * rs * SCALE[1] + BASE[S + lane])));
-      }
-      const bool act = lane < uint(S * S);
-      const uint cell = act ? lane : 0;
-      const float v = tot[2 * S + cell] * rs * SCALE[2] + BASE[2 * S + cell];
-      float mx = max(v, simd_shuffle_xor(v, ushort(1)));
-      mx = max(mx, simd_shuffle_xor(mx, ushort(2)));
-      const float e = precise::exp(v - mx);
-      float row = e + simd_shuffle_xor(e, ushort(1));
-      row = row + simd_shuffle_xor(row, ushort(2));
-      float cm = act ? e / row + a.hc_eps : 0.0f;
-      for (int it = 0; it < a.iters; it++) {
-        if (it > 0) {
-          float rsum = cm + simd_shuffle_xor(cm, ushort(1));
-          rsum = rsum + simd_shuffle_xor(rsum, ushort(2));
-          cm = act ? cm / (rsum + a.hc_eps) : 0.0f;
-        }
-        float csum = cm + simd_shuffle_xor(cm, ushort(4));
-        csum = csum + simd_shuffle_xor(csum, ushort(8));
-        cm = act ? cm / (csum + a.hc_eps) : 0.0f;
-      }
-      if (act) COMB_OUT[r * S * S + lane] = cm;
-    }
+  // the mixes' totals beside the lagged collapse (bf16, as hc_pre returns) of the previous boundary's pre: the
+  // collapse reads nothing this boundary computes, so the split below overlaps its rms reduction
+  if (MIXES && int(t) <= MIX) {
+    float s = 0.0f;
+    for (int j = 0; j < SLICES; j++) s += PART[(size_t(r) * SLICES + j) * (MIX + 1) + t];
+    tot[t] = s;
   }
   if (t < uint(S)) pre_in[t] = PRE_IN[r * S + t];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  // collapse (bf16, as hc_pre returns) and the rms norm over D
   float ys[5];
   float ss = 0.0f;
   for (int i = 0; i < 5; i++) {
@@ -243,18 +212,47 @@ template <bool MIXES>
     ss += ys[i] * ys[i];
   }
   const float s1 = simd_sum(ss);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane == 0) red[sg][0] = s1;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t == 0) {
+  // the split on simdgroup 0: lanes 0-3 a pre and a post each, lanes 0-15 a cell of the 4x4 comb (j = lane / 4,
+  // k = lane % 4), its row sums across lanes xor 1 and 2, its column sums across lanes xor 4 and 8
+  if (MIXES && sg == 0) {
+    const float rs = precise::rsqrt(tot[MIX] / float(F) + a.eps);
+    if (lane < uint(S)) {
+      PRE_OUT[r * S + lane] = 1.0f / (1.0f + precise::exp(-(tot[lane] * rs * SCALE[0] + BASE[lane]))) + a.hc_eps;
+      POST_OUT[r * S + lane] = 2.0f / (1.0f + precise::exp(-(tot[S + lane] * rs * SCALE[1] + BASE[S + lane])));
+    }
+    const bool act = lane < uint(S * S);
+    const uint cell = act ? lane : 0;
+    const float v = tot[2 * S + cell] * rs * SCALE[2] + BASE[2 * S + cell];
+    float mx = max(v, simd_shuffle_xor(v, ushort(1)));
+    mx = max(mx, simd_shuffle_xor(mx, ushort(2)));
+    const float e = precise::exp(v - mx);
+    float row = e + simd_shuffle_xor(e, ushort(1));
+    row = row + simd_shuffle_xor(row, ushort(2));
+    float cm = act ? e / row + a.hc_eps : 0.0f;
+    for (int it = 0; it < a.iters; it++) {
+      if (it > 0) {
+        float rsum = cm + simd_shuffle_xor(cm, ushort(1));
+        rsum = rsum + simd_shuffle_xor(rsum, ushort(2));
+        cm = act ? cm / (rsum + a.hc_eps) : 0.0f;
+      }
+      float csum = cm + simd_shuffle_xor(cm, ushort(4));
+      csum = csum + simd_shuffle_xor(csum, ushort(8));
+      cm = act ? cm / (csum + a.hc_eps) : 0.0f;
+    }
+    if (act) COMB_OUT[r * S * S + lane] = cm;
+  }
+  if (t == 32) {  // simdgroup 1, while simdgroup 0 runs the split
     float s = 0.0f;
     for (int k = 0; k < 32; k++) s += red[k][0];
-    tot[0] = precise::rsqrt(s / float(D) + a.eps);
+    pre_in[0] = precise::rsqrt(s / float(D) + a.eps);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float inv = pre_in[0];
   for (int i = 0; i < 5; i++) {
     const int d = int(t) + 1024 * i;
-    NORMED[size_t(r) * D + d] = bfloat(float(NORMW[d]) * (ys[i] * tot[0]));
+    NORMED[size_t(r) * D + d] = bfloat(float(NORMW[d]) * (ys[i] * inv));
   }
 }
 
@@ -767,33 +765,46 @@ inline const device bfloat* attn_key(const device bfloat* RING, const device bfl
   for (int h = 0; h < AH; h++) O[(size_t(r) * 64 + h0 + h) * HD + t] = bfloat(acc[h] / den[h]);
 }
 
-constant constexpr int SPLIT = 64;  // keys a split threadgroup takes
+constant constexpr int SPLIT = 32;  // keys a split threadgroup takes
+constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgroup each), sharing its key tiles
 
-// Decode and window rows' attention, split by keys: one threadgroup (8 simdgroups, a head each) a (8 heads, 64-key
-// chunk, row); each tile of 8 keys is read once into threadgroup memory for the 8 heads. Writes each head's chunk
-// partial (its max score, its sum of exps, its unnormalized output); ds_attend_merge folds the chunks and the sink.
+// Decode and window rows' attention, split by keys: one threadgroup (HG simdgroups, a head each) a (HG heads, SPLIT-key
+// chunk, row); each tile of 8 keys is read once into threadgroup memory for the HG heads. The queries' RoPE is
+// applied as they load. Writes each head's chunk partial (its max score, its sum of exps, its unnormalized output);
+// ds_attend_merge folds the chunks and the sink.
 [[kernel]] void ds_attend_split(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
                                 const device bfloat* COMP [[buffer(2)]], const device int* PICKS [[buffer(3)]],
                                 device float* PO [[buffer(4)]], device float2* PML [[buffer(5)]],
-                                constant AttnArgs& a [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],
+                                constant AttnArgs& a [[buffer(6)]], const device int* POS [[buffer(7)]],
+                                const device float* FREQ [[buffer(8)]], uint3 tg [[threadgroup_position_in_grid]],
                                 uint3 tgn [[threadgroups_per_grid]], uint lane [[thread_index_in_simdgroup]],
                                 uint sg [[simdgroup_index_in_threadgroup]], uint3 tpos [[thread_position_in_threadgroup]]) {
   const uint t = tpos.x;
-  const int h = int(tg.x) * 8 + int(sg), chunk = int(tg.y), r = int(tg.z), chunks = int(tgn.y);
+  const int h = int(tg.x) * HG + int(sg), chunk = int(tg.y), r = int(tg.z), chunks = int(tgn.y);
   const int pos = a.window_end >= 0 ? a.window_end : a.first_pos + r;
   const int nwin = min(a.window, pos + 1);
   const int nkeys = nwin + a.picks;
   const int k0 = chunk * SPLIT, k1 = min(nkeys, k0 + SPLIT);
   const device int* picks = PICKS + size_t(r) * a.picks;
   threadgroup bfloat ks[8][HD];
-  threadgroup float sc[8][SPLIT];
+  threadgroup float sc[HG][SPLIT];
   float q[16];
   const device bfloat* qr = Q + (size_t(r) * 64 + h) * HD;
   for (int i = 0; i < 16; i++) q[i] = float(qr[int(lane) * 16 + i]);
+  // the query's RoPE (its last 64 dims: lanes 28-31, pairs inside a lane), rounded to bf16 as ds_rope writes it
+  if (lane >= uint((HD - 64) / 16)) {
+    for (int p = 0; p < 8; p++) {
+      const float ang = float(POS[r]) * FREQ[(int(lane) - (HD - 64) / 16) * 8 + p];
+      const float cs = precise::cos(ang), sn = precise::sin(ang);
+      const float re = q[2 * p], im = q[2 * p + 1];
+      q[2 * p] = float(bfloat(re * cs - im * sn));
+      q[2 * p + 1] = float(bfloat(re * sn + im * cs));
+    }
+  }
   // scores: simdgroup sg's head against each key of the chunk (lane: 16 dims)
   for (int j0 = k0; j0 < k1; j0 += 8) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = int(t); i < 8 * HD; i += 256) {
+    for (int i = int(t); i < 8 * HD; i += HG * 32) {
       const int kk = i / HD, j = j0 + kk;
       ks[kk][i % HD] = j < k1 ? attn_key(RING, COMP, picks, pos, nwin, a.ring, j)[i % HD] : bfloat(0);
     }
@@ -823,7 +834,7 @@ constant constexpr int SPLIT = 64;  // keys a split threadgroup takes
   for (int i = 0; i < 16; i++) o[i] = 0.0f;
   for (int j0 = k0; j0 < k1; j0 += 8) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = int(t); i < 8 * HD; i += 256) {
+    for (int i = int(t); i < 8 * HD; i += HG * 32) {
       const int kk = i / HD, j = j0 + kk;
       ks[kk][i % HD] = j < k1 ? attn_key(RING, COMP, picks, pos, nwin, a.ring, j)[i % HD] : bfloat(0);
     }
@@ -878,14 +889,17 @@ static void fp8_row(threadgroup bfloat* x, uint t) {
   const uint t = tpos.x;
   const int h = int(tg.x), r = int(tg.y), chunks = ma.chunks;
   threadgroup bfloat row[HD];
+  threadgroup float scale[(128 + 512 + SPLIT - 1) / SPLIT];
   const size_t base = (size_t(r) * 64 + h) * chunks;
   float m = SINK[h];
   for (int c = 0; c < chunks; c++) m = max(m, PML[base + c].x);
   float denom = precise::exp(SINK[h] - m);
   for (int c = 0; c < chunks; c++) denom += PML[base + c].y * precise::exp(PML[base + c].x - m);
+  for (int c = int(t); c < chunks; c += 256) scale[c] = precise::exp(PML[base + c].x - m);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int d = int(t); d < HD; d += 256) {
     float acc = 0.0f;
-    for (int c = 0; c < chunks; c++) acc += PO[(base + c) * HD + d] * precise::exp(PML[base + c].x - m);
+    for (int c = 0; c < chunks; c++) acc += PO[(base + c) * HD + d] * scale[c];
     row[d] = bfloat(acc / denom);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
