@@ -215,13 +215,17 @@ pub const Enc = struct {
         self.groups(.{ (n + 7) / 8, (rows + 7) / 8, 1 }, .{ 256, 1, 1 });
     }
 
-    /// Attention over rows' windows and `picks` compressed keys (RoPE in and out, fp8): split by keys or tiled.
+    /// Attention over rows' windows and `picks` compressed keys (RoPE in and out, fp8): split by keys, or by row.
     pub fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32, freq: Buffer) void {
         const s = self.s;
         const aa = AttnArgs{ .first_pos = @intCast(self.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = window_end };
         if (self.rows >= nax_rows) {
             self.rope(q, self.rows, c.heads, c.head_dim, s.pos, freq, false);
-            self.pipe("ds_attend_rows");
+            const tensor_attend = self.m.kernels.attend_nax; // on the tensor units when the GPU has them
+            if (tensor_attend) |p| {
+                skipping = skips("ds_attend_nax");
+                self.ep.*.setPipeline(p);
+            } else self.pipe("ds_attend_rows");
             self.buf(q, 0, 0);
             self.buf(ring, 0, 1);
             self.buf(comp, 0, 2);
@@ -229,7 +233,7 @@ pub const Enc = struct {
             self.tensor(sink, 4);
             self.buf(o, 0, 5);
             self.args(aa, 6);
-            self.groups(.{ c.heads / 8, self.rows, 1 }, .{ 512, 1, 1 });
+            if (tensor_attend != null) self.groups(.{ c.heads / 16, self.rows, 1 }, .{ 128, 1, 1 }) else self.groups(.{ c.heads / 8, self.rows, 1 }, .{ 512, 1, 1 });
             self.rope(o, self.rows, c.heads, c.head_dim, s.pos, freq, true);
             self.fp8(o, self.rows * c.heads * c.head_dim);
             return;

@@ -38,6 +38,8 @@ pub const glm_dsa_glue = @embedFile("glm_dsa/glue.metal");
 pub const glm_dsa_moe_jobs = @embedFile("glm_dsa/moe_jobs.metal");
 pub const deepseek_v41 = @embedFile("deepseek/v41.metal") ++ @embedFile("deepseek/v41_index.metal") ++
     @embedFile("deepseek/v41_attend.metal") ++ @embedFile("deepseek/v41_moe.metal");
+/// DeepSeek-V4.1-Flash's prompt attention on the tensor units (nax.h inlined at load).
+pub const deepseek_v41_attend_nax = @embedFile("deepseek/v41_attend_nax.metal");
 pub const core_grammar_mask = @embedFile("core/grammar_mask.metal");
 pub const counter_probe = @embedFile("core/counter_probe.metal");
 
