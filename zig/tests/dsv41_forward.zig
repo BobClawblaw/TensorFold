@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10), out_dir);
-    if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d));
+    if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d), if (args.len == 5) chunk else 256);
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
     const m = try q.Model.load(gpa, init.io, args[1], false);
@@ -180,19 +180,21 @@ fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
     std.debug.print("plain {d:.1} tok/s, drafted {d:.1} tok/s; {d} rounds, {d:.2} tokens a round; replies equal for {d}/{d} tokens\n", .{ @as(f64, @floatFromInt(n)) / times[0], @as(f64, @floatFromInt(n)) / times[1], rounds, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(rounds)), same, n });
 }
 
-/// ms by section (the GPU's, and the host's engram) of a 256-row chunk and a decode row at each depth in `list`.
-fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, list: []const u8) !void {
+/// ms by section (the GPU's, and the host's engram) of a `chunk`-row call and a decode row at each depth in `list`.
+fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u32, list: []const u8, chunk: usize) !void {
     const m = try q.Model.load(gpa, io, dir, false);
     defer m.deinit();
-    var scratch = try q.state.Scratch.init(gpa, m.device, 256);
+    var scratch = try q.state.Scratch.init(gpa, m.device, chunk);
     defer scratch.deinit();
-    if (ids.len < 256) return error.ExpectedAChunkOfIds;
+    const ids = try gpa.alloc(u32, chunk); // the prompt's ids, cycled to a chunk
+    defer gpa.free(ids);
+    for (ids, 0..) |*v, i| v.* = prompt[i % prompt.len];
     var sections: [q.forward.sections.len]f64 = @splat(0);
     if (std.c.getenv("DS_SKIP")) |k| q.forward.skip = std.mem.span(k);
     var it = std.mem.splitScalar(u8, list, ',');
     while (it.next()) |field| {
         const depth = try std.fmt.parseInt(usize, field, 10);
-        var cache = try q.state.Cache.init(gpa, m.device, depth + 4 * 256 + 64);
+        var cache = try q.state.Cache.init(gpa, m.device, depth + 4 * chunk + 64);
         defer cache.deinit();
         var rng: u64 = 0x9e3779b97f4a7c15 ^ depth;
         for (cache.memory.buffers.items) |b| for (std.mem.bytesAsSlice(u16, b.contents()[0 .. b.length() & ~@as(usize, 1)])) |*v| {
@@ -202,7 +204,7 @@ fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
             v.* = @truncate((rng & 0x807f) | 0x3c00); // +-[2^-7, 2^-6): small finite values
         };
         for (0..depth) |i| cache.engram_ids.appendAssumeCapacity(m.engram.compress(ids[i % ids.len], true));
-        for ([_]usize{ 256, 1 }) |rows| {
+        for ([_]usize{ chunk, 1 }) |rows| {
             const reps: usize = if (rows == 1) 8 else 2;
             for (0..reps + 1) |r| {
                 if (r == 1) sections = @splat(0); // the first call warms the pipelines
