@@ -435,26 +435,28 @@ struct ScoreArgs {
 
 // score[r, t] = sum_h bf16(relu(bf16(q_h . k_t)) * w_h) (bf16 like the reference's einsum and product), -inf for
 // keys the row cannot see yet ((pos + 1) / ratio of them).
+// A simdgroup a key group, a lane a head (IH = 32): each head's dot in the order one thread took it, then lane 0 adds
+// the heads' terms in head order (bit-identical to a thread a group).
 [[kernel]] void ds_index_scores(const device bfloat* Q [[buffer(0)]], const device bfloat* WT [[buffer(1)]],
                                 const device bfloat* K [[buffer(2)]], device float* SCORE [[buffer(3)]],
-                                constant ScoreArgs& a [[buffer(4)]], uint2 g [[thread_position_in_grid]]) {
-  const int t = int(g.x), r = int(g.y);
+                                constant ScoreArgs& a [[buffer(4)]], uint2 g [[thread_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  const int t = int(g.x) / 32, r = int(g.y), h = int(lane);
   if (t >= a.groups) return;
   const int visible = (a.first_pos + r + 1) / a.ratio;
   device float* out = SCORE + size_t(r) * a.stride;
   if (t >= visible) {
-    out[t] = -INFINITY;
+    if (lane == 0) out[t] = -INFINITY;
     return;
   }
   const device bfloat* k = K + size_t(t) * ID;
+  const device bfloat* q = Q + (size_t(r) * IH + h) * ID;
+  float dot = 0.0f;
+  for (int i = 0; i < ID; i++) dot += float(q[i]) * float(k[i]);
+  const float term = bf_round(max(bf_round(dot), 0.0f) * float(WT[r * IH + h]));
   float total = 0.0f;
-  for (int h = 0; h < IH; h++) {
-    const device bfloat* q = Q + (size_t(r) * IH + h) * ID;
-    float dot = 0.0f;
-    for (int i = 0; i < ID; i++) dot += float(q[i]) * float(k[i]);
-    total += bf_round(max(bf_round(dot), 0.0f) * float(WT[r * IH + h]));
-  }
-  out[t] = bf_round(total);
+  for (int j = 0; j < IH; j++) total += simd_shuffle(term, ushort(j));
+  if (lane == 0) out[t] = bf_round(total);
 }
 
 struct MaskArgs {
@@ -520,12 +522,34 @@ inline uint order_key(float v) {
 
 // A row's k best finite scores (ties to the lower index), written in index order + offset; -1 fills the rest.
 // One threadgroup of 1024 a row: a radix select of the k-th key, then an ordered compaction.
+// A 1,024-thread group's sum of v (every thread gets it), and each thread's sum of v over the threads before it:
+// unsigned integers, so exact in any order. `sums` is 32 words of threadgroup scratch.
+static uint tg_sum(uint v, uint t, uint lane, uint sg, threadgroup uint* sums) {
+  const uint s = simd_sum(v);
+  if (lane == 0) sums[sg] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint total = simd_sum(sums[lane]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return total;
+}
+
+static uint tg_exclusive_sum(uint v, uint t, uint lane, uint sg, threadgroup uint* sums) {
+  const uint inside = simd_prefix_exclusive_sum(v);
+  if (lane == 31) sums[sg] = inside + v;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint lead = simd_prefix_exclusive_sum(sums[lane]);
+  const uint before = simd_shuffle(lead, ushort(sg));
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return before + inside;
+}
+
 [[kernel]] void ds_topk(const device float* SCORE [[buffer(0)]], device int* OUT [[buffer(1)]],
                         constant TopkArgs& a [[buffer(2)]], uint r [[threadgroup_position_in_grid]],
-                        uint t [[thread_position_in_threadgroup]]) {
+                        uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup atomic_uint hist[256];
   threadgroup uint prefix_bits, want;
-  threadgroup uint counts[1024];
+  threadgroup uint sums[32];
   const device float* s = SCORE + size_t(r) * a.stride;
   device int* out = OUT + size_t(r) * a.k;
   // finite candidates only: -inf marks keys that are not visible or not candidates
@@ -536,13 +560,8 @@ inline uint order_key(float v) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint finite = 0;
   for (int i = int(t); i < a.n; i += 1024) finite += isfinite(s[i]) ? 1 : 0;
-  counts[t] = finite;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (t == 0) {
-    uint total = 0;
-    for (int i = 0; i < 1024; i++) total += counts[i];
-    want = min(want, total);
-  }
+  const uint total = tg_sum(finite, t, lane, sg, sums);
+  if (t == 0) want = min(want, total);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint k = want;
   // the k-th largest key, 8 bits a pass from the top
@@ -556,16 +575,17 @@ inline uint order_key(float v) {
       if ((key & mask) == prefix_bits) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFF], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (t == 0) {
-      uint above = 0;
-      for (int b = 255; b >= 0; b--) {
-        const uint hb = atomic_load_explicit(&hist[b], memory_order_relaxed);
-        if (above + hb >= want) {
-          prefix_bits |= uint(b) << shift;
-          want -= above;
-          break;
-        }
-        above += hb;
+    // the bin holding the want-th largest: bins from the top (thread t reads bin 255 - t), each thread's count of
+    // the bins above its own by a scan; the one bin where that count reaches want takes it
+    {
+      const uint b = 255 - min(t, 255u);
+      const uint hb = t < 256 ? atomic_load_explicit(&hist[b], memory_order_relaxed) : 0;
+      const uint above = tg_exclusive_sum(hb, t, lane, sg, sums);
+      const uint w = want;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (t < 256 && above < w && above + hb >= w) {
+        prefix_bits |= b << shift;
+        want = w - above;
       }
     }
     mask |= 0xFFu << shift;
@@ -583,13 +603,8 @@ inline uint order_key(float v) {
     above += key > kth ? 1 : 0;
     equal += key == kth ? 1 : 0;
   }
-  counts[t] = (above << 16) | equal;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  uint before_above = 0, before_equal = 0;
-  for (uint i = 0; i < t; i++) {
-    before_above += counts[i] >> 16;
-    before_equal += counts[i] & 0xFFFF;
-  }
+  const uint before_above = tg_exclusive_sum(above, t, lane, sg, sums);
+  const uint before_equal = tg_exclusive_sum(equal, t, lane, sg, sums);
   uint taken_equal = before_equal;
   uint pos = before_above + min(before_equal, ties);
   for (int i = lo; i < hi; i++) {
@@ -765,11 +780,11 @@ inline const device bfloat* attn_key(const device bfloat* RING, const device bfl
   for (int h = 0; h < AH; h++) O[(size_t(r) * 64 + h0 + h) * HD + t] = bfloat(acc[h] / den[h]);
 }
 
-constant constexpr int SPLIT = 32;  // keys a split threadgroup takes
+constant constexpr int SPLIT = 16;  // keys a split threadgroup takes (held in threadgroup memory: 16 KiB)
 constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgroup each), sharing its key tiles
 
 // Decode and window rows' attention, split by keys: one threadgroup (HG simdgroups, a head each) a (HG heads, SPLIT-key
-// chunk, row); each tile of 8 keys is read once into threadgroup memory for the HG heads. The queries' RoPE is
+// chunk, row); the chunk's keys are read once into threadgroup memory for the HG heads. The queries' RoPE is
 // applied as they load. Writes each head's chunk partial (its max score, its sum of exps, its unnormalized output);
 // ds_attend_merge folds the chunks and the sink.
 [[kernel]] void ds_attend_split(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
@@ -786,8 +801,15 @@ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgr
   const int nkeys = nwin + a.picks;
   const int k0 = chunk * SPLIT, k1 = min(nkeys, k0 + SPLIT);
   const device int* picks = PICKS + size_t(r) * a.picks;
-  threadgroup bfloat ks[8][HD];
+  threadgroup bfloat ks[SPLIT][HD];
   threadgroup float sc[HG][SPLIT];
+  // the chunk's keys, once, 8 values a load
+  for (int i = int(t); i < SPLIT * (HD / 8); i += HG * 32) {
+    const int kk = i / (HD / 8), c8 = i % (HD / 8), j = k0 + kk;
+    uint4 v = uint4(0);
+    if (j < k1) v = ((const device uint4*)attn_key(RING, COMP, picks, pos, nwin, a.ring, j))[c8];
+    ((threadgroup uint4*)ks[kk])[c8] = v;
+  }
   float q[16];
   const device bfloat* qr = Q + (size_t(r) * 64 + h) * HD;
   for (int i = 0; i < 16; i++) q[i] = float(qr[int(lane) * 16 + i]);
@@ -801,22 +823,15 @@ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgr
       q[2 * p + 1] = float(bfloat(re * sn + im * cs));
     }
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   // scores: simdgroup sg's head against each key of the chunk (lane: 16 dims)
-  for (int j0 = k0; j0 < k1; j0 += 8) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = int(t); i < 8 * HD; i += HG * 32) {
-      const int kk = i / HD, j = j0 + kk;
-      ks[kk][i % HD] = j < k1 ? attn_key(RING, COMP, picks, pos, nwin, a.ring, j)[i % HD] : bfloat(0);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int kk = 0; kk < 8 && j0 + kk < k1; kk++) {
-      float d = 0.0f;
-      for (int i = 0; i < 16; i++) d += q[i] * float(ks[kk][int(lane) * 16 + i]);
-      d = simd_sum(d);
-      const int j = j0 + kk;
-      const bool valid = j < nwin || picks[j - nwin] >= 0;
-      if (lane == 0) sc[sg][j - k0] = valid ? d * a.scale : -INFINITY;
-    }
+  for (int kk = 0; kk < k1 - k0; kk++) {
+    float d = 0.0f;
+    for (int i = 0; i < 16; i++) d += q[i] * float(ks[kk][int(lane) * 16 + i]);
+    d = simd_sum(d);
+    const int j = k0 + kk;
+    const bool valid = j < nwin || picks[j - nwin] >= 0;
+    if (lane == 0) sc[sg][kk] = valid ? d * a.scale : -INFINITY;
   }
   simdgroup_barrier(mem_flags::mem_threadgroup);
   float m = -1e30f;
@@ -829,27 +844,21 @@ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgr
     l += p;
   }
   l = simd_sum(l);
-  // outputs: the chunk's keys again, a tile at a time (lane: 16 dims of its head)
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  // outputs: the same keys, still in threadgroup memory (lane: 16 dims of its head)
   float o[16];
   for (int i = 0; i < 16; i++) o[i] = 0.0f;
-  for (int j0 = k0; j0 < k1; j0 += 8) {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = int(t); i < 8 * HD; i += HG * 32) {
-      const int kk = i / HD, j = j0 + kk;
-      ks[kk][i % HD] = j < k1 ? attn_key(RING, COMP, picks, pos, nwin, a.ring, j)[i % HD] : bfloat(0);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int kk = 0; kk < 8 && j0 + kk < k1; kk++) {
-      const float p = sc[sg][j0 + kk - k0];
-      for (int i = 0; i < 16; i++) o[i] += p * float(ks[kk][int(lane) * 16 + i]);
-    }
+  for (int kk = 0; kk < k1 - k0; kk++) {
+    const float p = sc[sg][kk];
+    for (int i = 0; i < 16; i++) o[i] += p * float(ks[kk][int(lane) * 16 + i]);
   }
   const size_t part = (size_t(r) * 64 + h) * chunks + chunk;
   for (int i = 0; i < 16; i++) PO[part * HD + int(lane) * 16 + i] = o[i];
   if (lane == 0) PML[part] = float2(m, l);
 }
 
-// The chunks' partials of a (row, head) folded with the head's sink: the softmax over every key and the sink.
+// The chunks' partials of a (row, head) folded with the head's sink: the softmax over every key and the sink; a thread
+// a dim (a threadgroup of HD).
 struct MergeArgs {
   int chunks;
   int finish;  // then as ds_rope (inverse) and ds_fp8_qdq would: the head's RoPE taken back, fp8-rounded
@@ -869,14 +878,16 @@ static void rope_row(threadgroup bfloat* x, int pos, const device float* FREQ, b
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// A threadgroup's bf16 row of 512 fp8-rounded a block of 32, as ds_fp8_qdq does (16 threads).
-static void fp8_row(threadgroup bfloat* x, uint t) {
-  if (t < HD / 32) {
-    threadgroup bfloat* b = x + int(t) * 32;
-    float amax = 0.0f;
-    for (int i = 0; i < 32; i++) amax = max(amax, fabs(float(b[i])));
+// A threadgroup's bf16 row of 512 fp8-rounded a block of 32, as ds_fp8_qdq does: a block a simdgroup (a value a lane;
+// the block's max is the same in any order), `n` threads in the threadgroup.
+static void fp8_row(threadgroup bfloat* x, uint t, uint n) {
+  const uint lane = t % 32;
+  for (uint b = t / 32; b < uint(HD / 32); b += n / 32) {
+    threadgroup bfloat* p = x + b * 32;
+    const float v = float(p[lane]);
+    const float amax = simd_max(fabs(v));
     const float s = pow2_ceil(max(amax, 1e-4f) / 448.0f);
-    for (int i = 0; i < 32; i++) b[i] = bfloat(e4m3_round(clamp(float(b[i]) / s, -448.0f, 448.0f)) * s);
+    p[lane] = bfloat(e4m3_round(clamp(v / s, -448.0f, 448.0f)) * s);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -890,14 +901,17 @@ static void fp8_row(threadgroup bfloat* x, uint t) {
   const int h = int(tg.x), r = int(tg.y), chunks = ma.chunks;
   threadgroup bfloat row[HD];
   threadgroup float scale[(128 + 512 + SPLIT - 1) / SPLIT];
+  threadgroup float2 ml[(128 + 512 + SPLIT - 1) / SPLIT];
   const size_t base = (size_t(r) * 64 + h) * chunks;
-  float m = SINK[h];
-  for (int c = 0; c < chunks; c++) m = max(m, PML[base + c].x);
-  float denom = precise::exp(SINK[h] - m);
-  for (int c = 0; c < chunks; c++) denom += PML[base + c].y * precise::exp(PML[base + c].x - m);
-  for (int c = int(t); c < chunks; c += 256) scale[c] = precise::exp(PML[base + c].x - m);
+  for (int c = int(t); c < chunks; c += HD) ml[c] = PML[base + c];
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int d = int(t); d < HD; d += 256) {
+  float m = SINK[h];
+  for (int c = 0; c < chunks; c++) m = max(m, ml[c].x);
+  for (int c = int(t); c < chunks; c += HD) scale[c] = precise::exp(ml[c].x - m);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float denom = precise::exp(SINK[h] - m);
+  for (int c = 0; c < chunks; c++) denom += ml[c].y * scale[c];
+  for (int d = int(t); d < HD; d += HD) {
     float acc = 0.0f;
     for (int c = 0; c < chunks; c++) acc += PO[(base + c) * HD + d] * scale[c];
     row[d] = bfloat(acc / denom);
@@ -905,9 +919,9 @@ static void fp8_row(threadgroup bfloat* x, uint t) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (ma.finish) {
     rope_row(row, POS[r], FREQ, true, t);
-    fp8_row(row, t);
+    fp8_row(row, t, HD);
   }
-  for (int d = int(t); d < HD; d += 256) O[(size_t(r) * 64 + h) * HD + d] = row[d];
+  for (int d = int(t); d < HD; d += HD) O[(size_t(r) * 64 + h) * HD + d] = row[d];
 }
 
 // A window key's tail in one threadgroup a row, as ds_rms (kv_norm), ds_rope, ds_fp8_qdq and ds_put_rows would run
@@ -934,7 +948,7 @@ static void fp8_row(threadgroup bfloat* x, uint t) {
   for (int i = int(t); i < HD; i += 256) row[i] = bfloat(float(W[i]) * (float(x[i]) * inv));
   threadgroup_barrier(mem_flags::mem_threadgroup);
   rope_row(row, POS[r], FREQ, false, t);
-  fp8_row(row, t);
+  fp8_row(row, t, 256);
   const int ring = int(a.y);
   device bfloat* dst = RING + size_t(ring > 0 ? POS[r] % ring : 0) * HD;
   for (int i = int(t); i < HD; i += 256) {

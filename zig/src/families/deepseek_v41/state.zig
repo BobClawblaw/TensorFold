@@ -14,7 +14,7 @@ pub const max_rows = ring - c.window;
 pub const picks = c.index_topk;
 /// Rows that take the split attention (decode, windows, drafts), and its chunks of 64 keys at most a row.
 pub const split_rows = 16;
-pub const split_chunks = (c.window + picks + 31) / 32;
+pub const split_chunks = (c.window + picks + 15) / 16;
 /// Scores a prompt call's indexer holds at once (f32): rows are taken in slices of this many keys' worth.
 pub const score_budget = 64 << 20;
 

@@ -250,7 +250,7 @@ const Enc = struct {
             self.fp8(o, self.rows * c.heads * c.head_dim);
             return;
         }
-        const chunks: usize = (c.window + picks + 31) / 32;
+        const chunks: usize = (c.window + picks + 15) / 16;
         self.pipe("ds_attend_split");
         self.buf(q, 0, 0);
         self.buf(ring, 0, 1);
@@ -270,7 +270,7 @@ const Enc = struct {
         self.args([2]i32{ @intCast(chunks), 1 }, 4);
         self.buf(s.pos, 0, 5);
         self.buf(freq, 0, 6);
-        self.groups(.{ c.heads, self.rows, 1 }, .{ 256, 1, 1 });
+        self.groups(.{ c.heads, self.rows, 1 }, .{ c.head_dim, 1, 1 });
     }
 
     fn rms(self: Enc, x: Buffer, x_off: usize, w: wts.Tensor, y: Buffer, y_off: usize, rows: usize, n: usize) void {
@@ -767,7 +767,7 @@ fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.Inde
         x.buf(src.keys, 0, 2);
         x.buf(s.scores, 0, 3);
         x.args(ScoreArgs{ .rows = @intCast(n), .groups = @intCast(groups), .ratio = @intCast(ratio), .first_pos = @intCast(x.base + r0), .stride = @intCast(groups) }, 4);
-        x.threads(.{ groups, n, 1 }, .{ @min(groups, 256), 1, 1 });
+        x.threads(.{ groups * 32, n, 1 }, .{ 256, 1, 1 }); // a simdgroup a key group
         const nb = (groups + c.candidate_block - 1) / c.candidate_block;
         if (layer == c.candidate_source) {
             x.pipe("ds_block_max");
