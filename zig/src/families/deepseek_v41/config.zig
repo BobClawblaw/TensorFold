@@ -9,7 +9,6 @@ pub const stages = 3;
 pub const heads = 64;
 pub const head_dim = 512;
 pub const rope_dim = 64;
-pub const nope_dim = head_dim - rope_dim;
 pub const q_rank = 1280;
 pub const o_groups = 8;
 pub const o_rank = 1024;
@@ -65,16 +64,6 @@ pub fn kvSource(layer: usize) ?usize {
     return out;
 }
 
-/// The index source whose top-k a compressing layer attends with (the last indexer at or before it).
-pub fn indexSource(layer: usize) ?usize {
-    if (ratios[layer] == 0) return null;
-    var out: ?usize = null;
-    for (index_sources) |s| if (s <= layer) {
-        out = s;
-    };
-    return out;
-}
-
 pub fn isIndexSource(layer: usize) bool {
     return std.mem.indexOfScalar(usize, &index_sources, layer) != null;
 }
@@ -108,9 +97,6 @@ pub const Config = struct {
     experts: [layers]Width,
     draft_experts: [stages]Width,
     engram_rows: [engram_layers.len]usize,
-    compressed_vocab: usize,
-    eos: u32,
-    bos: u32,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -234,9 +220,6 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
         .experts = undefined,
         .draft_experts = undefined,
         .engram_rows = undefined,
-        .compressed_vocab = try integer(root, "engram_compressed_vocab_size"),
-        .eos = @intCast(try integer(root, "eos_token_id")),
-        .bos = @intCast(try integer(root, "bos_token_id")),
     };
     for (&out.experts, 0..) |*w, i| {
         var buf: [32]u8 = undefined;
@@ -257,9 +240,6 @@ test "the layer plan: sources, ratios and engram layers" {
     try std.testing.expectEqual(@as(?usize, 2), kvSource(7));
     try std.testing.expectEqual(@as(?usize, 14), kvSource(19));
     try std.testing.expectEqual(@as(?usize, 20), kvSource(39));
-    try std.testing.expectEqual(@as(?usize, 14), indexSource(19));
-    try std.testing.expectEqual(@as(?usize, 36), indexSource(39));
-    try std.testing.expectEqual(@as(?usize, 24), indexSource(27));
     try std.testing.expectEqual(@as(u8, 2), ratios[19]);
     try std.testing.expectEqual(@as(u8, 1), ratios[20]);
     try std.testing.expectEqual(@as(?usize, 1), engramIndex(14));

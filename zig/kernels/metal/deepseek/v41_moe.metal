@@ -104,17 +104,6 @@ struct GluArgs {
   OUT[i] = bfloat(v);
 }
 
-// The routed experts' outputs (fp32 sum in slot order) plus the shared expert's, bf16.
-[[kernel]] void ds_moe_combine(const device bfloat* Y [[buffer(0)]], const device bfloat* SH [[buffer(1)]],
-                               device bfloat* OUT [[buffer(2)]], constant int& topk [[buffer(3)]],
-                               uint2 g [[thread_position_in_grid]]) {
-  const uint d = g.x, r = g.y;
-  float acc = 0.0f;
-  for (int k = 0; k < topk; k++) acc += float(Y[(size_t(r) * topk + k) * D + d]);
-  acc += float(SH[size_t(r) * D + d]);
-  OUT[size_t(r) * D + d] = bfloat(acc);
-}
-
 struct SortArgs {
   int slots;
   int experts;

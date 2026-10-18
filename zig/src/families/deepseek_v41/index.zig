@@ -13,7 +13,7 @@ const PoolArgs = extern struct { first: i32, ring: i32 };
 const ScoreArgs = extern struct { rows: i32, groups: i32, ratio: i32, first_pos: i32, stride: i32 };
 const KeptArgs = extern struct { rows: i32, groups: i32, ratio: i32, first_pos: i32, block: i32, kept: i32 };
 const BlockArgs = extern struct { rows: i32, groups: i32, block: i32, first_pos: i32, ratio: i32, stride: i32 };
-const TopkArgs = extern struct { n: i32, k: i32, stride: i32, offset: i32 };
+const TopkArgs = extern struct { n: i32, k: i32, stride: i32 };
 
 /// A KV source's compressor: completed groups pooled or projected, normed, index keys, RoPE'd, fp4 into cache.
 pub fn compress(x: Enc, cache: *st.Cache, si: usize, ratio: usize, cp: wts.Compressor, ix: wts.Indexer, freq: Buffer) !void {
@@ -72,7 +72,7 @@ pub fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.
         x.pipe("ds_topk");
         x.buf(s.scores, 0, 0);
         x.buf(s.picks, 0, 1);
-        x.args(TopkArgs{ .n = 0, .k = st.picks, .stride = 1, .offset = 0 }, 2);
+        x.args(TopkArgs{ .n = 0, .k = st.picks, .stride = 1 }, 2);
         x.groups(.{ rows, 1, 1 }, .{ 1024, 1, 1 });
         return;
     }
@@ -100,13 +100,13 @@ pub fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.
             x.pipe("ds_topk");
             x.buf(s.blocks, 0, 0);
             x.buf(s.keep, r0 * c.candidate_blocks * 4, 1);
-            x.args(TopkArgs{ .n = @intCast(nb), .k = c.candidate_blocks, .stride = @intCast(groups), .offset = 0 }, 2);
+            x.args(TopkArgs{ .n = @intCast(nb), .k = c.candidate_blocks, .stride = @intCast(groups) }, 2);
             x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
         }
         x.pipe("ds_topk");
         x.buf(s.scores, 0, 0);
         x.buf(s.picks, r0 * st.picks * 4, 1);
-        x.args(TopkArgs{ .n = @intCast(groups), .k = st.picks, .stride = @intCast(groups), .offset = 0 }, 2);
+        x.args(TopkArgs{ .n = @intCast(groups), .k = st.picks, .stride = @intCast(groups) }, 2);
         x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
     }
 }
@@ -131,7 +131,7 @@ fn indexKept(x: Enc, src: *const st.Source, groups: usize, ratio: usize) void {
         x.pipe("ds_topk");
         x.buf(s.scores, 0, 0);
         x.buf(s.picks, r0 * st.picks * 4, 1);
-        x.args(TopkArgs{ .n = @intCast(slots), .k = st.picks, .stride = @intCast(slots), .offset = 0 }, 2);
+        x.args(TopkArgs{ .n = @intCast(slots), .k = st.picks, .stride = @intCast(slots) }, 2);
         x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
         x.pipe("ds_kept_keys");
         x.buf(s.picks, r0 * st.picks * 4, 0);

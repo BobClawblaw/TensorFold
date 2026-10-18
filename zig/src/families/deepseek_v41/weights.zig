@@ -66,10 +66,9 @@ pub const Stage = struct {
     block: Layer,
     main_proj: ?Linear, // stage 0: [5120, 3 x 5120]
     main_norm: ?Tensor,
-    norm: ?Tensor, // the last stage's head norm, Markov and confidence heads
+    norm: ?Tensor, // the last stage's head norm and Markov head (its confidence head is not used)
     markov_embed: ?Tensor,
     markov_head: ?Tensor,
-    confidence: ?Tensor,
 };
 
 /// The block-diagonal wo_a: affine, stacked by group (convert.py now), or bf16 [8192, 4096] (older checkpoints).
@@ -245,7 +244,6 @@ pub fn load(ckpt: *const ck.Checkpoint, config: *const c.Config, drafts: bool) !
                 .norm = if (last) try tensor(ckpt, p, "norm.weight", .bf16, &.{c.hidden}) else null,
                 .markov_embed = if (last) try tensor(ckpt, p, "markov_head.embed.weight", .bf16, &.{ c.vocab, c.markov_rank }) else null,
                 .markov_head = if (last) try tensor(ckpt, p, "markov_head.head.weight", .bf16, &.{ c.vocab, c.markov_rank }) else null,
-                .confidence = if (last) try tensor(ckpt, p, "confidence_head.proj.weight", .bf16, &.{ 1, c.hidden + c.markov_rank }) else null,
             };
         }
         w.stages = stages;

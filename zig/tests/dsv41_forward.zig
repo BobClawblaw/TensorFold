@@ -23,9 +23,6 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
-    if (std.c.getenv("DS_DISPATCH") != null) return dispatchCost(gpa, init.io, args[1]);
-    if (std.c.getenv("DS_BW") != null) return bandwidth(gpa, init.io, args[1]);
-    if (std.c.getenv("DS_ABLATE") != null) return ablate(gpa, init.io, args[1], ids);
     if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d));
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
@@ -174,163 +171,13 @@ fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
         replies[mode] = out;
         times[mode] = seconds(t0, t1);
     }
+    defer for (replies) |r| gpa.free(r);
     var same: usize = 0;
     while (same < n and replies[0][same] == replies[1][same]) same += 1;
     std.debug.print("plain {d:.1} tok/s, drafted {d:.1} tok/s; {d} rounds, {d:.2} tokens a round; replies equal for {d}/{d} tokens\n", .{ @as(f64, @floatFromInt(n)) / times[0], @as(f64, @floatFromInt(n)) / times[1], rounds, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(rounds)), same, n });
 }
 
-/// What a dispatch costs on its own: 2,000 one-thread dispatches in one serial encoder, then in a concurrent one.
-fn dispatchCost(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
-    const m = try q.Model.load(gpa, io, dir, false);
-    defer m.deinit();
-    const buf = try m.device.buffer(4096, mtl.ResourceOptions.shared);
-    defer buf.deinit();
-    for ([_]mtl.DispatchType{ .serial, .concurrent }) |kind| {
-        const cb = m.queue.commandBuffer();
-        const e = cb.compute(kind);
-        e.setPipeline(m.kernels.get("ds_scale"));
-        e.setBuffer(buf, 0, 0);
-        e.setValue(@as(f32, 1.0), 1);
-        for (0..2000) |_| e.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
-        e.end();
-        cb.commit();
-        cb.wait();
-        std.debug.print("{s}: {d:.2} us a dispatch on the GPU\n", .{ @tagName(kind), cb.gpuSeconds() * 1e6 / 2000.0 });
-    }
-    // concurrent, a barrier after each (a chain of dependent dispatches)
-    const cb = m.queue.commandBuffer();
-    const e = cb.compute(.concurrent);
-    e.setPipeline(m.kernels.get("ds_scale"));
-    e.setBuffer(buf, 0, 0);
-    e.setValue(@as(f32, 1.0), 1);
-    for (0..2000) |_| {
-        e.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
-        e.barrier();
-    }
-    e.end();
-    cb.commit();
-    cb.wait();
-    std.debug.print("concurrent, barrier each: {d:.2} us a dispatch on the GPU\n", .{cb.gpuSeconds() * 1e6 / 2000.0});
-    var scratch = try q.state.Scratch.init(gpa, m.device, 8);
-    defer scratch.deinit();
-    var cache = try q.state.Cache.init(gpa, m.device, 16);
-    defer cache.deinit();
-    try q.forward.run(m, &scratch, &cache, &.{0}, .last, null);
-    q.forward.dispatches = 0;
-    q.forward.trace = true;
-    try q.forward.run(m, &scratch, &cache, &.{1}, .last, null);
-    q.forward.trace = false;
-    std.debug.print("a decode step: {d} dispatches\n", .{q.forward.dispatches});
-}
-
-/// GPU ms a decode step with each kernel left out in turn (the outputs are wrong; only the time is read).
-fn ablate(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32) !void {
-    const m = try q.Model.load(gpa, io, dir, false);
-    defer m.deinit();
-    var scratch = try q.state.Scratch.init(gpa, m.device, 8);
-    defer scratch.deinit();
-    const names = [_][]const u8{ "", "rows", "indexed", "ds_hc_expand_mix", "ds_hc_mix_part", "ds_hc_boundary", "ds_hc_expand", "ds_kv_finish", "ds_rms", "ds_rope", "ds_fp8_qdq", "ds_fp4_qdq", "ds_put_rows", "ds_put_rows_f32", "ds_attend_split", "ds_attend_merge", "ds_gemv_bf_bf", "ds_gemv_bf_f32", "ds_route", "ds_swiglu", "ds_index_scores_2x16", "ds_topk", "ds_pool2", "ds_scale", "ds_engram", "ds_embed" };
-    var base: f64 = 0;
-    const only_all = std.mem.eql(u8, std.mem.span(std.c.getenv("DS_ABLATE").?), "all");
-    for (names[0..if (only_all) 1 else names.len]) |name| {
-        q.forward.skip = if (name.len == 0) null else name;
-        var timing: [3]f64 = @splat(0);
-        q.forward.timing = &timing;
-        var cache = try q.state.Cache.init(gpa, m.device, ids.len + 8);
-        defer cache.deinit();
-        const w: usize = if (std.c.getenv("DS_ROWS")) |r| try std.fmt.parseInt(usize, std.mem.span(r), 10) else 1;
-        var calls: usize = 0;
-        var at: usize = 0;
-        while (at + w <= ids.len) : (at += w) {
-            if (calls == 2) timing = @splat(0); // the first calls warm the pipelines
-            try q.forward.run(m, &scratch, &cache, ids[at..][0..w], .last, null);
-            calls += 1;
-        }
-        const ms = timing[1] * 1e3 / @as(f64, @floatFromInt(calls - 2));
-        if (name.len == 0) base = ms;
-        std.debug.print("{s:<18} {d:6.2} ms ({d:.2})\n", .{ if (name.len == 0) "(all)" else name, ms, ms - base });
-    }
-}
-
-/// GB/s the row kernels reach on a decode row (head, wq_b, wo_b, 6 experts), and a blit copy for the bus.
-fn bandwidth(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
-    const row = tf.row_projection;
-    const m = try q.Model.load(gpa, io, dir, false);
-    defer m.deinit();
-    const opts = mtl.ResourceOptions.shared;
-    const x = try m.device.buffer(64 << 20, opts);
-    defer x.deinit();
-    const y = try m.device.buffer(64 << 20, opts);
-    defer y.deinit();
-    const ids = try m.device.buffer(64, opts);
-    defer ids.deinit();
-    for (ids.slice(u32, 6), 0..) |*v, i| v.* = @intCast(i * 61 + 7);
-    const reps = 20;
-    const W = struct { name: []const u8, w: row.Weights };
-    const l = &m.weights.layers[12];
-    const list = [_]W{ .{ .name = "head", .w = m.weights.head }, .{ .name = "wq_b", .w = l.attn.wq_b }, .{ .name = "wo_b", .w = l.attn.wo_b }, .{ .name = "shared w1", .w = l.moe.shared.w1 } };
-    for (list) |it| {
-        const call = try row.call(&m.kernels.rows, it.w, 1, false);
-        const cb = m.queue.commandBuffer();
-        const e = cb.compute(.serial);
-        for (0..reps) |_| {
-            e.setPipeline(call.pipeline);
-            e.setBuffer(x, 0, 0);
-            e.setBuffer(it.w.w, it.w.w_off, 1);
-            e.setBuffer(it.w.scales, it.w.s_off, 2);
-            e.setBuffer(it.w.biases, it.w.b_off, 3);
-            e.setBytes(std.mem.asBytes(&call.dims), 4);
-            e.setBuffer(y, 0, 5);
-            e.dispatchThreads(mtl.Size.of(call.groups * call.threads, 1, 1), mtl.Size.of(call.threads, 1, 1));
-        }
-        e.end();
-        cb.commit();
-        cb.wait();
-        const bytes: f64 = @floatFromInt(it.w.n * it.w.k * it.w.bits / 8 + it.w.n * (it.w.k / it.w.group) * 4);
-        const t = cb.gpuSeconds() / reps;
-        std.debug.print("{s:<10} {d}-bit {d:7.1} MB {d:7.1} us {d:6.0} GB/s\n", .{ it.name, it.w.bits, bytes / 1e6, t * 1e6, bytes / t / 1e9 });
-    }
-    {
-        const ex = l.moe.w1;
-        const call = try row.callIndexed(&m.kernels.rows, ex, 6, false);
-        const cb = m.queue.commandBuffer();
-        const e = cb.compute(.serial);
-        for (0..reps) |_| {
-            e.setPipeline(call.pipeline);
-            e.setBuffer(x, 0, 0);
-            e.setBuffer(ex.one.w, ex.one.w_off, 1);
-            e.setBuffer(ex.one.scales, ex.one.s_off, 2);
-            e.setBuffer(ex.one.biases, ex.one.b_off, 3);
-            e.setBytes(std.mem.asBytes(&call.dims), 4);
-            e.setBuffer(y, 0, 5);
-            e.setBuffer(ids, 0, 6);
-            e.dispatchThreads(mtl.Size.of(call.groups * call.threads, call.slots, 1), mtl.Size.of(call.threads, 1, 1));
-        }
-        e.end();
-        cb.commit();
-        cb.wait();
-        const one = ex.one;
-        const bytes: f64 = @floatFromInt(6 * (one.n * one.k * one.bits / 8 + one.n * (one.k / one.group) * 4));
-        const t = cb.gpuSeconds() / reps;
-        std.debug.print("experts6   {d}-bit {d:7.1} MB {d:7.1} us {d:6.0} GB/s\n", .{ one.bits, bytes / 1e6, t * 1e6, bytes / t / 1e9 });
-    }
-    {
-        const h = m.weights.head;
-        const n = h.n * h.k * h.bits / 8;
-        const dst = try m.device.buffer(n, opts);
-        defer dst.deinit();
-        const cb = m.queue.commandBuffer();
-        const b = cb.blit();
-        for (0..4) |_| b.copy(h.w, h.w_off, dst, 0, n);
-        b.end();
-        cb.commit();
-        cb.wait();
-        const t = cb.gpuSeconds() / 4;
-        std.debug.print("blit copy  {d:7.1} MB {d:7.1} us {d:6.0} GB/s read+write\n", .{ @as(f64, @floatFromInt(n)) / 1e6, t * 1e6, 2 * @as(f64, @floatFromInt(n)) / t / 1e9 });
-    }
-}
-
-/// GPU ms by section of a 256-row chunk and a decode row at each depth in `list`, over a random-bf16 cache.
+/// ms by section (the GPU's, and the host's engram) of a 256-row chunk and a decode row at each depth in `list`.
 fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, list: []const u8) !void {
     const m = try q.Model.load(gpa, io, dir, false);
     defer m.deinit();

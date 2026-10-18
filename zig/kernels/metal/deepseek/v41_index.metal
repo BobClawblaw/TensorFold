@@ -129,7 +129,6 @@ struct TopkArgs {
   int n;       // candidates a row
   int k;       // picks a row
   int stride;  // score row stride
-  int offset;  // added to each pick (the compressed keys' place behind the window)
 };
 
 inline uint order_key(float v) {
@@ -158,7 +157,7 @@ static uint tg_exclusive_sum(uint v, uint t, uint lane, uint sg, threadgroup uin
   return before + inside;
 }
 
-// A row's k best finite scores (ties to the lower index) in index order + offset, -1 after: a radix select a row.
+// A row's k best finite scores (ties to the lower index) in index order, -1 after: a radix select a row.
 [[kernel]] void ds_topk(const device float* SCORE [[buffer(0)]], device int* OUT [[buffer(1)]],
                         constant TopkArgs& a [[buffer(2)]], uint r [[threadgroup_position_in_grid]],
                         uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
@@ -226,7 +225,7 @@ static uint tg_exclusive_sum(uint v, uint t, uint lane, uint sg, threadgroup uin
     if (!isfinite(s[i]) || k == 0) continue;
     const uint key = order_key(s[i]);
     if (key > kth || (key == kth && taken_equal < ties)) {
-      out[pos++] = i + a.offset;
+      out[pos++] = i;
     }
     if (key == kth) taken_equal++;
   }

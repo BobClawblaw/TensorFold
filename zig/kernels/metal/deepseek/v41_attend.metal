@@ -11,77 +11,6 @@ struct AttnArgs {
   int window_end; // >= 0: every row's window ends at this position (a draft block's), else at the row's own
 };
 
-// A threadgroup (256) a (row, head): its window and compressed picks (keys = values), fp32 softmax with the sink.
-[[kernel]] void ds_attend(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
-                          const device bfloat* COMP [[buffer(2)]], const device int* PICKS [[buffer(3)]],
-                          const device float* SINK [[buffer(4)]], device bfloat* O [[buffer(5)]],
-                          constant AttnArgs& a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
-                          uint2 tpos [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]]) {
-  const uint t = tpos.x;
-  const int h = int(tg.x), r = int(tg.y);
-  const int pos = a.window_end >= 0 ? a.window_end : a.first_pos + r;
-  const int nwin = min(a.window, pos + 1);
-  const int nkeys = nwin + a.picks;
-  threadgroup float sc[1024];
-  threadgroup float qs[HD];
-  threadgroup float red[8];
-  const device bfloat* q = Q + (size_t(r) * 64 + h) * HD;
-  for (int i = int(t); i < HD; i += 256) qs[i] = float(q[i]);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  // scores: simdgroup sg takes keys sg, sg + 8, ...
-  for (int j = int(sg); j < nkeys; j += 8) {
-    const device bfloat* key;
-    bool valid = true;
-    if (j < nwin) {
-      key = RING + size_t((pos - nwin + 1 + j) % a.ring) * HD;
-    } else {
-      const int p = PICKS[size_t(r) * a.picks + (j - nwin)];
-      valid = p >= 0;
-      key = COMP + size_t(max(p, 0)) * HD;
-    }
-    float dot = 0.0f;
-    for (int i = int(lane); i < HD; i += 32) dot += qs[i] * float(key[i]);
-    dot = simd_sum(dot);
-    if (lane == 0) sc[j] = valid ? dot * a.scale : -INFINITY;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float m = -1e30f;
-  for (int j = int(t); j < nkeys; j += 256) m = max(m, sc[j]);
-  m = simd_max(m);
-  if (lane == 0) red[sg] = m;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  m = red[0];
-  for (int k = 1; k < 8; k++) m = max(m, red[k]);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float l = 0.0f;
-  for (int j = int(t); j < nkeys; j += 256) {
-    const float p = precise::exp(sc[j] - m);
-    sc[j] = p;
-    l += p;
-  }
-  l = simd_sum(l);
-  if (lane == 0) red[sg] = l;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float denom = precise::exp(SINK[h] - m);
-  for (int k = 0; k < 8; k++) denom += red[k];
-  // outputs: thread t takes dims t and t + 256
-  for (int i = int(t); i < HD; i += 256) {
-    float acc = 0.0f;
-    for (int j = 0; j < nkeys; j++) {
-      if (sc[j] == 0.0f) continue;
-      const device bfloat* key;
-      if (j < nwin) {
-        key = RING + size_t((pos - nwin + 1 + j) % a.ring) * HD;
-      } else {
-        key = COMP + size_t(max(PICKS[size_t(r) * a.picks + (j - nwin)], 0)) * HD;
-      }
-      acc += sc[j] * float(key[i]);
-    }
-    O[(size_t(r) * 64 + h) * HD + i] = bfloat(acc / denom);
-  }
-}
-
 constant constexpr int AH = 8;     // heads a threadgroup
 constant constexpr int AT = 8;     // keys a tile
 constant constexpr int AMAX = 640; // keys a row at most: the window and the indexer's picks
@@ -93,7 +22,7 @@ inline const device bfloat* attn_key(const device bfloat* RING, const device bfl
   return COMP + size_t(max(picks[j - nwin], 0)) * HD;
 }
 
-// ds_attend for prompt chunks: a threadgroup (512) a (row, 8 heads), each 8-key tile read once for the 8 heads.
+// Prompt chunks: a threadgroup (512) a (row, 8 heads) over its window and picks, each 8-key tile read once.
 [[kernel]] void ds_attend_rows(const device bfloat* Q [[buffer(0)]], const device bfloat* RING [[buffer(1)]],
                                const device bfloat* COMP [[buffer(2)]], const device int* PICKS [[buffer(3)]],
                                const device float* SINK [[buffer(4)]], device bfloat* O [[buffer(5)]],
@@ -233,10 +162,9 @@ constant constexpr int HG = 16;     // heads a split threadgroup takes (a simdgr
   if (lane == 0) PML[part] = float2(m, l);
 }
 
-// A (row, head)'s chunk partials folded with its sink into the softmax over every key; a thread a dim.
+// A (row, head)'s partials and sink as one softmax, then (as ds_rope inverse, ds_fp8_qdq) RoPE taken back, fp8-rounded.
 struct MergeArgs {
   int chunks;
-  int finish;  // then as ds_rope (inverse) and ds_fp8_qdq would: the head's RoPE taken back, fp8-rounded
 };
 
 // A head's 64 RoPE dims (the last of its 512) rotated, in a threadgroup's bf16 row, as ds_rope does (32 threads).
@@ -291,10 +219,8 @@ static void fp8_row(threadgroup bfloat* x, uint t, uint n) {
     row[d] = bfloat(acc / denom);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (ma.finish) {
-    rope_row(row, POS[r], FREQ, true, t);
-    fp8_row(row, t, HD);
-  }
+  rope_row(row, POS[r], FREQ, true, t);
+  fp8_row(row, t, HD);
   for (int d = int(t); d < HD; d += HD) O[(size_t(r) * 64 + h) * HD + d] = row[d];
 }
 

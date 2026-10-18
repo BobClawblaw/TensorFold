@@ -77,8 +77,10 @@ pub fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
         x.indexed(mo.w1, slots, s.normed, s.route_pick, s.gate);
         x.with();
         x.indexed(mo.w3, slots, s.normed, s.route_pick, s.up);
-        x.with();
-        x.linear(mo.shared.w2, s.sh_act, 0, s.shared, 0, rows);
+        if (side) {
+            x.with();
+            x.linear(mo.shared.w2, s.sh_act, 0, s.shared, 0, rows);
+        }
         glu(x, slots, true);
         x.indexed(mo.w2, slots, s.act, s.route_pick, s.experts);
     }

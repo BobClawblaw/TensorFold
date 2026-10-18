@@ -42,6 +42,7 @@ pub const Model = struct {
         defer shards.freeShardFiles(gpa, files);
         // held resident as read: ~190 GiB of untouched buffers invite the compressor, then jetsam kills the load
         m.resident = m.device.residencySet(files.len) catch null;
+        errdefer if (m.resident) |set| set.deinit();
         for (files) |path| {
             try m.checkpoint.addFile(m.device, path, "");
             if (m.resident) |set| {
@@ -60,6 +61,7 @@ pub const Model = struct {
         errdefer m.engram.deinit();
         const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
         m.freq_plain = try m.device.buffer(32 * 4, opts);
+        errdefer m.freq_plain.deinit();
         m.freq_compressed = try m.device.buffer(32 * 4, opts);
         frequencies(m.config.rope, false, m.freq_plain.slice(f32, 32));
         frequencies(m.config.rope, true, m.freq_compressed.slice(f32, 32));

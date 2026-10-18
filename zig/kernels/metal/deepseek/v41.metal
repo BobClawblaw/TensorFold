@@ -1,4 +1,4 @@
-// DeepSeek-V4.1-Flash's own kernels in the reference's arithmetic (inference/model.py); projections are core's.
+// DeepSeek-V4.1-Flash's kernels in the reference's arithmetic (inference/model.py); quantized projections are core's.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -62,7 +62,7 @@ inline float pow2_ceil(float x) {
   for (int s = 0; s < S; s++) X[(size_t(r) * S + s) * D + d] = v;
 }
 
-// The MoE branch as ds_moe_combine rounds it: the routed experts' rows then the shared expert's, summed in f32.
+// The MoE branch: the routed experts' rows (in slot order) then the shared expert's, summed in f32.
 static float combined(const device bfloat* Y, const device bfloat* SH, int topk, int r, int d) {
   float acc = 0.0f;
   for (int k = 0; k < topk; k++) acc += float(Y[(size_t(r) * topk + k) * D + d]);

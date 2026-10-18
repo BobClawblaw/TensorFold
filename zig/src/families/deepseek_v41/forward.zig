@@ -63,9 +63,6 @@ fn skips(key: []const u8) bool {
     while (it.next()) |name| if (std.mem.eql(u8, name, key)) return !but;
     return but;
 }
-/// Dispatches encoded, counted for a check.
-pub var dispatches: usize = 0;
-pub var trace = false;
 /// Heads a split-attention threadgroup takes (v41_attend.metal's HG).
 const split_heads = 16;
 /// The next dispatch runs alongside the one before it (`Enc.with`): no barrier between them.
@@ -74,7 +71,6 @@ var joined = false;
 pub var pending_expand = false;
 /// The pending branch is the MoE's, still to be combined from its routed (this many a row) and shared rows.
 pub var pending_topk: i32 = 0;
-var last_pipe: []const u8 = "";
 pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
 
 pub const Enc = struct {
@@ -111,6 +107,11 @@ pub const Enc = struct {
         }
         self.ep.*.barrier();
     }
+    /// A left-out dispatch (DS_SKIP) still takes a `with` meant for it, so the next one keeps its barrier.
+    fn skipped() bool {
+        if (skipping) joined = false;
+        return skipping;
+    }
     pub fn with(self: Enc) void {
         _ = self;
         joined = true;
@@ -118,7 +119,6 @@ pub const Enc = struct {
 
     pub fn pipe(self: Enc, comptime key: []const u8) void {
         skipping = skips(key);
-        last_pipe = key;
         self.ep.*.setPipeline(self.m.kernels.get(key));
     }
     pub fn buf(self: Enc, b: Buffer, off: usize, slot: usize) void {
@@ -131,17 +131,13 @@ pub const Enc = struct {
         self.ep.*.setBytes(std.mem.asBytes(&v), slot);
     }
     pub fn threads(self: Enc, grid: [3]usize, group: [3]usize) void {
-        if (skipping) return;
-        dispatches += 1;
+        if (skipped()) return;
         self.fence();
-        if (trace) std.debug.print("{s} {d}x{d}x{d}\n", .{ last_pipe, grid[0], grid[1], grid[2] });
         self.ep.*.dispatchThreads(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
     pub fn groups(self: Enc, grid: [3]usize, group: [3]usize) void {
-        if (skipping) return;
-        dispatches += 1;
+        if (skipped()) return;
         self.fence();
-        if (trace) std.debug.print("{s} {d}x{d}x{d}\n", .{ last_pipe, grid[0], grid[1], grid[2] });
         self.ep.*.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
 
@@ -149,7 +145,10 @@ pub const Enc = struct {
     pub fn linear(self: Enc, w: wts.Linear, x: Buffer, x_off: usize, y: Buffer, y_off: usize, rows: usize) void {
         if (rows >= nax_rows) if (self.nax(w)) |p| {
             const xr = Ref{ .buf = x, .off = x_off };
-            const sums = Ref{ .buf = self.s.sums };
+            // one beside the projection before it (`with`) keeps its group sums apart: the buffer's second half
+            const half = self.s.sums.length() / 2 & ~@as(usize, 15);
+            std.debug.assert(!joined or rows * (w.k / w.group) * 4 <= half);
+            const sums = Ref{ .buf = self.s.sums, .off = if (joined) half else 0 };
             self.fence();
             am.rowSums(self.ep.*, p, @intCast(w.group), xr, sums, @intCast(rows), @intCast(w.k));
             self.fence();
@@ -157,8 +156,7 @@ pub const Enc = struct {
             return;
         };
         skipping = skips("rows");
-        last_pipe = "rows";
-        if (skipping) return;
+        if (skipped()) return;
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
         self.buf(x, x_off, 0);
@@ -173,8 +171,7 @@ pub const Enc = struct {
     /// Slot i takes expert ids[i] on input row i / repeat.
     pub fn indexed(self: Enc, x: row.Experts, slots: usize, in: Buffer, ids: Buffer, out: Buffer) void {
         skipping = skips("indexed");
-        last_pipe = "indexed";
-        if (skipping) return;
+        if (skipped()) return;
         const call = row.callIndexed(&self.m.kernels.rows, x, slots, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
         self.buf(in, 0, 0);
@@ -254,7 +251,7 @@ pub const Enc = struct {
         self.buf(s.attn_ml, 0, 1);
         self.tensor(sink, 2);
         self.buf(o, 0, 3);
-        self.args([2]i32{ @intCast(chunks), 1 }, 4);
+        self.args(@as(i32, @intCast(chunks)), 4);
         self.buf(s.pos, 0, 5);
         self.buf(freq, 0, 6);
         self.groups(.{ c.heads, self.rows, 1 }, .{ c.head_dim, 1, 1 });

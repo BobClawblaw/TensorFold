@@ -1,4 +1,4 @@
-//! DeepSeek-V4.1-Flash on the lane engine: one stream, prompts in chunks, DSpark drafts verified in windows.
+//! DeepSeek-V4.1-Flash on the lane engine: streams in turn, prompts in chunks, DSpark drafts verified in windows.
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");

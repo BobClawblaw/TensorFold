@@ -432,7 +432,7 @@ fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .{ .name = "tf-lfm2-forward", .path = "zig/tests/lfm2_forward.zig", .about = "LFM2-MoE native teacher-forced logits" },
         .{ .name = "tf-lfm2-bench", .path = "zig/tests/lfm2_bench.zig", .about = "LFM2-MoE prompt-chunk and one-row decode timing" },
         .{ .name = "tf-lfm2-exact", .path = "zig/tests/lfm2_exact.zig", .about = "LFM2-MoE prompt chunks, windows and committed-state exactness" },
-        .{ .name = "tf-dsv41-forward", .path = "zig/tests/dsv41_forward.zig", .about = "DeepSeek-V4.1-Flash: token ids through the native forward, each block's streams and the logits written for the reference (MODEL_DIR IDS OUT_DIR)" },
+        .{ .name = "tf-dsv41-forward", .path = "zig/tests/dsv41_forward.zig", .about = "DeepSeek-V4.1-Flash: token ids through the native forward, each block's streams and the logits written for the reference (MODEL_DIR IDS OUT_DIR [CHUNK]); DS_PROFILE (ms by section), DS_TIMING (encode and GPU ms a call), DS_SKIP=k1,k2 or !k1,k2 (pipelines left out), DS_DRAFT=N (N greedy tokens plain and DSpark-drafted), DS_DEPTH=d1,d2 (a chunk and a decode row timed at each depth)" },
         .{ .name = "tf-dsv41-vision", .path = "zig/tests/dsv41_vision.zig", .about = "DeepSeek-V4.1-Flash: the image tower and aligner on given patches, its rows written for the reference (MODEL_DIR PATCHES N_H N_W OUT)" },
         .{ .name = "tf-lfm2-fp64", .path = "zig/tests/lfm2_fp64.zig", .about = "LFM2 projection classes and attention on the tensor units, the tiles and the twin, each against float64" },
         .{ .name = "tensorfold", .path = "zig/src/main.zig", .about = "The native engine's command line" },

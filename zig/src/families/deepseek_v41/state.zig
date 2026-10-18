@@ -10,7 +10,7 @@ pub const ring = 4096;
 pub const max_rows = ring - c.window;
 /// Compressed picks a row: the indexer's top-k.
 pub const picks = c.index_topk;
-/// Rows that take the split attention (decode, windows, drafts), and its chunks of 64 keys at most a row.
+/// Rows that take the split attention (decode, windows, drafts), and its 16-key chunks a row.
 pub const split_rows = 16;
 pub const split_chunks = (c.window + picks + 15) / 16;
 /// Scores a prompt call's indexer holds at once (f32): rows are taken in slices of this many keys' worth.
@@ -90,16 +90,6 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache) void {
         self.engram_ids.deinit(self.gpa);
         self.memory.deinit();
-    }
-
-    /// Bytes a stream holds at `capacity` positions.
-    pub fn bytes(capacity: usize) usize {
-        var n: usize = c.vocab * 2 + c.layers * ring * c.head_dim * 2;
-        for (c.kv_sources) |layer| {
-            n += (capacity / c.ratios[layer] + 1) * (c.head_dim + c.index_dim) * 2;
-            if (c.ratios[layer] > 1) n += 2 * ring * c.head_dim * 4;
-        }
-        return n + capacity * 4;
     }
 };
 
