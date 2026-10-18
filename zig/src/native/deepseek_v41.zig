@@ -65,7 +65,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     errdefer gpa.destroy(h);
     h.gpa = gpa;
     h.model = model;
-    const chunk = 256;
+    const chunk = 1024; // a prompt pass's rows a call (the scratch, the lane host's step and the prompt cache's save points)
     h.metal = try q.backend.Metal.init(gpa, model, .{ .capacity = window, .chunk = chunk });
     errdefer h.metal.deinit();
     const rows: u32 = if (h.metal.drafts != null) q.backend.window_rows else 1;

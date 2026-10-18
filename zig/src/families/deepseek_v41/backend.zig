@@ -12,7 +12,7 @@ const Model = @import("model.zig").Model;
 const draw = @import("../lfm2_moe/backend.zig").draw;
 const be = lanes.backend;
 
-pub const Options = struct { capacity: usize, chunk: usize = 256 };
+pub const Options = struct { capacity: usize, chunk: usize = 1024 };
 
 /// The widest window: the pending row and the head's five drafts.
 pub const window_rows = 1 + c.draft_block;
