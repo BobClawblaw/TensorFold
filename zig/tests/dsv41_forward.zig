@@ -28,6 +28,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.c.getenv("DS_DISPATCH") != null) return dispatchCost(gpa, init.io, args[1]);
     if (std.c.getenv("DS_BW") != null) return bandwidth(gpa, init.io, args[1]);
     if (std.c.getenv("DS_ABLATE") != null) return ablate(gpa, init.io, args[1], ids);
+    if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d));
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
     const m = try q.Model.load(gpa, init.io, args[1], false);
@@ -72,7 +73,14 @@ pub fn main(init: std.process.Init) !void {
     }
     var dir = try std.Io.Dir.cwd().openDir(init.io, out_dir, .{});
     defer dir.close(init.io);
-    try dir.writeFile(init.io, .{ .sub_path = "logits.bin", .data = logits });
+    // past 1 GiB, logits.N.bin parts of 1 GiB (a single write past 2 GiB fails on macOS)
+    if (logits.len <= 1 << 30) try dir.writeFile(init.io, .{ .sub_path = "logits.bin", .data = logits });
+    var part: usize = 0;
+    while (logits.len > 1 << 30 and part * (1 << 30) < logits.len) : (part += 1) {
+        var name: [32]u8 = undefined;
+        const lo = part * (1 << 30);
+        try dir.writeFile(init.io, .{ .sub_path = try std.fmt.bufPrint(&name, "logits.{d}.bin", .{part}), .data = logits[lo..@min(logits.len, lo + (1 << 30))] });
+    }
     // the last index source's (layer 36's) picks for every row, when the whole input was one call
     if (dumping) try dir.writeFile(init.io, .{ .sub_path = "picks.bin", .data = scratch.picks.contents()[0 .. ids.len * q.state.picks * 4] });
     if (dumping) for (dump_bufs, 0..) |b, i| {
@@ -323,5 +331,46 @@ fn bandwidth(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
         cb.wait();
         const t = cb.gpuSeconds() / 4;
         std.debug.print("blit copy  {d:7.1} MB {d:7.1} us {d:6.0} GB/s read+write\n", .{ @as(f64, @floatFromInt(n)) / 1e6, t * 1e6, 2 * @as(f64, @floatFromInt(n)) / t / 1e9 });
+    }
+}
+
+/// GPU ms by section of a 256-row prompt chunk and a decode row at each depth in `list` (comma-separated positions):
+/// the cache before the depth is random bf16 (timing, not output), the history's engram ids the prompt's, cycled.
+fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, list: []const u8) !void {
+    const m = try q.Model.load(gpa, io, dir, false);
+    defer m.deinit();
+    var scratch = try q.state.Scratch.init(gpa, m.device, 256);
+    defer scratch.deinit();
+    if (ids.len < 256) return error.ExpectedAChunkOfIds;
+    var sections: [q.forward.sections.len]f64 = @splat(0);
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |field| {
+        const depth = try std.fmt.parseInt(usize, field, 10);
+        var cache = try q.state.Cache.init(gpa, m.device, depth + 4 * 256 + 64);
+        defer cache.deinit();
+        var rng: u64 = 0x9e3779b97f4a7c15 ^ depth;
+        for (cache.memory.buffers.items) |b| for (std.mem.bytesAsSlice(u16, b.contents()[0 .. b.length() & ~@as(usize, 1)])) |*v| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            v.* = @truncate((rng & 0x807f) | 0x3c00); // +-[2^-7, 2^-6): small finite values
+        };
+        for (0..depth) |i| cache.engram_ids.appendAssumeCapacity(m.engram.compress(ids[i % ids.len], true));
+        for ([_]usize{ 256, 1 }) |rows| {
+            const reps: usize = if (rows == 1) 8 else 2;
+            for (0..reps + 1) |r| {
+                if (r == 1) sections = @splat(0); // the first call warms the pipelines
+                cache.len = depth;
+                q.forward.profile = &sections;
+                try q.forward.run(m, &scratch, &cache, ids[0..rows], .last, null);
+                q.forward.profile = null;
+            }
+            var total: f64 = 0;
+            for (sections) |v| total += v;
+            const k: f64 = @floatFromInt(reps);
+            std.debug.print("depth {d} rows {d}: {d:.2} ms ({d:.0} tok/s);", .{ depth, rows, total * 1e3 / k, @as(f64, @floatFromInt(rows)) * k / total });
+            for (q.forward.sections, sections) |name, v| std.debug.print(" {s} {d:.2},", .{ name, v * 1e3 / k });
+            std.debug.print("\n", .{});
+        }
     }
 }

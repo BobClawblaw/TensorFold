@@ -34,7 +34,7 @@ const RopeArgs = extern struct { heads: i32, stride: i32, offset: i32, inverse: 
 const CopyArgs = extern struct { width: i32, ring: i32 };
 const PoolArgs = extern struct { first: i32, ring: i32 };
 const ScoreArgs = extern struct { rows: i32, groups: i32, ratio: i32, first_pos: i32, stride: i32 };
-const MaskArgs = extern struct { groups: i32, stride: i32, block: i32, kept: i32 };
+const KeptArgs = extern struct { rows: i32, groups: i32, ratio: i32, first_pos: i32, block: i32, kept: i32 };
 const BlockArgs = extern struct { rows: i32, groups: i32, block: i32, first_pos: i32, ratio: i32, stride: i32 };
 const TopkArgs = extern struct { n: i32, k: i32, stride: i32, offset: i32 };
 const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: i32, scale: f32, window_end: i32 = -1 };
@@ -757,6 +757,7 @@ fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.Inde
         x.groups(.{ rows, 1, 1 }, .{ 1024, 1, 1 });
         return;
     }
+    if (layer > c.candidate_source) return indexKept(x, src, groups, ratio);
     const slice = @max(1, @min(rows, st.score_budget / 4 / groups));
     var r0: usize = 0;
     while (r0 < rows) : (r0 += slice) {
@@ -780,18 +781,43 @@ fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.Inde
             x.buf(s.keep, r0 * c.candidate_blocks * 4, 1);
             x.args(TopkArgs{ .n = @intCast(nb), .k = c.candidate_blocks, .stride = @intCast(groups), .offset = 0 }, 2);
             x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
-        } else if (layer > c.candidate_source) {
-            x.pipe("ds_candidate_mask");
-            x.buf(s.scores, 0, 0);
-            x.buf(s.keep, r0 * c.candidate_blocks * 4, 1);
-            x.args(MaskArgs{ .groups = @intCast(groups), .stride = @intCast(groups), .block = c.candidate_block, .kept = c.candidate_blocks }, 2);
-            x.threads(.{ groups, n, 1 }, .{ @min(groups, 256), 1, 1 });
         }
         x.pipe("ds_topk");
         x.buf(s.scores, 0, 0);
         x.buf(s.picks, r0 * st.picks * 4, 1);
         x.args(TopkArgs{ .n = @intCast(groups), .k = st.picks, .stride = @intCast(groups), .offset = 0 }, 2);
         x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
+    }
+}
+
+/// An indexer after layer 20 scores only inside the row's candidate blocks (layer 20's keep): slots in key order, so
+/// the top-k over them, mapped back to keys, is the top-k of the masked full scan.
+fn indexKept(x: Enc, src: *const st.Source, groups: usize, ratio: usize) void {
+    const s = x.s;
+    const slots = c.candidate_blocks * c.candidate_block;
+    const slice = @max(1, @min(x.rows, st.score_budget / 4 / slots));
+    var r0: usize = 0;
+    while (r0 < x.rows) : (r0 += slice) {
+        const n = @min(slice, x.rows - r0);
+        const args = KeptArgs{ .rows = @intCast(n), .groups = @intCast(groups), .ratio = @intCast(ratio), .first_pos = @intCast(x.base + r0), .block = c.candidate_block, .kept = c.candidate_blocks };
+        x.pipe("ds_index_scores_kept");
+        x.buf(s.iq, r0 * c.index_heads * c.index_dim * 2, 0);
+        x.buf(s.iw, r0 * c.index_heads * 2, 1);
+        x.buf(src.keys, 0, 2);
+        x.buf(s.scores, 0, 3);
+        x.buf(s.keep, r0 * c.candidate_blocks * 4, 4);
+        x.args(args, 5);
+        x.threads(.{ slots * 32, n, 1 }, .{ 256, 1, 1 }); // a simdgroup a slot
+        x.pipe("ds_topk");
+        x.buf(s.scores, 0, 0);
+        x.buf(s.picks, r0 * st.picks * 4, 1);
+        x.args(TopkArgs{ .n = @intCast(slots), .k = st.picks, .stride = @intCast(slots), .offset = 0 }, 2);
+        x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
+        x.pipe("ds_kept_keys");
+        x.buf(s.picks, r0 * st.picks * 4, 0);
+        x.buf(s.keep, r0 * c.candidate_blocks * 4, 1);
+        x.args(args, 2);
+        x.threads(.{ st.picks, n, 1 }, .{ 256, 1, 1 });
     }
 }
 

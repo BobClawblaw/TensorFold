@@ -12,6 +12,7 @@ constant constexpr int MIX = (2 + S) * S;
 constant constexpr int HD = 512;  // the attention head (one shared key/value latent)
 constant constexpr int IH = 32;   // indexer heads
 constant constexpr int ID = 128;  // indexer head dim
+constant constexpr int IK = 512;  // indexer picks a row
 
 #pragma clang fp contract(off)
 
@@ -437,6 +438,17 @@ struct ScoreArgs {
 // keys the row cannot see yet ((pos + 1) / ratio of them).
 // A simdgroup a key group, a lane a head (IH = 32): each head's dot in the order one thread took it, then lane 0 adds
 // the heads' terms in head order (bit-identical to a thread a group).
+static float index_score(const device bfloat* Q, const device bfloat* WT, const device bfloat* K, int r, int t, int h) {
+  const device bfloat* k = K + size_t(t) * ID;
+  const device bfloat* q = Q + (size_t(r) * IH + h) * ID;
+  float dot = 0.0f;
+  for (int i = 0; i < ID; i++) dot += float(q[i]) * float(k[i]);
+  const float term = bf_round(max(bf_round(dot), 0.0f) * float(WT[r * IH + h]));
+  float total = 0.0f;
+  for (int j = 0; j < IH; j++) total += simd_shuffle(term, ushort(j));
+  return bf_round(total);
+}
+
 [[kernel]] void ds_index_scores(const device bfloat* Q [[buffer(0)]], const device bfloat* WT [[buffer(1)]],
                                 const device bfloat* K [[buffer(2)]], device float* SCORE [[buffer(3)]],
                                 constant ScoreArgs& a [[buffer(4)]], uint2 g [[thread_position_in_grid]],
@@ -449,38 +461,47 @@ struct ScoreArgs {
     if (lane == 0) out[t] = -INFINITY;
     return;
   }
-  const device bfloat* k = K + size_t(t) * ID;
-  const device bfloat* q = Q + (size_t(r) * IH + h) * ID;
-  float dot = 0.0f;
-  for (int i = 0; i < ID; i++) dot += float(q[i]) * float(k[i]);
-  const float term = bf_round(max(bf_round(dot), 0.0f) * float(WT[r * IH + h]));
-  float total = 0.0f;
-  for (int j = 0; j < IH; j++) total += simd_shuffle(term, ushort(j));
-  if (lane == 0) out[t] = bf_round(total);
+  const float s = index_score(Q, WT, K, r, t, h);
+  if (lane == 0) out[t] = s;
 }
 
-struct MaskArgs {
+struct KeptArgs {
+  int rows;
   int groups;
-  int stride;
+  int ratio;
+  int first_pos;
   int block;
   int kept;  // KEEP's row width: the candidate blocks in ascending order, -1 after the last
 };
 
-// Scores of positions outside the row's candidate blocks to -inf (a binary search of the row's kept blocks).
-[[kernel]] void ds_candidate_mask(device float* SCORE [[buffer(0)]], const device int* KEEP [[buffer(1)]],
-                                  constant MaskArgs& a [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
-  const int t = int(g.x), r = int(g.y);
-  if (t >= a.groups) return;
-  const device int* keep = KEEP + size_t(r) * a.kept;
-  const int b = t / a.block;
-  int lo = 0, hi = a.kept;
-  while (lo < hi) {
-    const int mid = (lo + hi) / 2;
-    const int v = keep[mid];
-    if (v >= 0 && v < b) lo = mid + 1;
-    else hi = mid;
+// ds_index_scores over the row's candidate blocks only: slot j scores key keep[j / block] * block + j % block, so
+// the slots run in key order (-inf for a -1 block or a key past the row's visible ones).
+[[kernel]] void ds_index_scores_kept(const device bfloat* Q [[buffer(0)]], const device bfloat* WT [[buffer(1)]],
+                                     const device bfloat* K [[buffer(2)]], device float* SCORE [[buffer(3)]],
+                                     const device int* KEEP [[buffer(4)]], constant KeptArgs& a [[buffer(5)]],
+                                     uint2 g [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+  const int j = int(g.x) / 32, r = int(g.y), h = int(lane);
+  const int slots = a.kept * a.block;
+  if (j >= slots) return;
+  const int b = KEEP[size_t(r) * a.kept + j / a.block];
+  const int t = b * a.block + j % a.block;
+  const int visible = (a.first_pos + r + 1) / a.ratio;
+  device float* out = SCORE + size_t(r) * slots;
+  if (b < 0 || t >= a.groups || t >= visible) {
+    if (lane == 0) out[j] = -INFINITY;
+    return;
   }
-  if (lo >= a.kept || keep[lo] != b) SCORE[size_t(r) * a.stride + t] = -INFINITY;
+  const float s = index_score(Q, WT, K, r, t, h);
+  if (lane == 0) out[j] = s;
+}
+
+// A row's picks over its candidate slots back to key positions (-1 stays).
+[[kernel]] void ds_kept_keys(device int* PICKS [[buffer(0)]], const device int* KEEP [[buffer(1)]],
+                             constant KeptArgs& a [[buffer(2)]], uint2 g [[thread_position_in_grid]]) {
+  const int i = int(g.x), r = int(g.y);
+  if (i >= IK || r >= a.rows) return;
+  device int* p = PICKS + size_t(r) * IK + i;
+  if (*p >= 0) *p = KEEP[size_t(r) * a.kept + *p / a.block] * a.block + *p % a.block;
 }
 
 struct BlockArgs {
