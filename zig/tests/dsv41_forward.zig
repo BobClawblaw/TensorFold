@@ -229,7 +229,7 @@ fn ablate(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32)
     defer m.deinit();
     var scratch = try q.state.Scratch.init(gpa, m.device, 8);
     defer scratch.deinit();
-    const names = [_][]const u8{ "", "rows", "indexed", "ds_hc_expand_mix", "ds_hc_mix_part", "ds_hc_boundary", "ds_hc_expand", "ds_kv_finish", "ds_rms", "ds_rope", "ds_fp8_qdq", "ds_fp4_qdq", "ds_put_rows", "ds_put_rows_f32", "ds_attend_split", "ds_attend_merge", "ds_gemv_bf_bf", "ds_gemv_bf_f32", "ds_route", "ds_swiglu", "ds_index_scores", "ds_topk", "ds_pool2", "ds_scale", "ds_engram", "ds_embed" };
+    const names = [_][]const u8{ "", "rows", "indexed", "ds_hc_expand_mix", "ds_hc_mix_part", "ds_hc_boundary", "ds_hc_expand", "ds_kv_finish", "ds_rms", "ds_rope", "ds_fp8_qdq", "ds_fp4_qdq", "ds_put_rows", "ds_put_rows_f32", "ds_attend_split", "ds_attend_merge", "ds_gemv_bf_bf", "ds_gemv_bf_f32", "ds_route", "ds_swiglu", "ds_index_scores_2x16", "ds_topk", "ds_pool2", "ds_scale", "ds_engram", "ds_embed" };
     var base: f64 = 0;
     const only_all = std.mem.eql(u8, std.mem.span(std.c.getenv("DS_ABLATE").?), "all");
     for (names[0..if (only_all) 1 else names.len]) |name| {
@@ -338,6 +338,7 @@ fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
     defer scratch.deinit();
     if (ids.len < 256) return error.ExpectedAChunkOfIds;
     var sections: [q.forward.sections.len]f64 = @splat(0);
+    if (std.c.getenv("DS_SKIP")) |k| q.forward.skip = std.mem.span(k);
     var it = std.mem.splitScalar(u8, list, ',');
     while (it.next()) |field| {
         const depth = try std.fmt.parseInt(usize, field, 10);

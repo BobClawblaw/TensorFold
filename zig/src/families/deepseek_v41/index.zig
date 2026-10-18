@@ -81,13 +81,15 @@ pub fn index(x: Enc, src: *const st.Source, layer: usize, ratio: usize, ix: wts.
     var r0: usize = 0;
     while (r0 < rows) : (r0 += slice) {
         const n = @min(slice, rows - r0);
-        x.pipe("ds_index_scores");
+        const tile: [2]usize = if (n == 1) .{ 1, 8 } else .{ 2, 16 };
+        if (n == 1) x.pipe("ds_index_scores_1x8") else x.pipe("ds_index_scores_2x16");
         x.buf(s.iq, r0 * c.index_heads * c.index_dim * 2, 0);
         x.buf(s.iw, r0 * c.index_heads * 2, 1);
         x.buf(src.keys, 0, 2);
         x.buf(s.scores, 0, 3);
         x.args(ScoreArgs{ .rows = @intCast(n), .groups = @intCast(groups), .ratio = @intCast(ratio), .first_pos = @intCast(x.base + r0), .stride = @intCast(groups) }, 4);
-        x.threads(.{ groups * 32, n, 1 }, .{ 256, 1, 1 }); // a simdgroup a key group
+        const row_tiles = (n + tile[0] - 1) / tile[0];
+        x.threads(.{ row_tiles * 32, (groups + tile[1] - 1) / tile[1], 1 }, .{ @as(usize, @min(row_tiles, 8)) * 32, 1, 1 });
         const nb = (groups + c.candidate_block - 1) / c.candidate_block;
         if (layer == c.candidate_source) {
             x.pipe("ds_block_max");

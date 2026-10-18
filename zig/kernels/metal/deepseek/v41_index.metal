@@ -22,21 +22,45 @@ static float index_score(const device bfloat* Q, const device bfloat* WT, const 
   return bf_round(total);
 }
 
+// index_score on R-row by T-key tiles (a lane a head): the same sums in the same order, each value loaded once a tile.
+template <int R, int T>
 [[kernel]] void ds_index_scores(const device bfloat* Q [[buffer(0)]], const device bfloat* WT [[buffer(1)]],
                                 const device bfloat* K [[buffer(2)]], device float* SCORE [[buffer(3)]],
                                 constant ScoreArgs& a [[buffer(4)]], uint2 g [[thread_position_in_grid]],
-                                uint lane [[thread_index_in_simdgroup]]) {
-  const int t = int(g.x) / 32, r = int(g.y), h = int(lane);
-  if (t >= a.groups) return;
-  const int visible = (a.first_pos + r + 1) / a.ratio;
-  device float* out = SCORE + size_t(r) * a.stride;
-  if (t >= visible) {
-    if (lane == 0) out[t] = -INFINITY;
-    return;
+                                uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  static_assert(R * T <= 32, "a lane sums a pair");
+  threadgroup bfloat terms[8][R * T][IH + 2];  // a simdgroup's terms by pair, then head (bf16-exact)
+  const int r0 = int(g.x) / 32 * R, t0 = int(g.y) * T, h = int(lane);
+  if (r0 >= a.rows || t0 >= a.groups) return;
+  const device bfloat4* q = (const device bfloat4*)(Q + size_t(r0) * IH * ID) + h * (ID / 4);
+  const device bfloat4* k = (const device bfloat4*)(K + size_t(t0) * ID);
+  const int rn = min(R, a.rows - r0) - 1, tn = min(T, a.groups - t0) - 1;  // the tile's last row and key in range
+  float dot[R][T];
+  for (int i = 0; i < R; i++)
+    for (int j = 0; j < T; j++) dot[i][j] = 0.0f;
+  for (int c = 0; c < ID / 4; c++) {
+    float4 qv[R], kv[T];
+    for (int i = 0; i < R; i++) qv[i] = float4(q[min(i, rn) * IH * (ID / 4) + c]);
+    for (int j = 0; j < T; j++) kv[j] = float4(k[min(j, tn) * (ID / 4) + c]);
+    for (int i = 0; i < R; i++)
+      for (int j = 0; j < T; j++)
+        for (int e = 0; e < 4; e++) dot[i][j] += qv[i][e] * kv[j][e];
   }
-  const float s = index_score(Q, WT, K, r, t, h);
-  if (lane == 0) out[t] = s;
+  for (int i = 0; i < R; i++) {
+    const float w = float(WT[(r0 + min(i, rn)) * IH + h]);
+    for (int j = 0; j < T; j++) terms[sg][i * T + j][h] = bfloat(max(bf_round(dot[i][j]), 0.0f) * w);
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  // lane p adds pair p's head terms in head order
+  const int i = h / T, j = h % T, r = r0 + i, t = t0 + j;
+  if (h >= R * T || i > rn || j > tn) return;
+  float total = 0.0f;
+  for (int l = 0; l < IH; l++) total += float(terms[sg][h][l]);
+  SCORE[size_t(r) * a.stride + t] = t < (a.first_pos + r + 1) / a.ratio ? bf_round(total) : -INFINITY;
 }
+
+template [[host_name("ds_index_scores_1x8")]] [[kernel]] decltype(ds_index_scores<1, 8>) ds_index_scores<1, 8>;
+template [[host_name("ds_index_scores_2x16")]] [[kernel]] decltype(ds_index_scores<2, 16>) ds_index_scores<2, 16>;
 
 struct KeptArgs {
   int rows;
