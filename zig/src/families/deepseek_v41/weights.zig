@@ -1,5 +1,4 @@
-//! Views into the converted checkpoint's buffers: affine projections for the row kernels, experts back to back,
-//! and the tensors the reference keeps in bf16 / f32 (norms, routers, compressors, indexer keys, wo_a, hc).
+//! Views into the converted checkpoint: affine projections, experts back to back, bf16 / f32 tensors.
 const std = @import("std");
 const ck = @import("../../core/checkpoint_metal.zig");
 const row = @import("../../core/row_projection.zig");
@@ -116,9 +115,7 @@ fn optional(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, 
     return try expect(ckpt, name, dtype, shape);
 }
 
-/// `count` matrices [n, k] (count 0: one matrix of rank 2) of affine codes as the row kernels read them. The width
-/// is the tensors' own (codes [.., n, k * bits / 32], scales [.., n, k / group]); `expected` is the config's, which a
-/// module may differ from (a per-module quantization entry).
+/// `count` [n, k] affine matrices (0: one of rank 2) at the tensors' own width; `expected` is the config's.
 fn affine(ckpt: *const ck.Checkpoint, prefix: []const u8, suffix: []const u8, count: usize, n: usize, k: usize, expected: c.Width) !Linear {
     var buf: [256]u8 = undefined;
     const name = try std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, suffix });

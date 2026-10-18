@@ -1,6 +1,4 @@
-//! DeepSeek-V4.1-Flash behind the lane engine's backend interface: one stream, the prompt in chunks, windows of up
-//! to six rows verifying the DSpark head's drafts (drafted replies equal one-row ones: tf-dsv41-forward DS_DRAFT),
-//! draws on the host from each row's bf16 logits.
+//! DeepSeek-V4.1-Flash on the lane engine: one stream, prompts in chunks, DSpark drafts verified in windows.
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
@@ -156,8 +154,7 @@ pub const Metal = struct {
         }
     }
 
-    /// The stream's images through the tower: every image's aligner rows in one buffer, and each prompt position's
-    /// code (the span's start, its rows with a line break after each, its end; -1 for text).
+    /// The stream's images through the tower: their aligner rows and each prompt position's code (-1 for text).
     fn images(self: *Metal, stream: *lanes.Stream, prompt_len: usize) !fwd.Vis {
         const v = &(self.model.vision orelse return error.DeepseekCheckpointHasNoVisionTower);
         var total: usize = 0;

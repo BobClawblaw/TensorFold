@@ -1,5 +1,4 @@
-//! A native DeepSeek-V4.1-Flash model: validated config, checkpoint views, the mapped engram tables, RoPE tables and
-//! the Metal pipelines.
+//! A native DeepSeek-V4.1-Flash model: config, checkpoint views, engram tables, RoPE tables and pipelines.
 const std = @import("std");
 const mtl = @import("metal");
 const cfg = @import("config.zig");
@@ -21,8 +20,7 @@ pub const Model = struct {
     engram: engram.Engram,
     /// The image tower and aligner, when the checkpoint has them.
     vision: ?vision.Weights,
-    /// RoPE frequencies (f32 [32]): plain for window-only layers and the draft stages, YaRN at the compressed theta
-    /// for every layer that reads compressed keys.
+    /// RoPE frequencies (f32 [32]): plain for window-only layers and drafts, YaRN for compressed-key layers.
     freq_plain: mtl.Buffer,
     freq_compressed: mtl.Buffer,
     /// The checkpoint's buffers held resident on the queue (none before macOS 15).
@@ -42,8 +40,7 @@ pub const Model = struct {
         errdefer m.checkpoint.deinit();
         const files = try shards.shardFiles(gpa, io, dir);
         defer shards.freeShardFiles(gpa, files);
-        // Each shard is held resident as soon as it is read: ~190 GiB of fresh, untouched buffers otherwise invite the
-        // compressor to take them while the rest loads, and with little swap jetsam then kills the load.
+        // held resident as read: ~190 GiB of untouched buffers invite the compressor, then jetsam kills the load
         m.resident = m.device.residencySet(files.len) catch null;
         for (files) |path| {
             try m.checkpoint.addFile(m.device, path, "");
@@ -91,8 +88,7 @@ pub const Model = struct {
     }
 };
 
-/// precompute_freqs_cis's frequencies for the 64 rotated dims: 1 / theta^(2i/64), with YaRN's ramp between the
-/// dims that keep their frequency and those divided by the factor when `compressed`.
+/// precompute_freqs_cis's 64-dim frequencies 1 / theta^(2i/64), with YaRN's ramp when `compressed`.
 pub fn frequencies(r: cfg.Rope, compressed: bool, out: []f32) void {
     const dim: f64 = cfg.rope_dim;
     const base: f64 = if (compressed) r.compress_theta else r.theta;

@@ -1,6 +1,4 @@
-//! A stream's caches and a forward's scratch. Everything a stream keeps is indexed by position (window rings,
-//! compressor projection rings) or by compressed group (the four sources' latents and index keys), so taking back
-//! rejected draft rows only moves `len`.
+//! A stream's caches (by position or group: dropping draft rows moves `len`) and a forward's scratch.
 const std = @import("std");
 const mtl = @import("metal");
 const c = @import("config.zig");
@@ -150,23 +148,19 @@ pub const Scratch = struct {
     act: mtl.Buffer,
     experts: mtl.Buffer,
     shared: mtl.Buffer,
-    /// A prompt chunk's slots sorted by expert: each expert's first sorted slot, sorted -> slot, the sorted weights,
-    /// the sorted slots' input rows, and the tensor units' group sums of a projection's input rows.
+    /// A chunk's slots sorted by expert: offsets, order, weights, input rows, the tensor units' group sums.
     offs: mtl.Buffer,
     order: mtl.Buffer,
     wsort: mtl.Buffer,
     xsort: mtl.Buffer,
     sums: mtl.Buffer,
     engram_rows: [c.engram_layers.len]mtl.Buffer, // bf16 [rows, 24 x 256] a layer, filled on the host
-    /// Compressed groups this call completes, a KV source each (written on the host while encoding, read when the
-    /// command buffer runs, so no two sources share one): their positions (for RoPE) and indices (cache rows).
+    /// Groups this call completes, a buffer a source (host-written as it encodes): positions and cache rows.
     gpos: [c.kv_sources.len]mtl.Buffer,
     gidx: [c.kv_sources.len]mtl.Buffer,
     engram_kv: mtl.Buffer,
     logits: mtl.Buffer,
-    /// DSpark: the target layers' stream means (bf16 [rows, 3 x 5120]) and their conditioning rows; a draft call's
-    /// token ids (the pending token, then the drafts as the Markov steps pick them), its picks of its own five keys,
-    /// and the argmax partials.
+    /// DSpark: target layers' stream means and conditioning rows; a draft call's ids, own-key picks, argmax parts.
     mh: mtl.Buffer,
     /// Each row's image flag (i32: an image span's row) and code (forward.Vis).
     img: mtl.Buffer,

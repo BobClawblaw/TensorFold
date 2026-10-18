@@ -1,7 +1,4 @@
-//! DeepSeek-V4.1-Flash's image tower (inference/vision.py): a patch embedding, 32 blocks of bidirectional attention
-//! with 2D RoPE and a SwiGLU MLP, a final norm, then the aligner's 3x3 unfold and two projections (GELU between)
-//! to the language model's width. The projections are the converter's 8-bit affine; the patch embedding, biases and
-//! norms as stored.
+//! DeepSeek-V4.1-Flash's image tower (vision.py): patch embedding, 32 blocks, final norm, 3x3 aligner.
 const std = @import("std");
 const mtl = @import("metal");
 const ck = @import("../../core/checkpoint_metal.zig");
@@ -114,8 +111,7 @@ const LinArgs = extern struct { rows: i32, n: i32, k: i32 };
 const RowsArgs = extern struct { n: i32, x_stride: i32, y_stride: i32, eps: f32 };
 const UnfoldArgs = extern struct { n_h: i32, n_w: i32, out_w: i32 };
 
-/// One image through the tower and the aligner: `pixels` bf16 [n_h * n_w, 588] (patch-major, as load_image's
-/// reshape lays them) to `out` bf16 [grid rows x grid cols, 5120], the span's image rows in reading order.
+/// One image through tower and aligner: `pixels` bf16 [n_h * n_w, 588] to `out` bf16 [grid cells, 5120].
 pub fn run(m: *Model, v: *const Weights, pixels: mtl.Buffer, n_h: u32, n_w: u32, out: mtl.Buffer) !void {
     const n: usize = @as(usize, n_h) * n_w;
     const g = tokenGrid(n_h, n_w);

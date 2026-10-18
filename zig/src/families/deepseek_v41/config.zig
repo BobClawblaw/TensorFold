@@ -1,5 +1,4 @@
-//! Admission for DeepSeek-V4.1-Flash (model_type deepseek_v41, the converter's layout): pinned geometry, MLX affine
-//! projections at the checkpoint's widths, routed experts at a width a layer, engram tables beside the shards.
+//! Admission for DeepSeek-V4.1-Flash (deepseek_v41): pinned geometry, affine widths, engram tables by the shards.
 const std = @import("std");
 
 pub const hidden = 5120;
@@ -46,8 +45,7 @@ pub const draft_block = 5;
 pub const draft_targets = [_]usize{ 37, 38, 39 };
 pub const markov_rank = 256;
 
-/// Layers' compressed-KV ratios (0: window only), the four that compress their own KV and the eight that run an
-/// indexer; layer 20 also picks the candidate blocks the indexers after it score inside.
+/// Layers' compressed-KV ratios (0: window only), the KV and index sources; layer 20 also picks candidate blocks.
 pub const ratios = blk: {
     var r: [layers]u8 = undefined;
     for (&r, 0..) |*x, i| x.* = if (i < 2) 0 else if (i < 20) 2 else 1;
@@ -187,17 +185,17 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     const t = try field(root, "model_type");
     if (t != .string or !std.mem.eql(u8, t.string, "deepseek_v41")) return error.UnsupportedDeepseekConfig;
     const dims = .{
-        .{ "hidden_size", hidden },              .{ "vocab_size", vocab },                       .{ "num_hidden_layers", layers },
-        .{ "num_attention_heads", heads },        .{ "num_key_value_heads", 1 },                  .{ "head_dim", head_dim },
-        .{ "qk_rope_head_dim", rope_dim },       .{ "q_lora_rank", q_rank },                     .{ "o_lora_rank", o_rank },
-        .{ "o_groups", o_groups },               .{ "sliding_window", window },                  .{ "n_routed_experts", experts },
-        .{ "num_experts_per_tok", topk },        .{ "moe_intermediate_size", moe_inter },        .{ "n_shared_experts", 1 },
-        .{ "index_n_heads", index_heads },       .{ "index_head_dim", index_dim },               .{ "index_topk", index_topk },
+        .{ "hidden_size", hidden },                         .{ "vocab_size", vocab },                       .{ "num_hidden_layers", layers },
+        .{ "num_attention_heads", heads },                  .{ "num_key_value_heads", 1 },                  .{ "head_dim", head_dim },
+        .{ "qk_rope_head_dim", rope_dim },                  .{ "q_lora_rank", q_rank },                     .{ "o_lora_rank", o_rank },
+        .{ "o_groups", o_groups },                          .{ "sliding_window", window },                  .{ "n_routed_experts", experts },
+        .{ "num_experts_per_tok", topk },                   .{ "moe_intermediate_size", moe_inter },        .{ "n_shared_experts", 1 },
+        .{ "index_n_heads", index_heads },                  .{ "index_head_dim", index_dim },               .{ "index_topk", index_topk },
         .{ "candidate_source_layer_id", candidate_source }, .{ "candidate_topk_blocks", candidate_blocks }, .{ "candidate_block_size", candidate_block },
-        .{ "hc_mult", hc },                      .{ "hc_sinkhorn_iters", sinkhorn },             .{ "engram_n_heads", engram_heads },
-        .{ "engram_head_dim", engram_dim },      .{ "engram_max_ngram_size", engram_ngram },     .{ "num_nextn_predict_layers", stages },
-        .{ "dspark_block_size", draft_block },   .{ "dspark_n_routed_experts", draft_experts },  .{ "dspark_num_experts_per_tok", draft_topk },
-        .{ "dspark_markov_rank", markov_rank },  .{ "dspark_noise_token_id", 128799 },
+        .{ "hc_mult", hc },                                 .{ "hc_sinkhorn_iters", sinkhorn },             .{ "engram_n_heads", engram_heads },
+        .{ "engram_head_dim", engram_dim },                 .{ "engram_max_ngram_size", engram_ngram },     .{ "num_nextn_predict_layers", stages },
+        .{ "dspark_block_size", draft_block },              .{ "dspark_n_routed_experts", draft_experts },  .{ "dspark_num_experts_per_tok", draft_topk },
+        .{ "dspark_markov_rank", markov_rank },             .{ "dspark_noise_token_id", 128799 },
     };
     inline for (dims) |d| if (try integer(root, d[0]) != d[1]) {
         std.log.err("deepseek_v41: {s} is not DeepSeek-V4.1-Flash's {d}", .{ d[0], d[1] });

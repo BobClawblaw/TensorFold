@@ -1,6 +1,4 @@
-//! DeepSeek-V4.1-Flash token ids through the native forward: every row's bf16 logits (logits.bin), and with one
-//! chunk each block's streams (layerN.bin, bf16 [rows, 4, 5120]), for the CPU reference to compare
-//! (ref/compare.py in the recipe). CHUNK rows a call (default: all of them; 1: decode steps).
+//! DeepSeek-V4.1-Flash ids through the native forward: bf16 logits.bin (streams too with one chunk), CHUNK a call.
 const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
@@ -118,8 +116,7 @@ fn bf(v: u16) f32 {
     return @bitCast(@as(u32, v) << 16);
 }
 
-/// `n` greedy tokens after the prompt, one row a step and then with the DSpark head's drafts verified in windows of
-/// six rows: the two replies must be the same tokens; prints the acceptance and both speeds.
+/// `n` greedy tokens a row a step, then with DSpark drafts in windows of six: the same tokens; both speeds.
 fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, n: usize) !void {
     const m = try q.Model.load(gpa, io, dir, true);
     defer m.deinit();
@@ -255,8 +252,7 @@ fn ablate(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32)
     }
 }
 
-/// GB/s the row kernels reach on one decode row: the head, a layer's wq_b and wo_b, 6 of a layer's experts; and a
-/// blit copy of the head's codes (read + write) for the bus.
+/// GB/s the row kernels reach on a decode row (head, wq_b, wo_b, 6 experts), and a blit copy for the bus.
 fn bandwidth(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     const row = tf.row_projection;
     const m = try q.Model.load(gpa, io, dir, false);
@@ -334,8 +330,7 @@ fn bandwidth(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
     }
 }
 
-/// GPU ms by section of a 256-row prompt chunk and a decode row at each depth in `list` (comma-separated positions):
-/// the cache before the depth is random bf16 (timing, not output), the history's engram ids the prompt's, cycled.
+/// GPU ms by section of a 256-row chunk and a decode row at each depth in `list`, over a random-bf16 cache.
 fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, list: []const u8) !void {
     const m = try q.Model.load(gpa, io, dir, false);
     defer m.deinit();

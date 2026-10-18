@@ -1,4 +1,4 @@
-//! The family's pipelines (kernels/metal/deepseek/v41.metal) and the core row projections.
+//! The family's pipelines (kernels/metal/deepseek/v41*.metal) and the core row projections.
 const std = @import("std");
 const mtl = @import("metal");
 const sources = @import("kernel_sources");

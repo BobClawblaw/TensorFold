@@ -37,7 +37,7 @@ const cannot = "the native DeepSeek-V4.1 engine cannot load this checkpoint ({s}
 /// <｜deepseek_image｜>: the config's image_token_id, each image's place in the rendered prompt.
 const image_token: u32 = 129264;
 
-/// Info.vision's prepare: an image's bytes to the tower's patches (families/deepseek_v41/image.zig), on the HTTP thread.
+/// Info.vision's prepare: an image's bytes to the tower's patches (deepseek_v41/image.zig), HTTP thread.
 fn prepareImage(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
     const h: *Host = @ptrCast(@alignCast(ctx));
     const p = try q.image.prepare(h.io, a, bytes, max_tokens);

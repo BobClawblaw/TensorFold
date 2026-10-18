@@ -1,6 +1,4 @@
-//! DeepSeek-V4.1-Flash's image tower on given patches (bf16 [n_h * n_w, 588], ref/vision_dump.py's), the aligner's
-//! rows written as bf16 for the reference to compare: MODEL_DIR PATCHES N_H N_W OUT. Or MODEL_DIR IMAGE OUT: the
-//! image prepared natively (families/deepseek_v41/image.zig), its patches also written (OUT.patches, bf16).
+//! The image tower on patches (MODEL_DIR PATCHES N_H N_W OUT) or a prepared image (MODEL_DIR IMAGE OUT).
 const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");

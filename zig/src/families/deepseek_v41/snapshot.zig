@@ -1,6 +1,4 @@
-//! Kept prompt states: what a stream needs to go on from `at` tokens, copied to host memory. Everything it keeps is by
-//! position or compressed group, so a state is the engram history, each window's (and draft stage's) last 128 keys,
-//! the sources' groups so far, and the ratio-2 sources' last two projections (a pair still filling).
+//! Kept prompt states on the host: engram history, last 128 window keys, sources' groups, a filling pair.
 const std = @import("std");
 const c = @import("config.zig");
 const st = @import("state.zig");

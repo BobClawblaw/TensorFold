@@ -1,6 +1,4 @@
-//! An image's bytes to DeepSeek-V4.1-Flash's tower input as inference/image_processor.py's load_image makes it:
-//! Image.open(...).convert("RGB") (no EXIF turn, alpha dropped), plan_image_grid's size, ImageOps.pad to it (Pillow's
-//! bicubic, centered on gray 127), (x / 255 - 0.5) / 0.5 in fp32, patches of 14 x 14 a channel at a time.
+//! An image's bytes to the tower's input as image_processor.py's load_image makes it (RGB, padded, patched).
 const std = @import("std");
 const picture = @import("../../core/picture/picture.zig");
 const png = @import("../../core/picture/png.zig");
@@ -34,8 +32,7 @@ fn tokensOf(best_h: u64, best_w: u64) u64 {
     return gh * (gw + 1) + 2;
 }
 
-/// plan_image_grid (vision_max_wh_ratio unset): small images grown to min_pixels, sides rounded up to patches, then
-/// shrunk with solve_resize_ratio when the span would pass `max_tokens`.
+/// plan_image_grid: small images grown to min_pixels, sides rounded to patches, shrunk past `max_tokens`.
 pub fn plan(width: u32, height: u32, max_tokens: u32) Error!Plan {
     const p: f64 = vision.patch;
     var w: f64 = @floatFromInt(width);

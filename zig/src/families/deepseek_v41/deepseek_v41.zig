@@ -1,5 +1,4 @@
-//! DeepSeek-V4.1-Flash (model_type deepseek_v41, tools' converted layout): hyper-connections, sliding-window plus
-//! compressed sparse attention with a two-level indexer, engram n-gram lookups, 384-expert MoE, on Metal.
+//! DeepSeek-V4.1-Flash on Metal: hyper-connections, compressed sparse attention, engram, 384-expert MoE.
 pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
 pub const engram = @import("engram.zig");

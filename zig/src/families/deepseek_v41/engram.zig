@@ -1,6 +1,4 @@
-//! Engram lookups on the CPU: the n-gram hash of each position (engram.py's NgramHashState) and the gather of its
-//! table rows from the mapped engram files, dequantized to bf16 for the GPU. The tables (~203 GB) are never loaded:
-//! a lookup reads 24 rows of 264 bytes a layer, which the page cache keeps or the SSD serves.
+//! Engram lookups on the CPU: each position's n-gram hash, its rows gathered from the mapped tables (~203 GB).
 const std = @import("std");
 const c = @import("config.zig");
 
@@ -70,9 +68,7 @@ pub const Engram = struct {
         }
     }
 
-    /// Rows `first..first + count` of a call, both engram layers, into `dsts` (bf16 [count, 24 x 256] each): every
-    /// row's pages are asked for first (madvise WILLNEED), so the SSD serves a chunk's thousands of lookups at once
-    /// instead of one page fault after another, then each row is dequantized.
+    /// Rows `first..first + count` of a call into `dsts`: all their pages asked for first (madvise), then dequantized.
     pub fn gatherRows(self: *const Engram, ids: []const i32, first: usize, count: usize, dsts: [c.engram_layers.len][]u16) !void {
         const page = std.heap.pageSize();
         for (0..c.engram_layers.len) |e| {

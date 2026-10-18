@@ -4,6 +4,7 @@ const json = @import("json");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
 const tool_closers = @import("tool_closers.zig");
+const tool_dsml = @import("tool_dsml.zig");
 const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_streaming = @import("tool_streaming.zig");
@@ -15,46 +16,22 @@ const strip = reply_text.pyStrip;
 pub const deltas = tool_streaming.deltas;
 pub const wrapCalls = tool_streaming.wrapCalls;
 
-const Error = error{ Invalid, OutOfMemory };
-const Call = struct { name: []const u8, arguments: Value };
+pub const Error = error{ Invalid, OutOfMemory };
+pub const Call = struct { name: []const u8, arguments: Value };
 const Envelope = struct { start: usize, end: usize, payload: []const u8, complete: bool = true };
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value };
 
-/// DeepSeek's DSML markup: V4's tags, and V4.1's (a "calls" block, and a space after the marker in every tag).
-pub const Dsml = struct { open: []const u8, close: []const u8, invoke_open: []const u8, invoke_close: []const u8, param_open: []const u8, param_close: []const u8 };
-
-fn dsmlDialect(comptime sep: []const u8, comptime block: []const u8) Dsml {
-    const m = "\u{ff5c}DSML\u{ff5c}" ++ sep;
-    return .{
-        .open = "<" ++ m ++ block ++ ">",
-        .close = "</" ++ m ++ block ++ ">",
-        .invoke_open = "<" ++ m ++ "invoke name=\"",
-        .invoke_close = "</" ++ m ++ "invoke>",
-        .param_open = "<" ++ m ++ "parameter name=\"",
-        .param_close = "</" ++ m ++ "parameter>",
-    };
-}
-
-pub const dsml_dialects = [_]Dsml{ dsmlDialect("", "tool_calls"), dsmlDialect(" ", "calls") };
-
-/// The first DSML block opener of any dialect at or after `pos`, and its dialect.
-fn findDsml(text: []const u8, pos: usize) ?struct { at: usize, d: *const Dsml } {
-    var best: ?usize = null;
-    var which: *const Dsml = &dsml_dialects[0];
-    for (&dsml_dialects) |*d| if (find(text, d.open, pos)) |at| if (best == null or at < best.?) {
-        best = at;
-        which = d;
-    };
-    return if (best) |at| .{ .at = at, .d = which } else null;
-}
+pub const Dsml = tool_dsml.Dsml;
+pub const dsml_dialects = tool_dsml.dialects;
+const findDsml = tool_dsml.find;
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
     return std.ascii.findIgnoreCasePos(hay, from, needle);
 }
 
-fn find(hay: []const u8, needle: []const u8, from: usize) ?usize {
+pub fn find(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
     return std.mem.indexOfPos(u8, hay, from, needle);
 }
@@ -66,7 +43,7 @@ fn word(ch: u8) bool {
 
 const space = reply_text.isSpaceByte;
 
-fn allSpace(s: []const u8) bool {
+pub fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
 
@@ -152,7 +129,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
         const parsed: ?[]Call = blk: {
             for (&dsml_dialects) |*d| if (std.mem.startsWith(u8, env.payload, d.open)) {
                 const inner = env.payload[d.open.len .. env.payload.len - d.close.len];
-                break :blk dsmlCalls(a, inner, d) catch |e| switch (e) {
+                break :blk tool_dsml.calls(a, inner, d) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.Invalid => null,
                 };
@@ -568,51 +545,4 @@ pub fn putBack(a: Allocator, text: []const u8, quoted: []const []const u8) Alloc
     };
     try out.appendSlice(a, text[cursor..]);
     return out.items;
-}
-
-/// Every invoke of a DSML block, or Invalid when anything in it is not a well-formed invoke.
-fn dsmlCalls(a: Allocator, block: []const u8, d: *const Dsml) Error![]Call {
-    var calls: std.ArrayList(Call) = .empty;
-    var at: usize = 0;
-    var pos: usize = 0;
-    while (find(block, d.invoke_open, pos)) |s| {
-        pos = s + 1;
-        const name_start = s + d.invoke_open.len;
-        const q = std.mem.indexOfScalarPos(u8, block, name_start, '"') orelse continue;
-        if (!std.mem.startsWith(u8, block[q..], "\">")) continue;
-        const e = find(block, d.invoke_close, q + 2) orelse continue;
-        if (!allSpace(block[at..s])) return error.Invalid;
-        at = e + d.invoke_close.len;
-        pos = at;
-        const body = block[q + 2 .. e];
-        const arguments = try json.newObject(a);
-        var p: usize = 0;
-        var kept: usize = 0;
-        var residue: std.ArrayList(u8) = .empty;
-        while (find(body, d.param_open, p)) |ps| {
-            p = ps + 1;
-            const ns = ps + d.param_open.len;
-            const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
-            const flag = body[nq..];
-            const is_string = std.mem.startsWith(u8, flag, "\" string=\"true\">");
-            if (!is_string and !std.mem.startsWith(u8, flag, "\" string=\"false\">")) continue;
-            const v_start = nq + (if (is_string) "\" string=\"true\">".len else "\" string=\"false\">".len);
-            const pe = find(body, d.param_close, v_start) orelse continue;
-            const value = body[v_start..pe];
-            try residue.appendSlice(a, body[kept..ps]);
-            kept = pe + d.param_close.len;
-            p = kept;
-            if (is_string) {
-                try arguments.put(a, body[ns..nq], .{ .string = value });
-            } else switch (try json.parseText(a, value)) {
-                .ok => |v| try arguments.put(a, body[ns..nq], v),
-                .err => return error.Invalid,
-            }
-        }
-        try residue.appendSlice(a, body[kept..]);
-        if (!allSpace(residue.items)) return error.Invalid;
-        try calls.append(a, .{ .name = strip(block[name_start..q]), .arguments = .{ .object = arguments } });
-    }
-    if (calls.items.len == 0 or !allSpace(block[at..])) return error.Invalid;
-    return calls.items;
 }
