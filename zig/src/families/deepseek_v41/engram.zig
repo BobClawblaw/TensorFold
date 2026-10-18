@@ -5,10 +5,28 @@ const c = @import("config.zig");
 /// Compressed id of a position that takes no part in an n-gram (an image span's tokens).
 pub const dead: i32 = -1;
 
+/// Parts a table may be split into (engram/layerL-partI.safetensors, each under the Hub's per-file limit).
+const max_parts = 8;
+
+const Part = struct { map: []align(std.heap.page_size_min) const u8, rows: []const u8, first: usize, count: usize };
+
+/// A table's rows, in one file or in parts of consecutive rows.
 const Table = struct {
-    map: []align(std.heap.page_size_min) const u8,
-    rows: []const u8,
-    count: usize,
+    parts: [max_parts]Part = undefined,
+    n: usize = 0,
+    count: usize = 0,
+
+    /// Row `r`'s bytes (r < count).
+    fn row(t: *const Table, r: usize) *const [c.engram_row]u8 {
+        var i: usize = 0;
+        while (i + 1 < t.n and r >= t.parts[i + 1].first) i += 1;
+        const p = t.parts[i];
+        return p.rows[(r - p.first) * c.engram_row ..][0..c.engram_row];
+    }
+
+    fn unmap(t: *const Table) void {
+        for (t.parts[0..t.n]) |p| std.posix.munmap(p.map);
+    }
 };
 
 pub const Hash = struct {
@@ -28,18 +46,16 @@ pub const Engram = struct {
         var out: Engram = .{ .gpa = gpa, .hash = try readHash(gpa, io, dir), .tables = undefined };
         errdefer gpa.free(out.hash.token_map);
         var opened: usize = 0;
-        errdefer for (out.tables[0..opened]) |t| std.posix.munmap(t.map);
+        errdefer for (out.tables[0..opened]) |*t| t.unmap();
         for (&out.tables, c.engram_layers, config.engram_rows) |*t, layer, rows| {
-            var buf: [64]u8 = undefined;
-            const name = try std.fmt.bufPrint(&buf, "engram/layer{d}.safetensors", .{layer});
-            t.* = try mapTable(gpa, dir, name, rows);
+            t.* = try openTable(gpa, dir, layer, rows);
             opened += 1;
         }
         return out;
     }
 
     pub fn deinit(self: *Engram) void {
-        for (self.tables) |t| std.posix.munmap(t.map);
+        for (&self.tables) |*t| t.unmap();
         self.gpa.free(self.hash.token_map);
     }
 
@@ -78,7 +94,7 @@ pub const Engram = struct {
                 self.rowsAt(e, ids, first + r, &rows);
                 for (rows) |row| {
                     if (row >= t.count) return error.EngramRowOutOfRange;
-                    const at = @intFromPtr(t.rows.ptr) + row * c.engram_row;
+                    const at = @intFromPtr(t.row(row).ptr);
                     const lo = std.mem.alignBackward(usize, at, page);
                     const hi = std.mem.alignForward(usize, at + c.engram_row, page);
                     _ = std.c.madvise(@ptrFromInt(lo), hi - lo, std.c.MADV.WILLNEED);
@@ -98,7 +114,7 @@ pub const Engram = struct {
         const t = self.tables[e];
         for (rows, 0..) |r, col| {
             if (r >= t.count) return error.EngramRowOutOfRange;
-            const src = t.rows[r * c.engram_row ..][0..c.engram_row];
+            const src = t.row(r);
             dequantRow(src, dst[col * c.engram_dim ..][0..c.engram_dim]);
         }
     }
@@ -131,7 +147,38 @@ fn dequantRow(src: *const [c.engram_row]u8, dst: *[c.engram_dim]u16) void {
     }
 }
 
-fn mapTable(gpa: std.mem.Allocator, dir: []const u8, name: []const u8, rows: usize) !Table {
+/// Layer `layer`'s table: engram/layerL.safetensors, or its parts engram/layerL-part0.safetensors, -part1, ...
+fn openTable(gpa: std.mem.Allocator, dir: []const u8, layer: usize, rows: usize) !Table {
+    var t: Table = .{};
+    errdefer t.unmap();
+    var buf: [64]u8 = undefined;
+    const whole = try std.fmt.bufPrint(&buf, "engram/layer{d}.safetensors", .{layer});
+    if (try exists(gpa, dir, whole)) {
+        t.parts[0] = try mapPart(gpa, dir, whole, 0);
+        t.n = 1;
+        t.count = t.parts[0].count;
+    } else while (t.n < max_parts) : (t.n += 1) {
+        const name = try std.fmt.bufPrint(&buf, "engram/layer{d}-part{d}.safetensors", .{ layer, t.n });
+        if (!try exists(gpa, dir, name)) break;
+        t.parts[t.n] = try mapPart(gpa, dir, name, t.count);
+        t.count += t.parts[t.n].count;
+    }
+    if (t.n == 0) {
+        std.log.err("deepseek_v41: no engram table for layer {d} in {s}", .{ layer, dir });
+        return error.OpenFailed;
+    }
+    if (t.count != rows) return error.BadEngramFile;
+    return t;
+}
+
+fn exists(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) !bool {
+    const path = try std.fs.path.joinZ(gpa, &.{ dir, name });
+    defer gpa.free(path);
+    return std.c.access(path, std.c.F_OK) == 0;
+}
+
+/// One file of a table, its rows from `first` on: one tensor, "rows": U8 [count, 264] at offset 0.
+fn mapPart(gpa: std.mem.Allocator, dir: []const u8, name: []const u8, first: usize) !Part {
     const path = try std.fs.path.joinZ(gpa, &.{ dir, name });
     defer gpa.free(path);
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
@@ -145,19 +192,16 @@ fn mapTable(gpa: std.mem.Allocator, dir: []const u8, name: []const u8, rows: usi
     const size: usize = @intCast(end);
     const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
     errdefer std.posix.munmap(map);
-    if (size < 8) return error.BadEngramFile;
     const n = std.mem.readInt(u64, map[0..8], .little);
     if (8 + n > size) return error.BadEngramFile;
-    const header = map[8..][0..n];
-    // the converter writes one tensor, "rows": U8 [rows, 264] at offset 0
-    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, std.mem.trimEnd(u8, header, " "), .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, std.mem.trimEnd(u8, map[8..][0..n], " "), .{});
     defer parsed.deinit();
     const info = parsed.value.object.get("rows") orelse return error.BadEngramFile;
     const shape = info.object.get("shape") orelse return error.BadEngramFile;
-    if (shape.array.items.len != 2 or shape.array.items[0].integer != rows or shape.array.items[1].integer != c.engram_row) return error.BadEngramFile;
-    const bytes = rows * c.engram_row;
-    if (8 + n + bytes > size) return error.BadEngramFile;
-    return .{ .map = map, .rows = map[8 + n ..][0..bytes], .count = rows };
+    if (shape.array.items.len != 2 or shape.array.items[0].integer <= 0 or shape.array.items[1].integer != c.engram_row) return error.BadEngramFile;
+    const count: usize = @intCast(shape.array.items[0].integer);
+    if (8 + n + count * c.engram_row > size) return error.BadEngramFile;
+    return .{ .map = map, .rows = map[8 + n ..][0 .. count * c.engram_row], .first = first, .count = count };
 }
 
 fn readHash(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Hash {
