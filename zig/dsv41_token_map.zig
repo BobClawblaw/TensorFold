@@ -1,10 +1,4 @@
-//! The Engram token map, built at pull or load from the original release's tokenizer and
-//! inference config — the Python tool's algorithm, byte for byte, no Python step for users.
-//!
-//! Algorithm attribution: DeepSeek-V4.1-Flash inference/engram.py, DeepSeek AI, MIT license
-//! (revision 2cba9e42aa026125f3ed06c6d98c1db82f7ca027). The key derivation mirrors the
-//! release's Rust normalizer chain (NFKC, NFD, StripAccents, Lowercase, whitespace replaces,
-//! strip — which composes to NFKD, mark-strip, lowercase) and numpy's PCG64 draw.
+//! The Engram token map builder's command line: tf-dsv41-token-map --tokenizer PATH --config PATH --output PATH.
 const std = @import("std");
 const tf = @import("tensorfold");
 const tok = @import("src/core/tokenizer/tokenizer.zig");
@@ -12,6 +6,7 @@ const unicode = @import("src/core/tokenizer/unicode.zig");
 const nfkd_data = @import("src/core/tokenizer/nfkd_data.zig");
 
 const magic = "DSENGR01";
+/// The release this algorithm and its recorded PCG64 draws come from (DeepSeek AI, MIT).
 const source = "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/2cba9e42aa026125f3ed06c6d98c1db82f7ca027/inference/engram.py";
 
 pub fn main(init: std.process.Init) !void {
@@ -37,8 +32,7 @@ pub fn main(init: std.process.Init) !void {
     var outer = try std.json.parseFromSliceLeaky(std.json.Value, a, config_bytes, .{});
     const config = if (outer == .object and outer.object.get("text_config") != null) outer.object.get("text_config").? else outer;
 
-    // The release's compressed_map: decode each id, fall back to the raw token when the
-    // decoder emits U+FFFD, normalize, dedupe keys first-seen.
+    // The release's compressed_map: decode each id (raw token on U+FFFD), normalize, dedupe first-seen.
     var key_arena = std.heap.ArenaAllocator.init(a);
     defer key_arena.deinit();
     const ka = key_arena.allocator();
@@ -73,8 +67,7 @@ pub fn main(init: std.process.Init) !void {
     const compressed = keys.count();
     const bound: u64 = @max(1, ((@as(u64, 1) << 63) - 1) / compressed / 2);
 
-    // Per layer: 24 prime buckets (never repeated across layers), offsets into the table,
-    // and the multipliers drawn from numpy's PCG64 seeded with 10007 * layer.
+    // Per layer: 24 prime buckets never repeated across layers, table offsets, PCG64 multipliers seeded 10007 * layer.
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(a);
     const layer_ids_v = try arrayField(config, "engram_layer_ids");
@@ -121,8 +114,7 @@ pub fn main(init: std.process.Init) !void {
     const pad_id: usize = @intCast(if (config.object.get("engram_pad_id")) |v| try asInt(v) else try intField(config, "engram_pad_token_id"));
     const pad = lookup[pad_id];
 
-    // LE layout: magic, raw/compressed/pad/order/heads/layers, provenance hashes, per-layer
-    // blocks, the lookup array.
+    // LE layout: magic, raw/compressed/pad/order/heads/layers, provenance hashes, per-layer blocks, the lookup array.
     var packed_buf: std.ArrayList(u8) = .empty;
     defer packed_buf.deinit(a);
     try packed_buf.appendSlice(a, magic);
@@ -232,12 +224,7 @@ fn isPrime(n: u64) bool {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// The release's key normalizer. The Rust chain NFKC, NFD, StripAccents, Lowercase,
-// Replace([ \t\r\n]+ -> " "), Replace(^ $ -> U+E000), Strip, Replace(U+E000 -> " ")
-// composes to: NFKD, strip Mn/Me, lowercase, the replaces, the strip (NFD(NFKC(x)) is NFKD(x),
-// and the strip's inner NFKD is idempotent).
-// ---------------------------------------------------------------------------
+// The release's key normalizer chain composes to NFKD, mark-strip, lowercase, space collapse and trim.
 
 const sentinel: u21 = 0xE000;
 
@@ -363,9 +350,7 @@ fn lowerOf(cp: u21) ?[]const u21 {
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// numpy's Generator.integers draw: SeedSequence -> PCG64 -> Lemire's bounded integers.
-// ---------------------------------------------------------------------------
+// numpy's Generator.integers draw: SeedSequence, PCG64 and Lemire's bounded integers.
 
 const Pcg64 = struct {
     state: u128,
@@ -373,8 +358,7 @@ const Pcg64 = struct {
 
     const multiplier: u128 = 0x2360ED051FC65DA44385DF649FCCF645;
 
-    /// pcg64_srandom_r: state = 0; one step; state += initstate; one step.
-    /// The seed words come from SeedSequence; inc = (initseq << 1) | 1 (mod 2^128).
+    /// pcg64_srandom_r: state = 0, one step, state += initstate, one step; inc = (initseq << 1) | 1 mod 2^128.
     fn init(seed: u64) Pcg64 {
         const w = seedSequenceWords(seed);
         const initstate: u128 = (@as(u128, w[0]) << 64) | @as(u128, w[1]);
@@ -406,10 +390,7 @@ const Pcg64 = struct {
     }
 };
 
-/// SeedSequence(seed).generate_state(4, uint64): the entropy word is hashed into a
-/// 4-word pool (numpy's hashmix/mix scheme), then eight output words are drawn by
-/// cycling the pool through a second hash, paired little-endian. Verified against
-/// numpy 2.5.3's SeedSequence for the two seeds this map uses.
+/// SeedSequence(seed).generate_state(4, uint64): hashmix a 4-word pool, then draw eight words paired little-endian.
 fn seedSequenceWords(seed: u64) [4]u64 {
     const entropy = [1]u32{@truncate(seed)};
     var mixer = [4]u32{ 0, 0, 0, 0 };
@@ -471,7 +452,8 @@ test "the normalizer chain matches the release's recorded behavior" {
         .{ .in = "é", .want = "e" },
         .{ .in = "ﬁ", .want = "fi" },
         .{ .in = "İ", .want = "i" },
-        .{ .in = "가", .want = "가" },
+        // NFKD decomposes Hangul syllables to conjoining jamo; the release's chain never recomposes.
+        .{ .in = "가", .want = "\u{1100}\u{1161}" },
         .{ .in = "Äffin", .want = "affin" },
         .{ .in = "ǅ", .want = "dz" },
         .{ .in = "ẞ", .want = "ß" },
