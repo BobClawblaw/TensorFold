@@ -12,13 +12,13 @@ const glue = @import("cuda_glue.zig");
 const b16 = @import("cuda_b16.zig");
 
 /// Checks a shared window's segments (a prompt buffer's: whole prompts) against its `rows` rows; each holds its own.
-pub fn begin(r: fw.Rank, rows: usize) !void {
+pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
     const most: usize = if (r.b.prefill) fw.prefill_rows else fw.window_rows;
     if (r.b.prefill and r.segs.len > @import("cuda_state.zig").prompt_heads) return error.BadWindow;
     var at: usize = 0;
     for (r.segs) |g| {
         if (g.row0 != at or g.rows == 0 or g.rows > most) return error.BadWindow;
-        if (g.st.pos + g.rows > g.st.capacity) return error.PastCapacity;
+        try g.st.ready(stream, g.rows);
         at += g.rows;
     }
     if (at != rows) return error.BadWindow;

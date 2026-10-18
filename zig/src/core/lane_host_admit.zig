@@ -38,6 +38,7 @@ pub fn many(h: *LaneHost) bool {
     var jobs: [lanes.Engine.max_together]*Job = undefined;
     var began: [lanes.Engine.max_together]i96 = undefined;
     var n: usize = 0;
+    var rows: usize = 0; // with chunked fills a batch is one pass of many_rows: decode rounds run between passes
     var took = false;
     while (n < jobs.len) {
         const job = switch (h.takeJob()) {
@@ -50,10 +51,13 @@ pub fn many(h: *LaneHost) bool {
         };
         took = true;
         const at = h.setup(job) orelse continue;
-        if (h.startsAlone(job) or (h.core.fills() and !h.core.batchable(&job.stream))) { // long, image, resumed: filled
+        const fills = h.core.fills();
+        const over = fills and rows + job.stream.prompt_len > h.core.backend.vtable.many_rows;
+        if (h.startsAlone(job) or (fills and (!h.core.batchable(&job.stream) or over))) { // long, image, resumed, overflow: filled
             _ = h.launch(job, at);
             continue;
         }
+        rows += job.stream.prompt_len;
         jobs[n] = job;
         began[n] = at;
         n += 1;

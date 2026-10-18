@@ -3,13 +3,15 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const engine = @import("cuda_engine.zig");
+const types = @import("cuda_engine_types.zig");
 const images_mod = @import("cuda_images.zig");
 const vcfg = @import("vision_config.zig");
 const sampler = @import("cuda_sampler.zig");
+const dflash = @import("dflash.zig");
 const prompts = @import("cuda_prompts.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, many };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -47,6 +49,10 @@ pub const Link = struct {
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize) !Link {
         const buf = try cuda.DeviceBuffer.alloc(d, 64 + max_ids * 4);
+        errdefer {
+            var owned = buf;
+            owned.free();
+        }
         const wait = if (std.c.getenv("TF_GLM_LINK_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         return .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait };
     }
@@ -165,10 +171,9 @@ pub const Leader = struct {
     /// The prompt pass's image rows (rank 0 encoded them for the bound slot) to every rank: spans, then the rows.
     pub fn images(x: Leader, v: *const images_mod.Images) !void {
         try x.flush();
-        var words: [3 * 64]u32 = undefined;
-        if (v.spans.items.len * 3 > words.len) return error.TooManyImages;
-        for (v.spans.items, 0..) |sp, i| words[3 * i ..][0..3].* = .{ sp.at, sp.n, sp.row };
-        try x.send(.{ .kind = @backingInt(Kind.image) }, words[0 .. 3 * v.spans.items.len]);
+        const words = try spanWords(v.gpa, v.spans.items, x.link.ids.len);
+        defer v.gpa.free(words);
+        try x.send(.{ .kind = @backingInt(Kind.image) }, words);
         try x.link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
     }
 
@@ -212,10 +217,13 @@ pub const Leader = struct {
     }
 
     /// Whole prompts in one pass on every rank (Engine.prefillMany): slots, lengths, ids; hold0 (field a).
-    pub fn prefillMany(x: Leader, parts: []const engine.Prompt, firsts: []u32, hold0: usize) !void {
+    pub fn prefillMany(x: Leader, parts: []const types.Prompt, firsts: []u32, hold0: usize) !void {
         if (!prompts.fits(parts, hold0, x.e.capacity)) return error.BadPrompts;
+        var ids: usize = 2 * parts.len;
+        for (parts) |p| ids += p.ids.len;
+        if (ids > x.link.ids.len) return error.BadPrompts; // refused before any broadcast: each prompt then goes alone
         try x.flush();
-        var buf: [2 * engine.max_together + engine.prompt_rows]u32 = undefined;
+        var buf: [2 * types.max_together + engine.prompt_rows]u32 = undefined;
         var n: usize = 2 * parts.len;
         for (parts, 0..) |p, i| {
             buf[2 * i] = p.slot;
@@ -239,6 +247,16 @@ pub const Leader = struct {
         try x.e.draft(from_prompt, follow_ids, depth, out);
     }
 
+    /// DFlash2's round on every rank (Engine.draftBlock): each stream's slot, kept rows and anchor.
+    pub fn block(x: Leader, reqs: []dflash.Req) !void {
+        if (reqs.len == 0 or reqs.len > dflash.MAX_S) return error.TooManyStreams;
+        try x.flush();
+        var buf: [3 * dflash.MAX_S]u32 = undefined;
+        for (reqs, 0..) |q, i| buf[3 * i ..][0..3].* = .{ q.slot, @intCast(q.n), q.anchor };
+        try x.send(.{ .kind = @backingInt(Kind.block), .depth = @intCast(reqs.len) }, buf[0 .. 3 * reqs.len]);
+        try x.e.draftBlock(reqs);
+    }
+
     /// The other ranks leave their loops.
     pub fn end(x: Leader) !void {
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
@@ -253,7 +271,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared and kind != .many) try e.bind(h.slot);
+        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
             .prefill => {
@@ -293,8 +311,8 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .many => {
                 const k = h.depth;
-                if (k == 0 or k > engine.max_together or step.ids.len < 2 * k) return error.BadStep;
-                var parts: [engine.max_together]engine.Prompt = undefined;
+                if (k == 0 or k > types.max_together or step.ids.len < 2 * k) return error.BadStep;
+                var parts: [types.max_together]types.Prompt = undefined;
                 var at: usize = 2 * k;
                 for (parts[0..k], 0..) |*p, i| {
                     const n = step.ids[2 * i + 1];
@@ -302,7 +320,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n] };
                     at += n;
                 }
-                var firsts: [engine.max_together]u32 = undefined;
+                var firsts: [types.max_together]u32 = undefined;
                 try e.prefillMany(parts[0..k], &firsts, @intCast(h.a));
             },
             .keep => try e.keep(@intCast(h.a)),
@@ -311,6 +329,13 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts);
             },
+            .block => {
+                const k = h.depth;
+                if (k == 0 or k > dflash.MAX_S or step.ids.len != 3 * k) return error.BadStep;
+                var reqs: [dflash.MAX_S]dflash.Req = undefined;
+                for (reqs[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[3 * i], .pos = 0, .n = step.ids[3 * i + 1], .anchor = step.ids[3 * i + 2] };
+                try e.draftBlock(reqs[0..k]);
+            },
             .image => {
                 const v = e.images orelse return error.NoVision; // the ranks agreed on --vision (cuda_ranks)
                 try v.take(h.slot, step.ids);
@@ -318,7 +343,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),
-            .end => return,
+            .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
         }
     }
 }
@@ -330,4 +355,62 @@ test "a step's header is 64 bytes and keeps its fields" {
     @memcpy(std.mem.asBytes(&back), bytes);
     try std.testing.expectEqual(h, back);
     try std.testing.expectEqual(Kind.draft, @as(Kind, @fromBackingInt(@intCast(back.kind))));
+}
+
+// The production image-step serializer, isolated so the host can test the offered video limits.
+pub fn spanWords(a: std.mem.Allocator, spans: []const images_mod.Span, max_words: usize) ![]u32 {
+    const n = std.math.mul(usize, spans.len, 3) catch return error.TooManyIds;
+    if (n > max_words) return error.TooManyIds;
+    const words = try a.alloc(u32, n);
+    for (spans, 0..) |sp, i| words[3 * i ..][0..3].* = .{ sp.at, sp.n, sp.row };
+    return words;
+}
+test "128 video pairs cross the span serializer and a follower's receiver; one word short is refused" {
+    const a = std.testing.allocator;
+    var spans: [128]images_mod.Span = undefined;
+    for (&spans, 0..) |*sp, i| sp.* = .{ .at = @intCast(i * 2), .n = 1, .row = @intCast(i) };
+    const words = try spanWords(a, &spans, 3 * spans.len);
+    defer a.free(words);
+    var v: images_mod.Images = undefined;
+    v.gpa = a;
+    v.spans = .empty;
+    v.slot = 9;
+    defer v.spans.deinit(a);
+    v.limits = .{ .image_tokens = 64, .max_images = 8, .video_tokens = 128, .max_frames = 256 };
+    v.video_ids = .{ 1, 2, 3 };
+    try v.take(9, words);
+    try std.testing.expectEqualSlices(images_mod.Span, &spans, v.spans.items);
+    try std.testing.expectEqual(@as(u32, 9), v.slot);
+    try std.testing.expectEqual(@as(usize, 128), v.rowCount());
+    try std.testing.expectError(error.TooManyIds, spanWords(a, &spans, 3 * spans.len - 1));
+}
+
+test "a link whose host allocation fails frees its device buffer" {
+    const Mock = struct {
+        var frees: usize = 0;
+        fn alloc(ptr: *cuda.abi.DevicePtr, _: usize) callconv(.c) cuda.abi.Result {
+            ptr.* = 4096;
+            return 0;
+        }
+        fn free(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
+            frees += 1;
+            return 0;
+        }
+    };
+    Mock.frees = 0;
+    var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = Mock.alloc;
+    d.api.cuMemFree_v2 = Mock.free;
+    var lib: cuda.nccl.Library = undefined;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const before = cuda.usage(false).device;
+    defer {
+        if (Mock.frees == 0) {
+            var leaked: cuda.DeviceBuffer = .{ .d = &d, .ptr = 4096, .len = 64 + 128 * 4 };
+            leaked.free();
+        }
+    }
+    try std.testing.expectError(error.OutOfMemory, Link.init(failing.allocator(), &d, &lib, null, .{ .d = &d, .handle = null }, 128));
+    try std.testing.expectEqual(@as(usize, 1), Mock.frees);
+    try std.testing.expectEqual(before, cuda.usage(false).device);
 }

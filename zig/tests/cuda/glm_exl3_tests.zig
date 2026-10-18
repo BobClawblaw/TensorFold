@@ -28,13 +28,14 @@ const Set = struct {
     svh_u: u64,
     suh_d: u64,
     svh_d: u64,
+    k2: u64,
     shx: bool,
     wg: []f64, // [E][D][N]
     wu: []f64,
     wd: []f64, // [E][N][D]
 
     fn experts(s: Set) glm.exl3.Experts {
-        return .{ .gt = s.gt, .ut = s.ut, .dt = s.dt, .suh_g = s.suh_g, .suh_u = s.suh_u, .svh_g = s.svh_g, .svh_u = s.svh_u, .suh_d = s.suh_d, .svh_d = s.svh_d, .shx = s.shx };
+        return .{ .k2 = s.k2, .gt = s.gt, .ut = s.ut, .dt = s.dt, .suh_g = s.suh_g, .suh_u = s.suh_u, .svh_g = s.svh_g, .svh_u = s.svh_u, .suh_d = s.suh_d, .svh_d = s.svh_d, .shx = s.shx };
     }
 };
 
@@ -59,12 +60,17 @@ fn matrices(r: *Rig, k: usize, n: usize, shared_suh: ?[]const f16, out_suh: *u64
     }
     out_suh.* = try r.dev(std.mem.sliceAsBytes(suh));
     out_svh.* = try r.dev(std.mem.sliceAsBytes(svh));
-    return r.dev(std.mem.sliceAsBytes(tr));
+    const base = try r.dev(std.mem.sliceAsBytes(tr));
+    const ptrs = try r.a.alloc(u64, E);
+    for (ptrs, 0..) |*ptr, e| ptr.* = base + e * words * 2;
+    return r.dev(std.mem.sliceAsBytes(ptrs));
 }
 
 fn weights(r: *Rig, one: bool) !Set {
     var s: Set = undefined;
     s.shx = one;
+    const k2: [E]i32 = @splat(8);
+    s.k2 = try r.dev(std.mem.sliceAsBytes(&k2));
     s.wg = try r.a.alloc(f64, E * D * N);
     s.wu = try r.a.alloc(f64, E * D * N);
     s.wd = try r.a.alloc(f64, E * N * D);
@@ -189,11 +195,11 @@ pub fn run_(gpu: Gpu) !void {
         for (r.bufs.items) |*b| b.free();
         r.bufs.deinit(gpu.gpa);
     }
-    var xm = try cuda.Module.load(gpu.d, cuda.kernels.glm_exl3);
-    defer xm.unload();
+
     var pm = try cuda.Module.load(gpu.d, cuda.kernels.experts);
     defer pm.unload();
-    const k = try glm.exl3.Kernels.load(xm);
+    var k = try glm.exl3.Kernels.load(gpu.d);
+    defer k.unload();
     var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
     defer ek.unload();
     for ([_]bool{ true, false }) |one| {
@@ -212,11 +218,19 @@ pub fn run_(gpu: Gpu) !void {
                 }
             }
         }
-        for ([_]usize{ 1, 40, 200 }) |rows| { // prompt chunks
+        for ([_]usize{ 1, 40, 200, glm.exl3.chunk_rows + 6 }) |rows| { // prompt chunks, the last in two calls
             const x = try r.bfs(rows * D, 1.0);
             const pk = try picks(&r, rows);
             const got = try run(&r, &k, &ek, s, x, pk, rows, true);
             try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
+            if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
+                const all = try r.back(got.ey, rows * slots * D * 4);
+                for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
+                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
+                    const mine = try r.back(alone.ey, slots * D * 4);
+                    try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
+                }
+            }
         }
     }
     { // a NaN in one row's input: that row's routed slots NaN, every other row finite
