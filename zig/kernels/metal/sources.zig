@@ -54,8 +54,7 @@ pub const nemotron_head = @embedFile("nemotron_head.metal");
 /// Keyed draws over the whole vocabulary where tf_gpu_sample would keep only its 1,024 candidates.
 pub const nemotron_sample = @embedFile("nemotron_sample.metal");
 
-/// Sliding Weights: the learned change in the forward and the bounded step on captured rows.
-/// Learning in the weights: a low-rank change at every layer, and the gradients through each kind of layer to it.
+/// Sliding Weights: the learned forward change and bounded captured-row steps; per-layer low-rank change and gradients.
 pub const train = @embedFile("train.metal");
 pub const train_mixers = @embedFile("train_mixers.metal");
 
@@ -137,8 +136,7 @@ pub const flashnext_gen = @import("flashnext/sources_gen.zig");
 pub const packed_metallib = @import("nemotron_packed_metallib").bytes;
 /// The core lane projection (tensor units): every window row's sums in one weight read, and its row order.
 pub const core_expert_groups = @embedFile("core/expert_groups.metal");
-/// DeepSeek V4.1 Flash: Engram hashing and commit, sparse/compressed attention, the
-/// hyperconnection mix, routed experts, shared projections, the cache and rotary glue.
+/// DeepSeek V4.1 Flash: Engram hash/commit, CSA attention, mHC mix, routed experts, shared projections, cache/rotary.
 pub const deepseek_v41_engram = @embedFile("deepseek_v41/engram.metal");
 pub const deepseek_v41_ops = @embedFile("deepseek_v41/ops.metal");
 pub const deepseek_v41_mhc = @embedFile("deepseek_v41/mhc.metal");

@@ -57,8 +57,7 @@ pub fn applyF32(matrix: weights.AnyMatrix, x: []const u16, y: []f32, scratch: *S
     }
 }
 
-/// The kept-dense form: the same input rotation boundary and output stages as the quantized
-/// path, with the tile decode replaced by an FP64 dense dot over the f16-rounded rotated row.
+/// Kept-dense: quantized rotation and output stages; FP64 dot over the f16-rounded row replaces the tile decode.
 fn applyDense(comptime T: type, d: weights.Dense, x: []const u16, y: []T, scratch: *Scratch) !void {
     @setFloatMode(.strict);
     if (x.len != d.k or y.len != d.n) return error.InvalidReferenceProjectionLength;

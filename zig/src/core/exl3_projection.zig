@@ -302,10 +302,7 @@ pub const DenseMatrix = struct {
     n: usize,
 };
 
-/// The kept-dense path: the same rotate stages as the quantized encode, with the trellis
-/// product replaced by a plain dense product over the rotated rows, accumulated in f32 in
-/// the scratch sums region the rotate_out stage reads. Sequential k; the fp64 reference
-/// mirrors this order.
+/// Kept-dense: quantized rotate stages, trellis to dense, f32 in rotate_out sums; sequential k, as the fp64 reference.
 pub fn encodeDense(p: *const Pipelines, e: mtl.ComputeEncoder, m: DenseMatrix, x: View, y: View, scratch: View, r: Rows) !void {
     try shape(m.k, m.n);
     var a = try rowsArgs(m.k, m.n, r, x, y, scratch);

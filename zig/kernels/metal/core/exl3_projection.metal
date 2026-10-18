@@ -241,9 +241,7 @@ kernel void tf_exl3_state_window_check(const device uint4* inputs [[buffer(0)]],
   outputs[tid] = tf_exl3_mapped_state(tile, (off << 6) | (1u << 11));
 }
 
-// A kept-dense matrix's plain product: the rotated rows times the bf16 weight, accumulated
-// in f32 in the sums region the rotate_out stage reads. Sequential k, one thread an output
-// element — the fp64 reference mirrors this order.
+// Kept-dense: rotated rows x bf16 weight, f32 in rotate_out sums; sequential k, one thread an output, in fp64 order.
 kernel void tf_exl3_dense(const device half* rotated [[buffer(0)]],
                           const device bfloat* weight [[buffer(1)]],
                           device float* sums [[buffer(2)]],
