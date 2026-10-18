@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const out_dir = args[3];
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
-    if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
+    if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10), out_dir);
     if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d));
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
@@ -113,8 +113,8 @@ fn bf(v: u16) f32 {
     return @bitCast(@as(u32, v) << 16);
 }
 
-/// `n` greedy tokens a row a step, then with DSpark drafts in windows of six: the same tokens; both speeds.
-fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, n: usize) !void {
+/// `n` greedy tokens a row a step (to greedy.bin, u32), then DSpark-drafted in windows of six: the same; both speeds.
+fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, n: usize, out_dir: []const u8) !void {
     const m = try q.Model.load(gpa, io, dir, true);
     defer m.deinit();
     var scratch = try q.state.Scratch.init(gpa, m.device, 256);
@@ -172,6 +172,9 @@ fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
         times[mode] = seconds(t0, t1);
     }
     defer for (replies) |r| gpa.free(r);
+    var out = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
+    defer out.close(io);
+    try out.writeFile(io, .{ .sub_path = "greedy.bin", .data = std.mem.sliceAsBytes(replies[0]) });
     var same: usize = 0;
     while (same < n and replies[0][same] == replies[1][same]) same += 1;
     std.debug.print("plain {d:.1} tok/s, drafted {d:.1} tok/s; {d} rounds, {d:.2} tokens a round; replies equal for {d}/{d} tokens\n", .{ @as(f64, @floatFromInt(n)) / times[0], @as(f64, @floatFromInt(n)) / times[1], rounds, @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(rounds)), same, n });
