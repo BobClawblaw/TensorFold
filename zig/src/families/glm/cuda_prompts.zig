@@ -5,9 +5,9 @@ const fw = @import("cuda_forward.zig");
 const engine = @import("cuda_engine.zig");
 const Engine = engine.Engine;
 
-/// Whether `parts` go in one pass: 1 to max_together fresh prompts, prompt_rows in all, each under the capacity.
-pub fn fits(parts: []const engine.Prompt, capacity: usize) bool {
-    if (parts.len == 0 or parts.len > engine.max_together) return false;
+/// Whether `parts` go in one pass: fresh prompts, prompt_rows in all, under the capacity, hold rows from hold0 fit.
+pub fn fits(parts: []const engine.Prompt, hold0: usize, capacity: usize) bool {
+    if (parts.len == 0 or hold0 + parts.len > engine.max_together) return false;
     var rows: usize = 0;
     for (parts, 0..) |p, i| {
         if (p.ids.len == 0 or p.ids.len + fw.window_rows >= capacity) return false;
@@ -17,9 +17,9 @@ pub fn fits(parts: []const engine.Prompt, capacity: usize) bool {
     return rows <= fw.prefill_rows;
 }
 
-/// The prompts' pass on their slots (each begun, at position 0); `firsts[k]`: prompt k's first token.
-pub fn prefillMany(e: *Engine, parts: []const engine.Prompt, firsts: []u32) !void {
-    if (!fits(parts, e.capacity) or firsts.len < parts.len) return error.BadPrompts;
+/// The prompts' pass (each begun at 0): prompt k's first token in firsts[k], draft source in hold row hold0 + k.
+pub fn prefillMany(e: *Engine, parts: []const engine.Prompt, firsts: []u32, hold0: usize) !void {
+    if (!fits(parts, hold0, e.capacity) or firsts.len < parts.len) return error.BadPrompts;
     var segs: [engine.max_together]fw.Seg = undefined;
     var ids: [fw.prefill_rows]u32 = undefined;
     var rows: usize = 0;
@@ -39,8 +39,9 @@ pub fn prefillMany(e: *Engine, parts: []const engine.Prompt, firsts: []u32) !voi
         try e.bind(p.slot);
         try e.draw(e.bp.logits + k * e.share.vocab.len() * 2, 1, p.ids.len, firsts[k..][0..1]);
         if (!e.mtp) continue;
-        try e.copy(e.hold.ptr + k * D * 2, e.bp.fnormed + (g.row0 + g.rows - 1) * D * 2, D * 2);
-        e.cur.held_at = e.hold.ptr + k * D * 2;
+        const row = e.hold.ptr + (hold0 + k) * D * 2;
+        try e.copy(row, e.bp.fnormed + (g.row0 + g.rows - 1) * D * 2, D * 2);
+        e.cur.held_at = row;
     }
     f.pieces = null;
     for (parts, segs[0..parts.len]) |p, g| {

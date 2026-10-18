@@ -140,26 +140,20 @@ pub const Lanes = struct {
         errdefer for (ss[0..opened]) |s| releaseFn(ptr, s);
         var parts: [engine.max_together]engine.Prompt = undefined;
         var firsts: [engine.max_together]u32 = undefined;
-        var lo: usize = 0;
-        var rows: usize = 0;
-        for (ss, 0..) |s, i| {
-            if (rows + s.prompt_len > engine.prompt_rows) { // this pass is full: run it, the next starts here
-                try self.many(ss[lo..i], parts[lo..i], firsts[lo..i]);
-                lo = i;
-                rows = 0;
+        var lens: [engine.max_together]usize = undefined;
+        for (ss, lens[0..ss.len]) |s, *n| n.* = s.prompt_len;
+        var cut: [engine.max_together][2]usize = undefined;
+        for (cut[0..passes(lens[0..ss.len], engine.prompt_rows, &cut)]) |p| {
+            for (ss[p[0]..p[1]], p[0]..) |s, i| {
+                if (try self.opening(s) != null) return error.BadPrompts; // no kept state (checked above)
+                opened += 1;
+                parts[i] = .{ .slot = self.lanes.getPtr(s).?.slot, .ids = s.prompt() };
             }
-            if (try self.opening(s) != null) return error.BadPrompts; // no kept state (checked above)
-            opened += 1;
-            parts[i] = .{ .slot = self.lanes.getPtr(s).?.slot, .ids = s.prompt() };
-            rows += s.prompt_len;
+            // stream i's hold row is i: every pass's rows stay until the core asks each stream's first drafts
+            try self.x.prefillMany(parts[p[0]..p[1]], firsts[p[0]..p[1]], p[0]);
+            for (ss[p[0]..p[1]], firsts[p[0]..p[1]]) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
         }
-        try self.many(ss[lo..], parts[lo..ss.len], firsts[lo..ss.len]);
         return true;
-    }
-
-    fn many(self: *Lanes, ss: []const *lanes.Stream, parts: []const engine.Prompt, firsts: []u32) !void {
-        try self.x.prefillMany(parts, firsts);
-        for (ss, firsts) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
     }
 
     /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
@@ -339,6 +333,47 @@ pub const Lanes = struct {
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
     }
 };
+
+/// prefill_many's passes over prompts of `lens` tokens, in order, at most `rows` tokens a pass: [lo, hi) of each.
+fn passes(lens: []const usize, rows: usize, out: *[engine.max_together][2]usize) usize {
+    var n: usize = 0;
+    var lo: usize = 0;
+    var used: usize = 0;
+    for (lens, 0..) |len, i| {
+        if (i > lo and used + len > rows) { // this pass is full: the next starts here
+            out[n] = .{ lo, i };
+            n += 1;
+            lo = i;
+            used = 0;
+        }
+        used += len;
+    }
+    if (lens.len > lo) {
+        out[n] = .{ lo, lens.len };
+        n += 1;
+    }
+    return n;
+}
+
+test "prefill_many's passes: in order, each within the rows, every prompt once, hold rows distinct across passes" {
+    var cut: [engine.max_together][2]usize = undefined;
+    const lens = [_]usize{ 1500, 800, 300, 2048, 10, 10 };
+    const n = passes(&lens, 2048, &cut);
+    try std.testing.expectEqualSlices([2]usize, &.{ .{ 0, 1 }, .{ 1, 3 }, .{ 3, 4 }, .{ 4, 6 } }, cut[0..n]);
+    var seen: [engine.max_together]bool = @splat(false);
+    for (cut[0..n]) |p| {
+        var used: usize = 0;
+        for (p[0]..p[1]) |i| {
+            used += lens[i];
+            try std.testing.expect(!seen[i]); // a stream's hold row is its index in the batch: no two share one
+            seen[i] = true;
+        }
+        try std.testing.expect(used <= 2048);
+    }
+    for (seen[0..lens.len]) |s| try std.testing.expect(s);
+    try std.testing.expectEqual(@as(usize, 1), passes(&[_]usize{ 28, 28, 28, 28 }, 2048, &cut)); // the ruler's case
+    try std.testing.expectEqual(@as(usize, 0), passes(&[_]usize{}, 2048, &cut));
+}
 
 comptime {
     std.debug.assert(max_rows <= fw.window_rows);

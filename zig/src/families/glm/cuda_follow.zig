@@ -211,9 +211,9 @@ pub const Leader = struct {
         try x.e.verifyShared(parts);
     }
 
-    /// Whole prompts in one prompt pass on every rank (Engine.prefillMany): their slots and lengths, then the ids.
-    pub fn prefillMany(x: Leader, parts: []const engine.Prompt, firsts: []u32) !void {
-        if (!prompts.fits(parts, x.e.capacity)) return error.BadPrompts;
+    /// Whole prompts in one pass on every rank (Engine.prefillMany): slots, lengths, ids; hold0 (field a).
+    pub fn prefillMany(x: Leader, parts: []const engine.Prompt, firsts: []u32, hold0: usize) !void {
+        if (!prompts.fits(parts, hold0, x.e.capacity)) return error.BadPrompts;
         try x.flush();
         var buf: [2 * engine.max_together + engine.prompt_rows]u32 = undefined;
         var n: usize = 2 * parts.len;
@@ -223,8 +223,8 @@ pub const Leader = struct {
             @memcpy(buf[n..][0..p.ids.len], p.ids);
             n += p.ids.len;
         }
-        try x.send(.{ .kind = @backingInt(Kind.many), .depth = @intCast(parts.len) }, buf[0..n]);
-        try x.e.prefillMany(parts, firsts);
+        try x.send(.{ .kind = @backingInt(Kind.many), .depth = @intCast(parts.len), .a = hold0 }, buf[0..n]);
+        try x.e.prefillMany(parts, firsts, hold0);
     }
 
     pub fn keep(x: Leader, n: usize) !void {
@@ -303,7 +303,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     at += n;
                 }
                 var firsts: [engine.max_together]u32 = undefined;
-                try e.prefillMany(parts[0..k], &firsts);
+                try e.prefillMany(parts[0..k], &firsts, @intCast(h.a));
             },
             .keep => try e.keep(@intCast(h.a)),
             .draft => {
