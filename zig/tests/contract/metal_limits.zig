@@ -58,6 +58,8 @@ fn launchOf(a: std.mem.Allocator, device: mtl.Device, d: limits.MetalLaunch) !La
     } else if (std.mem.startsWith(u8, d.name, "qwen image ")) {
         text = sources.qwen_image;
         frags = true;
+    } else if (std.mem.startsWith(u8, d.name, "deepseek_v41 index ")) {
+        text = try std.mem.concat(a, u8, &.{ sources.deepseek_v41_kv, sources.deepseek_v41_index });
     } else if (std.mem.startsWith(u8, d.name, "core deltanet ")) {
         text = sources.core_deltanet;
     } else if (std.mem.startsWith(u8, d.name, "qwen27 ")) {

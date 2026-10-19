@@ -5,6 +5,8 @@ const mtl = @import("metal");
 const sources = @import("kernel_sources");
 const View = @import("view.zig").View;
 pub const score_tile_width = 4096;
+/// Threads a row's merge and finish take (index.metal's dsv41_lanes).
+pub const select_threads = 1024;
 pub const Params = extern struct {
     rows: u32,
     heads: u32 = 32,
@@ -126,14 +128,14 @@ pub const Pipelines = struct {
             for ([_]View{ scratch.scores(), scratch.heap(), scratch.candidates() }, 0..) |v, i|
                 enc.setBuffer(v.buffer, v.offset, i);
             enc.setValue(tile, 3);
-            enc.dispatchThreads(mtl.Size.of(args.rows, 1, 1), mtl.Size.of(1, 1, 1));
+            enc.dispatchGroups(mtl.Size.of(args.rows, 1, 1), mtl.Size.of(select_threads, 1, 1));
             enc.barrier();
         }
         enc.setPipeline(p.finish);
         for ([_]View{ scratch.heap(), scratch.candidates(), scratch.positions() }, 0..) |v, i|
             enc.setBuffer(v.buffer, v.offset, i);
         enc.setValue(args, 3);
-        enc.dispatchThreads(mtl.Size.of(args.rows, 1, 1), mtl.Size.of(1, 1, 1));
+        enc.dispatchGroups(mtl.Size.of(args.rows, 1, 1), mtl.Size.of(select_threads, 1, 1));
         enc.barrier();
     }
 };

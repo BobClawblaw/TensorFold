@@ -397,6 +397,8 @@ pub fn checkCuda(a: std.mem.Allocator, list: []const CudaRecord, quiet: bool) !u
 
 /// Metal pipelines as the engine launches them; tg_memory is the most any chip reflects, m1 and m2 the compiled limits.
 pub const metal = [_]M{
+    .{ .name = "deepseek_v41 index merge dsv41_index_merge", .threads = 1024, .tg_memory = 1168, .m1 = 1024, .m2 = 1024 },
+    .{ .name = "deepseek_v41 index finish dsv41_index_finish", .threads = 1024, .tg_memory = 16384, .m1 = 1024, .m2 = 1024 },
     .{ .name = "softmax tf_softmax_bf16", .threads = 1024, .tg_memory = 256, .m1 = 1024, .m2 = 1024 },
     .{ .name = "rms tf_rms_norm_bf16", .threads = 1024, .tg_memory = 144, .m1 = 1024, .m2 = 1024 },
     .{ .name = "top-k tf_bf16_topk", .threads = 256, .tg_memory = 4096, .m1 = 768, .m2 = 768 },

@@ -102,8 +102,9 @@ MLX's formula keeps the infinity, because its codes enter the MMAs as q + 128 an
 Metal: softmax, RMS norm, bf16 top-k, the row projection (3, 4, 6 and 8 bits), affine_mm (4 and 8 bits), simd_qmm
 (4 bits) and simd_qmm_bits (3, 6 and 8 bits), and the lane projection (6-bit groups of 32 on every chip; 4- and 8-bit
 formats on the M5's tensor units, where its reg kernel must equal the cooperative one bit for bit), and tile_qmm's
-prompt tiles and their decode twin (4, 6 and 8 bits; the twin bit-equal to the tiles). Gate 5 also holds the rest of
-tile_qmm's pipelines and GLM-5.3-Flash's hc_expand_10.
+prompt tiles and their decode twin (4, 6 and 8 bits; the twin bit-equal to the tiles), and DeepSeek V4.1's index
+merge (its picks against a host oracle as sets) and finish (bit-equal to the serial finish). Gate 5 also holds the
+rest of tile_qmm's pipelines and GLM-5.3-Flash's hc_expand_10.
 CUDA: the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits (and their 128-row tiles,
 bit-equal to them) and top-k, the latent top-k's decode form (bit-equal to `tf_super_topk`), the latent combine and
 shared add over bf16 share sums (bit-equal to `tf_super_combine` and `tf_super_moe_out` over the fp32 shares), the

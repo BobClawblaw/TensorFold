@@ -10,6 +10,7 @@ const tile_k = @import("metal_tile.zig");
 const limits_k = @import("metal_limits.zig");
 const h3_k = @import("metal_h3.zig");
 const h3_topk = @import("metal_h3_topk.zig");
+const dsv41_select = @import("metal_dsv41_select.zig");
 const drama3_k = @import("metal_drama3.zig");
 
 const gemma = @import("metal_gemma4.zig");
@@ -171,6 +172,15 @@ pub fn main(init: std.process.Init) !u8 {
         h3_top = try h3_topk.TopK.init(a, device, queue);
         try kernels.append(a, h3_top.?.kernel());
     }
+    var selects: [2]dsv41_select.Select = undefined;
+    var select_made: usize = 0;
+    defer for (selects[0..select_made]) |*x| x.deinit();
+    for ([_]bool{ false, true }) |finish| {
+        if (!wanted(o, if (finish) dsv41_select.finishSpec().name else dsv41_select.mergeSpec().name)) continue;
+        selects[select_made] = try dsv41_select.Select.init(a, device, queue, finish);
+        select_made += 1;
+    }
+    for (selects[0..select_made]) |*x| try kernels.append(a, x.kernel());
     var tile_p = try tf.tile_qmm.Pipelines.load(device);
     defer tile_p.deinit();
     var tiles: [2 * tf.tile_qmm.bit_widths.len]tile_k.Tile = undefined;
