@@ -160,6 +160,13 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
             request.think_close = srv.think_close;
             request.think_end = srv.think_close_end;
         }
+        // the reasoning's reserve: max_tokens then limits the answer after the think block
+        if (srv.config.thinking_reserve > 0 and srv.info.answer_limit and srv.think_close_end != null) {
+            const room: i64 = if (window > 0) window - n else std.math.maxInt(u32);
+            request.answer_max = request.max_tokens;
+            request.max_tokens = @intCast(@min(@as(i64, request.max_tokens) + srv.config.thinking_reserve, room, std.math.maxInt(u32)));
+            request.think_end = srv.think_close_end;
+        }
     }
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
     request.prompt_logprobs = input.prompt_logprobs;
