@@ -69,8 +69,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_norm(__nv_bfloat16* __r
     const int t = threadIdx.x;
     const int E = D / 256;
     if ((E & 3) == 0) {
-        // h + r and w * (h * inv) are elementwise, so they move 8 entries a lane through xrow; only the sum of squares
-        // keeps a thread's E entries in order (below), the same arithmetic as the strided form after this branch
+        // h + r and w * (h * inv) move 8 entries a lane through xrow; the squares keep a thread's E entries in order
         uint4 wv[4];
 #pragma unroll
         for (int j = 0; j < 4; j++) {
