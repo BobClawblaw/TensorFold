@@ -42,6 +42,7 @@ pub fn open(h: *LaneHost, job: *Job) bool {
         .think_budget = r.think_budget,
         .think_close = r.think_close,
         .think_end = if (r.think_end) |t| t else -1,
+        .answer_max = r.answer_max,
         .logprobs = r.logprobs,
         .prompt_logprobs = r.prompt_logprobs,
         .loop_guard = r.loop_guard,
