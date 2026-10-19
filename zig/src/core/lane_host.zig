@@ -33,13 +33,13 @@ pub const LaneHost = struct {
     core: *lanes.Engine,
     info_: Info,
     min_match: i64 = 4,
-    /// A family's own copy proposer for each request (null: lanes.SuffixLookup at `min_match`)
-    proposers: ?Proposers = null,
+    proposers: ?Proposers = null, // a family's own copy proposer for each request (null: lanes.SuffixLookup at `min_match`)
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
     queued: std.ArrayList(*Job) = .empty,
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
+    fill_owed: i96 = 0, // ns of rounds the live streams are owed for the last prompt chunk (Info.decode_share)
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
@@ -386,12 +386,12 @@ pub const LaneHost = struct {
 
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
     fn fillOne(h: *LaneHost) void {
-        if (h.filling.items.len == 0) return;
+        if (h.filling.items.len == 0 or fill.owed(h)) return;
         const at = fill.next(h);
         const job = h.filling.items[at];
         const first = !job.fill_began;
         job.fill_began = true;
-        const done = h.core.fillStreamCommitted(&job.stream, first, .{ .ptr = job, .call = firstCommitted }) catch |e| {
+        const done = fill.timed(h, &job.stream, first, .{ .ptr = job, .call = firstCommitted }) catch |e| {
             _ = switch (e) {
                 error.Cancelled => h.cancel(job),
                 error.LaneMemory => blk: {
@@ -580,7 +580,7 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
-            h.core.step() catch |e| {
+            fill.round(h) catch |e| {
                 ends.failAll(h, @errorName(e));
                 continue;
             };

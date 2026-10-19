@@ -189,6 +189,8 @@ pub const Info = struct {
     prompt_logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// Between a prompt's chunks, the live streams' rounds take at least this share of the time (0: one round a chunk).
+    decode_share: f32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.
