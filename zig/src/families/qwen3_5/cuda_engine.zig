@@ -19,7 +19,7 @@ const DeviceBuffer = cuda.DeviceBuffer;
 const head_dim = geometry.head_dim;
 
 /// Rows of one forward at most: a prompt chunk, or a shared round's windows.
-pub const max_rows = 128;
+pub const max_rows = Round.max_rows;
 /// Streams' windows in one forward at most.
 pub const max_segs = Round.max_segs;
 /// Rows of a verify forward at most: each row's logits are kept and drawn.
@@ -79,9 +79,10 @@ pub const Engine = struct {
     g: Geometry,
     geo: Geo,
     stream: cuda.Stream,
-    mods: [16]cuda.Module,
+    mods: [18]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
     fp8: Kv8,
+    prompt_attn: @import("cuda_prompt.zig").Fns, // a prompt chunk's attention tiles and delta-rule chain
     draws: cuda.sample.Draws,
     affine: cuda.qlinear.Affine4Kernels,
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
@@ -194,7 +195,7 @@ pub const Engine = struct {
         errdefer e.arena.free();
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
         const kk = cuda.kernels;
-        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.affine8, kk.affine_prefill, kk.qwen35_kv8, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe, kk.experts3, kk.experts3_prefill };
+        const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.affine8, kk.affine_prefill, kk.qwen35_kv8, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe, kk.experts3, kk.experts3_prefill, kk.prefill_attention, kk.gdn_prefill };
         var loaded: usize = 0;
         errdefer for (e.mods[0..loaded]) |*m| m.unload();
         for (images, 0..) |img, i| {
@@ -204,6 +205,7 @@ pub const Engine = struct {
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         const gb10 = try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
+        e.affine.half_prompt = !gb10; // the 27B's prompt tile (Tile<64, 128, 128, 2, 2, 2>), quicker on an RTX 5090
         errdefer e.affine.deinit();
         e.wide = try cuda.qlinear.AffineNKernels.resolve(d, e.mods[7], e.mods[8], e.mods[3], sms, gb10);
         errdefer e.wide.deinit();
@@ -214,6 +216,7 @@ pub const Engine = struct {
         e.moe = try cuda.moe.Fns.resolve(e.mods[13]);
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
+        e.prompt_attn = try @import("cuda_prompt.zig").resolve(e.mods[16], e.mods[17]);
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
@@ -323,9 +326,10 @@ pub const Engine = struct {
         e.qraw = try t.alloc(R * 2 * g.attnWidth() * 2);
         e.qn = try t.alloc(R * g.attnWidth() * 2);
         inline for (.{ "kraw", "vraw", "kn" }) |name| @field(e, name) = try t.alloc(R * g.kv_heads * head_dim * 2);
-        e.pm = try t.alloc(R * g.q_heads * max_chunks * 4);
-        e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
-        e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
+        // the decode partials: verify rows only (a prompt chunk's attention runs cuda_prompt_attention's tiles)
+        e.pm = try t.alloc(most_verify * g.q_heads * max_chunks * 4);
+        e.pl = try t.alloc(most_verify * g.q_heads * max_chunks * 4);
+        e.po = try t.alloc(most_verify * g.q_heads * max_chunks * head_dim * 4);
         e.logits = try t.alloc(most_verify * g.vocab * 2);
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
