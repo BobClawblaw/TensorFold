@@ -10,6 +10,7 @@ const am = @import("../../core/affine_mm.zig");
 const idx = @import("index.zig");
 const ffn = @import("moe.zig");
 const dspark = @import("draft.zig");
+const layer = @import("layer.zig");
 const Buffer = mtl.Buffer;
 
 pub const Head = enum { last, all, none };
@@ -37,7 +38,6 @@ const GemvArgs = extern struct { rows: i32, n: i32, k: i32, group_n: i32, x_stri
 const RopeArgs = extern struct { heads: i32, stride: i32, offset: i32, inverse: i32 };
 const CopyArgs = extern struct { width: i32, ring: i32 };
 const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: i32, scale: f32, window_end: i32 = -1 };
-const EngramArgs = extern struct { eps: f32 };
 /// Rows from which a call's projections take the tensor units (core/affine_mm), on GPUs that have them.
 pub const nax_rows = 16;
 /// A buffer and byte offset as core/affine_mm binds them.
@@ -79,11 +79,28 @@ pub const Enc = struct {
     m: *Model,
     s: *st.Scratch,
     rows: usize,
-    base: usize, // the first row's position
+    base: usize, // the first row's position (a stream's view; meaningless across streams)
+    r0: usize = 0, // a stream's view: its first scratch row, where its row-indexed buffers bind
+    units: bool = false, // a lone stream's prompt chunk: the tensor units (shared forwards keep the row kernels)
+    segs: []const Seg = &.{}, // the streams of the forward, in scratch row order
 
-    /// The tensor-unit pipelines for `w` when this call is a prompt chunk of nax_rows or more.
+    /// The view of one stream's rows: its position, its scratch rows.
+    pub fn of(self: Enc, g: Seg) Enc {
+        var v = self;
+        v.rows = g.tokens.len;
+        v.base = g.cache.len;
+        v.r0 = g.r0;
+        return v;
+    }
+
+    /// `b` bound at this view's first row, `row_bytes` a row.
+    pub fn at(self: Enc, b: Buffer, row_bytes: usize, slot: usize) void {
+        self.ep.*.setBuffer(b, self.r0 * row_bytes, slot);
+    }
+
+    /// The tensor-unit pipelines for `w` when this call is a lone stream's prompt chunk.
     pub fn nax(self: Enc, w: row.Weights) ?am.Pipes {
-        if (self.rows < nax_rows) return null;
+        if (!self.units) return null;
         return self.m.kernels.naxPipes(.{ .bits = w.bits, .group = @intCast(w.group) });
     }
 
@@ -219,7 +236,8 @@ pub const Enc = struct {
     pub fn attend(self: Enc, q: Buffer, ring: Buffer, comp: Buffer, picks_buf: Buffer, picks: usize, sink: wts.Tensor, o: Buffer, window_end: i32, freq: Buffer) void {
         const s = self.s;
         const aa = AttnArgs{ .first_pos = @intCast(self.base), .ring = st.ring, .window = c.window, .picks = @intCast(picks), .scale = 1.0 / @sqrt(@as(f32, c.head_dim)), .window_end = window_end };
-        if (self.rows >= nax_rows) {
+        const qo = c.heads * c.head_dim * 2;
+        if (self.units and self.rows >= nax_rows) {
             self.rope(q, self.rows, c.heads, c.head_dim, s.pos, freq, false);
             const tensor_attend = self.m.kernels.attend_nax; // on the tensor units when the GPU has them
             if (tensor_attend) |p| {
@@ -235,28 +253,28 @@ pub const Enc = struct {
             self.args(aa, 6);
             if (tensor_attend != null) self.groups(.{ c.heads / 16, self.rows, 1 }, .{ 128, 1, 1 }) else self.groups(.{ c.heads / 8, self.rows, 1 }, .{ 512, 1, 1 });
             self.rope(o, self.rows, c.heads, c.head_dim, s.pos, freq, true);
-            self.fp8(o, self.rows * c.heads * c.head_dim);
+            self.fp8(o, self.rows, c.heads * c.head_dim);
             return;
         }
         const chunks: usize = (c.window + picks + 15) / 16;
         self.pipe("ds_attend_split");
-        self.buf(q, 0, 0);
+        self.at(q, qo, 0);
         self.buf(ring, 0, 1);
         self.buf(comp, 0, 2);
-        self.buf(picks_buf, 0, 3);
+        self.at(picks_buf, picks * 4, 3);
         self.buf(s.attn_po, 0, 4);
         self.buf(s.attn_ml, 0, 5);
         self.args(aa, 6);
-        self.buf(s.pos, 0, 7);
+        self.at(s.pos, 4, 7);
         self.buf(freq, 0, 8);
         self.groups(.{ c.heads / split_heads, chunks, self.rows }, .{ split_heads * 32, 1, 1 });
         self.pipe("ds_attend_merge");
         self.buf(s.attn_po, 0, 0);
         self.buf(s.attn_ml, 0, 1);
         self.tensor(sink, 2);
-        self.buf(o, 0, 3);
+        self.at(o, qo, 3);
         self.args(@as(i32, @intCast(chunks)), 4);
-        self.buf(s.pos, 0, 5);
+        self.at(s.pos, 4, 5);
         self.buf(freq, 0, 6);
         self.groups(.{ c.heads, self.rows, 1 }, .{ c.head_dim, 1, 1 });
     }
@@ -272,42 +290,42 @@ pub const Enc = struct {
 
     pub fn rope(self: Enc, x: Buffer, rows: usize, heads: usize, stride: usize, positions: Buffer, freq: Buffer, inverse: bool) void {
         self.pipe("ds_rope");
-        self.buf(x, 0, 0);
-        self.buf(positions, 0, 1);
+        self.at(x, heads * stride * 2, 0);
+        self.at(positions, 4, 1);
         self.buf(freq, 0, 2);
         self.args(RopeArgs{ .heads = @intCast(heads), .stride = @intCast(stride), .offset = @intCast(stride - c.rope_dim), .inverse = @intFromBool(inverse) }, 3);
         self.threads(.{ c.rope_dim / 2, heads, rows }, .{ c.rope_dim / 2, 1, 1 });
     }
 
-    pub fn fp8(self: Enc, x: Buffer, values: usize) void {
+    pub fn fp8(self: Enc, x: Buffer, rows: usize, width: usize) void {
         self.pipe("ds_fp8_qdq");
-        self.buf(x, 0, 0);
-        self.threads(.{ values / 32, 1, 1 }, .{ 64, 1, 1 });
+        self.at(x, width * 2, 0);
+        self.threads(.{ rows * width / 32, 1, 1 }, .{ 64, 1, 1 });
     }
 
-    pub fn fp4(self: Enc, x: Buffer, values: usize, e4m3_scale: bool) void {
+    pub fn fp4(self: Enc, x: Buffer, rows: usize, width: usize, e4m3_scale: bool) void {
         self.pipe("ds_fp4_qdq");
-        self.buf(x, 0, 0);
+        self.at(x, width * 2, 0);
         self.args(@as(i32, @intFromBool(e4m3_scale)), 1);
-        self.threads(.{ values / @as(usize, if (e4m3_scale) 16 else 32), 1, 1 }, .{ 64, 1, 1 });
+        self.threads(.{ rows * width / @as(usize, if (e4m3_scale) 16 else 32), 1, 1 }, .{ 64, 1, 1 });
     }
 
     /// The window keys' tail in place (kv_norm, RoPE, fp8), then into `ring` at their positions when given.
     pub fn kvFinish(self: Enc, kv: Buffer, norm: wts.Tensor, freq: Buffer, ring: ?Buffer) void {
         self.pipe("ds_kv_finish");
-        self.buf(kv, 0, 0);
+        self.at(kv, c.head_dim * 2, 0);
         self.tensor(norm, 1);
-        self.buf(self.s.pos, 0, 2);
+        self.at(self.s.pos, 4, 2);
         self.buf(freq, 0, 3);
-        self.buf(ring orelse kv, 0, 4);
+        if (ring) |r| self.buf(r, 0, 4) else self.at(kv, c.head_dim * 2, 4);
         self.args([2]f32{ c.norm_eps, if (ring != null) @floatFromInt(st.ring) else 0 }, 5);
         self.groups(.{ self.rows, 1, 1 }, .{ 256, 1, 1 });
     }
 
     pub fn put(self: Enc, src: Buffer, positions: Buffer, dst: Buffer, rows: usize, width: usize, ring: usize) void {
         self.pipe("ds_put_rows");
-        self.buf(src, 0, 0);
-        self.buf(positions, 0, 1);
+        self.at(src, width * 2, 0);
+        self.at(positions, 4, 1);
         self.buf(dst, 0, 2);
         self.args(CopyArgs{ .width = @intCast(width), .ring = @intCast(ring) }, 3);
         self.threads(.{ width, rows, 1 }, .{ @min(width, 256), 1, 1 });
@@ -315,8 +333,8 @@ pub const Enc = struct {
 
     pub fn putF32(self: Enc, src: Buffer, positions: Buffer, dst: Buffer, rows: usize, width: usize, ring: usize) void {
         self.pipe("ds_put_rows_f32");
-        self.buf(src, 0, 0);
-        self.buf(positions, 0, 1);
+        self.at(src, width * 4, 0);
+        self.at(positions, 4, 1);
         self.buf(dst, 0, 2);
         self.args(CopyArgs{ .width = @intCast(width), .ring = @intCast(ring) }, 3);
         self.threads(.{ width, rows, 1 }, .{ @min(width, 256), 1, 1 });
@@ -406,34 +424,55 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
 
 /// `run` over prompt rows that may lie in image spans (`vis`): their rows are the tower's, not the token embedding.
 pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, head: Head, dump: ?Dump, vis: ?*const Vis) !void {
-    const rows = tokens.len;
-    if (rows == 0 or rows > s.rows or rows > st.max_rows) return error.DeepseekRowsExceeded;
-    const base = cache.len;
-    if (base + rows > cache.capacity) return error.DeepseekCacheFull;
+    return runSegs(m, s, &.{.{ .cache = cache, .tokens = tokens }}, head, dump, vis);
+}
+
+/// A stream's rows in a forward: its cache, its tokens, from scratch row `r0` (the rows of the streams before it).
+pub const Seg = struct { cache: *st.Cache, tokens: []const u32, r0: usize = 0 };
+
+/// Several streams' rows in one forward, each stream's attention on its own rows (row kernels: each matches alone).
+pub fn many(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head) !void {
+    return runSegs(m, s, segs, head, null, null);
+}
+
+fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump, vis: ?*const Vis) !void {
+    var rows: usize = 0;
+    for (segs) |g| {
+        if (g.r0 != rows or g.tokens.len == 0 or g.tokens.len > st.max_rows) return error.DeepseekRowsExceeded;
+        if (g.cache.len + g.tokens.len > g.cache.capacity) return error.DeepseekCacheFull;
+        rows += g.tokens.len;
+    }
+    if (rows == 0 or rows > s.rows) return error.DeepseekRowsExceeded;
+    if (segs.len > 1 and (vis != null or dump != null or head == .last)) return error.DeepseekSharedForward;
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
 
     // host side: ids, positions, the engram history and lookups, the first collapse (copy 0)
-    for (s.ids.slice(u32, rows), tokens) |*d, t| d.* = t;
-    for (s.pos.slice(i32, rows), 0..) |*p, i| p.* = @intCast(base + i);
-    cache.engram_ids.shrinkRetainingCapacity(base);
     var images = false;
-    for (tokens, s.img.slice(i32, rows), s.img_code.slice(i32, rows), 0..) |t, *flag, *code, i| {
-        code.* = Vis.code(vis, base + i);
-        flag.* = @intFromBool(code.* != -1);
-        images = images or code.* != -1;
-        cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, code.* == -1)); // image rows end every n-gram
-    }
-    var h0: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &h0);
     var dsts: [c.engram_layers.len][]u16 = undefined;
-    for (&dsts, s.engram_rows) |*d, b| d.* = b.slice(u16, rows * c.engram_cols * c.engram_dim);
-    try m.engram.gatherRows(cache.engram_ids.items, base, rows, dsts);
-    if (profile) |p| {
+    var host: f64 = 0;
+    for (segs) |g| {
+        const base = g.cache.len;
+        const n = g.tokens.len;
+        for (s.ids.slice(u32, g.r0 + n)[g.r0..], g.tokens) |*d, t| d.* = t;
+        for (s.pos.slice(i32, g.r0 + n)[g.r0..], 0..) |*p, i| p.* = @intCast(base + i);
+        g.cache.engram_ids.shrinkRetainingCapacity(base);
+        for (g.tokens, s.img.slice(i32, g.r0 + n)[g.r0..], s.img_code.slice(i32, g.r0 + n)[g.r0..], 0..) |t, *flag, *code, i| {
+            code.* = Vis.code(vis, base + i);
+            flag.* = @intFromBool(code.* != -1);
+            images = images or code.* != -1;
+            g.cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, code.* == -1)); // image rows end every n-gram
+        }
+        var h0: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &h0);
+        const width = c.engram_cols * c.engram_dim;
+        for (&dsts, s.engram_rows) |*d, b| d.* = b.slice(u16, (g.r0 + n) * width)[g.r0 * width ..];
+        try m.engram.gatherRows(g.cache.engram_ids.items, base, n, dsts);
         var h1: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &h1);
-        p[10] += @as(f64, @floatFromInt(h1.sec - h0.sec)) + @as(f64, @floatFromInt(h1.nsec - h0.nsec)) / 1e9;
+        host += secs(h0, h1);
     }
+    if (profile) |p| p[10] += host;
     for (s.pre[0].slice(f32, rows * c.hc), 0..) |*v, i| v.* = if (i % c.hc == 0) 1 else 0;
 
     var t_start: std.c.timespec = undefined;
@@ -443,7 +482,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
     var e = cb.compute(.concurrent);
     pending_expand = false;
     pending_topk = 0;
-    const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = s, .rows = rows, .base = base };
+    const x: Enc = .{ .ep = &e, .cbp = &cb, .m = m, .s = s, .rows = rows, .base = segs[0].cache.len, .units = segs.len == 1 and rows >= nax_rows, .segs = segs };
     x.pipe("ds_embed");
     x.buf(s.ids, 0, 0);
     x.tensor(w.embed, 1);
@@ -460,7 +499,9 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
         x.tensor(v.newline, 5);
         x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
     }
-    const drafting = w.stages != null and cache.stage_rings != null;
+    const drafting = w.stages != null and for (segs) |g| {
+        if (g.cache.stage_rings == null) break false;
+    } else true;
     for (&w.layers, 0..) |*l, i| {
         if (drafting) if (std.mem.indexOfScalar(usize, &c.draft_targets, i)) |t| {
             // the draft head reads its target layers' attention inputs: the mean of the four streams
@@ -471,7 +512,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
             x.args([2]i32{ @intCast(t * c.hidden), @intCast(c.draft_targets.len * c.hidden) }, 2);
             x.threads(.{ c.hidden, rows, 1 }, .{ 256, 1, 1 });
         };
-        try block(x, cache, i, l);
+        try layer.block(x, i, l);
         if (dump) |d| { // the streams after each block: the buffers are untracked, so each block completes first
             x.flush();
             e.end();
@@ -483,7 +524,7 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
             e = cb.compute(.concurrent);
         }
     }
-    if (drafting) dspark.condition(x, cache);
+    if (drafting) dspark.condition(x);
     try x.cut(0);
     // the last block's FFN pre collapses the streams for the head
     x.boundary(null, s.pre[0], s.pre[1], w.norm);
@@ -509,79 +550,19 @@ pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32,
         if (cb.failure()) |why| std.log.err("deepseek_v41: the forward failed: {s}", .{why});
         return error.DeepseekGpuFailed;
     }
-    cache.len += rows;
-    if (head != .none) {
-        const last = if (head == .last) 0 else rows - 1;
-        @memcpy(cache.logits.contents()[0 .. c.vocab * 2], (s.logits.contents() + last * c.vocab * 2)[0 .. c.vocab * 2]);
+    for (segs) |g| {
+        const n = g.tokens.len;
+        g.cache.len += n;
+        if (head != .none) {
+            const last = if (head == .last) 0 else g.r0 + n - 1;
+            @memcpy(g.cache.logits.contents()[0 .. c.vocab * 2], (s.logits.contents() + last * c.vocab * 2)[0 .. c.vocab * 2]);
+        }
+        g.cache.last_start = g.cache.len - n;
+        g.cache.last_rows = n;
+        g.cache.last_r0 = g.r0;
     }
-    cache.last_start = base;
-    cache.last_rows = rows;
 }
 
 fn secs(a: std.c.timespec, b: std.c.timespec) f64 {
     return @as(f64, @floatFromInt(b.sec - a.sec)) + @as(f64, @floatFromInt(b.nsec - a.nsec)) / 1e9;
-}
-
-/// One block: the engram lookup (layers 1 and 14), attention and the MoE, each between its boundaries.
-fn block(x: Enc, cache: *st.Cache, i: usize, l: *const wts.Layer) !void {
-    const s = x.s;
-    if (l.engram) |eg| {
-        x.flush();
-        x.linear(eg.wkv, s.engram_rows[c.engramIndex(i).?], 0, s.engram_kv, 0, x.rows);
-        x.pipe("ds_engram");
-        x.buf(s.x, 0, 0);
-        x.buf(s.engram_kv, 0, 1);
-        x.tensor(eg.q_weight, 2);
-        x.tensor(eg.k_weight, 3);
-        x.args(EngramArgs{ .eps = c.norm_eps }, 4);
-        x.buf(s.img, 0, 5);
-        x.groups(.{ c.hc, x.rows, 1 }, .{ 256, 1, 1 });
-        try x.cut(8);
-    }
-    x.boundary(l.hc_attn, s.pre[0], s.pre[1], l.attn_norm);
-    try x.cut(0);
-    try attention(x, cache, i, l);
-    x.expand();
-    x.boundary(l.hc_ffn, s.pre[1], s.pre[0], l.ffn_norm);
-    try x.cut(0);
-    try ffn.moe(x, &l.moe, c.topk, c.experts);
-    x.expand();
-}
-
-fn attention(x: Enc, cache: *st.Cache, layer: usize, l: *const wts.Layer) !void {
-    const s = x.s;
-    const m = x.m;
-    const rows = x.rows;
-    const a = &l.attn;
-    const freq = m.freq(layer);
-    // q = wq_b(q_norm(wq_a(x))) and the window key kv_norm(wkv(x)) into the ring, the two chains side by side
-    x.linear(a.wq_a, s.normed, 0, s.qr, 0, rows);
-    x.with();
-    x.linear(a.wkv, s.normed, 0, s.kv, 0, rows);
-    x.rms(s.qr, 0, a.q_norm, s.qr, 0, rows, c.q_rank);
-    x.with();
-    x.kvFinish(s.kv, a.kv_norm, freq, cache.windows[layer]);
-    x.linear(a.wq_b, s.qr, 0, s.q, 0, rows);
-    try x.cut(1);
-
-    var picks: usize = 0;
-    var comp = cache.windows[layer]; // unread without picks
-    const ratio: usize = c.ratios[layer];
-    if (ratio != 0) {
-        const src_layer = c.kvSource(layer).?;
-        const si = std.mem.indexOfScalar(usize, &c.kv_sources, src_layer).?;
-        const src = &cache.sources[si];
-        if (a.compressor) |cp| try idx.compress(x, cache, si, ratio, cp, a.indexer.?, freq);
-        comp = src.latents;
-        picks = st.picks;
-        if (a.indexer) |ix| try idx.index(x, src, layer, ratio, ix, freq);
-    }
-    try x.cut(2);
-    // sparse attention over the window and the picks, then the output's RoPE taken back
-    x.attend(s.q, cache.windows[layer], comp, s.picks, picks, a.sink, s.o, -1, freq);
-    try x.cut(3);
-    // the grouped low-rank output: block-diagonal wo_a, wo_b
-    x.woA(a.wo_a, rows);
-    x.linear(a.wo_b, s.oa, 0, s.branch, 0, rows);
-    try x.cut(4);
 }

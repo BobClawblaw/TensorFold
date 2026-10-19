@@ -15,15 +15,15 @@ const MarkovArgs = extern struct { vocab: i32, rank: i32, step: i32 };
 const noise_token: u32 = 128799;
 
 /// The draft head's view of the rows: main_norm(main_proj(target means)), each stage's window keys to its ring.
-pub fn condition(x: Enc, cache: *st.Cache) void {
+pub fn condition(x: Enc) void {
     const s = x.s;
     const stages = &x.m.weights.stages.?;
     x.linear(stages[0].main_proj.?, s.mh, 0, s.mainx, 0, x.rows);
     x.rms(s.mainx, 0, stages[0].main_norm.?, s.mainx, 0, x.rows, c.hidden);
-    for (stages, cache.stage_rings.?, 0..) |*stage, ring, k| {
+    for (stages, 0..) |*stage, k| {
         const a = &stage.block.attn;
         x.linear(a.wkv, s.mainx, 0, s.kv, 0, x.rows);
-        x.kvFinish(s.kv, a.kv_norm, x.m.freq(c.layers + k), ring);
+        for (x.segs) |g| x.of(g).kvFinish(s.kv, a.kv_norm, x.m.freq(c.layers + k), g.cache.stage_rings.?[k]);
     }
 }
 

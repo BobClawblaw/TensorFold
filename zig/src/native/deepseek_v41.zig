@@ -84,8 +84,8 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         }
         offer = .{ .ctx = h, .prepare = prepareImage, .image_token = image_token, .markers = &h.markers, .image_tokens = v.image_tokens, .max_images = v.max_images, .explain = q.image.decoderProblem };
     }
-    // streams take turns (no forward shares rows between them yet): each holds only its own small caches
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = @max(1, @min(o.lanes, 4)), .context_window = @intCast(window), .prefill_step = chunk, .structures = true, .answer_limit = true, .vision = offer });
+    // up to four streams: their windows share a forward, and a new prompt goes in a chunk between their rounds
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = @max(1, @min(o.lanes, 4)), .context_window = @intCast(window), .prefill_step = chunk, .decode_share = 0.5, .structures = true, .answer_limit = true, .vision = offer });
     h.cache = null;
     var why: []const u8 = "";
     const dev = model.device;

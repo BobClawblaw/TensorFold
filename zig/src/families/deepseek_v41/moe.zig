@@ -20,7 +20,7 @@ pub fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
     const s = x.s;
     const rows = x.rows;
     const slots = rows * topk;
-    const side = x.rows < fwd.nax_rows; // decode-sized: the shared expert runs beside the routed path
+    const side = !x.units; // decode-sized: the shared expert runs beside the routed path
     x.gemv(true, mo.router, s.normed, 0, c.hidden, s.router, 0, rows, experts, c.hidden, experts);
     if (side) {
         x.with();

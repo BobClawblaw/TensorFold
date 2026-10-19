@@ -53,9 +53,10 @@ pub const Cache = struct {
     logits: mtl.Buffer,
     /// With the DSpark head: each stage's window keys of the target's positions (bf16 [ring, 512] by position).
     stage_rings: ?[c.stages]mtl.Buffer = null,
-    /// Where the last call started and its rows (a window's keep takes back to a prefix of them).
+    /// Where the last call started, its rows and its first scratch row (a window's keep takes back to a prefix).
     last_start: usize = 0,
     last_rows: usize = 0,
+    last_r0: usize = 0,
     /// The drafts held for the next window (the head's greedy chain).
     held: [c.draft_block]u32 = @splat(0),
     held_n: usize = 0,

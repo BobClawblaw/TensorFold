@@ -1,4 +1,4 @@
-//! DeepSeek-V4.1-Flash on the lane engine: streams in turn, prompts in chunks, DSpark drafts verified in windows.
+//! DeepSeek-V4.1-Flash on the lane engine: chunked prompts, DSpark drafts in windows, several streams a forward.
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
@@ -16,6 +16,10 @@ pub const Options = struct { capacity: usize, chunk: usize = 1024 };
 
 /// The widest window: the pending row and the head's five drafts.
 pub const window_rows = 1 + c.draft_block;
+/// Streams a shared forward takes at most.
+pub const max_streams = 4;
+/// Shared forwards timed at load: their total rows, split evenly over `max_streams` streams.
+const shared_rows = [_]usize{ 8, 12, 16, 24 };
 
 pub const Metal = struct {
     gpa: std.mem.Allocator,
@@ -27,7 +31,13 @@ pub const Metal = struct {
     caches: std.AutoHashMapUnmanaged(*lanes.Stream, *st.Cache) = .empty,
     /// Forward ms by window width and one draft round's, timed at load: the lane core weighs depths against them.
     costs: [window_rows]lanes.config.Cost = undefined,
+    shared: [shared_rows.len]lanes.config.Cost = undefined,
     draft_ms: f64 = 0,
+    /// Prompt passes under way, a chunk a `prefillStepFn` call.
+    fills: std.AutoHashMapUnmanaged(*lanes.Stream, Fill) = .empty,
+
+    /// A prompt pass's next row and its images' rows.
+    const Fill = struct { at: usize, vis: ?fwd.Vis };
 
     pub fn init(gpa: std.mem.Allocator, model: *Model, options: Options) !*Metal {
         const out = try gpa.create(Metal);
@@ -48,6 +58,9 @@ pub const Metal = struct {
             self.gpa.destroy(cache.*);
         }
         self.caches.deinit(self.gpa);
+        var fills = self.fills.valueIterator();
+        while (fills.next()) |f| if (f.vis) |v| self.freeVis(v);
+        self.fills.deinit(self.gpa);
         if (self.drafts) |*d| d.deinit();
         self.scratch.deinit();
         self.gpa.destroy(self);
@@ -55,6 +68,7 @@ pub const Metal = struct {
 
     pub fn facts(self: *const Metal) lanes.Model {
         if (self.drafts == null) return .{ .exact_width = 1, .batch_rows = 1, .max_streams = 1, .streams_exact = true, .plain_guard = true };
+        // shared forwards: every row on the row kernels, so a stream's rows give its own bits (forward.many)
         return .{
             .exact_width = window_rows,
             .mtp = true,
@@ -65,8 +79,11 @@ pub const Metal = struct {
             // the head drafts its five in one call: priced a step at a fifth of it
             .mtp_step_ms = self.draft_ms / c.draft_block,
             .plain_guard = true,
-            .batch_rows = window_rows,
-            .max_streams = 1,
+            .hidden_rows = true,
+            .batch_rows = max_streams * window_rows,
+            .max_streams = max_streams,
+            .shared_costs = &self.shared,
+            .draft_step_ms = self.draft_ms, // the head drafts a shared round's streams one after another
             .streams_exact = true,
         };
     }
@@ -97,11 +114,33 @@ pub const Metal = struct {
             best = @min(best, now() - t0);
         }
         self.draft_ms = best;
-        std.log.info("deepseek_v41: window ms by width 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 6 {d:.1}; a draft round {d:.1} ms", .{ self.costs[0].ms, self.costs[1].ms, self.costs[3].ms, self.costs[5].ms, self.draft_ms });
+        var more: [max_streams - 1]st.Cache = undefined;
+        var made: usize = 0;
+        defer for (more[0..made]) |*m| m.deinit();
+        for (&more) |*m| {
+            m.* = try st.Cache.initWith(self.gpa, self.model.device, 512, true);
+            made += 1;
+            try fwd.run(self.model, &self.scratch, m, &ids, .last, null);
+        }
+        const caches = [max_streams]*st.Cache{ &cache, &more[0], &more[1], &more[2] };
+        for (&self.shared, shared_rows) |*cost, total| {
+            const each = total / max_streams;
+            var segs: [max_streams]fwd.Seg = undefined;
+            for (&segs, caches, 0..) |*g, cc, k| g.* = .{ .cache = cc, .tokens = ids[0..each], .r0 = k * each };
+            best = std.math.floatMax(f64);
+            for (0..3) |_| {
+                const t0 = now();
+                try fwd.many(self.model, &self.scratch, &segs, .all);
+                best = @min(best, now() - t0);
+                for (caches) |cc| cc.len = base;
+            }
+            cost.* = .{ .width = @intCast(total), .ms = best };
+        }
+        std.log.info("deepseek_v41: window ms by width 1 {d:.1}, 2 {d:.1}, 4 {d:.1}, 6 {d:.1}; shared over 4 streams 8 rows {d:.1}, 16 {d:.1}, 24 {d:.1}; a draft round {d:.1} ms", .{ self.costs[0].ms, self.costs[1].ms, self.costs[3].ms, self.costs[5].ms, self.shared[0].ms, self.shared[2].ms, self.shared[3].ms, self.draft_ms });
     }
 
     pub fn backend(self: *Metal) be.Backend {
-        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .release = releaseFn } };
+        return .{ .ptr = self, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .held = heldFn, .release = releaseFn, .reports_fill = true } };
     }
 
     fn cast(ptr: *anyopaque) *Metal {
@@ -112,13 +151,53 @@ pub const Metal = struct {
         return self.caches.get(stream) orelse error.UnknownDeepseekStream;
     }
 
+    /// The whole prompt pass: the chunks `prefillStepFn` takes one a call, run back to back.
     fn prefillFn(ptr: *anyopaque, stream: *lanes.Stream) !void {
-        const self = cast(ptr);
+        while (!try cast(ptr).chunk(stream)) {}
+    }
+
+    /// One chunk of the prompt pass, the other streams' rounds running between calls; true once the prompt is in.
+    fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream) !bool {
+        if (stream.isCancelled()) return error.Cancelled;
+        return cast(ptr).chunk(stream);
+    }
+
+    /// The next chunk of the stream's prompt, its caches made (and a kept prefix restored) before the first.
+    fn chunk(self: *Metal, stream: *lanes.Stream) !bool {
+        errdefer releaseFn(self, stream);
+        const ids = stream.prompt();
+        const fill = self.fills.getPtr(stream) orelse try self.begin(stream);
+        var end: usize = @min(ids.len, fill.at + self.scratch.rows);
+        for (stream.chunks) |boundary| if (boundary > fill.at) {
+            end = @min(end, boundary);
+            break;
+        };
+        for (stream.reuse.marks) |m| if (m > fill.at) {
+            end = @min(end, m);
+            break;
+        };
+        try fwd.runWith(self.model, &self.scratch, try self.cacheOf(stream), ids[fill.at..end], if (end == ids.len) .last else .none, null, if (fill.vis) |*v| v else null);
+        fill.at = end;
+        stream.fill_at.store(@intCast(end), .monotonic);
+        if (stream.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null)
+            hk.at(hk.ptr, stream, @intCast(end));
+        if (end < ids.len) return false;
+        self.endFill(stream);
+        return true;
+    }
+
+    /// A prompt pass starts: the stream's caches, a kept prefix of its prompt restored, its images through the tower.
+    fn begin(self: *Metal, stream: *lanes.Stream) !*Fill {
         const ids = stream.prompt();
         if (ids.len == 0 or ids.len + stream.max_new > self.options.capacity or self.caches.contains(stream)) return error.InvalidDeepseekPrompt;
+        const rows = @min(self.options.capacity, ids.len + stream.max_new + window_rows);
+        var held: usize = 0;
+        var them = self.caches.valueIterator();
+        while (them.next()) |other| held += other.*.capacity;
+        if (held + rows > self.options.capacity) return error.LaneMemory; // the streams share --context: it waits for room
         const cache = try self.gpa.create(st.Cache);
         errdefer self.gpa.destroy(cache);
-        cache.* = try st.Cache.initWith(self.gpa, self.model.device, @min(self.options.capacity, ids.len + stream.max_new + window_rows), self.drafts != null);
+        cache.* = try st.Cache.initWith(self.gpa, self.model.device, rows, self.drafts != null);
         errdefer cache.deinit();
         try self.caches.put(self.gpa, stream, cache);
         errdefer _ = self.caches.remove(stream);
@@ -132,26 +211,24 @@ pub const Metal = struct {
             stream.cached = @intCast(at);
             stream.reuse_failed = at == 0;
         }
-        var vis: ?fwd.Vis = null;
-        defer if (vis) |v| {
-            v.rows.deinit();
-            self.gpa.free(v.codes);
+        const vis: ?fwd.Vis = if (stream.images.len > 0) try self.images(stream, ids.len) else null;
+        const got = self.fills.getOrPut(self.gpa, stream) catch |e| {
+            if (vis) |v| self.freeVis(v);
+            return e;
         };
-        if (stream.images.len > 0) vis = try self.images(stream, ids.len);
-        var mark: usize = 0;
-        while (at < ids.len) {
-            var end: usize = @min(ids.len, at + self.scratch.rows);
-            for (stream.chunks) |boundary| if (boundary > at) {
-                end = @min(end, boundary);
-                break;
-            };
-            while (mark < stream.reuse.marks.len and stream.reuse.marks[mark] <= at) mark += 1;
-            if (mark < stream.reuse.marks.len) end = @min(end, stream.reuse.marks[mark]);
-            try fwd.runWith(self.model, &self.scratch, cache, ids[at..end], if (end == ids.len) .last else .none, null, if (vis) |*v| v else null);
-            at = end;
-            if (stream.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(at)) != null)
-                hk.at(hk.ptr, stream, @intCast(at));
-        }
+        got.value_ptr.* = .{ .at = at, .vis = vis };
+        return got.value_ptr;
+    }
+
+    /// The stream's prompt pass is over: its images' rows are freed.
+    fn endFill(self: *Metal, stream: *lanes.Stream) void {
+        const entry = self.fills.fetchRemove(stream) orelse return;
+        if (entry.value.vis) |v| self.freeVis(v);
+    }
+
+    fn freeVis(self: *Metal, v: fwd.Vis) void {
+        v.rows.deinit();
+        self.gpa.free(v.codes);
     }
 
     /// The stream's images through the tower: their aligner rows and each prompt position's code (-1 for text).
@@ -237,28 +314,35 @@ pub const Metal = struct {
 
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) !void {
         const self = cast(ptr);
-        if (windows.len != out.len) return error.InvalidDeepseekWindows;
+        if (windows.len != out.len or windows.len == 0 or windows.len > max_streams) return error.InvalidDeepseekWindows;
         const mask_words = (c.vocab + 31) / 32;
-        for (windows, out) |w, o| {
+        var ids: [max_streams][window_rows]u32 = undefined;
+        var segs: [max_streams]fwd.Seg = undefined;
+        var r0: usize = 0;
+        for (windows, out, ids[0..windows.len], segs[0..windows.len]) |w, o, *row_ids, *g| {
             const rows = w.rows();
             if (rows > window_rows or w.parents != null or w.early) return error.UnsupportedDeepseekWindow;
             const cache = try self.cacheOf(w.stream);
             if (w.held > cache.held_n) return error.DeepseekWindowOutOfStep;
             for (w.positions, 0..) |p, r| if (p != cache.len + r + 1) return error.InvalidDeepseekPosition;
             if (w.masks.len != 0 and w.masks.len != rows * mask_words) return error.InvalidDeepseekMasks;
-            var ids: [window_rows]u32 = undefined;
-            ids[0] = w.pending;
-            @memcpy(ids[1..][0..w.held], cache.held[0..w.held]);
-            @memcpy(ids[1 + w.held ..][0..w.tokens.len], w.tokens);
-            try fwd.run(self.model, &self.scratch, cache, ids[0..rows], .all, null);
-            const logits = self.scratch.logits.slice(u16, rows * c.vocab);
             if (o.sampled.len != rows or o.drafts.len != rows - 1) return error.InvalidDeepseekOutputs;
+            row_ids[0] = w.pending;
+            @memcpy(row_ids[1..][0..w.held], cache.held[0..w.held]);
+            @memcpy(row_ids[1 + w.held ..][0..w.tokens.len], w.tokens);
+            g.* = .{ .cache = cache, .tokens = row_ids[0..rows], .r0 = r0 };
+            r0 += rows;
+        }
+        try fwd.many(self.model, &self.scratch, segs[0..windows.len], .all);
+        for (windows, out, segs[0..windows.len]) |w, o, g| {
+            const rows = g.tokens.len;
+            const logits = self.scratch.logits.slice(u16, (g.r0 + rows) * c.vocab)[g.r0 * c.vocab ..];
             for (o.sampled, w.positions, 0..) |*t, p, r| {
                 const mask = if (w.masks.len > 0) w.masks[r * mask_words ..][0..mask_words] else &.{};
                 t.* = try draw(self.gpa, logits[r * c.vocab ..][0..c.vocab], w.stream.sampling, p, mask);
             }
-            @memcpy(o.drafts, ids[1..rows]);
-            cache.held_n = 0;
+            @memcpy(o.drafts, g.tokens[1..rows]);
+            g.cache.held_n = 0;
         }
     }
 
@@ -270,18 +354,23 @@ pub const Metal = struct {
             const cache = try self.cacheOf(w.stream);
             if (path.len == 0 or path.len > cache.last_rows) return error.DeepseekKeepOutOfStep;
             cache.len = cache.last_start + path.len;
-            const row = self.scratch.logits.contents() + (path.len - 1) * c.vocab * 2;
+            const row = self.scratch.logits.contents() + (cache.last_r0 + path.len - 1) * c.vocab * 2;
             @memcpy(cache.logits.contents()[0 .. c.vocab * 2], row[0 .. c.vocab * 2]);
         }
     }
 
-    /// The head drafts from the stream's last committed row with its pending token; `depth` of the five are held.
+    /// The head drafts from the stream's last kept row with its pending token; `depth` of the five are held.
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) !void {
         const self = cast(ptr);
         for (requests) |r| {
             if (r.early or r.lanes != null or r.ranks) return error.UnsupportedDeepseekDraft;
             const cache = try self.cacheOf(r.stream);
             cache.held_n = 0;
+            if (r.rows) |kept| { // a shared round drafts before its keep: the cache goes back to the kept rows first
+                if (r.start != cache.last_start or kept.len == 0 or kept.len > cache.last_rows) return error.DeepseekDraftOutOfStep;
+                for (kept, 0..) |row, k| if (row != k) return error.UnsupportedDeepseekTree;
+                cache.len = cache.last_start + kept.len;
+            }
             if (r.depth == 0) continue;
             if (self.drafts == null) return error.DeepseekCheckpointHasNoDraftHead;
             const ds = &self.drafts.?;
@@ -297,6 +386,7 @@ pub const Metal = struct {
 
     fn releaseFn(ptr: *anyopaque, stream: *lanes.Stream) void {
         const self = cast(ptr);
+        self.endFill(stream);
         if (self.caches.fetchRemove(stream)) |entry| {
             entry.value.deinit();
             self.gpa.destroy(entry.value);

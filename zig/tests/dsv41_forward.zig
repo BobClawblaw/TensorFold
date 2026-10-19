@@ -23,6 +23,7 @@ pub fn main(init: std.process.Init) !void {
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10), out_dir);
+    if (std.c.getenv("DS_SHARED")) |n| return shared(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
     if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d), if (args.len == 5) chunk else 256);
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
@@ -221,4 +222,77 @@ fn depths(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, prompt: []const u
             std.debug.print("\n", .{});
         }
     }
+}
+
+/// Four streams' windows of 1 to 6 rows in one forward a round against each alone: equal logits and drafts.
+fn shared(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32, rounds: usize) !void {
+    const k = q.backend.max_streams;
+    const lens = [k]usize{ ids.len, ids.len - 37, ids.len - 101, ids.len - 250 };
+    const m = try q.Model.load(gpa, io, dir, true);
+    defer m.deinit();
+    var wide = try q.state.Scratch.init(gpa, m.device, 256);
+    defer wide.deinit();
+    var solo = try q.state.Scratch.init(gpa, m.device, 256);
+    defer solo.deinit();
+    var heads = try q.state.Scratch.init(gpa, m.device, 8);
+    defer heads.deinit();
+    var together: [k]q.state.Cache = undefined;
+    var alone: [k]q.state.Cache = undefined;
+    for (&together, &alone, lens) |*t, *a, n| {
+        t.* = try q.state.Cache.initWith(gpa, m.device, n + 6 * rounds + 64, true);
+        a.* = try q.state.Cache.initWith(gpa, m.device, n + 6 * rounds + 64, true);
+        var at: usize = 0;
+        while (at < n) : (at += 256) {
+            const end = @min(n, at + 256);
+            try q.forward.run(m, &solo, t, ids[at..end], .last, null);
+            try q.forward.run(m, &solo, a, ids[at..end], .last, null);
+        }
+    }
+    defer for (&together, &alone) |*t, *a| {
+        t.deinit();
+        a.deinit();
+    };
+    const row = c.vocab * 2;
+    var rows_same: usize = 0;
+    var rows_all: usize = 0;
+    var drafts_same: usize = 0;
+    var times = [2]f64{ 0, 0 };
+    var t0: std.c.timespec = undefined;
+    var t1: std.c.timespec = undefined;
+    for (0..rounds) |round| {
+        var tokens: [k][6]u32 = undefined;
+        var segs: [k]q.forward.Seg = undefined;
+        var r0: usize = 0;
+        for (&tokens, &segs, &together, 0..) |*tk, *g, *t, j| {
+            const w = 1 + (round + 2 * j) % 6;
+            for (tk[0..w], 0..) |*v, i| v.* = ids[(t.len * 7 + i * 13 + j) % ids.len];
+            g.* = .{ .cache = t, .tokens = tk[0..w], .r0 = r0 };
+            r0 += w;
+        }
+        _ = std.c.clock_gettime(.MONOTONIC, &t0);
+        try q.forward.many(m, &wide, &segs, .all);
+        _ = std.c.clock_gettime(.MONOTONIC, &t1);
+        times[0] += seconds(t0, t1);
+        for (segs, &alone) |g, *a| {
+            _ = std.c.clock_gettime(.MONOTONIC, &t0);
+            try q.forward.run(m, &solo, a, g.tokens, .all, null);
+            _ = std.c.clock_gettime(.MONOTONIC, &t1);
+            times[1] += seconds(t0, t1);
+            for (0..g.tokens.len) |r| {
+                rows_all += 1;
+                if (std.mem.eql(u8, wide.logits.contents()[(g.r0 + r) * row ..][0..row], solo.logits.contents()[r * row ..][0..row])) rows_same += 1;
+            }
+            // a partial accept: back to a prefix of the window, as the lanes' keep does
+            const kept = 1 + (round + g.r0) % g.tokens.len;
+            g.cache.len = g.cache.last_start + kept;
+            a.len = a.last_start + kept;
+            var mine: [c.draft_block]u32 = undefined;
+            var theirs: [c.draft_block]u32 = undefined;
+            try q.forward.draft(m, &heads, g.cache, g.tokens[kept - 1], g.cache.len - 1, &mine);
+            try q.forward.draft(m, &heads, a, g.tokens[kept - 1], a.len - 1, &theirs);
+            if (std.mem.eql(u32, &mine, &theirs)) drafts_same += 1;
+        }
+    }
+    std.debug.print("shared {d} rounds of {d} streams: logits equal for {d}/{d} rows, drafts equal {d}/{d}; {d:.1} ms a round shared, {d:.1} ms alone\n", .{ rounds, k, rows_same, rows_all, drafts_same, rounds * k, times[0] * 1e3 / @as(f64, @floatFromInt(rounds)), times[1] * 1e3 / @as(f64, @floatFromInt(rounds)) });
+    if (rows_same != rows_all or drafts_same != rounds * k) return error.SharedForwardDiffers;
 }
