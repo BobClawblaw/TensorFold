@@ -237,7 +237,7 @@ The binary's `capabilities --json` response lists its supported flags and platfo
 | `--thinking`, `--no-thinking` | Choose whether the chat template opens a reasoning block. |
 | `--reasoning-effort LEVEL` | Default template effort: `low`, `medium`, `high` or `xhigh`. |
 | `--thinking-budget N` | Limit reasoning tokens where the engine supports closing the reasoning block. |
-| `--loop-guard` | Close a short repeated reasoning cycle where the engine supports it. |
+| `--loop-guard` | Close reasoning that repeats itself verbatim (a short cycle, or a long passage) where the engine supports it. |
 | `--no-drafts` | Produce the plain reference through the same engine. |
 | `--drafter DRAFTER` | An external drafter, as a directory or a repo id in the Hugging Face cache, for models that take one: Qwen3.8-27B uses DFlash2 and Gemma 4 31B the drafter named in its recipe. Without one they decode plain. |
 | `--drafter-bits 0\|4` | Drafter weight precision where the model offers a choice: 4 bits (the default), or 0 to keep bf16. Qwen3.8-27B on CUDA takes 4 only. |

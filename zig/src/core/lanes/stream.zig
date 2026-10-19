@@ -9,6 +9,7 @@ const Reader = @import("recall.zig").Reader;
 const Sampling = @import("sampling.zig").Sampling;
 const State = @import("depth.zig").State;
 const Row = @import("logprob.zig").Row;
+const long_loop = @import("long_loop.zig");
 
 pub const Reason = enum {
     none,
@@ -55,7 +56,8 @@ pub fn loopCut(s: *const Stream, tokens: []const u32) ?usize {
     if (!s.loop_guard or !s.think_open or s.think_end < 0 or s.loop_period != null) return null;
     for (tokens, 0..) |token, i| {
         if (@as(i64, token) == s.think_end) return null;
-        if (cycleAt(s.emitted(), tokens, s.emitted().len + i + 1) != null) return i;
+        const n = s.emitted().len + i + 1;
+        if (cycleAt(s.emitted(), tokens, n) != null or s.long_loop.cycleAt(s.emitted(), tokens, n) != null) return i;
     }
     return null;
 }
@@ -157,6 +159,7 @@ pub const Stream = struct {
     think_open: bool,
     loop_guard: bool,
     loop_period: ?u32 = null,
+    long_loop: long_loop.Index = .{}, // the reasoning's runs, for passages repeated verbatim (long_loop.zig)
     chunks: []const u32,
     history_len: u32,
     shared_prefixes: []const u32,
@@ -258,6 +261,7 @@ pub const Stream = struct {
         s.rows.deinit(gpa);
         s.prompt_rows.deinit(gpa);
         s.force.deinit(gpa);
+        s.long_loop.deinit(gpa);
         s.dropRoundState(gpa);
     }
 
@@ -289,6 +293,14 @@ pub const Stream = struct {
 
     pub fn emitted(s: *const Stream) []const u32 {
         return s.context.items[s.prompt_len..];
+    }
+
+    /// A long cycle ending at the last committed token (the runs before it indexed), then that token's run indexed.
+    fn longCycle(s: *Stream, gpa: Allocator) !?u32 {
+        const e = s.emitted();
+        const period = s.long_loop.cycleAt(e, &.{}, e.len);
+        try s.long_loop.add(gpa, e);
+        return period;
     }
 
     pub fn budgetLeft(s: *const Stream) i64 {
@@ -392,7 +404,8 @@ pub const Stream = struct {
                     break;
                 }
             }
-            const fire = if (s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null) detectLoop(s.emitted()) else null;
+            const guarded = s.loop_guard and s.think_open and s.think_end >= 0 and s.loop_period == null;
+            const fire = if (guarded) detectLoop(s.emitted()) orelse try s.longCycle(gpa) else null;
             if (s.isEos(t) or s.stopped()) {
                 s.finished = true;
                 s.reason = .stop;
