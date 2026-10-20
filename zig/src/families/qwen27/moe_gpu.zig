@@ -86,7 +86,7 @@ pub const Kernels = struct {
     /// f.output, the shared expert's rows of f.input's normed rows, becomes the block's: the routed experts' weighted
     /// rows plus the gated shared one.
     pub fn block(k: *Kernels, e: mtl.ComputeEncoder, c: Config, mo: *const wts.Moe, f: *const Frame, rows: u32, prompt: bool) !void {
-        var span = profile.begin(k.profiler, e, .activation);
+        var span = profile.begin(k.profiler, e, .route);
         errdefer span.cancel();
         const enc = span.encoder;
         const slots = f.slotsOf(rows);
@@ -94,18 +94,29 @@ pub const Kernels = struct {
         const topk: u32 = @intCast(c.top_k);
         const hidden: u32 = @intCast(c.hidden);
         const inter: u32 = @intCast(c.moe_intermediate);
-        const ld: u32 = @intCast(mo.router.n);
-        // the router: bf16 logits [rows, ld], the shared gate's in column `experts`
+        const units = k.sorted(mo, rows, prompt);
+        // the router: bf16 logits [rows, ld], the shared gate's in column `experts`; a prompt chunk's rows on the
+        // tensor units (y's pitch is n rounded up to 64), decode rows through the row kernel (pitch n)
+        const ld: u32 = if (units) std.mem.alignForward(u32, @intCast(mo.router.n), 64) else @intCast(mo.router.n);
         const pipes = try k.rowPipelines();
-        const call = try row.call(pipes, mo.router, rows, false);
-        enc.setPipeline(call.pipeline);
-        enc.setBuffer(f.get(.input).buffer, 0, 0);
-        enc.setBuffer(mo.router.w, mo.router.w_off, 1);
-        enc.setBuffer(mo.router.scales, mo.router.s_off, 2);
-        enc.setBuffer(mo.router.biases, mo.router.b_off, 3);
-        enc.setValue(call.dims, 4);
-        enc.setBuffer(f.get(.router).buffer, 0, 5);
-        enc.dispatchGroups(.{ .width = call.groups }, .{ .width = call.threads });
+        if (units) {
+            const p = try k.naxPipes(.{ .bits = mo.router.bits, .group = @intCast(mo.router.group) });
+            const x = R{ .buf = f.get(.input).buffer };
+            const sums = R{ .buf = f.get(.expert_sums).buffer };
+            am.rowSums(enc, p, @intCast(mo.router.group), x, sums, rows, hidden);
+            enc.barrier();
+            am.dense(enc, p, x, sums, matrix(mo.router), R{ .buf = f.get(.router).buffer }, rows);
+        } else {
+            const call = try row.call(pipes, mo.router, rows, false);
+            enc.setPipeline(call.pipeline);
+            enc.setBuffer(f.get(.input).buffer, 0, 0);
+            enc.setBuffer(mo.router.w, mo.router.w_off, 1);
+            enc.setBuffer(mo.router.scales, mo.router.s_off, 2);
+            enc.setBuffer(mo.router.biases, mo.router.b_off, 3);
+            enc.setValue(call.dims, 4);
+            enc.setBuffer(f.get(.router).buffer, 0, 5);
+            enc.dispatchGroups(.{ .width = call.groups }, .{ .width = call.threads });
+        }
         enc.barrier();
         enc.setPipeline(k.route);
         enc.setBuffer(f.get(.router).buffer, 0, 0);
@@ -114,55 +125,59 @@ pub const Kernels = struct {
         enc.setValue(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .ld = @intCast(ld), .renorm = @intFromBool(c.renorm) }, 3);
         enc.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(@max(32, (experts + 31) / 32 * 32), 1, 1));
         enc.barrier();
-        if (k.sorted(mo, rows, prompt)) {
+        try span.end();
+        var products = profile.begin(k.profiler, e, .experts);
+        errdefer products.cancel();
+        const enc2 = products.encoder;
+        if (units) {
             const p = try k.naxPipes(.{ .bits = mo.gate.one.bits, .group = @intCast(mo.gate.one.group) });
-            enc.setPipeline(k.sort);
-            enc.setBuffer(f.get(.picks).buffer, 0, 0);
-            enc.setBuffer(f.get(.route_weights).buffer, 0, 1);
-            enc.setBuffer(f.get(.offsets).buffer, 0, 2);
-            enc.setBuffer(f.get(.order).buffer, 0, 3);
-            enc.setBuffer(f.get(.sorted_weights).buffer, 0, 4);
-            enc.setValue(SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }, 5);
-            enc.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
-            enc.barrier();
-            enc.setPipeline(k.gather);
-            enc.setBuffer(f.get(.input).buffer, 0, 0);
-            enc.setBuffer(f.get(.order).buffer, 0, 1);
-            enc.setBuffer(f.get(.sorted_rows).buffer, 0, 2);
-            enc.setValue([2]i32{ @intCast(hidden), @intCast(topk) }, 3);
-            enc.dispatchThreads(mtl.Size.of(hidden, slots, 1), mtl.Size.of(256, 1, 1));
-            enc.barrier();
+            enc2.setPipeline(k.sort);
+            enc2.setBuffer(f.get(.picks).buffer, 0, 0);
+            enc2.setBuffer(f.get(.route_weights).buffer, 0, 1);
+            enc2.setBuffer(f.get(.offsets).buffer, 0, 2);
+            enc2.setBuffer(f.get(.order).buffer, 0, 3);
+            enc2.setBuffer(f.get(.sorted_weights).buffer, 0, 4);
+            enc2.setValue(SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }, 5);
+            enc2.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
+            enc2.barrier();
+            enc2.setPipeline(k.gather);
+            enc2.setBuffer(f.get(.input).buffer, 0, 0);
+            enc2.setBuffer(f.get(.order).buffer, 0, 1);
+            enc2.setBuffer(f.get(.sorted_rows).buffer, 0, 2);
+            enc2.setValue([2]i32{ @intCast(hidden), @intCast(topk) }, 3);
+            enc2.dispatchThreads(mtl.Size.of(hidden, slots, 1), mtl.Size.of(256, 1, 1));
+            enc2.barrier();
             const sums = R{ .buf = f.get(.expert_sums).buffer };
             const offsets = R{ .buf = f.get(.offsets).buffer };
             const x = R{ .buf = f.get(.sorted_rows).buffer };
-            am.rowSums(enc, p, @intCast(mo.gate.one.group), x, sums, slots, hidden);
-            enc.barrier();
-            am.gather(enc, p, x, sums, matrix(mo.gate.one), offsets, R{ .buf = f.get(.expert_gate).buffer }, slots, experts);
-            am.gather(enc, p, x, sums, matrix(mo.up.one), offsets, R{ .buf = f.get(.expert_up).buffer }, slots, experts);
-            enc.barrier();
-            k.activation(enc, f, slots, inter);
-            enc.barrier();
+            am.rowSums(enc2, p, @intCast(mo.gate.one.group), x, sums, slots, hidden);
+            enc2.barrier();
+            am.gather(enc2, p, x, sums, matrix(mo.gate.one), offsets, R{ .buf = f.get(.expert_gate).buffer }, slots, experts);
+            am.gather(enc2, p, x, sums, matrix(mo.up.one), offsets, R{ .buf = f.get(.expert_up).buffer }, slots, experts);
+            enc2.barrier();
+            k.activation(enc2, f, slots, inter);
+            enc2.barrier();
             const act = R{ .buf = f.get(.expert_act).buffer };
-            am.rowSums(enc, p, @intCast(mo.down.one.group), act, sums, slots, inter);
-            enc.barrier();
-            am.gatherTo(enc, p, act, sums, matrix(mo.down.one), offsets, R{ .buf = f.get(.expert_out).buffer }, R{ .buf = f.get(.order).buffer }, slots, experts);
+            am.rowSums(enc2, p, @intCast(mo.down.one.group), act, sums, slots, inter);
+            enc2.barrier();
+            am.gatherTo(enc2, p, act, sums, matrix(mo.down.one), offsets, R{ .buf = f.get(.expert_out).buffer }, R{ .buf = f.get(.order).buffer }, slots, experts);
         } else {
-            try k.indexed(enc, pipes, mo.gate, slots, f.get(.input), f.get(.picks), f.get(.expert_gate));
-            try k.indexed(enc, pipes, mo.up, slots, f.get(.input), f.get(.picks), f.get(.expert_up));
-            enc.barrier();
-            k.activation(enc, f, slots, inter);
-            enc.barrier();
-            try k.indexed(enc, pipes, mo.down, slots, f.get(.expert_act), f.get(.picks), f.get(.expert_out));
+            try k.indexed(enc2, pipes, mo.gate, slots, f.get(.input), f.get(.picks), f.get(.expert_gate));
+            try k.indexed(enc2, pipes, mo.up, slots, f.get(.input), f.get(.picks), f.get(.expert_up));
+            enc2.barrier();
+            k.activation(enc2, f, slots, inter);
+            enc2.barrier();
+            try k.indexed(enc2, pipes, mo.down, slots, f.get(.expert_act), f.get(.picks), f.get(.expert_out));
         }
-        enc.barrier();
-        enc.setPipeline(k.combine);
-        enc.setBuffer(f.get(.expert_out).buffer, 0, 0);
-        enc.setBuffer(f.get(.route_weights).buffer, 0, 1);
-        enc.setBuffer(f.get(.router).buffer, 0, 2);
-        enc.setBuffer(f.get(.output).buffer, 0, 3);
-        enc.setValue(CombineArgs{ .hidden = @intCast(hidden), .topk = @intCast(topk), .ld = @intCast(ld), .experts = @intCast(experts) }, 4);
-        enc.dispatchThreads(mtl.Size.of(hidden, rows, 1), mtl.Size.of(256, 1, 1));
-        try span.end();
+        enc2.barrier();
+        enc2.setPipeline(k.combine);
+        enc2.setBuffer(f.get(.expert_out).buffer, 0, 0);
+        enc2.setBuffer(f.get(.route_weights).buffer, 0, 1);
+        enc2.setBuffer(f.get(.router).buffer, 0, 2);
+        enc2.setBuffer(f.get(.output).buffer, 0, 3);
+        enc2.setValue(CombineArgs{ .hidden = @intCast(hidden), .topk = @intCast(topk), .ld = @intCast(ld), .experts = @intCast(experts) }, 4);
+        enc2.dispatchThreads(mtl.Size.of(hidden, rows, 1), mtl.Size.of(256, 1, 1));
+        try products.end();
     }
 
     fn activation(k: *Kernels, e: mtl.ComputeEncoder, f: *const Frame, slots: u32, inter: u32) void {

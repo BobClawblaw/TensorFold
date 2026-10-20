@@ -140,12 +140,15 @@ pub fn main(init: std.process.Init) !void {
         try s.prefill(ids[0..@min(ids.len, 128)], 128);
         try runner.reset(0);
     }
+    var trace = profile.Trace{ .queue = m.queue };
+    if (profile_steps > 0) runner.profile(&trace);
+    // TF_PROFILE_PROMPT=1 (with --profile-steps) counts the prompt pass's kernels into the profile too
+    trace.enabled = profile_steps > 0 and std.c.getenv("TF_PROFILE_PROMPT") != null;
     const start = std.Io.Clock.awake.now(io);
     try s.prefill(ids, chunk);
     const prompt_ns = start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    trace.enabled = false;
     const digest = try s.fingerprint();
-    var trace = profile.Trace{ .queue = m.queue };
-    if (profile_steps > 0) runner.profile(&trace);
     const decode_start = std.Io.Clock.awake.now(io);
     const generation = try generated(a, s, count, force, expected, if (profile_steps > 0) &trace else null, profile_steps, teacher);
     if (std.c.getenv("TF_LOGITS_DUMP")) |v| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(v), .data = logits_dump.items });

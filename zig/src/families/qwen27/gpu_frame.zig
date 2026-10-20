@@ -9,8 +9,9 @@ pub const Field = enum { ids, dims, positions, hidden, residual, input, sums, mi
 /// A prompt pass's rows at most (a chain); rounds with trees and every logits row stay within `logit_rows`.
 pub const max_rows = 2048;
 
+/// The router's output pitch: its rows rounded up to the tensor units' 64 (core.affine_mm.dense).
 fn routerRows(config: Config) usize {
-    return if (config.moe()) @import("widths.zig").routerRows(config.experts) else 0;
+    return if (config.moe()) std.mem.alignForward(usize, @import("widths.zig").routerRows(config.experts), 64) else 0;
 }
 pub const logit_rows = 128;
 
