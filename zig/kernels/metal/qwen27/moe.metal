@@ -84,7 +84,7 @@ struct CombineArgs { int hidden, topk, shared_in_out, pad; };
   }
 }
 
-// Routed slots (id < experts) sorted by expert (stable) for core/affine_mm: OFFS (first slots, then the end), ORDER, WS.
+// Routed slots (id < experts) sorted by expert (stable) for core/affine_mm: OFFS (first slots, the end), ORDER, WS.
 [[kernel]] void q27_route_sort(const device uint* PICK [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
                                device int* OFFS [[buffer(2)]], device int* ORDER [[buffer(3)]],
                                device float* WS [[buffer(4)]], constant SortArgs& a [[buffer(5)]],
@@ -124,8 +124,7 @@ struct CombineArgs { int hidden, topk, shared_in_out, pad; };
   OUT[i] = bfloat(gate / (1.0f + exp(-gate)) * float(U[i]));
 }
 
-// OUT[r] becomes bf16(bf16(sum_k bf16(Y[slot k] * w_k)) + bf16(sigma * shared)): the shared row is OUT[r] itself
-// (shared_in_out, a prompt chunk's lane product) or slot topk of Y (a decode row's extra slot); sigma is its weight.
+// OUT[r] = bf16(bf16(sum_k bf16(Y[k] * w_k)) + bf16(sigma * shared)); shared: OUT[r] (shared_in_out) or Y's slot topk.
 [[kernel]] void q27_expert_combine(const device bfloat* Y [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
                                    device bfloat* OUT [[buffer(2)]], constant CombineArgs& a [[buffer(3)]],
                                    uint2 g [[thread_position_in_grid]]) {

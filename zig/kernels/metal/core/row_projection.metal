@@ -190,7 +190,7 @@ template <int RPS, int SG, bool RELU2, int BITS, bool BF16SUM>
   if (lane == 0)
     for (int j = 0; j < RPS; j++) out[j] = tf_rp_out<RELU2>(acc[0][j]);
 }
-// `tf_row_projection_indexed` with an extra matrix at id `experts` (buffers 7-9): a shared expert rides with the routed ones.
+// tf_row_projection_indexed with an extra matrix at id `experts` (buffers 7-9): a shared expert among the routed ones.
 template <int RPS, int SG, bool RELU2, int BITS, bool BF16SUM>
 [[kernel]] void tf_row_projection_indexed_extra(const device bfloat* X [[buffer(0)]],
                                           const device uint32_t* W [[buffer(1)]],

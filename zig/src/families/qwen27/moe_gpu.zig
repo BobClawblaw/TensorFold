@@ -82,8 +82,7 @@ pub const Kernels = struct {
         return g.bits == mo.up.one.bits and g.group == mo.up.one.group and g.bits == mo.down.one.bits and g.group == mo.down.one.group;
     }
 
-    /// f.output becomes the block's rows: the weighted experts plus the gated shared expert, which a prompt chunk's lane
-    /// product left in f.output and a decode row runs as one more slot of the experts' kernel.
+    /// f.output becomes the weighted experts plus the gated shared expert (f.output for a prompt chunk, else a slot).
     pub fn block(k: *Kernels, e: mtl.ComputeEncoder, c: Config, mo: *const wts.Moe, f: *const Frame, rows: u32, prompt: bool) !void {
         var span = profile.begin(k.profiler, e, .route);
         errdefer span.cancel();
