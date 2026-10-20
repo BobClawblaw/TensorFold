@@ -18,7 +18,8 @@ const help =
     \\--compare-chunk reruns the whole prompt and decode and checks prompt state/KV/logits bytes.
     \\--seams N (with --compare-chunk): state/KV/logits bytes every N prompt rows under both chunks and after decode.
     \\CPU only: --help or --emit-sources EXISTING_DIR, no Metal device or model load.
-    \\TF_LAYERS=N runs the first N layers only; TF_LOGITS_DUMP=FILE writes every step's bf16 logits row (a port's checks).
+    \\TF_LAYERS=N runs the first N layers only; TF_LOGITS_DUMP=FILE writes every step's bf16 logits row (a port's checks);
+    \\TF_PROFILE_PROMPT=1 with --profile-steps counts the prompt pass's kernels into the profile.
 ;
 
 fn tokens(a: std.mem.Allocator, io: std.Io, file: []const u8) ![]const u32 {

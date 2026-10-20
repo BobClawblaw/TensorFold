@@ -94,7 +94,7 @@ pub const Kernels = struct {
         const inter: u32 = @intCast(c.moe_intermediate);
         const units = k.sorted(mo, rows, prompt);
         // the router's bf16 logits [rows, ld] (column `experts`: the shared gate), on tensor units or the row kernel
-        const ld: u32 = if (units) std.mem.alignForward(u32, @intCast(mo.router.n), 64) else @intCast(mo.router.n);
+        const ld: u32 = @intCast(mo.router.n); // a multiple of 64: both paths write that pitch
         const pipes = try k.rowPipelines();
         if (units) {
             const p = try k.naxPipes(.{ .bits = mo.router.bits, .group = @intCast(mo.router.group) });
