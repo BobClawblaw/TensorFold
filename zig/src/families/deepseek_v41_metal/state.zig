@@ -148,7 +148,7 @@ pub const Scratch = struct {
     wsort: mtl.Buffer,
     xsort: mtl.Buffer,
     sums: mtl.Buffer,
-    /// bf16 [rows, 24 x 256] a layer, filled on the host: two sets, so a chunk's can be gathered while the one before runs.
+    /// bf16 [rows, 24 x 256] a layer, filled on the host: two sets, so a chunk's gather overlaps the chunk before.
     engram_rows: [2][c.engram_layers.len]mtl.Buffer,
     /// The set this call's rows read.
     engram_set: u8,

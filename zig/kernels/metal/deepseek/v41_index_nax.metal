@@ -1,6 +1,4 @@
-// DeepSeek-V4.1-Flash's index scores for a prompt chunk on the tensor units: row r's score of key t is the sum over heads
-// in order of bf16(relu(bf16(q_h . k_t)) * w_h), rounded to bf16, as v41_index.metal's ds_index_scores sums it; only the
-// dot's fp32 order is the op's rather than the lane loop's.
+// Prompt index scores on the tensor units: ds_index_scores's bf16 head sum, the dot in the op's order
 #include <metal_stdlib>
 using namespace metal;
 #include "../nax.h"
@@ -32,8 +30,7 @@ inline frag<bfloat> ix_frag(const device bfloat* r0, const device bfloat* r1, in
 #endif
 }
 
-// Grid (64-key tiles, 64-row tiles): 4 simdgroups of 32 rows x 32 keys. A key past a row's visible keys scores -inf
-// (ds_topk takes finite scores only); a tile past every row's is written so and skipped.
+// 64-key by 64-row tiles, 4 simdgroups of 32x32; keys past a row's visible ones score -inf, whole such tiles skipped
 [[kernel]] void ds_index_scores_nax(const device bfloat* Q [[buffer(0)]], const device bfloat* WT [[buffer(1)]],
                                     const device bfloat* K [[buffer(2)]], device float* SCORE [[buffer(3)]],
                                     constant ScoreArgs& a [[buffer(4)]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -93,7 +90,7 @@ inline frag<bfloat> ix_frag(const device bfloat* r0, const device bfloat* r1, in
         mma_16x32<false, true>(s[m][0], s[m][1], qa, k0, k1);
       }
     }
-    // the head's term as the lane loop makes it: bf16 dot, relu, times the weight, bf16; the terms summed in fp32 in head order
+    // the head's term as the lane loop makes it: bf16 dot, relu, times the weight, bf16; summed in fp32 in head order
     TF_UNROLL
     for (short m = 0; m < 2; m++) {
       const float w0 = float(wr[m][0][hd]), w1 = float(wr[m][1][hd]);

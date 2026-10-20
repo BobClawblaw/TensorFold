@@ -12,7 +12,7 @@ const Model = @import("model.zig").Model;
 const draw = @import("../lfm2_moe/backend.zig").draw;
 const be = lanes.backend;
 
-/// `chunk`: a lone stream's prompt rows a call (the scratch); `shared_chunk`: a prompt's rows a call beside other streams.
+/// `chunk`: a lone stream's prompt rows a call (the scratch); `shared_chunk`: its rows a call beside other streams.
 pub const Options = struct { capacity: usize, chunk: usize = 1024, shared_chunk: usize = 1024 };
 
 /// The widest window: the pending row and the head's five drafts.

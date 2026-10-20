@@ -11,6 +11,7 @@ const idx = @import("index.zig");
 const ffn = @import("moe.zig");
 const dspark = @import("draft.zig");
 const layer = @import("layer.zig");
+const ahead = @import("ahead.zig");
 const Buffer = mtl.Buffer;
 
 pub const Head = enum { last, all, none };
@@ -26,7 +27,7 @@ pub const Vis = struct {
     codes: []const i32,
     rows: Buffer,
 
-    fn code(v: ?*const Vis, pos: usize) i32 {
+    pub fn code(v: ?*const Vis, pos: usize) i32 {
         const x = v orelse return -1;
         return if (pos < x.codes.len) x.codes[pos] else -1;
     }
@@ -450,32 +451,6 @@ pub fn many(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head) !void {
     return runSegs(m, s, segs, head, null, null, null);
 }
 
-fn hashOf(tokens: []const u32) u64 {
-    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tokens));
-}
-
-/// Whether `s.prepared` holds this call's rows: the same cache at the same rows, its ids appended, the tokens the same.
-fn preparedFor(s: *const st.Scratch, g: Seg) bool {
-    const p = s.prepared orelse return false;
-    return p.cache == g.cache and p.base == g.cache.len and p.n == g.tokens.len and g.cache.engram_ids.items.len == p.base + p.n and p.hash == hashOf(g.tokens);
-}
-
-/// The next chunk's engram ids and rows into the other set, recorded in `s.prepared`; on any failure, nothing is kept.
-fn prepare(m: *Model, s: *st.Scratch, cache: *st.Cache, base: usize, nx: Next) void {
-    const n = nx.tokens.len;
-    if (n == 0 or n > s.rows or base + n > cache.capacity or cache.engram_ids.items.len != base) return;
-    const set: u8 = 1 - s.engram_set;
-    for (nx.tokens, 0..) |t, i| cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, Vis.code(nx.vis, base + i) == -1));
-    var dsts: [c.engram_layers.len][]u16 = undefined;
-    const width = c.engram_cols * c.engram_dim;
-    for (&dsts, s.engram_rows[set]) |*d, b| d.* = b.slice(u16, n * width);
-    m.engram.gatherRows(cache.engram_ids.items, base, n, dsts) catch {
-        cache.engram_ids.shrinkRetainingCapacity(base);
-        return;
-    };
-    s.prepared = .{ .cache = cache, .base = base, .n = n, .hash = hashOf(nx.tokens), .set = set };
-}
-
 fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump, vis: ?*const Vis, next: ?Next) !void {
     var rows: usize = 0;
     for (segs) |g| {
@@ -492,8 +467,8 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
     var images = false;
     var dsts: [c.engram_layers.len][]u16 = undefined;
     var host: f64 = 0;
-    // a lone chunk gathered ahead (runChunk's `next` the call before) keeps its ids and rows; anything else is gathered now
-    const ready = segs.len == 1 and preparedFor(s, segs[0]);
+    // a lone chunk gathered ahead (runChunk's `next` the call before) keeps its ids and rows; the rest is gathered now
+    const ready = segs.len == 1 and ahead.preparedFor(s, segs[0]);
     if (ready) s.engram_set = s.prepared.?.set;
     s.prepared = null;
     for (segs) |g| {
@@ -586,7 +561,7 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
     if (next) |nx| if (segs.len == 1) { // the next chunk's engram rows, on the host while the GPU runs this one
         var a0: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &a0);
-        prepare(m, s, segs[0].cache, segs[0].cache.len + rows, nx);
+        ahead.prepare(m, s, segs[0].cache, segs[0].cache.len + rows, nx);
         var a1: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &a1);
         if (profile) |p| p[11] += secs(a0, a1);
