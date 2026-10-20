@@ -1,5 +1,4 @@
-//! The routed block on the GPU: the router's row kernel, the route, the experts by id (row kernels) or sorted by
-//! expert on the tensor units (core.affine_mm), their SwiGLU, and the combine over the shared expert's output.
+//! The routed block on the GPU: router, route, experts by id (row kernels) or sorted (core.affine_mm), SwiGLU, combine.
 const std = @import("std");
 const mtl = @import("metal");
 const core = @import("core");
@@ -83,8 +82,7 @@ pub const Kernels = struct {
         return g.bits == mo.up.one.bits and g.group == mo.up.one.group and g.bits == mo.down.one.bits and g.group == mo.down.one.group;
     }
 
-    /// f.output, the shared expert's rows of f.input's normed rows, becomes the block's: the routed experts' weighted
-    /// rows plus the gated shared one.
+    /// f.output (the shared expert's rows of f.input) becomes the block's: weighted experts plus the gated shared row.
     pub fn block(k: *Kernels, e: mtl.ComputeEncoder, c: Config, mo: *const wts.Moe, f: *const Frame, rows: u32, prompt: bool) !void {
         var span = profile.begin(k.profiler, e, .route);
         errdefer span.cancel();
@@ -95,8 +93,7 @@ pub const Kernels = struct {
         const hidden: u32 = @intCast(c.hidden);
         const inter: u32 = @intCast(c.moe_intermediate);
         const units = k.sorted(mo, rows, prompt);
-        // the router: bf16 logits [rows, ld], the shared gate's in column `experts`; a prompt chunk's rows on the
-        // tensor units (y's pitch is n rounded up to 64), decode rows through the row kernel (pitch n)
+        // the router's bf16 logits [rows, ld] (column `experts`: the shared gate), on tensor units or the row kernel
         const ld: u32 = if (units) std.mem.alignForward(u32, @intCast(mo.router.n), 64) else @intCast(mo.router.n);
         const pipes = try k.rowPipelines();
         if (units) {

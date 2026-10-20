@@ -1,4 +1,4 @@
-//! Qwen3.5-class text shapes (dense, or routed experts), layer schedule, rotary metadata and ordered checkpoint EOS ids.
+//! Qwen3.5-class text shapes (dense or routed), layer schedule, rotary metadata and ordered checkpoint EOS ids.
 const std = @import("std");
 
 pub const Kind = enum { linear, attention };

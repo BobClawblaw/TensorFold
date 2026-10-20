@@ -1,5 +1,4 @@
-//! DFlash2 is a separate GQA contract (five layers tapping the 27B at five blocks, six tapping Ornith at eight); the
-//! target's GDN and draft conventions are not interchangeable.
+//! DFlash2 is a separate GQA contract (five layers over the 27B's taps, six over Ornith's eight), not the target's.
 const std = @import("std");
 pub const repository = "z-lab/Qwen3.8-27B-DFlash2";
 pub const max_taps = 8;

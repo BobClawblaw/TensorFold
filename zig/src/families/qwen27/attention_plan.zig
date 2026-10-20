@@ -29,7 +29,7 @@ pub const Geometry = struct {
     /// Chains of rows take the prefix kernel to their last key; a test turns this off to compare with the tail kernel.
     fuse_chain: bool = true,
     pub fn check(g: Geometry) !void {
-        // the kernels' 16-row tiles hold one KV group of up to 16 query heads: the 27B's 24 over 4 and Ornith's 32 over 2
+        // a 16-row tile holds one KV group of up to 16 query heads: the 27B's 24 over 4, Ornith's 32 over 2
         const grouped = (g.heads == 24 and g.kv_heads == 4) or (g.heads == 32 and g.kv_heads == 2);
         if (!grouped or g.dim != 256 or g.rotary != 64) return error.TargetAttentionShape;
     }

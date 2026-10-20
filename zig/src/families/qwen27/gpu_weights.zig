@@ -14,7 +14,7 @@ pub const Tensor = cp.Tensor;
 
 pub const Gdn = struct { qkv: Linear, zba: Linear, out: Linear, conv: Tensor, a_log: Tensor, dt: Tensor, norm: Tensor };
 pub const Attention = struct { q: Linear, kv: Linear, out: Linear, q_norm: Tensor, k_norm: Tensor };
-/// The routed block: the router's rows (the experts, then the shared expert's gate, then zero rows) and the stacked experts.
+/// The routed block: the router's rows (the experts, the shared gate, then zero rows) and the stacked experts.
 pub const Moe = struct { router: row.Weights, gate: row.Experts, up: row.Experts, down: row.Experts };
 /// With experts, `gu` and `down` are the shared expert's.
 pub const Layer = struct { norm: Tensor, post_norm: Tensor, gu: Linear, down: Linear, moe: ?Moe = null, mixer: union(@import("config.zig").Kind) { linear: Gdn, attention: Attention } };

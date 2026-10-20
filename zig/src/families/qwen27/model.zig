@@ -106,9 +106,7 @@ pub const Model = struct {
     }
 };
 
-/// A prompt pass's rows: 512, or 1,024 with routed experts (a chunk reads every expert's weights once, so wider
-/// chunks prefill faster: 2,230, 2,580 and 2,760 tok/s at 512, 1,024 and 2,048 on Ornith-1.5-122B); TF_PROMPT_ROWS
-/// takes another multiple of 16 up to the frame's 2048.
+/// A prompt pass's rows: 512, or 1,024 with experts (a chunk reads every expert once); TF_PROMPT_ROWS: 16 to 2048.
 pub fn promptRows(c: cfg.Config) u32 {
     const default: u32 = if (c.moe()) 1024 else 512;
     const v = std.c.getenv("TF_PROMPT_ROWS") orelse return default;

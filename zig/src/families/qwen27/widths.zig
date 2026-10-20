@@ -199,8 +199,7 @@ fn check(chip: Chip, n: usize, k: usize, w: Width) !void {
     return (row.Weights{ .w = undefined, .scales = undefined, .biases = undefined, .n = n, .k = k, .group = w.group }).validate();
 }
 
-/// The routed block's kernels: the router and the shared gate share one row matrix; the experts take the row kernels
-/// by id and, on tensor units, core.affine_mm's gathers (whose format admits 2-6 and 8 bits at groups 32, 64 and 128).
+/// The routed block's kernels: the router's row matrix; the experts' row kernels and (tensor units) affine_mm gathers.
 fn checkRouted(c: cfg.Config, chip: Chip, m: Member, w: Width) !void {
     const s = shape(c, m);
     if (std.mem.indexOfScalar(u8, chip.row_bits, w.bits) == null) return error.UnsupportedRowBits;
