@@ -3,6 +3,7 @@ const std = @import("std");
 const picture = @import("../../core/picture/picture.zig");
 const png = @import("../../core/picture/png.zig");
 const jpeg = @import("../../core/picture/jpeg.zig");
+const webp = @import("../../core/picture/webp.zig");
 const resample = @import("../../core/picture/resample.zig");
 const identity = @import("../../core/picture/identity.zig");
 const vision = @import("vision.zig");
@@ -67,12 +68,13 @@ pub fn plan(width: u32, height: u32, max_tokens: u32) Error!Plan {
     return .{ .best_h = @intCast(best_h), .best_w = @intCast(best_w) };
 }
 
-/// The bytes as convert("RGB") sees them: PNG or JPEG samples as stored, alpha dropped, gray spread to three.
+/// The bytes as convert("RGB") sees them: PNG, JPEG or WebP samples as stored, alpha dropped, gray spread to three.
 fn rgb(io: std.Io, a: std.mem.Allocator, bytes: []const u8) Error!picture.Rgb {
     const s = switch (picture.sniff(bytes)) {
         .png => try png.decode(a, bytes),
         .jpeg => try jpeg.decode(io, a, bytes),
-        .webp, .unknown => return error.Invalid,
+        .webp => try webp.decode(io, a, bytes),
+        .unknown => return error.Invalid,
     };
     defer a.free(s.data);
     const out = try a.alloc(u8, s.width * s.height * 3);
