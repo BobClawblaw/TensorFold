@@ -103,6 +103,10 @@ pub const Stages = struct {
                 try m.kernels.addAne(lane.enc, .{ .buffer = share.partial }, .{ .buffer = share.outputs[slice].buffer }, f.get(.output), h, width, share.columns, @min(ane_mlp.width, s.rows - base), base);
             }
             lane.enc.barrier();
+            if (layer.moe) |*mo| {
+                try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+                lane.enc.barrier();
+            }
             s.pending = f.get(.output);
             return;
         } else {
@@ -113,6 +117,11 @@ pub const Stages = struct {
         lane.enc.barrier();
         try m.kernels.quant(lane.enc, layer.down, f.get(.activated), sums(f, .act_sums, s.rows), f.get(.dims), f.get(.output), s.rows);
         lane.enc.barrier();
+        if (layer.moe) |*mo| {
+            // the shared expert's rows in f.output take the routed experts' weighted rows and the shared gate
+            if (std.c.getenv("TF_NO_ROUTED") == null) try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+            lane.enc.barrier();
+        }
         s.pending = f.get(.output);
     }
     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {

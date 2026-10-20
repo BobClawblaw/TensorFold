@@ -1,4 +1,4 @@
-//! Dense Qwen text shapes, layer schedule, rotary metadata and ordered checkpoint EOS ids.
+//! Qwen3.5-class text shapes (dense, or routed experts), layer schedule, rotary metadata and ordered checkpoint EOS ids.
 const std = @import("std");
 
 pub const Kind = enum { linear, attention };
@@ -27,6 +27,17 @@ pub const Config = struct {
     eos_count: usize = 0,
     max_position: usize = 262144,
     mrope_interleaved: bool = true,
+    /// Routed experts (qwen3_5_moe): their count and the picks a row makes; 0: a dense MLP of `intermediate`.
+    experts: usize = 0,
+    top_k: usize = 0,
+    /// A routed expert's width; `intermediate` is then the shared expert's (the same, as the CUDA family requires).
+    moe_intermediate: usize = 0,
+    /// Whether a row's top-k softmax weights are renormalized to sum to one (`norm_topk_prob`).
+    renorm: bool = false,
+
+    pub fn moe(c: Config) bool {
+        return c.experts != 0;
+    }
 
     pub fn kind(c: Config, layer: usize) Kind {
         return c.kinds[layer];
@@ -119,8 +130,13 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
     const root = try object(parsed.value);
     const t = if (root.get("text_config")) |v| try object(v) else root;
     const model = t.get("model_type") orelse root.get("model_type") orelse return error.BadConfig;
-    if (model != .string or (!std.mem.eql(u8, model.string, "qwen3_5") and !std.mem.eql(u8, model.string, "qwen3_5_text"))) return error.NotQwenDense;
-    if (t.get("num_experts")) |v| if (try integer(v, true) != 0) return error.NotQwenDense;
+    const kinds_of = [_][]const u8{ "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text" };
+    if (model != .string) return error.NotQwenDense;
+    const routed = for (kinds_of, 0..) |k, i| {
+        if (std.mem.eql(u8, model.string, k)) break i >= 2;
+    } else return error.NotQwenDense;
+    const experts = if (t.get("num_experts")) |v| try integer(v, true) else 0;
+    if (routed != (experts != 0)) return error.NotQwenDense;
     if (try flag(root, "tie_word_embeddings") or try flag(t, "tie_word_embeddings")) return error.TiedEmbeddingHead;
     if (t.get("attn_output_gate")) |v| if (v != .bool or !v.bool) return error.UnsupportedAttentionGate;
     inline for (.{ .{ "hidden_act", "silu" }, .{ "output_gate_type", "swish" }, .{ "linear_attn_state_dtype", "float32" } }) |entry| {
@@ -137,7 +153,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
     if (factor <= 0 or factor > 1) return error.BadConfig;
     var c = Config{
         .hidden = hidden,
-        .intermediate = try required(t, "intermediate_size"),
+        .intermediate = if (routed) try required(t, "shared_expert_intermediate_size") else try required(t, "intermediate_size"),
         .layers = try required(t, "num_hidden_layers"),
         .vocab = try required(t, "vocab_size"),
         .heads = heads,
@@ -152,6 +168,13 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
         .rope_dims = @intFromFloat(@as(f64, @floatFromInt(head_dim)) * factor),
         .rope_theta = if (rope) |r| try optional(r, "rope_theta", try optional(t, "rope_theta", 10000000)) else try optional(t, "rope_theta", 10000000),
     };
+    if (routed) {
+        c.experts = experts;
+        c.top_k = try required(t, "num_experts_per_tok");
+        c.moe_intermediate = try required(t, "moe_intermediate_size");
+        c.renorm = try flag(t, "norm_topk_prob");
+        if (c.experts > 256 or c.top_k >= c.experts or c.top_k > 15 or c.moe_intermediate != c.intermediate) return error.UnsupportedRouting;
+    }
     if (t.get("max_position_embeddings")) |v| c.max_position = try integer(v, false);
     if (rope) |r| if (r.get("mrope_interleaved")) |v| {
         if (v != .bool or !v.bool) return error.UnsupportedMrope;

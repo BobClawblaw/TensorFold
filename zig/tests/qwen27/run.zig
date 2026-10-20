@@ -48,6 +48,8 @@ fn emit(a: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
 }
 const Difference = struct { position: usize, expected: ?u32, actual: u32, top2: q.session.TopTwo };
 const Generated = struct { tokens: []u32, first_difference: ?Difference, top2: ?[]q.session.TopTwo };
+/// TF_LOGITS_DUMP names a file that takes every step's bf16 logits row (a check's teacher-forced distributions).
+var logits_dump: std.ArrayList(u8) = .empty;
 fn generated(a: std.mem.Allocator, s: q.session.Session, count: usize, force: bool, expected: ?[]const u32, trace: ?*profile.Trace, profile_steps: usize, teacher: bool) !Generated {
     var out: std.ArrayList(u32) = .empty;
     var difference: ?Difference = null;
@@ -55,6 +57,7 @@ fn generated(a: std.mem.Allocator, s: q.session.Session, count: usize, force: bo
     for (0..count) |i| {
         const token = try s.greedy();
         if (margins) |values| values[i] = try q.session.topTwo(s.runner.model.frame.get(.logits).buffer.slice(u16, s.runner.model.config.vocab));
+        if (std.c.getenv("TF_LOGITS_DUMP") != null) try logits_dump.appendSlice(a, std.mem.sliceAsBytes(s.runner.model.frame.get(.logits).buffer.slice(u16, s.runner.model.config.vocab)));
         if (expected) |wanted| if (difference == null and (i >= wanted.len or token != wanted[i])) {
             difference = .{ .position = i, .expected = if (i < wanted.len) wanted[i] else null, .actual = token, .top2 = try q.session.topTwo(s.runner.model.frame.get(.logits).buffer.slice(u16, s.runner.model.config.vocab)) };
         };
@@ -144,6 +147,21 @@ pub fn main(init: std.process.Init) !void {
     if (profile_steps > 0) runner.profile(&trace);
     const decode_start = std.Io.Clock.awake.now(io);
     const generation = try generated(a, s, count, force, expected, if (profile_steps > 0) &trace else null, profile_steps, teacher);
+    if (std.c.getenv("TF_LOGITS_DUMP")) |v| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(v), .data = logits_dump.items });
+    if (std.c.getenv("TF_ROUTE_DUMP")) |v| {
+        // the frame's last pass's picks and weights (its last layer): a port's routing check
+        const f = &s.runner.model.frame;
+        const n = f.slotsOf(@intCast(ids.len));
+        const picks = std.mem.sliceAsBytes(f.get(.picks).buffer.slice(u32, n));
+        const weights = std.mem.sliceAsBytes(f.get(.route_weights).buffer.slice(f32, n));
+        const h = s.runner.model.config.hidden;
+        const out_rows = std.mem.sliceAsBytes(f.get(.output).buffer.slice(u16, ids.len * h));
+        const expert_rows = std.mem.sliceAsBytes(f.get(.expert_out).buffer.slice(u16, n * h));
+        const hid = std.mem.sliceAsBytes(f.get(.hidden).buffer.slice(u16, ids.len * h));
+        const res = std.mem.sliceAsBytes(f.get(.residual).buffer.slice(u16, ids.len * h));
+        const both = try std.mem.concat(a, u8, &.{ picks, weights, out_rows, expert_rows, hid, res });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(v), .data = both });
+    }
     const out = generation.tokens;
     const decode_ns = decode_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     const decoded = if (compare > 0) try s.fingerprint() else digest;
