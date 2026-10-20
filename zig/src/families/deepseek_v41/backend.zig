@@ -401,6 +401,9 @@ pub const Metal = struct {
         const self = cast(ptr);
         self.endFill(stream);
         if (self.caches.fetchRemove(stream)) |entry| {
+            if (self.scratch.prepared) |p| if (p.cache == entry.value) { // a chunk gathered ahead for this stream
+                self.scratch.prepared = null;
+            };
             entry.value.deinit();
             self.gpa.destroy(entry.value);
         }
