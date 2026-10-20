@@ -23,7 +23,7 @@ pub const Frame = struct {
     pub fn init(device: mtl.Device, config: Config, capacity: u32) !Frame {
         if (capacity == 0 or capacity > max_rows) return error.BadFrameRows;
         const mp = 16 * ((capacity + 15) / 16);
-        const slots: usize = if (config.moe()) capacity * config.top_k else 0;
+        const slots: usize = if (config.moe()) capacity * (config.top_k + 1) else 0; // a row's picks and its shared expert
         const widths = [_]usize{
             capacity * 4,                                                                       8 * 4,                                                                                                                                  3 * capacity * 4,
             capacity * config.hidden * 2,                                                       capacity * config.hidden * 2,                                                                                                           capacity * config.hidden * 2,
@@ -56,9 +56,9 @@ pub const Frame = struct {
         return .{ .buffers = buffers, .capacity = capacity, .config = config };
     }
 
-    /// Routed slots a pass of `rows` makes: each row's top-k picks.
+    /// Slots a pass of `rows` makes: each row's top-k picks and its shared expert.
     pub fn slotsOf(frame: *const Frame, rows: u32) u32 {
-        return rows * @as(u32, @intCast(frame.config.top_k));
+        return rows * @as(u32, @intCast(frame.config.top_k + 1));
     }
 
     pub fn deinit(frame: *Frame) void {

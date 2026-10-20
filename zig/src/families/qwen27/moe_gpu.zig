@@ -14,7 +14,7 @@ const Ref = @import("projection.zig").Ref;
 const RouteArgs = extern struct { experts: i32, topk: i32, ld: i32, renorm: i32 };
 const SortArgs = extern struct { slots: i32, experts: i32 };
 const GluArgs = extern struct { width: i32 };
-const CombineArgs = extern struct { hidden: i32, topk: i32, ld: i32, experts: i32 };
+const CombineArgs = extern struct { hidden: i32, topk: i32, shared_in_out: i32, pad: i32 = 0 };
 const R = struct { buf: mtl.Buffer, off: usize = 0 };
 const Matrix = struct { w: R, s: R, b: R, n: u32, k: u32 };
 const Key = struct { bits: u8, group: u16 };
@@ -82,16 +82,18 @@ pub const Kernels = struct {
         return g.bits == mo.up.one.bits and g.group == mo.up.one.group and g.bits == mo.down.one.bits and g.group == mo.down.one.group;
     }
 
-    /// f.output (the shared expert's rows of f.input) becomes the block's: weighted experts plus the gated shared row.
+    /// f.output becomes the block's rows: the weighted experts plus the gated shared expert, which a prompt chunk's lane
+    /// product left in f.output and a decode row runs as one more slot of the experts' kernel.
     pub fn block(k: *Kernels, e: mtl.ComputeEncoder, c: Config, mo: *const wts.Moe, f: *const Frame, rows: u32, prompt: bool) !void {
         var span = profile.begin(k.profiler, e, .route);
         errdefer span.cancel();
         const enc = span.encoder;
-        const slots = f.slotsOf(rows);
+        const slots = f.slotsOf(rows); // each row's picks and its shared expert
         const experts: u32 = @intCast(c.experts);
         const topk: u32 = @intCast(c.top_k);
         const hidden: u32 = @intCast(c.hidden);
         const inter: u32 = @intCast(c.moe_intermediate);
+        const routed = rows * topk; // the sorted path's slots: the picks alone
         const units = k.sorted(mo, rows, prompt);
         // the router's bf16 logits [rows, ld] (column `experts`: the shared gate), on tensor units or the row kernel
         const ld: u32 = @intCast(mo.router.n); // a multiple of 64: both paths write that pitch
@@ -134,45 +136,45 @@ pub const Kernels = struct {
             enc2.setBuffer(f.get(.offsets).buffer, 0, 2);
             enc2.setBuffer(f.get(.order).buffer, 0, 3);
             enc2.setBuffer(f.get(.sorted_weights).buffer, 0, 4);
-            enc2.setValue(SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }, 5);
+            enc2.setValue(SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }, 5); // the shared slots skipped
             enc2.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
             enc2.barrier();
             enc2.setPipeline(k.gather);
             enc2.setBuffer(f.get(.input).buffer, 0, 0);
             enc2.setBuffer(f.get(.order).buffer, 0, 1);
             enc2.setBuffer(f.get(.sorted_rows).buffer, 0, 2);
-            enc2.setValue([2]i32{ @intCast(hidden), @intCast(topk) }, 3);
-            enc2.dispatchThreads(mtl.Size.of(hidden, slots, 1), mtl.Size.of(256, 1, 1));
+            enc2.setValue([2]i32{ @intCast(hidden), @intCast(topk + 1) }, 3);
+            enc2.dispatchThreads(mtl.Size.of(hidden, routed, 1), mtl.Size.of(256, 1, 1));
             enc2.barrier();
             const sums = R{ .buf = f.get(.expert_sums).buffer };
             const offsets = R{ .buf = f.get(.offsets).buffer };
             const x = R{ .buf = f.get(.sorted_rows).buffer };
-            am.rowSums(enc2, p, @intCast(mo.gate.one.group), x, sums, slots, hidden);
+            am.rowSums(enc2, p, @intCast(mo.gate.one.group), x, sums, routed, hidden);
             enc2.barrier();
-            am.gather(enc2, p, x, sums, matrix(mo.gate.one), offsets, R{ .buf = f.get(.expert_gate).buffer }, slots, experts);
-            am.gather(enc2, p, x, sums, matrix(mo.up.one), offsets, R{ .buf = f.get(.expert_up).buffer }, slots, experts);
+            am.gather(enc2, p, x, sums, matrix(mo.gate.one), offsets, R{ .buf = f.get(.expert_gate).buffer }, routed, experts);
+            am.gather(enc2, p, x, sums, matrix(mo.up.one), offsets, R{ .buf = f.get(.expert_up).buffer }, routed, experts);
             enc2.barrier();
-            k.activation(enc2, f, slots, inter);
+            k.activation(enc2, f, routed, inter);
             enc2.barrier();
             const act = R{ .buf = f.get(.expert_act).buffer };
-            am.rowSums(enc2, p, @intCast(mo.down.one.group), act, sums, slots, inter);
+            am.rowSums(enc2, p, @intCast(mo.down.one.group), act, sums, routed, inter);
             enc2.barrier();
-            am.gatherTo(enc2, p, act, sums, matrix(mo.down.one), offsets, R{ .buf = f.get(.expert_out).buffer }, R{ .buf = f.get(.order).buffer }, slots, experts);
+            am.gatherTo(enc2, p, act, sums, matrix(mo.down.one), offsets, R{ .buf = f.get(.expert_out).buffer }, R{ .buf = f.get(.order).buffer }, routed, experts);
         } else {
-            try k.indexed(enc2, pipes, mo.gate, slots, f.get(.input), f.get(.picks), f.get(.expert_gate));
-            try k.indexed(enc2, pipes, mo.up, slots, f.get(.input), f.get(.picks), f.get(.expert_up));
+            // every slot through the experts' kernel, the shared expert as the extra matrix of each product
+            try k.indexed(enc2, pipes, mo.gate, mo.shared_gate, slots, f.get(.input), f.get(.picks), f.get(.expert_gate));
+            try k.indexed(enc2, pipes, mo.up, mo.shared_up, slots, f.get(.input), f.get(.picks), f.get(.expert_up));
             enc2.barrier();
             k.activation(enc2, f, slots, inter);
             enc2.barrier();
-            try k.indexed(enc2, pipes, mo.down, slots, f.get(.expert_act), f.get(.picks), f.get(.expert_out));
+            try k.indexed(enc2, pipes, mo.down, mo.shared_down, slots, f.get(.expert_act), f.get(.picks), f.get(.expert_out));
         }
         enc2.barrier();
         enc2.setPipeline(k.combine);
         enc2.setBuffer(f.get(.expert_out).buffer, 0, 0);
         enc2.setBuffer(f.get(.route_weights).buffer, 0, 1);
-        enc2.setBuffer(f.get(.router).buffer, 0, 2);
-        enc2.setBuffer(f.get(.output).buffer, 0, 3);
-        enc2.setValue(CombineArgs{ .hidden = @intCast(hidden), .topk = @intCast(topk), .ld = @intCast(ld), .experts = @intCast(experts) }, 4);
+        enc2.setBuffer(f.get(.output).buffer, 0, 2);
+        enc2.setValue(CombineArgs{ .hidden = @intCast(hidden), .topk = @intCast(topk), .shared_in_out = @intFromBool(units) }, 3);
         enc2.dispatchThreads(mtl.Size.of(hidden, rows, 1), mtl.Size.of(256, 1, 1));
         try products.end();
     }
@@ -186,9 +188,9 @@ pub const Kernels = struct {
         e.dispatchThreads(mtl.Size.of(inter, slots, 1), mtl.Size.of(256, 1, 1));
     }
 
-    /// Slot i takes expert ids[i] on input row i / repeat.
-    fn indexed(_: *Kernels, e: mtl.ComputeEncoder, pipes: *const row.Pipelines, x: row.Experts, slots: u32, in: Ref, ids: Ref, out: Ref) !void {
-        const call = try row.callIndexed(pipes, x, slots, false);
+    /// Slot i takes expert ids[i] on input row i / repeat; id `experts` is the shared expert's `extra` matrix.
+    fn indexed(_: *Kernels, e: mtl.ComputeEncoder, pipes: *const row.Pipelines, x: row.Experts, extra: row.Weights, slots: u32, in: Ref, ids: Ref, out: Ref) !void {
+        const call = try row.callIndexedExtra(pipes, x, extra, slots);
         e.setPipeline(call.pipeline);
         e.setBuffer(in.buffer, in.offset, 0);
         e.setBuffer(x.one.w, x.one.w_off, 1);
@@ -197,6 +199,9 @@ pub const Kernels = struct {
         e.setValue(call.dims, 4);
         e.setBuffer(out.buffer, out.offset, 5);
         e.setBuffer(ids.buffer, ids.offset, 6);
+        e.setBuffer(extra.w, extra.w_off, 7);
+        e.setBuffer(extra.scales, extra.s_off, 8);
+        e.setBuffer(extra.biases, extra.b_off, 9);
         e.dispatchThreads(mtl.Size.of(call.groups * call.threads, call.slots, 1), mtl.Size.of(call.threads, 1, 1));
     }
 };

@@ -14,8 +14,9 @@ pub const Tensor = cp.Tensor;
 
 pub const Gdn = struct { qkv: Linear, zba: Linear, out: Linear, conv: Tensor, a_log: Tensor, dt: Tensor, norm: Tensor };
 pub const Attention = struct { q: Linear, kv: Linear, out: Linear, q_norm: Tensor, k_norm: Tensor };
-/// The routed block: the router's rows (the experts, the shared gate, then zero rows) and the stacked experts.
-pub const Moe = struct { router: row.Weights, gate: row.Experts, up: row.Experts, down: row.Experts };
+/// The routed block: the router's rows (the experts, the shared gate, then zero rows), the stacked experts, and the
+/// shared expert's own matrices (decode rows run it as one more slot of the experts' kernel).
+pub const Moe = struct { router: row.Weights, gate: row.Experts, up: row.Experts, down: row.Experts, shared_gate: row.Weights, shared_up: row.Weights, shared_down: row.Weights };
 /// With experts, `gu` and `down` are the shared expert's.
 pub const Layer = struct { norm: Tensor, post_norm: Tensor, gu: Linear, down: Linear, moe: ?Moe = null, mixer: union(@import("config.zig").Kind) { linear: Gdn, attention: Attention } };
 
@@ -48,7 +49,7 @@ fn uniform(p: Linear) bool {
 }
 
 /// Modules the graph reads only through repacked copies: their tensors stay in the files until load stages them.
-const repacked_modules = [_][]const u8{ ".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj", ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj", ".mlp.shared_expert.down_proj", ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z", ".linear_attn.in_proj_b", ".linear_attn.in_proj_a", ".linear_attn.out_proj", ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.o_proj" };
+const repacked_modules = [_][]const u8{ ".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj", ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z", ".linear_attn.in_proj_b", ".linear_attn.in_proj_a", ".linear_attn.out_proj", ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.o_proj" };
 
 /// Whether `name` is a weight, scales or biases tensor of a repacked module or the LM head.
 pub fn repacked(name: []const u8, _: usize) bool {
@@ -220,14 +221,23 @@ const Builder = struct {
                 .k_norm = try b.tensor(try Name.full(a, prefix, "self_attn.k_norm.weight"), .bf16, &.{c.head_dim}),
             } },
         };
+        const shared: ?[3]projection.Triple = if (!c.moe()) null else .{
+            try b.quant(try Name.full(a, prefix, widths.leaf(c, .gate)), c.intermediate, c.hidden, w[@backingInt(M.gate)]),
+            try b.quant(try Name.full(a, prefix, widths.leaf(c, .up)), c.intermediate, c.hidden, w[@backingInt(M.up)]),
+            try b.quant(try Name.full(a, prefix, widths.leaf(c, .down)), c.hidden, c.intermediate, w[@backingInt(M.down)]),
+        };
         const moe: ?Moe = if (!c.moe()) null else .{
+            .shared_gate = weightsOf(shared.?[0], c.intermediate, c.hidden),
+            .shared_up = weightsOf(shared.?[1], c.intermediate, c.hidden),
+            .shared_down = weightsOf(shared.?[2], c.hidden, c.intermediate),
             .router = try b.router(prefix, c, w[@backingInt(M.router)]),
-            .gate = try b.experts(try Name.full(a, prefix, widths.leaf(c, .egate)), c.experts, c.moe_intermediate, c.hidden, w[@backingInt(M.egate)], c.top_k),
-            .up = try b.experts(try Name.full(a, prefix, widths.leaf(c, .eup)), c.experts, c.moe_intermediate, c.hidden, w[@backingInt(M.eup)], c.top_k),
+            .gate = try b.experts(try Name.full(a, prefix, widths.leaf(c, .egate)), c.experts, c.moe_intermediate, c.hidden, w[@backingInt(M.egate)], c.top_k + 1),
+            .up = try b.experts(try Name.full(a, prefix, widths.leaf(c, .eup)), c.experts, c.moe_intermediate, c.hidden, w[@backingInt(M.eup)], c.top_k + 1),
             .down = try b.experts(try Name.full(a, prefix, widths.leaf(c, .edown)), c.experts, c.hidden, c.moe_intermediate, w[@backingInt(M.edown)], 1),
         };
-        const gu = try b.linear(&.{ .{ .module = try Name.full(a, prefix, widths.leaf(c, .gate)), .n = c.intermediate, .w = w[@backingInt(M.gate)] }, .{ .module = try Name.full(a, prefix, widths.leaf(c, .up)), .n = c.intermediate, .w = w[@backingInt(M.up)] } }, c.hidden);
-        const down = try b.linear(&.{.{ .module = try Name.full(a, prefix, widths.leaf(c, .down)), .n = c.hidden, .w = w[@backingInt(M.down)] }}, c.intermediate);
+        // with experts the shared expert's lane layouts come from its resident tensors, else the dense MLP's are staged
+        const gu = if (shared) |t| try b.stack(&.{ t[0], t[1] }) else try b.linear(&.{ .{ .module = try Name.full(a, prefix, widths.leaf(c, .gate)), .n = c.intermediate, .w = w[@backingInt(M.gate)] }, .{ .module = try Name.full(a, prefix, widths.leaf(c, .up)), .n = c.intermediate, .w = w[@backingInt(M.up)] } }, c.hidden);
+        const down = if (shared) |t| try b.stack(&.{t[2]}) else try b.linear(&.{.{ .module = try Name.full(a, prefix, widths.leaf(c, .down)), .n = c.hidden, .w = w[@backingInt(M.down)] }}, c.intermediate);
         return .{ .norm = try b.tensor(try Name.full(a, prefix, "input_layernorm.weight"), .bf16, &.{c.hidden}), .post_norm = try b.tensor(try Name.full(a, prefix, "post_attention_layernorm.weight"), .bf16, &.{c.hidden}), .gu = gu, .down = down, .moe = moe, .mixer = mixer };
     }
 };
