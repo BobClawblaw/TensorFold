@@ -137,7 +137,7 @@ pub const Generation = struct {
         const width: u32 = @intCast(g.runner.model.config.vocab);
         const shape = try g.matcher.encode(e, .{ .buf = logits.buffer, .off = logits.offset }, ids, parents, width, budget, eos);
         const result = @import("core").tree_commit_gpu.Ref{ .buf = g.matcher.buffers[4] };
-        try g.commit.taps(e, result, .{ .buf = g.runner.taps.buffer }, .{ .buf = g.taps }, .{ .rows = shape.rows, .width = g.runner.taps.width, .capacity = g.runner.taps.capacity, .planes = 5 });
+        try g.commit.taps(e, result, .{ .buf = g.runner.taps.buffer }, .{ .buf = g.taps }, .{ .rows = shape.rows, .width = g.runner.taps.width, .capacity = g.runner.taps.capacity, .planes = @intCast(g.runner.taps.count) });
         try g.commit.head(e, result, .{ .buf = logits.buffer, .off = logits.offset }, .{ .rows = shape.rows, .width = width, .stride = width });
         e.end();
         ended = true;

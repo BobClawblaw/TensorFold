@@ -386,7 +386,7 @@ pub const Metal = struct {
         var ended = false;
         errdefer if (!ended) e.end();
         try r.keepDevice(&b.round.?, e, g.commit, ref);
-        try g.commit.taps(e, ref, .{ .buf = r.taps.buffer }, .{ .buf = g.taps }, .{ .rows = rows, .width = r.taps.width, .capacity = r.taps.capacity, .planes = 5 });
+        try g.commit.taps(e, ref, .{ .buf = r.taps.buffer }, .{ .buf = g.taps }, .{ .rows = rows, .width = r.taps.width, .capacity = r.taps.capacity, .planes = @intCast(r.taps.count) });
         try g.commit.head(e, ref, .{ .buf = logits.buffer, .off = logits.offset }, .{ .rows = rows, .width = vocab, .stride = vocab });
         e.end();
         ended = true;
