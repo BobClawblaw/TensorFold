@@ -14,7 +14,7 @@ pub const picks = c.index_topk;
 pub const split_rows = 16;
 pub const split_chunks = (c.window + picks + 15) / 16;
 /// Scores a prompt call's indexer holds at once (f32): rows are taken in slices of this many keys' worth.
-pub const score_budget = 64 << 20;
+pub const score_budget = 256 << 20;
 
 pub const Storage = struct {
     gpa: std.mem.Allocator,
@@ -94,6 +94,9 @@ pub const Cache = struct {
     }
 };
 
+/// A prompt chunk whose engram rows were gathered ahead: its cache and rows, its tokens' hash, the set holding them.
+pub const Prepared = struct { cache: *Cache, base: usize, n: usize, hash: u64, set: u8 };
+
 pub const Scratch = struct {
     memory: Storage,
     rows: usize,
@@ -145,7 +148,12 @@ pub const Scratch = struct {
     wsort: mtl.Buffer,
     xsort: mtl.Buffer,
     sums: mtl.Buffer,
-    engram_rows: [c.engram_layers.len]mtl.Buffer, // bf16 [rows, 24 x 256] a layer, filled on the host
+    /// bf16 [rows, 24 x 256] a layer, filled on the host: two sets, so a chunk's can be gathered while the one before runs.
+    engram_rows: [2][c.engram_layers.len]mtl.Buffer,
+    /// The set this call's rows read.
+    engram_set: u8,
+    /// A chunk gathered ahead into the other set (forward.runChunk), or null.
+    prepared: ?Prepared,
     /// Groups this call completes, a buffer a source (host-written as it encodes): positions and cache rows.
     gpos: [c.kv_sources.len]mtl.Buffer,
     gidx: [c.kv_sources.len]mtl.Buffer,
@@ -213,7 +221,11 @@ pub const Scratch = struct {
         out.wsort = try m.alloc(slots * 4);
         out.xsort = try m.alloc(slots * c.hidden * 2);
         out.sums = try m.alloc(@max(rows * (c.heads * c.head_dim) / 64, slots * c.hidden / 64) * 4);
-        for (&out.engram_rows) |*b| b.* = try m.alloc(rows * c.engram_cols * c.engram_dim * 2);
+        for (&out.engram_rows) |*set| for (set) |*b| {
+            b.* = try m.alloc(rows * c.engram_cols * c.engram_dim * 2);
+        };
+        out.engram_set = 0;
+        out.prepared = null;
         for (&out.gpos, &out.gidx) |*p, *g| {
             p.* = try m.alloc(rows * 4);
             g.* = try m.alloc(rows * 4);

@@ -65,8 +65,9 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     errdefer gpa.destroy(h);
     h.gpa = gpa;
     h.model = model;
-    const chunk = 1024; // a prompt pass's rows a call (the scratch, the lane host's step and the prompt cache's save points)
-    h.metal = try q.backend.Metal.init(gpa, model, .{ .capacity = window, .chunk = chunk });
+    const chunk = 1024; // a prompt pass's rows a call beside other streams (the lane host's step and the prompt cache's save points)
+    const lone_chunk = q.state.max_rows; // a lone stream's rows a call (the scratch): more rows share each expert's weights
+    h.metal = try q.backend.Metal.init(gpa, model, .{ .capacity = window, .chunk = lone_chunk, .shared_chunk = chunk });
     errdefer h.metal.deinit();
     const rows: u32 = if (h.metal.drafts != null) q.backend.window_rows else 1;
     h.config = try lanes.Config.init(gpa, h.metal.facts(), rows, rows - 1);

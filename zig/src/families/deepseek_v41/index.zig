@@ -98,14 +98,23 @@ fn indexOne(x: Enc, src: *const st.Source, layer: usize, ratio: usize) void {
         const n = @min(slice, rows - r0);
         const r = x.r0 + r0;
         const tile: [2]usize = if (n == 1) .{ 1, 8 } else .{ 2, 16 };
-        if (n == 1) x.pipe("ds_index_scores_1x8") else x.pipe("ds_index_scores_2x16");
+        // a lone stream's prompt chunk: 64-row by 64-key tiles on the tensor units (the dot's fp32 order is the op's)
+        const nax: ?mtl.Pipeline = if (fwd.index_nax and x.units and n >= fwd.nax_rows) x.m.kernels.index_nax else null;
+        if (nax) |p| {
+            x.skipAs("ds_index_scores_nax");
+            x.ep.*.setPipeline(p);
+        } else if (n == 1) x.pipe("ds_index_scores_1x8") else x.pipe("ds_index_scores_2x16");
         x.buf(s.iq, r * c.index_heads * c.index_dim * 2, 0);
         x.buf(s.iw, r * c.index_heads * 2, 1);
         x.buf(src.keys, 0, 2);
         x.buf(s.scores, 0, 3);
         x.args(ScoreArgs{ .rows = @intCast(n), .groups = @intCast(groups), .ratio = @intCast(ratio), .first_pos = @intCast(x.base + r0), .stride = @intCast(groups) }, 4);
-        const row_tiles = (n + tile[0] - 1) / tile[0];
-        x.threads(.{ row_tiles * 32, (groups + tile[1] - 1) / tile[1], 1 }, .{ @as(usize, @min(row_tiles, 8)) * 32, 1, 1 });
+        if (nax != null) {
+            x.groups(.{ (groups + 63) / 64, (n + 63) / 64, 1 }, .{ 128, 1, 1 });
+        } else {
+            const row_tiles = (n + tile[0] - 1) / tile[0];
+            x.threads(.{ row_tiles * 32, (groups + tile[1] - 1) / tile[1], 1 }, .{ @as(usize, @min(row_tiles, 8)) * 32, 1, 1 });
+        }
         const nb = (groups + c.candidate_block - 1) / c.candidate_block;
         if (layer == c.candidate_source) {
             x.pipe("ds_block_max");

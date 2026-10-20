@@ -14,7 +14,7 @@ pub fn block(x: Enc, i: usize, l: *const wts.Layer) !void {
     const s = x.s;
     if (l.engram) |eg| {
         x.flush();
-        x.linear(eg.wkv, s.engram_rows[c.engramIndex(i).?], 0, s.engram_kv, 0, x.rows);
+        x.linear(eg.wkv, s.engram_rows[s.engram_set][c.engramIndex(i).?], 0, s.engram_kv, 0, x.rows);
         x.pipe("ds_engram");
         x.buf(s.x, 0, 0);
         x.buf(s.engram_kv, 0, 1);

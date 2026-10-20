@@ -71,7 +71,12 @@ var joined = false;
 pub var pending_expand = false;
 /// The pending branch is the MoE's, still to be combined from its routed (this many a row) and shared rows.
 pub var pending_topk: i32 = 0;
-pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)" };
+pub const sections = [_][]const u8{ "boundaries", "attn proj", "compress+index", "attend", "attn out", "route", "experts", "shared", "engram", "head", "host engram (CPU)", "engram ahead (CPU)" };
+/// A lone stream's prompt chunk scores its index keys on the tensor units (a check turns them off: DS_INDEX_ROWS).
+pub var index_nax = true;
+
+/// The chunk after this call's, its engram rows gathered on the host while this one runs on the GPU (`runChunk`).
+pub const Next = struct { tokens: []const u32, vis: ?*const Vis = null };
 
 pub const Enc = struct {
     ep: *mtl.ComputeEncoder,
@@ -137,6 +142,11 @@ pub const Enc = struct {
     pub fn pipe(self: Enc, comptime key: []const u8) void {
         skipping = skips(key);
         self.ep.*.setPipeline(self.m.kernels.get(key));
+    }
+    /// DS_SKIP for a pipeline set by hand (the tensor-unit ones outside `names`).
+    pub fn skipAs(self: Enc, key: []const u8) void {
+        _ = self;
+        skipping = skips(key);
     }
     pub fn buf(self: Enc, b: Buffer, off: usize, slot: usize) void {
         self.ep.*.setBuffer(b, off, slot);
@@ -424,7 +434,12 @@ pub fn run(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, hea
 
 /// `run` over prompt rows that may lie in image spans (`vis`): their rows are the tower's, not the token embedding.
 pub fn runWith(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, head: Head, dump: ?Dump, vis: ?*const Vis) !void {
-    return runSegs(m, s, &.{.{ .cache = cache, .tokens = tokens }}, head, dump, vis);
+    return runSegs(m, s, &.{.{ .cache = cache, .tokens = tokens }}, head, dump, vis, null);
+}
+
+/// `runWith` for a prompt pass's chunk: `next`, the chunk after it, has its engram rows gathered while this one runs.
+pub fn runChunk(m: *Model, s: *st.Scratch, cache: *st.Cache, tokens: []const u32, head: Head, vis: ?*const Vis, next: ?Next) !void {
+    return runSegs(m, s, &.{.{ .cache = cache, .tokens = tokens }}, head, null, vis, next);
 }
 
 /// A stream's rows in a forward: its cache, its tokens, from scratch row `r0` (the rows of the streams before it).
@@ -432,10 +447,36 @@ pub const Seg = struct { cache: *st.Cache, tokens: []const u32, r0: usize = 0 };
 
 /// Several streams' rows in one forward, each stream's attention on its own rows (row kernels: each matches alone).
 pub fn many(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head) !void {
-    return runSegs(m, s, segs, head, null, null);
+    return runSegs(m, s, segs, head, null, null, null);
 }
 
-fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump, vis: ?*const Vis) !void {
+fn hashOf(tokens: []const u32) u64 {
+    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tokens));
+}
+
+/// Whether `s.prepared` holds this call's rows: the same cache at the same rows, its ids appended, the tokens the same.
+fn preparedFor(s: *const st.Scratch, g: Seg) bool {
+    const p = s.prepared orelse return false;
+    return p.cache == g.cache and p.base == g.cache.len and p.n == g.tokens.len and g.cache.engram_ids.items.len == p.base + p.n and p.hash == hashOf(g.tokens);
+}
+
+/// The next chunk's engram ids and rows into the other set, recorded in `s.prepared`; on any failure, nothing is kept.
+fn prepare(m: *Model, s: *st.Scratch, cache: *st.Cache, base: usize, nx: Next) void {
+    const n = nx.tokens.len;
+    if (n == 0 or n > s.rows or base + n > cache.capacity or cache.engram_ids.items.len != base) return;
+    const set: u8 = 1 - s.engram_set;
+    for (nx.tokens, 0..) |t, i| cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, Vis.code(nx.vis, base + i) == -1));
+    var dsts: [c.engram_layers.len][]u16 = undefined;
+    const width = c.engram_cols * c.engram_dim;
+    for (&dsts, s.engram_rows[set]) |*d, b| d.* = b.slice(u16, n * width);
+    m.engram.gatherRows(cache.engram_ids.items, base, n, dsts) catch {
+        cache.engram_ids.shrinkRetainingCapacity(base);
+        return;
+    };
+    s.prepared = .{ .cache = cache, .base = base, .n = n, .hash = hashOf(nx.tokens), .set = set };
+}
+
+fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump, vis: ?*const Vis, next: ?Next) !void {
     var rows: usize = 0;
     for (segs) |g| {
         if (g.r0 != rows or g.tokens.len == 0 or g.tokens.len > st.max_rows) return error.DeepseekRowsExceeded;
@@ -451,22 +492,27 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
     var images = false;
     var dsts: [c.engram_layers.len][]u16 = undefined;
     var host: f64 = 0;
+    // a lone chunk gathered ahead (runChunk's `next` the call before) keeps its ids and rows; anything else is gathered now
+    const ready = segs.len == 1 and preparedFor(s, segs[0]);
+    if (ready) s.engram_set = s.prepared.?.set;
+    s.prepared = null;
     for (segs) |g| {
         const base = g.cache.len;
         const n = g.tokens.len;
         for (s.ids.slice(u32, g.r0 + n)[g.r0..], g.tokens) |*d, t| d.* = t;
         for (s.pos.slice(i32, g.r0 + n)[g.r0..], 0..) |*p, i| p.* = @intCast(base + i);
-        g.cache.engram_ids.shrinkRetainingCapacity(base);
+        if (!ready) g.cache.engram_ids.shrinkRetainingCapacity(base);
         for (g.tokens, s.img.slice(i32, g.r0 + n)[g.r0..], s.img_code.slice(i32, g.r0 + n)[g.r0..], 0..) |t, *flag, *code, i| {
             code.* = Vis.code(vis, base + i);
             flag.* = @intFromBool(code.* != -1);
             images = images or code.* != -1;
-            g.cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, code.* == -1)); // image rows end every n-gram
+            if (!ready) g.cache.engram_ids.appendAssumeCapacity(m.engram.compress(t, code.* == -1)); // image rows end every n-gram
         }
+        if (ready) continue;
         var h0: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &h0);
         const width = c.engram_cols * c.engram_dim;
-        for (&dsts, s.engram_rows) |*d, b| d.* = b.slice(u16, (g.r0 + n) * width)[g.r0 * width ..];
+        for (&dsts, s.engram_rows[s.engram_set]) |*d, b| d.* = b.slice(u16, (g.r0 + n) * width)[g.r0 * width ..];
         try m.engram.gatherRows(g.cache.engram_ids.items, base, n, dsts);
         var h1: std.c.timespec = undefined;
         _ = std.c.clock_gettime(.MONOTONIC, &h1);
@@ -537,6 +583,14 @@ fn runSegs(m: *Model, s: *st.Scratch, segs: []const Seg, head: Head, dump: ?Dump
     var t_commit: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t_commit);
     cb.commit();
+    if (next) |nx| if (segs.len == 1) { // the next chunk's engram rows, on the host while the GPU runs this one
+        var a0: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &a0);
+        prepare(m, s, segs[0].cache, segs[0].cache.len + rows, nx);
+        var a1: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &a1);
+        if (profile) |p| p[11] += secs(a0, a1);
+    };
     cb.wait();
     if (profile) |p| p[9] += cb.gpuSeconds();
     if (timing) |t| {

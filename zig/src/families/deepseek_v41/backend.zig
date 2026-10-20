@@ -12,7 +12,8 @@ const Model = @import("model.zig").Model;
 const draw = @import("../lfm2_moe/backend.zig").draw;
 const be = lanes.backend;
 
-pub const Options = struct { capacity: usize, chunk: usize = 1024 };
+/// `chunk`: a lone stream's prompt rows a call (the scratch); `shared_chunk`: a prompt's rows a call beside other streams.
+pub const Options = struct { capacity: usize, chunk: usize = 1024, shared_chunk: usize = 1024 };
 
 /// The widest window: the pending row and the head's five drafts.
 pub const window_rows = 1 + c.draft_block;
@@ -167,16 +168,13 @@ pub const Metal = struct {
         errdefer releaseFn(self, stream);
         const ids = stream.prompt();
         const fill = self.fills.getPtr(stream) orelse try self.begin(stream);
-        var end: usize = @min(ids.len, fill.at + self.scratch.rows);
-        for (stream.chunks) |boundary| if (boundary > fill.at) {
-            end = @min(end, boundary);
-            break;
-        };
-        for (stream.reuse.marks) |m| if (m > fill.at) {
-            end = @min(end, m);
-            break;
-        };
-        try fwd.runWith(self.model, &self.scratch, try self.cacheOf(stream), ids[fill.at..end], if (end == ids.len) .last else .none, null, if (fill.vis) |*v| v else null);
+        // a lone stream takes the widest chunk; beside other streams (they decode between chunks) the shared one
+        const step = if (self.caches.count() == 1) self.scratch.rows else @min(self.scratch.rows, self.options.shared_chunk);
+        const end = cut(stream, fill.at, step);
+        const after = cut(stream, end, step);
+        const vis: ?*const fwd.Vis = if (fill.vis) |*v| v else null;
+        const next: ?fwd.Next = if (after > end) .{ .tokens = ids[end..after], .vis = vis } else null;
+        try fwd.runChunk(self.model, &self.scratch, try self.cacheOf(stream), ids[fill.at..end], if (end == ids.len) .last else .none, vis, next);
         fill.at = end;
         stream.fill_at.store(@intCast(end), .monotonic);
         if (stream.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, stream.reuse.marks, @intCast(end)) != null)
@@ -184,6 +182,21 @@ pub const Metal = struct {
         if (end < ids.len) return false;
         self.endFill(stream);
         return true;
+    }
+
+    /// Where a chunk from `at` ends: `step` rows on, or the first chunk boundary or save mark past `at`.
+    fn cut(stream: *lanes.Stream, at: usize, step: usize) usize {
+        const ids = stream.prompt();
+        var end: usize = @min(ids.len, at + step);
+        for (stream.chunks) |boundary| if (boundary > at) {
+            end = @min(end, boundary);
+            break;
+        };
+        for (stream.reuse.marks) |m| if (m > at) {
+            end = @min(end, m);
+            break;
+        };
+        return end;
     }
 
     /// A prompt pass starts: the stream's caches, a kept prefix of its prompt restored, its images through the tower.

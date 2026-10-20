@@ -26,6 +26,8 @@ pub const Kernels = struct {
     nax: [9]?am.Pipes = @splat(null),
     /// A prompt chunk's attention on the tensor units (v41_attend_nax.metal); null without them.
     attend_nax: ?mtl.Pipeline = null,
+    /// A prompt chunk's index scores on the tensor units (v41_index_nax.metal); null without them.
+    index_nax: ?mtl.Pipeline = null,
 
     pub fn get(self: *const Kernels, comptime key: []const u8) mtl.Pipeline {
         const i = comptime for (names, 0..) |n, i| {
@@ -44,6 +46,7 @@ pub const Kernels = struct {
         for (self.pipelines) |p| p.deinit();
         for (self.nax) |set| if (set) |pipes| for (pipes) |p| p.deinit();
         if (self.attend_nax) |p| p.deinit();
+        if (self.index_nax) |p| p.deinit();
         self.rows.deinit();
     }
 };
@@ -64,6 +67,7 @@ pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Widt
     errdefer out.rows.deinit();
     out.nax = @splat(null);
     out.attend_nax = null;
+    out.index_nax = null;
     if (device.tensorUnits()) {
         const a = std.heap.c_allocator;
         const src = try frags.source(device, a, sources.deepseek_v41_attend_nax);
@@ -73,6 +77,15 @@ pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Widt
         out.attend_nax = try mtl.Pipeline.init(device, nax_lib, "ds_attend_nax", false);
     }
     errdefer if (out.attend_nax) |p| p.deinit();
+    if (device.tensorUnits()) {
+        const a = std.heap.c_allocator;
+        const src = try frags.source(device, a, sources.deepseek_v41_index_nax);
+        defer a.free(src);
+        const nax_lib = try mtl.Library.fromSource(device, src, mtl.CompileOptions.mlx());
+        defer nax_lib.deinit();
+        out.index_nax = try mtl.Pipeline.init(device, nax_lib, "ds_index_scores_nax", false);
+    }
+    errdefer if (out.index_nax) |p| p.deinit();
     if (device.tensorUnits()) {
         errdefer for (out.nax) |set| if (set) |pipes| for (pipes) |p| p.deinit();
         var widths: [cfg.layers + cfg.stages + 2]cfg.Width = undefined;

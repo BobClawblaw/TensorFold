@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10), out_dir);
     if (std.c.getenv("DS_SHARED")) |n| return shared(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
+    if (std.c.getenv("DS_INDEX_ROWS") != null) q.forward.index_nax = false;
     if (std.c.getenv("DS_DEPTH")) |d| return depths(gpa, init.io, args[1], ids, std.mem.span(d), if (args.len == 5) chunk else 256);
     var t0: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &t0);
@@ -57,7 +58,12 @@ pub fn main(init: std.process.Init) !void {
     while (at < ids.len) {
         const n = @min(chunk, ids.len - at);
         _ = std.c.clock_gettime(.MONOTONIC, &t0);
-        try q.forward.run(m, &scratch, &cache, ids[at..][0..n], .all, if (dumping) .{ .layers = &dump_bufs } else null);
+        if (dumping) {
+            try q.forward.run(m, &scratch, &cache, ids[at..][0..n], .all, .{ .layers = &dump_bufs });
+        } else { // as the server's prompt pass: the next chunk's engram rows gathered while this one runs
+            const after = @min(chunk, ids.len - at - n);
+            try q.forward.runChunk(m, &scratch, &cache, ids[at..][0..n], .all, null, if (after > 0) .{ .tokens = ids[at + n ..][0..after] } else null);
+        }
         _ = std.c.clock_gettime(.MONOTONIC, &t1);
         if (at == 0 or n > 1) std.debug.print("rows {d}..{d}: {d:.1} ms\n", .{ at, at + n, seconds(t0, t1) * 1e3 });
         if (at > 0) {
