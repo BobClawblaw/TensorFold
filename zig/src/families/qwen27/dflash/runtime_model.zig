@@ -110,7 +110,7 @@ pub const Model = struct {
             try m.session.absorb(m.backend.ops(), &m.graph, m.preparation, .{ .values = view, .positions = positions[0..rows], .layers = m.graph.config.taps, .target_end = first + rows });
         }
     }
-    /// The tree search's options for `nodes` drafts: TF_DRAFT_CHILDREN, TF_DRAFT_TAU and TF_DRAFT_EDGE override the defaults.
+    /// The tree search's options for `nodes` drafts; TF_DRAFT_CHILDREN, TF_DRAFT_TAU, TF_DRAFT_EDGE override them.
     pub fn selectorOptions(m: *const Model, nodes: u32) selector.Options {
         _ = m;
         var o = selector.Options{ .nodes = nodes };

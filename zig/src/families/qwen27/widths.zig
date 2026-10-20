@@ -211,8 +211,7 @@ fn checkRouted(c: cfg.Config, chip: Chip, m: Member, w: Width) !void {
     }
 }
 
-/// The router matrix's rows: the experts, the shared expert's gate, then zero rows to a multiple of 64 (the tensor
-/// units' dense product reads whole 64-row tiles of the weights).
+/// The router matrix's rows: the experts, the shared gate, then zero rows to a multiple of 64 (whole weight tiles).
 pub fn routerRows(experts: usize) usize {
     return (experts + 1 + 63) / 64 * 64;
 }

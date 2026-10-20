@@ -75,8 +75,7 @@ pub const Kernels = struct {
         return pipes;
     }
 
-    /// Whether a pass of `rows` takes the sorted tensor-unit path: a prompt chunk of whole tiles, experts of one width.
-    /// Decode windows keep the row kernels, whose sums match a lone row's bit for bit (drafted replies stay exact).
+    /// The sorted tensor-unit path: prompt chunks of whole tiles only; decode windows keep the row kernels (exact).
     pub fn sorted(k: *Kernels, mo: *const wts.Moe, rows: u32, prompt: bool) bool {
         if (!prompt or rows < 16 or !k.device.tensorUnits()) return false;
         const g = mo.gate.one;
