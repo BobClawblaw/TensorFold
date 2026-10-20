@@ -75,7 +75,7 @@ pub const Model = struct {
         errdefer m.glue.deinit();
         m.moe = if (c.moe()) try moe_gpu.Kernels.init(a, m.device) else null;
         errdefer if (m.moe) |*k| k.deinit();
-        m.frame = try Frame.init(m.device, c, @max(rows, promptRows()));
+        m.frame = try Frame.init(m.device, c, @max(rows, promptRows(c)));
         errdefer m.frame.deinit();
         m.ane = null;
         const columns = try ane_policy.columns(if (platform.c.getenv("TF_ANE_COLUMNS")) |v| std.mem.span(v) else null);
@@ -106,9 +106,11 @@ pub const Model = struct {
     }
 };
 
-/// A prompt pass's rows: 512 (TF_PROMPT_ROWS takes another multiple of 16 up to the frame's 2048).
-pub fn promptRows() u32 {
-    const default = 512;
+/// A prompt pass's rows: 512, or 1,024 with routed experts (a chunk reads every expert's weights once, so wider
+/// chunks prefill faster: 2,230, 2,580 and 2,760 tok/s at 512, 1,024 and 2,048 on Ornith-1.5-122B); TF_PROMPT_ROWS
+/// takes another multiple of 16 up to the frame's 2048.
+pub fn promptRows(c: cfg.Config) u32 {
+    const default: u32 = if (c.moe()) 1024 else 512;
     const v = std.c.getenv("TF_PROMPT_ROWS") orelse return default;
     const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return default;
     return if (n >= 16 and n <= @import("gpu_frame.zig").max_rows and n % 16 == 0) n else default;
