@@ -172,7 +172,8 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
         c.experts = experts;
         c.top_k = try required(t, "num_experts_per_tok");
         c.moe_intermediate = try required(t, "moe_intermediate_size");
-        c.renorm = try flag(t, "norm_topk_prob");
+        // absent means true, as Qwen3.5-MoE's reference config and the CUDA family read it
+        c.renorm = if (t.get("norm_topk_prob")) |v| (if (v == .bool) v.bool else return error.BadConfig) else true;
         if (c.experts > 256 or c.top_k >= c.experts or c.top_k > 15 or c.moe_intermediate != c.intermediate) return error.UnsupportedRouting;
     }
     if (t.get("max_position_embeddings")) |v| c.max_position = try integer(v, false);
@@ -276,7 +277,7 @@ test "a routed config reads its experts, the shared expert's width as the layer'
     try std.testing.expectEqual(@as(usize, 8), c.top_k);
     try std.testing.expectEqual(@as(usize, 1024), c.moe_intermediate);
     try std.testing.expectEqual(@as(usize, 1024), c.intermediate);
-    try std.testing.expect(!c.renorm);
+    try std.testing.expect(c.renorm); // absent: renormalized
     try std.testing.expectEqual(Kind.attention, c.kind(3));
     try std.testing.expectEqual(Kind.linear, c.kind(2));
     // a routed model type without experts, and a dense one with them, are refused
