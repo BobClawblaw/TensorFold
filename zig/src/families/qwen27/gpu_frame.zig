@@ -36,12 +36,11 @@ pub const Frame = struct {
             capacity * config.conv_kernel * 4,                                                  capacity * 4,                                                                                                                           capacity * 16,
             capacity * 16,                                                                      capacity * 4,                                                                                                                           capacity * config.kvDim() * 2,
             capacity * 4,                                                                       capacity * @sizeOf(@import("core").tree_slots.Step),
-            // the routed block: a row's logits, its picks and weights, the sorted slots, the experts' rows
-            capacity * routerRows(config) * 2,                                                 slots * 4,
-            slots * 4,                                                                          (config.experts + 1) * 4,
-            slots * 4,                                                                          slots * 4,
-            slots * config.hidden * 2,                                                          slots * config.moe_intermediate * 2,
-            slots * config.moe_intermediate * 2,                                                slots * config.moe_intermediate * 2,
+                // the routed block: a row's logits, its picks and weights, the sorted slots, the experts' rows
+                                                                                               capacity * routerRows(config) * 2,
+            slots * 4,                                                                          slots * 4,                                                                                                                              (config.experts + 1) * 4,
+            slots * 4,                                                                          slots * 4,                                                                                                                              slots * config.hidden * 2,
+            slots * config.moe_intermediate * 2,                                                slots * config.moe_intermediate * 2,                                                                                                    slots * config.moe_intermediate * 2,
             slots * config.hidden * 2,                                                          slots * @max(config.hidden, config.moe_intermediate) / 64 * 4,
         };
         comptime std.debug.assert(widths.len == std.enums.values(Field).len);

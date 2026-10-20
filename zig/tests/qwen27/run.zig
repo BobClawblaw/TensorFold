@@ -18,6 +18,7 @@ const help =
     \\--compare-chunk reruns the whole prompt and decode and checks prompt state/KV/logits bytes.
     \\--seams N (with --compare-chunk): state/KV/logits bytes every N prompt rows under both chunks and after decode.
     \\CPU only: --help or --emit-sources EXISTING_DIR, no Metal device or model load.
+    \\TF_LAYERS=N runs the first N layers only; TF_LOGITS_DUMP=FILE writes every step's bf16 logits row (a port's checks).
 ;
 
 fn tokens(a: std.mem.Allocator, io: std.Io, file: []const u8) ![]const u32 {
@@ -148,20 +149,6 @@ pub fn main(init: std.process.Init) !void {
     const decode_start = std.Io.Clock.awake.now(io);
     const generation = try generated(a, s, count, force, expected, if (profile_steps > 0) &trace else null, profile_steps, teacher);
     if (std.c.getenv("TF_LOGITS_DUMP")) |v| try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(v), .data = logits_dump.items });
-    if (std.c.getenv("TF_ROUTE_DUMP")) |v| {
-        // the frame's last pass's picks and weights (its last layer): a port's routing check
-        const f = &s.runner.model.frame;
-        const n = f.slotsOf(@intCast(ids.len));
-        const picks = std.mem.sliceAsBytes(f.get(.picks).buffer.slice(u32, n));
-        const weights = std.mem.sliceAsBytes(f.get(.route_weights).buffer.slice(f32, n));
-        const h = s.runner.model.config.hidden;
-        const out_rows = std.mem.sliceAsBytes(f.get(.output).buffer.slice(u16, ids.len * h));
-        const expert_rows = std.mem.sliceAsBytes(f.get(.expert_out).buffer.slice(u16, n * h));
-        const hid = std.mem.sliceAsBytes(f.get(.hidden).buffer.slice(u16, ids.len * h));
-        const res = std.mem.sliceAsBytes(f.get(.residual).buffer.slice(u16, ids.len * h));
-        const both = try std.mem.concat(a, u8, &.{ picks, weights, out_rows, expert_rows, hid, res });
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(v), .data = both });
-    }
     const out = generation.tokens;
     const decode_ns = decode_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     const decoded = if (compare > 0) try s.fingerprint() else digest;

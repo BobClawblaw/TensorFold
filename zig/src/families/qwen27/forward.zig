@@ -119,7 +119,7 @@ pub const Stages = struct {
         lane.enc.barrier();
         if (layer.moe) |*mo| {
             // the shared expert's rows in f.output take the routed experts' weighted rows and the shared gate
-            if (std.c.getenv("TF_NO_ROUTED") == null) try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+            try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
             lane.enc.barrier();
         }
         s.pending = f.get(.output);
