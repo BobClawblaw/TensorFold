@@ -1,4 +1,4 @@
-//! The actual benchmark command must reject local-only v2 before any publication effect.
+//! The actual benchmark command must reject local-only v2 before any publication effect, and publish a v1 run.
 const std = @import("std");
 const json = @import("json");
 const command = @import("benchmark_cli_test.zig");
@@ -67,4 +67,33 @@ test "benchmark publication: run publish refuses before credentials, server work
         try std.testing.expect(!r.has("This generates model replies"));
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, out, .{}));
     }
+}
+
+test "benchmark publication: --suite community-v1 runs the protocol the board accepts, and its run's --publish uploads the v1 receipt" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var r = try command.Run.init(a, &tmp);
+    const f = try command.world(a, false, "202 Accepted");
+    defer f.stop();
+    const api = try f.url(a, "");
+    r.hf_base = try f.url(a, "/api/models/");
+    try r.env.put("TENSORFOLD_BENCHMARK_TOKEN", command.token);
+    const out = try r.path("v1.json");
+    const argv = try std.mem.concat(a, []const u8, &.{ try command.runArgs(&r, api, out), &.{ "--suite", "community-v1", "--publish", "--yes", "--upload-url", api } });
+    try std.testing.expectEqual(@as(u8, 0), try r.command(argv));
+    try std.testing.expect(r.has("community-v1: code and chat") and r.has("Submission synthetic-submission: pending") and !r.has(command.token));
+    try std.testing.expectEqual(@as(usize, 1), command.posts(f, "/submissions"));
+    var problem: []const u8 = "";
+    const v = (try receipt.load(a, std.testing.io, out, std.Io.Clock.real.now(std.testing.io).toMilliseconds(), &problem)).?;
+    try std.testing.expectEqualStrings("community-v1", v.get("suite").?.get("id").?.string);
+    try std.testing.expectEqualStrings(@import("benchmark_suite.zig").legacy_sha256_hex, v.get("suite").?.get("sha256").?.string);
+    for (v.get("samples").?.array) |s| try std.testing.expect(s.get("finish_reason") == null and s.get("route") == null);
+    try std.testing.expectEqualStrings(try receipt.canonical(a, v), f.request(f.count() - 1).body);
+    try std.testing.expectEqual(@as(u8, 2), try r.command(&.{ "example-org/test-model", "--suite", "community-v3" }));
+    try std.testing.expect(r.has("argument --suite: invalid choice: 'community-v3'"));
+    try std.testing.expectEqual(@as(u8, 1), try r.command(&.{ "example-org/test-model", "--server", api, "--chat-only", "--suite", "community-v1" }));
+    try std.testing.expect(r.has("--chat-only applies only to a v2 run with --server"));
 }

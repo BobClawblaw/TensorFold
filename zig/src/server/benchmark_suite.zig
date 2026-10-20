@@ -298,6 +298,17 @@ pub fn protocol(v: json.Value) ?[]const u8 {
     return null;
 }
 
+/// A protocol this client runs, by id: the newest, or the legacy one a receiver may still be the only one to accept.
+pub fn named(sid: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, sid, id)) return id;
+    if (std.mem.eql(u8, sid, legacy_id)) return legacy_id;
+    return null;
+}
+
+pub fn digestOf(sid: []const u8) []const u8 {
+    return if (std.mem.eql(u8, sid, legacy_id)) legacy_sha256_hex else sha256_hex;
+}
+
 /// Cells retain their receipt's protocol so callers cannot present old results as new ones.
 pub fn receiptCells(a: Allocator, v: json.Value) ![]Cell {
     const sid = protocol(v.get("suite") orelse return error.UnknownProtocol) orelse return error.UnknownProtocol;

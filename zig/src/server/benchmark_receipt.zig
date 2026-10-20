@@ -49,6 +49,8 @@ pub const Settings = struct {
     group: ?Value = null,
     /// The cache format the run used (bf16 or fp8); null for an attached run, whose own format is not known.
     kv_cache: ?[]const u8 = null,
+    /// The protocol the samples followed (``suite.named``); a community-v1 sample has no finish_reason or route.
+    suite: []const u8 = suite.id,
 };
 
 const Builder = struct {
@@ -85,8 +87,8 @@ pub fn value(a: Allocator, run_id: []const u8, created_at: []const u8, model: Mo
     const top = try Builder.init(a);
     try top.int("schema_version", @as(?u8, 1));
     const s = try Builder.init(a);
-    try s.str("id", suite.id);
-    try s.str("sha256", suite.sha256_hex);
+    try s.str("id", settings.suite);
+    try s.str("sha256", suite.digestOf(settings.suite));
     try top.put("suite", s.value());
     try top.str("run_id", run_id);
     try top.str("created_at", created_at);
@@ -118,7 +120,8 @@ pub fn value(a: Allocator, run_id: []const u8, created_at: []const u8, model: Mo
     try top.put("settings", st.value());
     if (settings.group) |g| try top.put("group", g);
     const rows = try a.alloc(Value, samples.len);
-    for (samples, rows) |x, *slot| slot.* = try sampleValue(a, x);
+    const v2 = std.mem.eql(u8, settings.suite, suite.id);
+    for (samples, rows) |x, *slot| slot.* = try sampleValue(a, x, v2);
     try top.put("samples", .{ .array = rows });
     const v = top.value();
     suite.sortKeys(v);
@@ -145,15 +148,15 @@ pub fn hardwareValue(a: Allocator, hardware: Hardware) !Value {
     return h.value();
 }
 
-fn sampleValue(a: Allocator, x: suite.Sample) !Value {
+fn sampleValue(a: Allocator, x: suite.Sample, v2: bool) !Value {
     const b = try Builder.init(a);
     try b.str("fixture_id", x.fixture_id);
     try b.float("temperature", x.temperature);
     try b.int("repeat", @as(?i32, x.repeat));
     try b.int("seed", @as(?u32, x.seed));
     try b.str("status", @tagName(x.status));
-    try b.str("finish_reason", x.finish_reason);
-    try b.str("route", x.route orelse if (std.mem.eql(u8, x.fixture_id, "chat")) "/v1/chat/completions" else "/v1/completions");
+    if (v2) try b.str("finish_reason", x.finish_reason);
+    if (v2) try b.str("route", x.route orelse if (std.mem.eql(u8, x.fixture_id, "chat")) "/v1/chat/completions" else "/v1/completions");
     try b.int("prompt_tokens", x.prompt_tokens);
     try b.int("completion_tokens", x.completion_tokens);
     try b.int("cached_tokens", x.cached_tokens);
