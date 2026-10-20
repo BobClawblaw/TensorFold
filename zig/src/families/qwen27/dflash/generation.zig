@@ -25,6 +25,7 @@ pub const Generation = struct {
         if (runner.model != draft.backend.target or runner.model.config.hidden != draft.graph.config.hidden or runner.model.config.layers != draft.graph.config.target_layers) return error.TargetBinding;
         runner.capture_taps = true;
         for (draft.graph.config.taps, &runner.taps.ids) |id, *to| to.* = id;
+        runner.taps.count = draft.graph.config.tap_count;
         const options = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
         const kept = try runner.model.device.buffer(128 * 4, options);
         errdefer kept.deinit();

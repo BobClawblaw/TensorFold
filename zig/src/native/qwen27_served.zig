@@ -177,7 +177,7 @@ fn slotCost(model: *const q.model.Model, context: u32, drafting: bool) usize {
     var attention: usize = 0;
     for (0..c.layers) |i| attention += @intFromBool(c.kind(i) == .attention);
     const kv = attention * 2 * @as(usize, context) * c.kvDim() * 2;
-    const ring_bytes: usize = if (drafting) 2048 * 5 * c.hidden * 2 else 0;
+    const ring_bytes: usize = if (drafting) 2048 * 8 * c.hidden * 2 else 0; // a drafter's window of up to eight taps
     return kv + ring_bytes + (256 << 20); // DeltaNet states, conv tails and scratch, generously
 }
 
