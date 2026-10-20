@@ -11,6 +11,7 @@ const idx = @import("index.zig");
 const ffn = @import("moe.zig");
 const dspark = @import("draft.zig");
 const layer = @import("layer.zig");
+const kern = @import("kernels.zig");
 const ahead = @import("ahead.zig");
 const Buffer = mtl.Buffer;
 
@@ -185,6 +186,15 @@ pub const Enc = struct {
         };
         skipping = skips("rows");
         if (skipped()) return;
+        // a window's rows on the tiles: each weight read once for 8 rows, a row's sums the same at any width
+        if (self.m.kernels.tiles) |*t| if (kern.tiled(w)) {
+            if (row.simd_bits.call(t, w.bits, w.n, w.k, rows, w.n, rows <= 2)) |call| {
+                const m = row.simd_bits.Matrix{ .w = w.w, .w_off = w.w_off, .scales = w.scales, .s_off = w.s_off, .biases = w.biases, .b_off = w.b_off };
+                self.fence();
+                row.simd_bits.encode(self.ep.*, call, m, x, x_off, y, y_off);
+                return;
+            } else |_| {}
+        };
         const call = row.call(&self.m.kernels.rows, w, rows, false) catch unreachable;
         self.ep.*.setPipeline(call.pipeline);
         self.buf(x, x_off, 0);

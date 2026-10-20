@@ -57,6 +57,8 @@ pub const Model = struct {
         const wq_b = m.weights.layers[0].attn.wq_b;
         m.kernels = try kernels.load(m.device, &m.config, .{ .bits = @intCast(wq_b.bits), .group = @intCast(wq_b.group) });
         errdefer m.kernels.deinit();
+        const l0 = &m.weights.layers[0];
+        try kernels.checkTwins(&m.kernels, m.device, &.{ l0.attn.wq_a, l0.attn.wq_b, l0.attn.wkv, l0.attn.wo_b, l0.moe.shared.w1, l0.moe.shared.w2, l0.moe.shared.w3, m.weights.head });
         m.engram = try engram.Engram.open(gpa, io, dir, &m.config);
         errdefer m.engram.deinit();
         const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;

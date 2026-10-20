@@ -28,6 +28,8 @@ pub const Kernels = struct {
     attend_nax: ?mtl.Pipeline = null,
     /// A prompt chunk's index scores on the tensor units (v41_index_nax.metal); null without them.
     index_nax: ?mtl.Pipeline = null,
+    /// core/simd_qmm_bits: a window's dense projections on 8-row simdgroup-matrix tiles, a scalar twin at 1-2 rows.
+    tiles: ?row.simd_bits.Pipelines = null,
 
     pub fn get(self: *const Kernels, comptime key: []const u8) mtl.Pipeline {
         const i = comptime for (names, 0..) |n, i| {
@@ -47,9 +49,30 @@ pub const Kernels = struct {
         for (self.nax) |set| if (set) |pipes| for (pipes) |p| p.deinit();
         if (self.attend_nax) |p| p.deinit();
         if (self.index_nax) |p| p.deinit();
+        if (self.tiles) |*t| t.deinit();
         self.rows.deinit();
     }
 };
+
+/// Whether `w` is a shape the tiles take: g64 codes of a width they unpack, fp32 sums, 8 outputs a tile, 64 inputs a chunk.
+pub fn tiled(w: row.Weights) bool {
+    if (w.group != 64 or w.sum != .f32 or w.n % 8 != 0 or w.k % 64 != 0) return false;
+    return std.mem.indexOfScalar(u8, &row.simd_bits.bit_widths, w.bits) != null;
+}
+
+/// The scalar twin against the tiles on each of `mats` (a layer's dense shapes): a difference keeps the row kernels.
+pub fn checkTwins(self: *Kernels, device: mtl.Device, mats: []const row.Weights) !void {
+    const t: *row.simd_bits.Pipelines = if (self.tiles) |*p| p else return;
+    for (mats) |w| {
+        if (!tiled(w)) continue;
+        const m = row.simd_bits.Matrix{ .w = w.w, .w_off = w.w_off, .scales = w.scales, .s_off = w.s_off, .biases = w.biases, .b_off = w.b_off };
+        if (try row.simd_bits.twinExact(t, device, w.bits, m, w.n, w.k)) continue;
+        std.log.warn("deepseek_v41: the scalar twin differs from the tiles at [{d}, {d}] of {d} bits; windows keep the row kernels", .{ w.n, w.k, w.bits });
+        t.deinit();
+        self.tiles = null;
+        return;
+    }
+}
 
 pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Width) !Kernels {
     const pool = mtl.objc.Pool.push();
@@ -65,6 +88,8 @@ pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Widt
     }
     out.rows = try row.Pipelines.load(device);
     errdefer out.rows.deinit();
+    out.tiles = try row.simd_bits.Pipelines.load(device);
+    errdefer if (out.tiles) |*t| t.deinit();
     out.nax = @splat(null);
     out.attend_nax = null;
     out.index_nax = null;
