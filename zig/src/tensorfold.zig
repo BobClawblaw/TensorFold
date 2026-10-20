@@ -48,7 +48,7 @@ pub const qwen35 = @import("families/qwen3_5/qwen3_5.zig");
 pub const gemma4 = @import("families/gemma4/gemma4.zig");
 pub const step5 = @import("families/step5/step5.zig");
 pub const lfm2_moe = @import("families/lfm2_moe/lfm2_moe.zig");
-pub const deepseek_v41 = @import("families/deepseek_v41/deepseek_v41.zig");
+pub const deepseek_v41 = @import("families/deepseek_v41_metal/deepseek_v41.zig");
 pub const flashnext_pack = @import("families/flashnext/pack.zig");
 
 test {
@@ -86,7 +86,7 @@ test {
     _ = @import("families/lfm2_moe/config.zig");
     _ = @import("families/lfm2_moe/backend.zig");
     _ = @import("families/lfm2_moe/state.zig");
-    _ = @import("families/deepseek_v41/deepseek_v41.zig");
+    _ = @import("families/deepseek_v41_metal/deepseek_v41.zig");
 }
 
 pub const lane_projection = @import("core/lane_projection.zig");
