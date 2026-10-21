@@ -76,7 +76,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     try @import("cuda_prompt.zig").run(e, @intCast(ai), total);
                 } else {
                     if (total > E.most_verify) return error.InvalidQwenSegments; // the partials hold verify rows only
-                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
+                    const args = .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po };
+                    if (e.kv8) {
+                        // a short stream's rows one a block, a long stream's in groups sharing each key tile
+                        if (group < 2 or group > 16) return error.InvalidQwenSegments;
+                        try e.run(e.fp8.attn_partial, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
+                        try e.run(e.fp8.attn_rows, .{ (total + 64 / group - 1) / (64 / group), max_chunks, g.kv_heads }, .{ 256, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po });
+                    } else try e.run(e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, args);
                     try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                 }
                 try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
