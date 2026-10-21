@@ -29,6 +29,7 @@ const nvfp4_experts_tests = @import("nvfp4_experts_tests.zig");
 const quant_ref_tests = @import("quant_ref_tests.zig");
 const glm_ref_tests = @import("glm_ref_tests.zig");
 const affine8_tests = @import("affine8_tests.zig");
+const w4a8_tests = @import("w4a8_tests.zig");
 const glm_exl3_tests = @import("glm_exl3_tests.zig");
 const glm_vision_tests = @import("glm_vision_tests.zig");
 const glm_mm_fixed = @import("glm_mm_fixed_tests.zig");
@@ -174,6 +175,7 @@ const usage =
     \\  mxfp8                     MXFP8 strided projections against FP64 and row-count invariance
     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
     \\  affine8                   MLX affine 2 to 8-bit tiles and the 8-bit lane_gemv: widened codes, float64, rows (synthetic)
+    \\  w4a8                      int8-activation prompt matmuls on affine-4 tiles: float64 of their formula, rows (synthetic)
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
     \\  moe                       softmax routing and SwiGLU experts against host references, then moe-live
@@ -301,6 +303,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-ref")) return glm_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "affine8")) return affine8_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "w4a8")) return w4a8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return glm_mm_fixed.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
