@@ -98,8 +98,7 @@ pub const Affine4Kernels = struct {
         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
     }
 
-    /// Keep other devices at 16 rows; GB10 verify shares one weight panel across up to eight m16 row tiles, sm_120 (when
-    /// its engine says) across two.
+    /// 16 rows elsewhere; GB10 verify shares a weight panel across up to eight m16 row tiles, sm_120 across two.
     pub fn verifyRows(a: *const Affine4Kernels) usize {
         return if (a.pdl) 128 else if (a.wide_verify) 32 else max_rows;
     }
