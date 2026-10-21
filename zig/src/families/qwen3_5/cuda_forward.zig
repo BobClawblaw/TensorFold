@@ -1,9 +1,12 @@
 //! The landed CUDA forward with optional learner taps and pocket contributions.
 const E = @import("cuda_engine.zig");
+const cuda = @import("cuda");
 const hooks = @import("cuda_learn_hooks.zig");
 const geometry = @import("cuda_geometry.zig");
 const head_dim = geometry.head_dim;
 const max_chunks = 64;
+/// qwen35_attn_tc.cuh's bf16 tile buffers: two of a 32-key tile's keys and values, 512 bytes a row each.
+pub const attn_tiles = 4 * 32 * 512;
 /// Prompt experts keep the shipped arithmetic boundary, independently of verification capacity.
 pub const prompt_moe_cutoff: usize = 16;
 const ids_at = E.Engine.ids_at;
@@ -77,12 +80,17 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 } else {
                     if (total > E.most_verify) return error.InvalidQwenSegments; // the partials hold verify rows only
                     const args = .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po };
+                    // a short stream's rows one a block, a long stream's in groups sharing each key tile
+                    if (group < 2 or group > 16) return error.InvalidQwenSegments;
+                    const groups = (total + 64 / group - 1) / (64 / group);
+                    const rows_args = .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po };
                     if (e.kv8) {
-                        // a short stream's rows one a block, a long stream's in groups sharing each key tile
-                        if (group < 2 or group > 16) return error.InvalidQwenSegments;
                         try e.run(e.fp8.attn_partial, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
-                        try e.run(e.fp8.attn_rows, .{ (total + 64 / group - 1) / (64 / group), max_chunks, g.kv_heads }, .{ 256, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po });
-                    } else try e.run(e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, args);
+                        try e.run(e.fp8.attn_rows, .{ groups, max_chunks, g.kv_heads }, .{ 256, 1, 1 }, rows_args);
+                    } else {
+                        try shared(e, e.fns.attn_partial, .{ total, max_chunks, g.kv_heads }, 128, args);
+                        try shared(e, e.fns.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
+                    }
                     try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                 }
                 try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params, sums });
@@ -110,6 +118,14 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         };
     }
     try finish(e, total, heads, shape.hidden);
+}
+
+/// A bf16 decode attention launch with its two tile buffers of dynamic shared memory.
+fn shared(e: *E.Engine, f: cuda.Function, grid: [3]usize, threads: u32, args: anytype) !void {
+    var a: cuda.Args = .{};
+    inline for (args) |v| a.add(v);
+    const cfg: cuda.Config = .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = threads }, .shared = attn_tiles };
+    try cuda.launch.launch(f, cfg, e.stream, &a);
 }
 
 /// Layer inputs are already kept; hidden reads need neither the final norm nor the vocabulary head.
