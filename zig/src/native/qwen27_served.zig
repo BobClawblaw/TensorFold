@@ -271,6 +271,13 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, o: Options, a: Allocato
     defer pool.pop();
     const model = try q.model.Model.load(gpa, io, dir, 128, shareFits);
     errdefer model.deinit();
+    // past the trained window the rotation stretches with static YaRN, every prompt alike
+    const trained = model.config.max_position;
+    model.config.extend(o.context) catch |err| {
+        why.* = try std.fmt.allocPrint(a, "--context {d} is past this checkpoint's {d}-token window and the YaRN x4 reach the engine stretches it to", .{ o.context, trained });
+        return err;
+    };
+    if (model.config.yarn_factor != 0) std.log.info("qwen27: static YaRN x{d} over a {d}-token window: {d} tokens a stream", .{ model.config.yarn_factor, model.config.yarn_original, model.config.max_position });
     var with = o;
     // the tower before the slots: their room and the cache's budget count it as taken
     if (o.vision) |v| with.images = try images.open(gpa, io, model, dir, v, a, why);

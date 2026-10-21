@@ -341,8 +341,9 @@ fn qwen27Engine(a: Allocator, io: std.Io, dir: []const u8) bool {
 /// Qwen3.8-27B on the lane host: `--parallel` streams in shared rounds, DFlash2 drafts from --drafter for one of them.
 fn openQwen27(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const context = o.context orelse 32768;
-    if (context <= 0 or context > 262144) {
-        problem.* = try std.fmt.allocPrint(a, "--context {d} is outside this Qwen checkpoint's 1 to 262,144 tokens", .{context});
+    // the checkpoint's window, or up to four times it with static YaRN (the served host checks its own window)
+    if (context <= 0 or context > 4 * 262144) {
+        problem.* = try std.fmt.allocPrint(a, "--context {d} is outside 1 to 1,048,576 tokens (a 262,144-token Qwen window, stretched up to four times with YaRN)", .{context});
         return null;
     }
     if (o.drafts and o.drafter != null and o.drafter_bits != 0 and o.drafter_bits != 4) {

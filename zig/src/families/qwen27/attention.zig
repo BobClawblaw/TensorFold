@@ -4,6 +4,7 @@ const mtl = @import("metal");
 const profile = @import("core").gpu_profile;
 const Ref = @import("projection.zig").Ref;
 const glue = @import("glue.zig");
+const config = @import("config.zig");
 pub const planning = @import("attention_plan.zig");
 pub const Plan = planning.Plan;
 pub const Cache = struct { keys: Ref, values: Ref, capacity: u32, key_stride: u32 = 0, value_stride: u32 = 0 };
@@ -185,7 +186,7 @@ fn bind(e: mtl.ComputeEncoder, refs: anytype) void {
     inline for (refs, 0..) |r, i| e.setBuffer(r.buffer, r.offset, i);
 }
 /// h_end and w_end above 0: an M-RoPE round, the h and w position planes `plane` rows past each other in `positions`.
-pub const Preprocess = struct { heads: u32 = 24, kv_heads: u32 = 4, qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0 };
+pub const Preprocess = struct { heads: u32 = 24, kv_heads: u32 = 4, qg: Ref, key: Ref, q_gain: Ref, k_gain: Ref, norm_q: Ref, norm_k: Ref, query: Ref, rotated_key: Ref, positions: Ref, rows: u32, eps: f32, theta: f64, yarn: ?config.Yarn = null, h_end: u32 = 0, w_end: u32 = 0, plane: u32 = 0 };
 pub const Attention = struct {
     profiler: ?*profile.Trace = null,
     prefix: [16]mtl.Pipeline,
@@ -255,7 +256,13 @@ pub const Attention = struct {
         for ([_]struct { x: Ref, y: Ref, heads: u32 }{ .{ .x = p.norm_q, .y = p.query, .heads = p.heads }, .{ .x = p.norm_k, .y = p.rotated_key, .heads = p.kv_heads } }) |r| {
             e.setPipeline(a.io[8]);
             bind(e, .{ r.x, p.positions });
-            e.setValue(glue.Rope{ .width = 256, .heads = r.heads, .rows = p.rows, .rotary = 64, .activation = .bf16, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane }, 2);
+            var rope = glue.Rope{ .width = 256, .heads = r.heads, .rows = p.rows, .rotary = 64, .activation = .bf16, .theta = @floatCast(p.theta), .h_end = p.h_end, .w_end = p.w_end, .plane = p.plane };
+            if (p.yarn) |y| {
+                rope.yarn = 1;
+                rope.scale = y.scale;
+                rope.freq = y.freq;
+            }
+            e.setValue(rope, 2);
             e.setBuffer(r.y.buffer, r.y.offset, 3);
             e.dispatchThreads(mtl.Size.of(256, r.heads, p.rows), mtl.Size.of(32, 1, 1));
         }

@@ -27,6 +27,11 @@ pub const Config = struct {
     eos_count: usize = 0,
     max_position: usize = 262144,
     mrope_interleaved: bool = true,
+    /// Static YaRN: factor (0: plain), stretched window, ramp betas, attention factor (0: 0.1 ln(factor) + 1).
+    yarn_factor: f64 = 0,
+    yarn_original: usize = 0,
+    yarn_beta: [2]f64 = .{ 32, 1 },
+    yarn_attention: f64 = 0,
     /// Routed experts (qwen3_5_moe): their count and the picks a row makes; 0: a dense MLP of `intermediate`.
     experts: usize = 0,
     top_k: usize = 0,
@@ -59,10 +64,48 @@ pub const Config = struct {
         return 2 * c.k_heads * c.dk + c.gdnValueDim();
     }
 
+    /// Fit `context` past the trained window with static YaRN at the window multiple rounded up (at most 4: 1M).
+    pub fn extend(c: *Config, context: usize) !void {
+        if (context <= c.max_position) return;
+        if (c.yarn_factor != 0 or c.rope_dims != 64) return error.ContextFull;
+        const factor = std.math.divCeil(usize, context, c.max_position) catch unreachable;
+        if (factor > 4) return error.ContextFull;
+        c.yarn_factor = @floatFromInt(factor);
+        c.yarn_original = c.max_position;
+        c.max_position *= factor;
+    }
+
+    /// The rotary pairs' YaRN frequencies and cos/sin scale (null: plain rope), built as vLLM's YaRN rotary does.
+    pub fn yarn(c: Config) ?Yarn {
+        if (c.yarn_factor == 0) return null;
+        const dim: f64 = 64;
+        const original: f64 = @floatFromInt(c.yarn_original);
+        const dimOf = struct {
+            fn f(rotations: f64, base: f64, positions: f64) f64 {
+                return 64 * @log(positions / (rotations * 2 * std.math.pi)) / (2 * @log(base));
+            }
+        }.f;
+        const low = @max(@floor(dimOf(c.yarn_beta[0], c.rope_theta, original)), 0);
+        var high = @min(@ceil(dimOf(c.yarn_beta[1], c.rope_theta, original)), dim - 1);
+        if (low == high) high += 0.001;
+        var y: Yarn = .{ .freq = undefined, .scale = @floatCast(if (c.yarn_attention != 0) c.yarn_attention else 0.1 * @log(c.yarn_factor) + 1) };
+        for (&y.freq, 0..) |*f, k| {
+            const kf: f64 = @floatFromInt(k);
+            const pos_freq: f32 = @floatCast(std.math.pow(f64, c.rope_theta, @as(f64, @as(f32, @floatCast(2 * kf / dim)))));
+            const extrapolated: f32 = 1.0 / pos_freq;
+            const interpolated: f32 = 1.0 / (@as(f32, @floatCast(c.yarn_factor)) * pos_freq);
+            const keep: f32 = 1 - @as(f32, @floatCast(std.math.clamp((kf - low) / (high - low), 0, 1)));
+            f.* = interpolated * (1 - keep) + extrapolated * keep;
+        }
+        return y;
+    }
+
     pub fn isEos(c: Config, token: u32) bool {
         return std.mem.indexOfScalar(u32, c.eos[0..c.eos_count], token) != null;
     }
 };
+
+pub const Yarn = struct { freq: [32]f32, scale: f32 };
 
 pub fn object(v: std.json.Value) !std.json.ObjectMap {
     return if (v == .object) v.object else error.BadConfig;
@@ -109,6 +152,26 @@ fn eos(c: *Config, v: std.json.Value) !void {
     if (c.eos_count == max_eos) return error.TooManyEos;
     c.eos[c.eos_count] = id;
     c.eos_count += 1;
+}
+
+/// `rope_parameters.rope_type` (default or yarn), or a `rope_scaling` block beside it in either config level.
+fn scaling(c: *Config, root: std.json.ObjectMap, t: std.json.ObjectMap, rope: ?std.json.ObjectMap) !void {
+    const block = for ([_]?std.json.ObjectMap{ if (t.get("rope_scaling")) |v| (if (v == .null) null else try object(v)) else null, if (root.get("rope_scaling")) |v| (if (v == .null) null else try object(v)) else null, rope }) |b| {
+        const o = b orelse continue;
+        const kind = o.get("rope_type") orelse o.get("type") orelse continue;
+        if (kind != .string) return error.UnsupportedRope;
+        if (std.mem.eql(u8, kind.string, "default")) continue;
+        if (!std.mem.eql(u8, kind.string, "yarn")) return error.UnsupportedRope;
+        break o;
+    } else return;
+    if (block.get("mscale") != null or block.get("mscale_all_dim") != null or c.rope_dims != 64) return error.UnsupportedRope;
+    c.yarn_factor = try number(block.get("factor") orelse return error.BadConfig);
+    if (c.yarn_factor <= 1) return error.BadConfig;
+    c.yarn_original = if (block.get("original_max_position_embeddings")) |v| try integer(v, false) else c.max_position;
+    c.yarn_beta = .{ try optional(block, "beta_fast", 32), try optional(block, "beta_slow", 1) };
+    c.yarn_attention = try optional(block, "attention_factor", 0);
+    if (c.yarn_beta[0] <= c.yarn_beta[1] or c.yarn_beta[1] <= 0 or c.yarn_attention < 0) return error.BadConfig;
+    c.max_position = @max(c.max_position, @as(usize, @intFromFloat(@floor(c.yarn_factor * @as(f64, @floatFromInt(c.yarn_original))))));
 }
 
 fn shapeProducts(c: Config) !void {
@@ -183,6 +246,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, generation: ?[]const u8) 
     };
     if (c.layers > max_layers or c.head_dim == 0 or c.heads % c.kv_heads != 0 or c.v_heads % c.k_heads != 0) return error.BadConfig;
     if (!std.math.isFinite(c.eps) or c.eps <= 0 or c.rope_theta <= 0 or c.rope_dims == 0 or c.rope_dims % 2 != 0) return error.BadConfig;
+    try scaling(&c, root, t, rope);
     if (rope) |r| if (r.get("mrope_section")) |v| {
         if (v != .array or v.array.items.len != 3) return error.BadConfig;
         for (v.array.items, 0..) |x, i| c.mrope_section[i] = try integer(x, true);
@@ -349,4 +413,40 @@ test "text execution refuses unsupported gates and activation contracts" {
     const act = try edit(a, "output_gate_type", .{ .string = "sigmoid" });
     defer a.free(act);
     try std.testing.expectError(error.UnsupportedActivation, parse(a, act, null));
+}
+
+test "a yarn rope_scaling block stretches the window, its table vLLM's (theta 1e7, x4 over 262,144: ramp 14 to 22)" {
+    const a = std.testing.allocator;
+    const json = try std.mem.replaceOwned(u8, a, fixture, "\"head_dim\":16,", "\"head_dim\":256,\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":262144},");
+    defer a.free(json);
+    const c = try parse(a, json, null);
+    try std.testing.expectEqual(@as(usize, 1048576), c.max_position);
+    const y = c.yarn().?;
+    try std.testing.expectApproxEqRel(@as(f32, 1.1386294), y.scale, 1e-6);
+    // pairs below the ramp keep their frequency, above it a quarter of it, between a blend (numpy float32)
+    for ([_]usize{ 0, 5, 10, 16, 20, 31 }, [_]f32{ 1.0, 0.08058421313762665, 0.006493816617876291, 0.00025693507632240653, 1.844922371674329e-05, 4.1370427084075345e-08 }) |k, want| {
+        try std.testing.expectApproxEqRel(want, y.freq[k], 2e-6);
+    }
+}
+
+test "a context past the window turns on YaRN by the window multiple, up to four; other rope types refuse" {
+    const a = std.testing.allocator;
+    var c = try parse(a, fixture, null);
+    c.rope_dims = 64;
+    try c.extend(262144);
+    try std.testing.expect(c.yarn() == null);
+    var half = c;
+    try half.extend(500000);
+    try std.testing.expectEqual(@as(f64, 2), half.yarn_factor);
+    try c.extend(1000000);
+    try std.testing.expectEqual(@as(f64, 4), c.yarn_factor);
+    try std.testing.expectEqual(@as(usize, 1048576), c.max_position);
+    var far = try parse(a, fixture, null);
+    far.rope_dims = 64;
+    try std.testing.expectError(error.ContextFull, far.extend(1048577));
+    const p = try std.json.parseFromSlice(std.json.Value, a, "{\"rope_type\":\"linear\",\"factor\":2.0}", .{});
+    defer p.deinit();
+    const json = try edit(a, "rope_scaling", p.value);
+    defer a.free(json);
+    try std.testing.expectError(error.UnsupportedRope, parse(a, json, null));
 }
