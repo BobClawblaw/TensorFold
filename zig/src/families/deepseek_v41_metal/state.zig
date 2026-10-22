@@ -13,6 +13,8 @@ pub const picks = c.index_topk;
 /// Rows that take the split attention (decode, windows, drafts), and its 16-key chunks a row.
 pub const split_rows = 16;
 pub const split_chunks = (c.window + picks + 15) / 16;
+/// Routed slots a threadgroup of the prompt chunk's expert sort takes (v41_moe.metal's SORT_BLOCK).
+pub const sort_block = 256;
 /// Scores a prompt call's indexer holds at once (f32): rows are taken in slices of this many keys' worth.
 pub const score_budget = 256 << 20;
 
@@ -142,11 +144,11 @@ pub const Scratch = struct {
     act: mtl.Buffer,
     experts: mtl.Buffer,
     shared: mtl.Buffer,
-    /// A chunk's slots sorted by expert: offsets, order, weights, input rows, the tensor units' group sums.
+    /// A chunk's slots sorted by expert: offsets, order, weights, each block's counts, the tensor units' group sums.
     offs: mtl.Buffer,
     order: mtl.Buffer,
     wsort: mtl.Buffer,
-    xsort: mtl.Buffer,
+    counts: mtl.Buffer,
     sums: mtl.Buffer,
     /// bf16 [rows, 24 x 256] a layer, filled on the host: two sets, so a chunk's gather overlaps the chunk before.
     engram_rows: [2][c.engram_layers.len]mtl.Buffer,
@@ -219,7 +221,7 @@ pub const Scratch = struct {
         out.offs = try m.alloc((c.experts + 1) * 4);
         out.order = try m.alloc(slots * 4);
         out.wsort = try m.alloc(slots * 4);
-        out.xsort = try m.alloc(slots * c.hidden * 2);
+        out.counts = try m.alloc((slots + sort_block - 1) / sort_block * c.experts * 4);
         out.sums = try m.alloc(@max(rows * (c.heads * c.head_dim) / 64, slots * c.hidden / 64) * 4);
         for (&out.engram_rows) |*set| for (set) |*b| {
             b.* = try m.alloc(rows * c.engram_cols * c.engram_dim * 2);

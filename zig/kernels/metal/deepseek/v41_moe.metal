@@ -109,35 +109,70 @@ struct SortArgs {
   int experts;
 };
 
-// A chunk's routed slots sorted by expert (stable) for core/affine_mm's gathers: OFFS, ORDER, WS; one thread.
-[[kernel]] void ds_sort_slots(const device uint* PICK [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
-                              device int* OFFS [[buffer(2)]], device int* ORDER [[buffer(3)]],
-                              device float* WS [[buffer(4)]], constant SortArgs& a [[buffer(5)]],
-                              uint t [[thread_position_in_grid]]) {
-  if (t != 0) return;
-  for (int e = 0; e < a.experts; e++) OFFS[e] = 0;
-  for (int i = 0; i < a.slots; i++) OFFS[PICK[i]]++;
-  int at = 0;
-  for (int e = 0; e < a.experts; e++) {
-    const int n = OFFS[e];
-    OFFS[e] = at;
-    at += n;
-  }
-  // place, then shift the offsets back (each expert's fill pointer ends at the next one's start)
-  for (int i = 0; i < a.slots; i++) {
-    const int at2 = OFFS[PICK[i]]++;
-    ORDER[at2] = i;
-    WS[at2] = WEIGHT[i];
-  }
-  for (int e = a.experts - 1; e > 0; e--) OFFS[e] = OFFS[e - 1];
-  OFFS[0] = 0;
+// A chunk's routed slots sorted by expert (stable) for core/affine_mm's gathers, SORT_BLOCK slots a threadgroup.
+constant int SORT_BLOCK = 256;
+
+// Each block's count of each expert's slots.
+
+[[kernel]] void ds_sort_count(const device uint* PICK [[buffer(0)]], device int* COUNTS [[buffer(1)]],
+                              constant SortArgs& a [[buffer(2)]], uint t [[thread_position_in_threadgroup]],
+                              uint b [[threadgroup_position_in_grid]]) {
+  threadgroup atomic_int n[1024];
+  for (int e = int(t); e < a.experts; e += SORT_BLOCK) atomic_store_explicit(&n[e], 0, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const int i = int(b) * SORT_BLOCK + int(t);
+  if (i < a.slots) atomic_fetch_add_explicit(&n[PICK[i]], 1, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = int(t); e < a.experts; e += SORT_BLOCK)
+    COUNTS[size_t(b) * a.experts + e] = atomic_load_explicit(&n[e], memory_order_relaxed);
 }
 
-// Sorted slot i's input row: X[ORDER[i] / topk] (a token's row for each of its picks).
-[[kernel]] void ds_gather_rows(const device bfloat* X [[buffer(0)]], const device int* ORDER [[buffer(1)]],
-                               device bfloat* Y [[buffer(2)]], constant int2& wk [[buffer(3)]],
-                               uint2 g [[thread_position_in_grid]]) {
-  Y[size_t(g.y) * wk.x + g.x] = X[size_t(ORDER[g.y] / wk.y) * wk.x + g.x];
+// One threadgroup, a thread an expert: COUNTS becomes each block's first place for it, OFFS each expert's first.
+[[kernel]] void ds_sort_scan(device int* COUNTS [[buffer(0)]], device int* OFFS [[buffer(1)]],
+                             constant SortArgs& a [[buffer(2)]], uint t [[thread_position_in_threadgroup]]) {
+  threadgroup int base[1024];
+  const int blocks = (a.slots + SORT_BLOCK - 1) / SORT_BLOCK;
+  const bool mine = int(t) < a.experts;
+  int total = 0;
+  if (mine)
+    for (int b = 0; b < blocks; b++) total += COUNTS[size_t(b) * a.experts + t];
+  base[t] = total;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t == 0) {
+    int at = 0;
+    for (int e = 0; e < a.experts; e++) {
+      const int n = base[e];
+      base[e] = at;
+      at += n;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!mine) return;
+  int at = base[t];
+  OFFS[t] = at;
+  for (int b = 0; b < blocks; b++) {
+    const int n = COUNTS[size_t(b) * a.experts + t];
+    COUNTS[size_t(b) * a.experts + t] = at;
+    at += n;
+  }
+}
+
+// Each slot's place: its block's first for its expert plus its rank among the block's earlier slots of that expert.
+[[kernel]] void ds_sort_place(const device uint* PICK [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
+                              const device int* COUNTS [[buffer(2)]], device int* ORDER [[buffer(3)]],
+                              device float* WS [[buffer(4)]], constant SortArgs& a [[buffer(5)]],
+                              uint t [[thread_position_in_threadgroup]], uint b [[threadgroup_position_in_grid]]) {
+  threadgroup uint picks[SORT_BLOCK];
+  const int i = int(b) * SORT_BLOCK + int(t);
+  const uint e = i < a.slots ? PICK[i] : 0xffffffffu;
+  picks[t] = e;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (i >= a.slots) return;
+  int rank = 0;
+  for (uint k = 0; k < t; k++) rank += picks[k] == e;
+  const int at = COUNTS[size_t(b) * a.experts + e] + rank;
+  ORDER[at] = i;
+  WS[at] = WEIGHT[i];
 }
 
 // The mean of a row's four streams (bf16) into Y at column `col` of `ld`-wide rows: a DSpark target layer's input.

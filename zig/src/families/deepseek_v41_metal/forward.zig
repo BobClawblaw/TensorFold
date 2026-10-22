@@ -36,7 +36,7 @@ pub const Vis = struct {
 
 const HcArgs = extern struct { eps: f32, hc_eps: f32, iters: i32 };
 const RowsArgs = extern struct { n: i32, x_stride: i32, y_stride: i32, eps: f32 };
-const GemvArgs = extern struct { rows: i32, n: i32, k: i32, group_n: i32, x_stride: i32, y_stride: i32 };
+pub const GemvArgs = extern struct { rows: i32, n: i32, k: i32, group_n: i32, x_stride: i32, y_stride: i32 };
 const RopeArgs = extern struct { heads: i32, stride: i32, offset: i32, inverse: i32 };
 const CopyArgs = extern struct { width: i32, ring: i32 };
 const AttnArgs = extern struct { first_pos: i32, ring: i32, window: i32, picks: i32, scale: f32, window_end: i32 = -1 };
@@ -367,7 +367,8 @@ pub const Enc = struct {
         if (hc) |h| {
             if (pending_expand) {
                 pending_expand = false;
-                self.pipe("ds_hc_expand_mix");
+                const by_rows = self.rows >= nax_rows; // a chunk's rows four to a threadgroup, FN read once for them
+                if (by_rows) self.pipe("ds_hc_expand_mix_rows") else self.pipe("ds_hc_expand_mix");
                 self.buf(s.x, 0, 0);
                 self.buf(s.branch, 0, 1);
                 self.buf(s.post, 0, 2);
@@ -377,9 +378,10 @@ pub const Enc = struct {
                 self.buf(s.x2, 0, 6);
                 self.buf(s.experts, 0, 7);
                 self.buf(s.shared, 0, 8);
-                self.args(pending_topk, 9);
+                self.args([2]i32{ pending_topk, @intCast(self.rows) }, 9);
                 pending_topk = 0;
-                self.groups(.{ c.hc * c.hidden / 1024, self.rows, 1 }, .{ 256, 1, 1 });
+                const grid: [2]usize = if (by_rows) .{ c.hidden / 1024, (self.rows + 3) / 4 } else .{ c.hc * c.hidden / 1024, self.rows };
+                self.groups(.{ grid[0], grid[1], 1 }, .{ 256, 1, 1 });
                 std.mem.swap(Buffer, &s.x, &s.x2);
             } else {
                 self.pipe("ds_hc_mix_part");

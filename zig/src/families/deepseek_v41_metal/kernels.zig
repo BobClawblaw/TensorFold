@@ -8,15 +8,15 @@ const frags = @import("../../core/frags.zig");
 const cfg = @import("config.zig");
 
 pub const names = [_][:0]const u8{
-    "ds_embed",             "ds_hc_expand",     "ds_hc_boundary", "ds_hc_collapse",      "ds_rms",
-    "ds_gemv_bf_bf",        "ds_gemv_bf_f32",   "ds_rope",        "ds_fp8_qdq",          "ds_fp4_qdq",
-    "ds_put_rows",          "ds_put_rows_f32",  "ds_pool2",       "ds_index_scores_1x8", "ds_index_scores_2x16",
-    "ds_index_scores_kept", "ds_kept_keys",     "ds_block_max",   "ds_topk",             "ds_route",
-    "ds_swiglu",            "ds_engram",        "ds_scale",       "ds_hc_mix_part",      "ds_sort_slots",
-    "ds_gather_rows",       "ds_attend_rows",   "ds_stream_mean", "ds_markov",           "ds_markov_pick",
-    "ds_linear_bias",       "ds_bias",          "ds_add",         "ds_vit_rope",         "ds_vit_attend",
-    "ds_vit_glu",           "ds_unfold",        "ds_put_image",   "ds_attend_split",     "ds_attend_merge",
-    "ds_kv_finish",         "ds_hc_expand_mix",
+    "ds_embed",             "ds_hc_expand",     "ds_hc_boundary", "ds_hc_collapse",        "ds_rms",
+    "ds_gemv_bf_bf",        "ds_gemv_bf_f32",   "ds_rope",        "ds_fp8_qdq",            "ds_fp4_qdq",
+    "ds_put_rows",          "ds_put_rows_f32",  "ds_pool2",       "ds_index_scores_1x8",   "ds_index_scores_2x16",
+    "ds_index_scores_kept", "ds_kept_keys",     "ds_block_max",   "ds_topk",               "ds_route",
+    "ds_swiglu",            "ds_engram",        "ds_scale",       "ds_hc_mix_part",        "ds_sort_count",
+    "ds_sort_scan",         "ds_attend_rows",   "ds_stream_mean", "ds_markov",             "ds_markov_pick",
+    "ds_linear_bias",       "ds_bias",          "ds_add",         "ds_vit_rope",           "ds_vit_attend",
+    "ds_vit_glu",           "ds_unfold",        "ds_put_image",   "ds_attend_split",       "ds_attend_merge",
+    "ds_kv_finish",         "ds_hc_expand_mix", "ds_sort_place",  "ds_hc_expand_mix_rows", "ds_gemv_cols_bf_f32",
 };
 
 pub const Kernels = struct {
@@ -126,10 +126,10 @@ pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Widt
     return out;
 }
 
-/// core/affine_mm at `bits`, group 64 (its GLU entry points unused: the experts' SwiGLU is the family's own).
+/// core/affine_mm at `bits`, group 64, its gather GLU in DeepSeek's route-weighted form (the experts' gate and up).
 fn naxLoad(device: mtl.Device, bits: u8) !am.Pipes {
     const a = std.heap.c_allocator;
-    const src = try am.source(device, a, .{ .bits = bits, .group = 64 });
+    const src = try am.source(device, a, .{ .bits = bits, .group = 64, .glu = .weighted });
     defer a.free(src);
     const lib = try mtl.Library.fromSource(device, src, mtl.CompileOptions.mlx());
     defer lib.deinit();

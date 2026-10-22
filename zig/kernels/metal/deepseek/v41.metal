@@ -130,12 +130,12 @@ constant constexpr int SLICES = F / 1024;
                                  const device float* POST [[buffer(2)]], const device float* COMB [[buffer(3)]],
                                  const device float* FN [[buffer(4)]], device float* PART [[buffer(5)]],
                                  device bfloat* XO [[buffer(6)]], const device bfloat* Y [[buffer(7)]],
-                                 const device bfloat* SH [[buffer(8)]], constant int& topk [[buffer(9)]],
+                                 const device bfloat* SH [[buffer(8)]], constant int2& topk_rows [[buffer(9)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint2 tpos [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
                                  uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float red[8][MIX + 1];
-  const int j = int(tg.x), r = int(tg.y);
+  const int j = int(tg.x), r = int(tg.y), topk = topk_rows.x;
   const uint t = tpos.x;
   const int col = 1024 * j + 4 * int(t);
   const int k = col / D, d0 = col % D;
@@ -168,6 +168,73 @@ constant constexpr int SLICES = F / 1024;
     float s = 0.0f;
     for (int q = 0; q < 8; q++) s += red[q][t];
     PART[(size_t(r) * SLICES + j) * (MIX + 1) + t] = s;
+  }
+}
+
+// ds_hc_expand_mix's sums for a chunk: XR rows of a 1024-wide d slice (all streams) a threadgroup, FN read once.
+constant constexpr int XR = 4;
+constant constexpr int DSLICES = D / 1024;
+
+[[kernel]] void ds_hc_expand_mix_rows(const device bfloat* X [[buffer(0)]], const device bfloat* BR [[buffer(1)]],
+                                      const device float* POST [[buffer(2)]], const device float* COMB [[buffer(3)]],
+                                      const device float* FN [[buffer(4)]], device float* PART [[buffer(5)]],
+                                      device bfloat* XO [[buffer(6)]], const device bfloat* Y [[buffer(7)]],
+                                      const device bfloat* SH [[buffer(8)]], constant int2& topk_rows [[buffer(9)]],
+                                      uint2 tg [[threadgroup_position_in_grid]],
+                                      uint2 tpos [[thread_position_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]],
+                                      uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float red[8][XR][S][MIX + 1];
+  const int q = int(tg.x), r0 = int(tg.y) * XR, topk = topk_rows.x;
+  const int live = min(XR, topk_rows.y - r0);
+  const uint t = tpos.x;
+  const int d0 = 1024 * q + 4 * int(t);
+  float v[XR][S][4];
+  for (int rr = 0; rr < XR; rr++) {
+    if (rr >= live) {
+      for (int k = 0; k < S; k++)
+        for (int i = 0; i < 4; i++) v[rr][k][i] = 0.0f;
+      continue;
+    }
+    const int r = r0 + rr;
+    const device bfloat* x = X + size_t(r) * F;
+    const device float* cm = COMB + r * S * S;
+    for (int i = 0; i < 4; i++) {
+      const int d = d0 + i;
+      const float b = topk > 0 ? combined(Y, SH, topk, r, d) : float(BR[size_t(r) * D + d]);
+      float xs[S];
+      for (int jj = 0; jj < S; jj++) xs[jj] = float(x[jj * D + d]);
+      for (int k = 0; k < S; k++) {
+        float mm = 0.0f;
+        for (int jj = 0; jj < S; jj++) mm += cm[jj * S + k] * xs[jj];
+        const bfloat o = bfloat(POST[r * S + k] * b + mm);
+        XO[size_t(r) * F + k * D + d] = o;
+        v[rr][k][i] = float(o);
+      }
+    }
+  }
+  for (int k = 0; k < S; k++) {
+    for (int m = 0; m < MIX; m++) {
+      const device float* f = FN + size_t(m) * F + k * D + d0;
+      const float f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3];
+      for (int rr = 0; rr < XR; rr++) {
+        const float s = simd_sum(f0 * v[rr][k][0] + f1 * v[rr][k][1] + f2 * v[rr][k][2] + f3 * v[rr][k][3]);
+        if (lane == 0) red[sg][rr][k][m] = s;
+      }
+    }
+    for (int rr = 0; rr < XR; rr++) {
+      const float s = simd_sum(v[rr][k][0] * v[rr][k][0] + v[rr][k][1] * v[rr][k][1] + v[rr][k][2] * v[rr][k][2] +
+                               v[rr][k][3] * v[rr][k][3]);
+      if (lane == 0) red[sg][rr][k][MIX] = s;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = int(t); e < XR * S * (MIX + 1); e += 256) {
+    const int m = e % (MIX + 1), k = (e / (MIX + 1)) % S, rr = e / ((MIX + 1) * S);
+    if (rr >= live) continue;
+    float s = 0.0f;
+    for (int w = 0; w < 8; w++) s += red[w][rr][k][m];
+    PART[(size_t(r0 + rr) * SLICES + k * DSLICES + q) * (MIX + 1) + m] = s;
   }
 }
 
@@ -320,6 +387,47 @@ template <typename XT, typename YT>
   }
 }
 
+// ds_gemv's sums for a chunk over one x slice (group_n = n): 4 columns a simdgroup, each x value read once for them.
+template <typename XT, typename YT>
+[[kernel]] void ds_gemv_cols(const device XT* X [[buffer(0)]], const device bfloat* W [[buffer(1)]],
+                             device YT* Y [[buffer(2)]], constant GemvArgs& a [[buffer(3)]],
+                             uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr int NC = 4;
+  const int j0 = (int(tg.x) * 8 + int(sg)) * NC;
+  if (j0 >= a.n) return;
+  const int nc = min(NC, a.n - j0);
+  const int r0 = int(tg.y) * 8;
+  const int nr = min(8, a.rows - r0);
+  float acc[NC][8];
+  for (int c = 0; c < NC; c++)
+    for (int i = 0; i < 8; i++) acc[c][i] = 0.0f;
+  for (int kk = int(lane) * 8; kk < a.k; kk += 256) {
+    float wv[NC][8];
+    for (int c = 0; c < NC; c++) {
+      const device bfloat* w = W + size_t(min(j0 + c, a.n - 1)) * a.k + kk;
+      for (int u = 0; u < 8; u++) wv[c][u] = float(w[u]);
+    }
+    for (int i = 0; i < nr; i++) {
+      const device XT* xr = X + size_t(r0 + i) * a.x_stride + kk;
+      float xv[8];
+      for (int u = 0; u < 8; u++) xv[u] = float(xr[u]);
+      for (int c = 0; c < NC; c++) {
+        float part = 0.0f;
+        for (int u = 0; u < 8; u++) part += xv[u] * wv[c][u];
+        acc[c][i] += part;
+      }
+    }
+  }
+  for (int c = 0; c < nc; c++)
+    for (int i = 0; i < nr; i++) {
+      const float s = simd_sum(acc[c][i]);
+      if (lane == 0) Y[size_t(r0 + i) * a.y_stride + j0 + c] = YT(s);
+    }
+}
+
+template [[host_name("ds_gemv_cols_bf_f32")]] [[kernel]]
+decltype(ds_gemv_cols<bfloat, float>) ds_gemv_cols<bfloat, float>;
 template [[host_name("ds_gemv_bf_bf")]] [[kernel]] decltype(ds_gemv<bfloat, bfloat>) ds_gemv<bfloat, bfloat>;
 template [[host_name("ds_gemv_bf_f32")]] [[kernel]] decltype(ds_gemv<bfloat, float>) ds_gemv<bfloat, float>;
 

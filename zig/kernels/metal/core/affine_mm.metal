@@ -461,9 +461,16 @@ TF_GATHER(64)
 TF_GATHER_SCATTER(32)
 TF_GATHER_SCATTER(64)
 
-#ifdef TF_GLU_PLAIN
+#if defined(TF_GLU_WEIGHTED)
+// DeepSeek-V4.1's SwiGLU: bf16-rounded gate and up, w * silu(min(g, limit)) * clamp(u, +-limit) in fp32, rounded once.
+inline bfloat am_swiglu(float g, float u, float limit, float w) {
+  const float gate = min(float(bfloat(g)), limit);
+  const float up = clamp(float(bfloat(u)), -limit, limit);
+  return bfloat(w * (gate / (1.0f + metal::precise::exp(-gate)) * up));
+}
+#elif defined(TF_GLU_PLAIN)
 // mlx-lm's compiled SwiGLU on bf16 rows (LFM2): silu(g) * u, rounded to bf16 at each step; `limit` unused.
-inline bfloat am_swiglu(float g, float u, float limit) {
+inline bfloat am_swiglu(float g, float u, float limit, float) {
   const float gt = float(bfloat(g));
   const bfloat s = static_cast<bfloat>(1.0f / (1.0f + metal::precise::exp(-gt)));
   const bfloat silu = static_cast<bfloat>(gt * float(s));
@@ -477,7 +484,7 @@ inline bfloat am_sigmoid(bfloat x) {
   return (x < 0) ? y : (bfloat(1) - y);
 }
 
-inline bfloat am_swiglu(float g, float u, float limit) {
+inline bfloat am_swiglu(float g, float u, float limit, float) {
   const float lim = float(bfloat(limit));
   const bfloat gt = bfloat(metal::min(float(bfloat(g)), lim));
   const bfloat up = bfloat(metal::min(metal::max(float(bfloat(u)), -lim), lim));
@@ -486,19 +493,32 @@ inline bfloat am_swiglu(float g, float u, float limit) {
 }
 #endif
 
-// A simdgroup's gate (j 0) and up (j 1) fragments as SwiGLU outputs into y (ld N), rows below live only.
+// Gate (j 0) and up (j 1) fragments as SwiGLU outputs into y (ld N), rows below live only; ws: rows' route weights.
 template <int TM>
 inline void am_store_glu(thread const frag<float> (&acc)[TM][2], device bfloat* y, int N, int live, short2 home,
-                         float limit) {
+                         float limit, const device float* ws) {
   TF_UNROLL
   for (short i = 0; i < TM; i++) {
     TF_UNROLL
     for (short e = 0; e < 8; e++) {
       const int r = 16 * i + home.y + (e >> 2) * 8;
-      if (r < live) y[long(r) * N + home.x + TF_COL(e)] = am_swiglu(acc[i][0][e], acc[i][1][e], limit);
+#if defined(TF_GLU_WEIGHTED)
+      const float w = r < live ? ws[r] : 0.0f;
+#else
+      const float w = 1.0f;
+#endif
+      if (r < live) y[long(r) * N + home.x + TF_COL(e)] = am_swiglu(acc[i][0][e], acc[i][1][e], limit, w);
     }
   }
 }
+
+#if defined(TF_GLU_WEIGHTED)
+#define TF_GLU_WS , const device float *WS [[buffer(13)]]
+#define TF_GLU_WS_AT(r) (WS + (r))
+#else
+#define TF_GLU_WS
+#define TF_GLU_WS_AT(r) nullptr
+#endif
 
 // The routed experts' gate and up over token rows read through ORDER (pair / topk), SwiGLU'd into act [rows, n]: 32 columns a tile.
 #define TF_GATHER_GLU(BM)                                                                                               \
@@ -508,7 +528,7 @@ inline void am_store_glu(thread const frag<float> (&acc)[TM][2], device bfloat* 
       const device float* XS [[buffer(4)]], constant MmArgs& a [[buffer(5)]], device bfloat* Y [[buffer(6)]],          \
       const device int32_t* OFFS [[buffer(7)]], const device int32_t* ORDER [[buffer(8)]],                            \
       const device uint32_t* WU [[buffer(9)]], const device bfloat* SU [[buffer(10)]],                                 \
-      const device bfloat* BU [[buffer(11)]], constant float2& glu [[buffer(12)]],                                     \
+      const device bfloat* BU [[buffer(11)]], constant float2& glu [[buffer(12)]] TF_GLU_WS,                           \
       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],                            \
       uint3 tg [[threadgroup_position_in_grid]]) {                                                                     \
     constexpr int SM = BM / 2;                                                                                         \
@@ -528,7 +548,7 @@ inline void am_store_glu(thread const frag<float> (&acc)[TM][2], device bfloat* 
                   (const device uchar*)(up ? WU : WG) + wrow * (a.k * TF_BITS / 8) + HALF_BYTES * (t % 2),            \
                   (up ? SU : SG) + wrow * (a.k / TF_GROUP), (up ? BU : BG) + wrow * (a.k / TF_GROUP), tile, sb, tn,     \
                   uint(t), home);                                                                                      \
-    am_store_glu<TM>(acc, Y + long(row + tm) * a.n + c0 + tn / 2, a.n, live, home, glu.y);                            \
+    am_store_glu<TM>(acc, Y + long(row + tm) * a.n + c0 + tn / 2, a.n, live, home, glu.y, TF_GLU_WS_AT(row + tm));    \
   }
 TF_GATHER_GLU(32)
 TF_GATHER_GLU(64)

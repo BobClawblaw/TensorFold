@@ -4,8 +4,8 @@ const mtl = @import("metal");
 const ks = @import("kernel_sources");
 const frags = @import("frags.zig");
 
-/// The gather GLU's SwiGLU: GLM's clipped bf16 form, or mlx-lm's compiled silu(g) * u on bf16 rows (LFM2).
-pub const Glu = enum { clipped, plain };
+/// The gather GLU's SwiGLU: GLM's clipped bf16 form, mlx-lm's silu(g) * u (LFM2), or DeepSeek-V4.1's weighted one.
+pub const Glu = enum { clipped, plain, weighted };
 
 /// The weights' bits (2-6 or 8) and group (32, 64 or 128), the output's type and the GLU epilogue.
 pub const Format = struct { bits: u8 = 4, group: u16 = 64, out_f32: bool = false, glu: Glu = .clipped };
@@ -16,7 +16,11 @@ pub fn source(device: mtl.Device, a: std.mem.Allocator, f: Format) ![]u8 {
     if (f.bits < 2 or f.bits > 8 or f.bits == 7 or !group_ok) return error.UnsupportedFormat;
     const body = try frags.source(device, a, ks.core_affine_mm);
     defer a.free(body);
-    const glu = if (f.glu == .plain) "#define TF_GLU_PLAIN 1\n" else "";
+    const glu = switch (f.glu) {
+        .clipped => "",
+        .plain => "#define TF_GLU_PLAIN 1\n",
+        .weighted => "#define TF_GLU_WEIGHTED 1\n",
+    };
     const out = if (f.out_f32) "float" else "bfloat";
     const head = "#define TF_BITS {d}\n#define TF_GROUP {d}\n#define TF_OUT_T {s}\n{s}{s}";
     return std.fmt.allocPrint(a, head, .{ f.bits, f.group, out, glu, body });
@@ -116,6 +120,12 @@ pub fn gatherGlu(e: mtl.ComputeEncoder, p: Pipes, x: anytype, sums: anytype, gat
     e.setValue([2]f32{ @floatFromInt(topk), limit }, 12);
     const tiles = @min(rows, (rows + bm - 1) / bm + experts - 1); // each expert's last tile may be partial
     e.dispatchGroups(mtl.Size.of(gate.n / 32, tiles, 1), mtl.Size.of(32, 2, 2));
+}
+
+/// `gatherGlu` in a `.weighted` format: each sorted pair's activations times its route weight (`weights`, fp32 [rows]).
+pub fn gatherGluWeighted(e: mtl.ComputeEncoder, p: Pipes, x: anytype, sums: anytype, gate: anytype, up: anytype, offsets: anytype, order: anytype, weights: anytype, act: anytype, rows: u32, experts: u32, topk: u32, limit: f32) void {
+    bind(e, 13, weights);
+    gatherGlu(e, p, x, sums, gate, up, offsets, order, act, rows, experts, topk, limit);
 }
 
 /// The code at bit `at` of a little-endian bit stream (MLX's packing at every width).
