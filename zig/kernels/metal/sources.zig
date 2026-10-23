@@ -135,6 +135,8 @@ pub const glm_absorb_nax = @embedFile("glm_absorb_nax.metal");
 /// A MoE layer's route in two launches (core/moe_route.zig): router logits, then the top-k and the expert groups.
 pub const core_moe_route = @embedFile("core/moe_route.metal");
 pub const core_affine_mm = @embedFile("core/affine_mm.metal");
+/// affine_mm's int8 tile pieces (TF_I8), inlined where core_affine_mm includes them.
+pub const core_affine_mm_i8 = @embedFile("core/affine_mm_i8.h");
 /// A hyper-connection block boundary in two launches (core/hc.zig).
 pub const core_hc_boundary = @embedFile("core/hc_boundary.metal");
 /// MLX's precise row softmax and its embedding and RMS kernels, as the replicas in ops/ write them.

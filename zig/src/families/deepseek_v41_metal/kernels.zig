@@ -20,11 +20,16 @@ pub const names = [_][:0]const u8{
     "ds_gemv_cols_bf_f32",
 };
 
+/// A prompt chunk's routed experts in int8 (x a 32 columns and the codes as int8, int32 sums); set before loading.
+pub var int8_experts = true;
+
 pub const Kernels = struct {
     pipelines: [names.len]mtl.Pipeline,
     rows: row.Pipelines,
     /// core/affine_mm by code width (group 64) for prompt chunks on the tensor units; null without them.
     nax: [9]?am.Pipes = @splat(null),
+    /// The routed experts' widths in core/affine_mm's int8 form (int8_experts); null when off.
+    nax_i8: [9]?am.Pipes = @splat(null),
     /// A prompt chunk's attention on the tensor units (v41_attend_nax.metal); null without them.
     attend_nax: ?mtl.Pipeline = null,
     /// A prompt chunk's index scores on the tensor units (v41_index_nax.metal); null without them.
@@ -48,6 +53,7 @@ pub const Kernels = struct {
     pub fn deinit(self: *Kernels) void {
         for (self.pipelines) |p| p.deinit();
         for (self.nax) |set| if (set) |pipes| for (pipes) |p| p.deinit();
+        for (self.nax_i8) |set| if (set) |pipes| for (pipes) |p| p.deinit();
         if (self.attend_nax) |p| p.deinit();
         if (self.index_nax) |p| p.deinit();
         if (self.tiles) |*t| t.deinit();
@@ -92,6 +98,7 @@ pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Widt
     out.tiles = try row.simd_bits.Pipelines.load(device);
     errdefer if (out.tiles) |*t| t.deinit();
     out.nax = @splat(null);
+    out.nax_i8 = @splat(null);
     out.attend_nax = null;
     out.index_nax = null;
     if (device.tensorUnits()) {
@@ -121,16 +128,21 @@ pub fn load(device: mtl.Device, config: *const cfg.Config, block_dense: cfg.Widt
         @memcpy(widths[2 + cfg.layers ..], &config.draft_experts);
         for (widths) |w| {
             if (w.group != 64 or out.nax[w.bits] != null) continue;
-            out.nax[w.bits] = try naxLoad(device, w.bits);
+            out.nax[w.bits] = try naxLoad(device, w.bits, false);
         }
+        errdefer for (out.nax_i8) |set| if (set) |pipes| for (pipes) |p| p.deinit();
+        if (int8_experts) for (config.experts) |w| {
+            if (w.group != 64 or out.nax_i8[w.bits] != null) continue;
+            out.nax_i8[w.bits] = try naxLoad(device, w.bits, true);
+        };
     }
     return out;
 }
 
 /// core/affine_mm at `bits`, group 64, its gather GLU in DeepSeek's route-weighted form (the experts' gate and up).
-fn naxLoad(device: mtl.Device, bits: u8) !am.Pipes {
+fn naxLoad(device: mtl.Device, bits: u8, int8: bool) !am.Pipes {
     const a = std.heap.c_allocator;
-    const src = try am.source(device, a, .{ .bits = bits, .group = 64, .glu = .weighted });
+    const src = try am.source(device, a, .{ .bits = bits, .group = 64, .glu = .weighted, .int8 = int8 });
     defer a.free(src);
     const lib = try mtl.Library.fromSource(device, src, mtl.CompileOptions.mlx());
     defer lib.deinit();

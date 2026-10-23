@@ -22,6 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const out_dir = args[3];
     try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
 
+    if (std.c.getenv("DS_BF16") != null) q.kernels.int8_experts = false;
     if (std.c.getenv("DS_DRAFT")) |n| return drafts(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10), out_dir);
     if (std.c.getenv("DS_SHARED")) |n| return shared(gpa, init.io, args[1], ids, try std.fmt.parseInt(usize, std.mem.span(n), 10));
     if (std.c.getenv("DS_INDEX_ROWS") != null) q.forward.index_nax = false;

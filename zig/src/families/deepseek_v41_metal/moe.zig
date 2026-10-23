@@ -44,7 +44,11 @@ pub fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
         gluTo(x, rows, false, s.route_weight, s.sh_gate, s.sh_up, s.sh_act);
     }
     try x.cut(5);
-    if (x.nax(mo.w1.one)) |p| {
+    if (x.nax(mo.w1.one)) |p_bf| {
+        // the experts' inputs as int8 when that form loaded (kernels.int8_experts), so the MMAs run int8 x int8
+        const p8: ?am.Pipes = if (x.units) x.m.kernels.nax_i8[mo.w1.one.bits] else null;
+        const p = p8 orelse p_bf;
+        const int8 = p8 != null;
         // a prompt chunk: slots sorted by expert, each expert's rows through its weights once on the tensor units
         const blocks = (slots + st.sort_block - 1) / st.sort_block;
         const sort = SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) };
@@ -71,14 +75,20 @@ pub fn moe(x: Enc, mo: *const wts.Moe, topk: usize, experts: usize) !void {
         const sums = fwd.Ref{ .buf = s.sums };
         const offs = fwd.Ref{ .buf = s.offs };
         const order = fwd.Ref{ .buf = s.order };
+        const xq = fwd.Ref{ .buf = s.xq };
+        const xa = fwd.Ref{ .buf = s.xa };
         x.fence();
-        am.rowSums(e, p, 64, fwd.Ref{ .buf = s.normed }, sums, @intCast(rows), c.hidden);
+        const normed = fwd.Ref{ .buf = s.normed };
+        const act = fwd.Ref{ .buf = s.act };
+        if (int8) am.quantRows(e, p, 64, normed, sums, xq, xa, @intCast(rows), c.hidden) else am.rowSums(e, p, 64, normed, sums, @intCast(rows), c.hidden);
         x.fence();
-        am.gatherGluWeighted(e, p, fwd.Ref{ .buf = s.normed }, sums, fwd.matrix(mo.w1.one), fwd.matrix(mo.w3.one), offs, order, fwd.Ref{ .buf = s.wsort }, fwd.Ref{ .buf = s.act }, @intCast(slots), @intCast(experts), @intCast(topk), c.swiglu_limit);
+        if (int8) am.bindScales(e, xa);
+        am.gatherGluWeighted(e, p, if (int8) xq else normed, sums, fwd.matrix(mo.w1.one), fwd.matrix(mo.w3.one), offs, order, fwd.Ref{ .buf = s.wsort }, act, @intCast(slots), @intCast(experts), @intCast(topk), c.swiglu_limit);
         x.fence();
-        am.rowSums(e, p, 64, fwd.Ref{ .buf = s.act }, sums, @intCast(slots), c.moe_inter);
+        if (int8) am.quantRows(e, p, 64, act, sums, xq, xa, @intCast(slots), c.moe_inter) else am.rowSums(e, p, 64, act, sums, @intCast(slots), c.moe_inter);
         x.fence();
-        am.gatherTo(e, p, fwd.Ref{ .buf = s.act }, sums, fwd.matrix(mo.w2.one), offs, fwd.Ref{ .buf = s.experts }, order, @intCast(slots), @intCast(experts));
+        if (int8) am.bindScales(e, xa);
+        am.gatherTo(e, p, if (int8) xq else act, sums, fwd.matrix(mo.w2.one), offs, fwd.Ref{ .buf = s.experts }, order, @intCast(slots), @intCast(experts));
     } else {
         x.indexed(mo.w1, slots, s.normed, s.route_pick, s.gate);
         x.with();

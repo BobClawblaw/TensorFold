@@ -152,6 +152,9 @@ pub const Scratch = struct {
     wsort: mtl.Buffer,
     counts: mtl.Buffer,
     sums: mtl.Buffer,
+    /// The int8 experts' x (tokens by hidden or slots by moe_inter) and its fp32 scales a 32 columns; empty when off.
+    xq: mtl.Buffer,
+    xa: mtl.Buffer,
     /// bf16 [rows, 24 x 256] a layer, filled on the host: two sets, so a chunk's gather overlaps the chunk before.
     engram_rows: [2][c.engram_layers.len]mtl.Buffer,
     /// The set this call's rows read.
@@ -235,6 +238,9 @@ pub const Scratch = struct {
         out.wsort = try m.alloc(slots * 4);
         out.counts = try m.alloc((slots + sort_block - 1) / sort_block * c.experts * 4);
         out.sums = try m.alloc(@max(rows * (c.heads * c.head_dim) / 64, slots * c.hidden / 64) * 4);
+        const quantized: usize = if (@import("kernels.zig").int8_experts) @max(rows * c.hidden, slots * c.moe_inter) else 0;
+        out.xq = try m.alloc(quantized);
+        out.xa = try m.alloc(quantized / 32 * 4);
         for (&out.engram_rows) |*set| for (set) |*b| {
             b.* = try m.alloc(rows * c.engram_cols * c.engram_dim * 2);
         };

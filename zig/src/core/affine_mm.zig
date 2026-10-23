@@ -8,13 +8,15 @@ const frags = @import("frags.zig");
 pub const Glu = enum { clipped, plain, weighted };
 
 /// The weights' bits (2-6 or 8) and group (32, 64 or 128), the output's type and the GLU epilogue.
-pub const Format = struct { bits: u8 = 4, group: u16 = 64, out_f32: bool = false, glu: Glu = .clipped };
+pub const Format = struct { bits: u8 = 4, group: u16 = 64, out_f32: bool = false, glu: Glu = .clipped, int8: bool = false, int8_cols: u8 = 32 };
 
 /// The kernel source for `f` (nax.h inlined for this GPU).
 pub fn source(device: mtl.Device, a: std.mem.Allocator, f: Format) ![]u8 {
     const group_ok = f.group == 32 or f.group == 64 or f.group == 128;
-    if (f.bits < 2 or f.bits > 8 or f.bits == 7 or !group_ok) return error.UnsupportedFormat;
-    const body = try frags.source(device, a, ks.core_affine_mm);
+    if (f.bits < 2 or f.bits > 8 or f.bits == 7 or !group_ok or (f.int8 and f.group == 128)) return error.UnsupportedFormat;
+    const with_i8 = try std.mem.replaceOwned(u8, a, ks.core_affine_mm, "#include \"affine_mm_i8.h\"", ks.core_affine_mm_i8);
+    defer a.free(with_i8);
+    const body = try frags.source(device, a, with_i8);
     defer a.free(body);
     const glu = switch (f.glu) {
         .clipped => "",
@@ -22,8 +24,10 @@ pub fn source(device: mtl.Device, a: std.mem.Allocator, f: Format) ![]u8 {
         .weighted => "#define TF_GLU_WEIGHTED 1\n",
     };
     const out = if (f.out_f32) "float" else "bfloat";
-    const head = "#define TF_BITS {d}\n#define TF_GROUP {d}\n#define TF_OUT_T {s}\n{s}{s}";
-    return std.fmt.allocPrint(a, head, .{ f.bits, f.group, out, glu, body });
+    const head = "#define TF_BITS {d}\n#define TF_GROUP {d}\n#define TF_OUT_T {s}\n{s}{s}{s}";
+    var line: [48]u8 = undefined;
+    const int8 = if (f.int8) try std.fmt.bufPrint(&line, "#define TF_I8 1\n#define TF_QG {d}\n", .{f.int8_cols}) else "";
+    return std.fmt.allocPrint(a, head, .{ f.bits, f.group, out, glu, int8, body });
 }
 
 /// Entry points: row sums, the dense matmul, gathers by tile height, scattering gathers, the experts' gate and up through a pair order into SwiGLU.
@@ -53,6 +57,18 @@ pub fn rowSumsAt(e: mtl.ComputeEncoder, p: Pipes, group: u32, x: anytype, sums: 
     e.setValue(Args{ .rows = @intCast(rows), .n = @intCast(ld), .k = @intCast(k), .experts = 0 }, 5);
     bind(e, 6, sums);
     e.dispatchThreads(mtl.Size.of(k / group, rows, 1), mtl.Size.of(@min(k / group, 64), 1, 1));
+}
+
+/// An int8 format's `rowSums`: also x as int8 (`xq`, [rows, k]) and each group's scale (`xa`, fp32 [rows, k / group]).
+pub fn quantRows(e: mtl.ComputeEncoder, p: Pipes, group: u32, x: anytype, sums: anytype, xq: anytype, xa: anytype, rows: u32, k: u32) void {
+    bind(e, 7, xq);
+    bind(e, 8, xa);
+    rowSumsAt(e, p, group, x, sums, rows, k, k);
+}
+
+/// An int8 format's matmuls read x's group scales (`quantRows`' `xa`) from slot 14: bound before the gathers.
+pub fn bindScales(e: mtl.ComputeEncoder, xa: anytype) void {
+    bind(e, 14, xa);
 }
 
 /// y [rows, n] = x [rows, q.k] W^T with x's group sums `sums`; n is q.n rounded up to 64 (the padded weight rows, y's pitch).
