@@ -170,8 +170,8 @@ pub const Metal = struct {
         const fill = self.fills.getPtr(stream) orelse try self.begin(stream);
         // a lone stream takes the widest chunk; beside other streams (they decode between chunks) the shared one
         const step = if (self.caches.count() == 1) self.scratch.rows else @min(self.scratch.rows, self.options.shared_chunk);
-        const end = cut(stream, fill.at, step);
-        const after = cut(stream, end, step);
+        const end = cut(stream, fill.at, step, step > self.options.shared_chunk);
+        const after = cut(stream, end, step, step > self.options.shared_chunk);
         const vis: ?*const fwd.Vis = if (fill.vis) |*v| v else null;
         const next: ?fwd.Next = if (after > end) .{ .tokens = ids[end..after], .vis = vis } else null;
         try fwd.runChunk(self.model, &self.scratch, try self.cacheOf(stream), ids[fill.at..end], if (end == ids.len) .last else .none, vis, next);
@@ -184,13 +184,18 @@ pub const Metal = struct {
         return true;
     }
 
-    /// Where a chunk from `at` ends: `step` rows on, or the first chunk boundary or save mark past `at`.
-    fn cut(stream: *lanes.Stream, at: usize, step: usize) usize {
+    /// Where a chunk from `at` ends: `step` rows on, at a chunk boundary (`wide`: the last it reaches) or a save mark.
+    fn cut(stream: *lanes.Stream, at: usize, step: usize, wide: bool) usize {
         const ids = stream.prompt();
         var end: usize = @min(ids.len, at + step);
+        var reached: ?usize = null;
         for (stream.chunks) |boundary| if (boundary > at) {
-            end = @min(end, boundary);
-            break;
+            if (boundary > end) break;
+            reached = boundary;
+            if (!wide) break;
+        };
+        if (reached) |r| if (!wide or end < ids.len) {
+            end = r;
         };
         for (stream.reuse.marks) |m| if (m > at) {
             end = @min(end, m);
