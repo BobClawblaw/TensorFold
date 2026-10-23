@@ -15,8 +15,8 @@ pub const split_rows = 16;
 pub const split_chunks = (c.window + picks + 15) / 16;
 /// Routed slots a threadgroup of the prompt chunk's expert sort takes (v41_moe.metal's SORT_BLOCK).
 pub const sort_block = 256;
-/// Scores a prompt call's indexer holds at once (f32): rows are taken in slices of this many keys' worth.
-pub const score_budget = 256 << 20;
+/// Scores a prompt call's indexer holds at once (bf16), in bytes: rows are taken in slices of this many keys' worth.
+pub const score_budget = 768 << 20;
 
 pub const Storage = struct {
     gpa: std.mem.Allocator,
@@ -102,6 +102,8 @@ pub const Prepared = struct { cache: *Cache, base: usize, n: usize, hash: u64, s
 pub const Scratch = struct {
     memory: Storage,
     rows: usize,
+    /// The bytes of `scores`: score_budget, or 0 in the draft head's scratch (it runs no indexer).
+    score_bytes: usize,
     ids: mtl.Buffer,
     pos: mtl.Buffer,
     x: mtl.Buffer, // the streams, bf16 [rows, 4, 5120]
@@ -123,11 +125,11 @@ pub const Scratch = struct {
     iq: mtl.Buffer,
     iw: mtl.Buffer,
     ik: mtl.Buffer,
-    scores: mtl.Buffer,
+    scores: mtl.Buffer, // bf16, a slice of rows by the keys they score
     /// Split attention's chunk partials for up to `split_rows` rows: outputs f32 [rows, 64, chunks, 512], (max, sum).
     attn_po: mtl.Buffer,
     attn_ml: mtl.Buffer,
-    blocks: mtl.Buffer,
+    blocks: mtl.Buffer, // f32: the slice's block maxima, a row's 8-key blocks together
     keep: mtl.Buffer, // i32 [rows, 2048]: the candidate blocks, in order
     picks: mtl.Buffer, // i32 [rows, 512]
     router: mtl.Buffer,
@@ -172,10 +174,20 @@ pub const Scratch = struct {
     markov_part: mtl.Buffer,
 
     pub fn init(gpa: std.mem.Allocator, device: mtl.Device, rows: usize) !Scratch {
+        return initScored(gpa, device, rows, score_budget);
+    }
+
+    /// The draft head's scratch: its stage attention reads fixed picks, so no index scores.
+    pub fn initDraft(gpa: std.mem.Allocator, device: mtl.Device, rows: usize) !Scratch {
+        return initScored(gpa, device, rows, 0);
+    }
+
+    fn initScored(gpa: std.mem.Allocator, device: mtl.Device, rows: usize, score_bytes: usize) !Scratch {
         var out: Scratch = undefined;
         out.memory = .{ .gpa = gpa, .device = device };
         errdefer out.memory.deinit();
         out.rows = rows;
+        out.score_bytes = score_bytes;
         const m = &out.memory;
         const slots = rows * c.topk;
         out.ids = try m.alloc(rows * 4);
@@ -199,10 +211,10 @@ pub const Scratch = struct {
         out.iq = try m.alloc(rows * c.index_heads * c.index_dim * 2);
         out.iw = try m.alloc(rows * c.index_heads * 2);
         out.ik = try m.alloc(rows * c.index_dim * 2);
-        out.scores = try m.alloc(score_budget);
+        out.scores = try m.alloc(score_bytes);
         out.attn_po = try m.alloc(@min(rows, split_rows) * @as(usize, c.heads) * split_chunks * c.head_dim * 4);
         out.attn_ml = try m.alloc(@min(rows, split_rows) * @as(usize, c.heads) * split_chunks * 8);
-        out.blocks = try m.alloc(score_budget);
+        out.blocks = try m.alloc(if (score_bytes == 0) 0 else score_bytes / 4 + rows * 4); // rows by keys / 8 + 1
         out.keep = try m.alloc(rows * c.candidate_blocks * 4);
         out.picks = try m.alloc(rows * picks * 4);
         out.router = try m.alloc(rows * c.experts * 4);

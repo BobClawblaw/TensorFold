@@ -32,7 +32,7 @@ inline frag<bfloat> ix_frag(const device bfloat* r0, const device bfloat* r1, in
 
 // 64-key by 64-row tiles, 4 simdgroups of 32x32; keys past a row's visible ones score -inf, whole such tiles skipped
 [[kernel]] void ds_index_scores_nax(const device bfloat* Q [[buffer(0)]], const device bfloat* WT [[buffer(1)]],
-                                    const device bfloat* K [[buffer(2)]], device float* SCORE [[buffer(3)]],
+                                    const device bfloat* K [[buffer(2)]], device bfloat* SCORE [[buffer(3)]],
                                     constant ScoreArgs& a [[buffer(4)]], uint sg [[simdgroup_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
   threadgroup bfloat tile[64 * PAD];
@@ -42,7 +42,7 @@ inline frag<bfloat> ix_frag(const device bfloat* r0, const device bfloat* r1, in
   if (t0 >= (a.first_pos + r0 + rows) / a.ratio) {  // the tile's last row reads keys below (first_pos + r + 1) / ratio
     for (uint i = t; i < 64 * 64; i += 128) {
       const int r = int(i) / 64, k = t0 + int(i) % 64;
-      if (r < rows && k < a.groups) SCORE[size_t(r0 + r) * a.stride + k] = -INFINITY;
+      if (r < rows && k < a.groups) SCORE[size_t(r0 + r) * a.stride + k] = bfloat(-INFINITY);
     }
     return;
   }
@@ -111,7 +111,7 @@ inline frag<bfloat> ix_frag(const device bfloat* r0, const device bfloat* r1, in
       for (short e = 0; e < 8; e++) {
         const int r = tm + 16 * m + home.y + (e >> 2) * 8;
         const int k = t0 + tn + 16 * j + home.x + TF_COL(e);
-        if (r < rows && k < a.groups) SCORE[size_t(r0 + r) * a.stride + k] = k < (a.first_pos + r0 + r + 1) / a.ratio ? ix_bf(total[m][j][e]) : -INFINITY;
+        if (r < rows && k < a.groups) SCORE[size_t(r0 + r) * a.stride + k] = bfloat(k < (a.first_pos + r0 + r + 1) / a.ratio ? total[m][j][e] : -INFINITY);
       }
     }
   }

@@ -126,7 +126,7 @@ fn drafts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
     defer m.deinit();
     var scratch = try q.state.Scratch.init(gpa, m.device, 256);
     defer scratch.deinit();
-    var ds = try q.state.Scratch.init(gpa, m.device, 8);
+    var ds = try q.state.Scratch.initDraft(gpa, m.device, 8);
     defer ds.deinit();
     var replies: [2][]u32 = undefined;
     var times: [2]f64 = undefined;
@@ -240,7 +240,7 @@ fn shared(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, ids: []const u32,
     defer wide.deinit();
     var solo = try q.state.Scratch.init(gpa, m.device, 256);
     defer solo.deinit();
-    var heads = try q.state.Scratch.init(gpa, m.device, 8);
+    var heads = try q.state.Scratch.initDraft(gpa, m.device, 8);
     defer heads.deinit();
     var together: [k]q.state.Cache = undefined;
     var alone: [k]q.state.Cache = undefined;

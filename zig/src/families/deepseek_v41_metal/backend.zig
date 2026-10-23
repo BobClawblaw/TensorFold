@@ -46,7 +46,7 @@ pub const Metal = struct {
         out.* = .{ .gpa = gpa, .model = model, .options = options, .scratch = try st.Scratch.init(gpa, model.device, @min(options.chunk, st.max_rows)), .drafts = null };
         errdefer out.scratch.deinit();
         if (model.weights.stages != null) {
-            out.drafts = try st.Scratch.init(gpa, model.device, 8);
+            out.drafts = try st.Scratch.initDraft(gpa, model.device, 8);
             try out.time();
         }
         return out;

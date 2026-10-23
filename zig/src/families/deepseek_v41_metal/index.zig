@@ -84,7 +84,7 @@ fn indexOne(x: Enc, src: *const st.Source, layer: usize, ratio: usize) void {
     const rows = x.rows;
     const groups = (x.base + rows) / ratio;
     if (groups == 0) {
-        x.pipe("ds_topk");
+        x.pipe("ds_topk_bf");
         x.buf(s.scores, 0, 0);
         x.at(s.picks, st.picks * 4, 1);
         x.args(TopkArgs{ .n = 0, .k = st.picks, .stride = 1 }, 2);
@@ -92,7 +92,8 @@ fn indexOne(x: Enc, src: *const st.Source, layer: usize, ratio: usize) void {
         return;
     }
     if (layer > c.candidate_source) return indexKept(x, src, groups, ratio);
-    const slice = @max(1, @min(rows, st.score_budget / 4 / groups));
+    std.debug.assert(s.score_bytes > 0);
+    const slice = @max(1, @min(rows, s.score_bytes / 2 / groups));
     var r0: usize = 0;
     while (r0 < rows) : (r0 += slice) {
         const n = @min(slice, rows - r0);
@@ -125,10 +126,10 @@ fn indexOne(x: Enc, src: *const st.Source, layer: usize, ratio: usize) void {
             x.pipe("ds_topk");
             x.buf(s.blocks, 0, 0);
             x.buf(s.keep, r * c.candidate_blocks * 4, 1);
-            x.args(TopkArgs{ .n = @intCast(nb), .k = c.candidate_blocks, .stride = @intCast(groups) }, 2);
+            x.args(TopkArgs{ .n = @intCast(nb), .k = c.candidate_blocks, .stride = @intCast(nb) }, 2);
             x.groups(.{ n, 1, 1 }, .{ 1024, 1, 1 });
         }
-        x.pipe("ds_topk");
+        x.pipe("ds_topk_bf");
         x.buf(s.scores, 0, 0);
         x.buf(s.picks, r * st.picks * 4, 1);
         x.args(TopkArgs{ .n = @intCast(groups), .k = st.picks, .stride = @intCast(groups) }, 2);
@@ -138,9 +139,11 @@ fn indexOne(x: Enc, src: *const st.Source, layer: usize, ratio: usize) void {
 
 /// Indexers after layer 20 score only its candidate blocks, in key order: the top-k equals the masked scan's.
 fn indexKept(x: Enc, src: *const st.Source, groups: usize, ratio: usize) void {
+    comptime std.debug.assert(c.candidate_block == 8); // ds_index_scores_kept's block
     const s = x.s;
     const slots = c.candidate_blocks * c.candidate_block;
-    const slice = @max(1, @min(x.rows, st.score_budget / 4 / slots));
+    std.debug.assert(s.score_bytes > 0);
+    const slice = @max(1, @min(x.rows, s.score_bytes / 2 / slots));
     var r0: usize = 0;
     while (r0 < x.rows) : (r0 += slice) {
         const n = @min(slice, x.rows - r0);
@@ -153,8 +156,8 @@ fn indexKept(x: Enc, src: *const st.Source, groups: usize, ratio: usize) void {
         x.buf(s.scores, 0, 3);
         x.buf(s.keep, r * c.candidate_blocks * 4, 4);
         x.args(args, 5);
-        x.threads(.{ slots * 32, n, 1 }, .{ 256, 1, 1 }); // a simdgroup a slot
-        x.pipe("ds_topk");
+        x.threads(.{ c.candidate_blocks * 32, n, 1 }, .{ 256, 1, 1 }); // a simdgroup a candidate block (8 keys)
+        x.pipe("ds_topk_bf");
         x.buf(s.scores, 0, 0);
         x.buf(s.picks, r * st.picks * 4, 1);
         x.args(TopkArgs{ .n = @intCast(slots), .k = st.picks, .stride = @intCast(slots) }, 2);
