@@ -26,17 +26,11 @@ pub fn drafterKind() ?DrafterKind {
     return std.meta.stringToEnum(DrafterKind, std.mem.span(v));
 }
 
-/// Keys and values cached as int8 (half the bytes a token) unless MINIMAX_KV_CACHE=bf16.
-pub fn kvCacheInt8() bool {
-    const v = std.c.getenv("MINIMAX_KV_CACHE") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(v), "bf16");
-}
-
 /// A prompt chunk's tensor-unit matmul for one (bits, group) the checkpoint uses.
 pub const Mm = struct { bits: u8, group: usize, pipes: affine_mm.Pipes };
 
-pub const glue_names = [_][:0]const u8{ "mm_embed", "mm_norm", "mm_add_norm", "mm_add", "mm_swiglu", "mm_router", "mm_route_pick", "mm_moe_add_norm", "mm_moe_add", "mm_sort", "mm_rows_by_order", "mm_prep", "mm_index_scores", "mm_index_select", "mm_decode_vec", "mm_merge_vec", "mm_argmax", "mm_route_groups", "mm_widen", "mm_narrow", "mm_prep8", "mm_decode_vec8" };
-pub const Glue = enum { embed, norm, add_norm, add, swiglu, router, route_pick, moe_add_norm, moe_add, sort, rows_by_order, prep, index_scores, index_select, decode_vec, merge_vec, argmax, route_groups, widen, narrow, prep8, decode_vec8 };
+pub const glue_names = [_][:0]const u8{ "mm_embed", "mm_norm", "mm_add_norm", "mm_add", "mm_swiglu", "mm_router", "mm_route_pick", "mm_moe_add_norm", "mm_moe_add", "mm_sort", "mm_rows_by_order", "mm_prep", "mm_index_scores", "mm_index_select", "mm_decode_vec", "mm_merge_vec", "mm_argmax", "mm_route_groups", "mm_widen", "mm_narrow" };
+pub const Glue = enum { embed, norm, add_norm, add, swiglu, router, route_pick, moe_add_norm, moe_add, sort, rows_by_order, prep, index_scores, index_select, decode_vec, merge_vec, argmax, route_groups, widen, narrow };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -78,7 +72,6 @@ pub const Model = struct {
         m.mms = 0;
         m.vision = null;
         m.config = try cfg.Config.read(gpa, io, dir);
-        m.config.kv8 = kvCacheInt8();
         const c = &m.config;
         m.device = try mtl.Device.init();
         errdefer m.device.deinit();
@@ -109,7 +102,7 @@ pub const Model = struct {
         {
             const body = try frags.source(m.device, gpa, ks.minimax_m3_attention_nax);
             defer gpa.free(body);
-            const src = try std.fmt.allocPrint(gpa, "#define DH {d}\n#define NQ {d}\n#define G {d}\n#define KVH {d}\n#define WORDS {d}\n#define SCALE {e}f\n{s}{s}", .{ c.head_dim, c.heads, c.heads / c.kv_heads, c.kv_heads, st.selWords(c), 1.0 / @sqrt(@as(f64, @floatFromInt(c.head_dim))), if (c.kv8) "#define KV8\n" else "", body });
+            const src = try std.fmt.allocPrint(gpa, "#define DH {d}\n#define NQ {d}\n#define G {d}\n#define KVH {d}\n#define WORDS {d}\n#define SCALE {e}f\n{s}", .{ c.head_dim, c.heads, c.heads / c.kv_heads, c.kv_heads, st.selWords(c), 1.0 / @sqrt(@as(f64, @floatFromInt(c.head_dim))), body });
             defer gpa.free(src);
             const lib = try mtl.Library.fromSource(m.device, src, mtl.CompileOptions.mlx());
             defer lib.deinit();

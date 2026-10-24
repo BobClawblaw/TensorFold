@@ -14,8 +14,6 @@ pub const Config = struct {
     heads: u32 = 64,
     kv_heads: u32 = 4,
     head_dim: u32 = 128,
-    /// Keys and values cached as int8 with a scale a position and head (the default), or bf16 (MINIMAX_KV_CACHE=bf16).
-    kv8: bool = false,
     /// Rotated dims of each head (and of each index head): the first `rotary`, NeoX halves.
     rotary: u32 = 64,
     theta: f32 = 1e7,
@@ -48,11 +46,6 @@ pub const Config = struct {
     /// Key and value width of one token in one layer.
     pub fn kvWidth(c: *const Config) u32 {
         return c.kv_heads * c.head_dim;
-    }
-
-    /// Bytes of one cached key or value element.
-    pub fn kvBytes(c: *const Config) usize {
-        return if (c.kv8) 1 else 2;
     }
 
     /// Rows of the stacked q | k | v | index q | index k projection.

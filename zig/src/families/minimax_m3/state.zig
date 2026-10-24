@@ -15,10 +15,9 @@ pub fn slots(c: *const cfg.Config, capacity: usize) usize {
     return std.mem.alignForward(usize, capacity, c.block);
 }
 
-/// Bytes of one position in one layer: key and value heads (int8 ones with an fp32 scale a head), and the index key.
+/// Bytes of one position in one layer: its bf16 key and value heads, and its bf16 index key.
 pub fn rowBytes(c: *const cfg.Config) usize {
-    const scales: usize = if (c.kv8) @as(usize, c.kv_heads) * 4 * 2 else 0;
-    return @as(usize, c.kvWidth()) * 2 * c.kvBytes() + scales + @as(usize, c.index_dim) * 2;
+    return (@as(usize, c.kvWidth()) * 2 + c.index_dim) * 2;
 }
 
 /// Bytes a stream of `capacity` positions holds in caches.
@@ -61,21 +60,11 @@ pub const Cache = struct {
     }
 
     pub fn values(self: *const Cache, c: *const cfg.Config, l: usize) usize {
-        return self.layer_at[l] + slots(c, self.capacity) * c.kvWidth() * c.kvBytes();
-    }
-
-    /// An int8 cache's key scales [slot][kv head] fp32, then the value scales.
-    pub fn keyScales(self: *const Cache, c: *const cfg.Config, l: usize) usize {
         return self.layer_at[l] + slots(c, self.capacity) * c.kvWidth() * 2;
     }
 
-    pub fn valueScales(self: *const Cache, c: *const cfg.Config, l: usize) usize {
-        return self.keyScales(c, l) + slots(c, self.capacity) * c.kv_heads * 4;
-    }
-
     pub fn indexKeys(self: *const Cache, c: *const cfg.Config, l: usize) usize {
-        const scales: usize = if (c.kv8) slots(c, self.capacity) * c.kv_heads * 4 * 2 else 0;
-        return self.layer_at[l] + slots(c, self.capacity) * c.kvWidth() * c.kvBytes() * 2 + scales;
+        return self.layer_at[l] + slots(c, self.capacity) * c.kvWidth() * 2 * 2;
     }
 
     pub fn deinit(self: *Cache) void {

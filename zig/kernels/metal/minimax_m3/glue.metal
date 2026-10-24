@@ -260,23 +260,11 @@ inline float mm_moe_out(const device bfloat* Y, const device int* pick, const de
 
 struct mm_prep_args { uint rows, heads, kv_heads, index_heads, dim, pos, rotary, stride; float eps, theta; };
 
-// An int8 cache row: a head's 128 values (four a lane) as round(x / s), s = max |x| / 127 (an all-zero row s = 0).
-inline void mm_put8(thread const float* v, device char* q, device float* scale, uint lane) {
-  float m = 0.0f;
-  for (uint j = 0; j < 4; ++j) m = max(m, fabs(v[j]));
-  m = simd_max(m);
-  const float s = m / 127.0f, inv = m > 0.0f ? 127.0f / m : 0.0f;
-  for (uint j = 0; j < 4; ++j) q[lane + 32 * j] = char(rint(v[j] * inv));
-  if (lane == 0) *scale = s;
-}
-
-// KV8: keys and values to int8 rows with a scale a (slot, head) in KS and VS; else bf16 rows.
-template <bool KV8>
+// Normed and rotated q, k and index q, k; the keys, values and index keys into the cache at their slots.
 [[kernel]] void mm_prep(const device bfloat* X [[buffer(0)]], const device bfloat* qw [[buffer(1)]],
     const device bfloat* kw [[buffer(2)]], const device bfloat* iqw [[buffer(3)]], const device bfloat* ikw [[buffer(4)]],
     constant mm_prep_args& a [[buffer(5)]], device bfloat* QN [[buffer(6)]], device bfloat* IQ [[buffer(7)]],
-    device uchar* KC [[buffer(8)]], device uchar* VC [[buffer(9)]], device bfloat* IK [[buffer(10)]],
-    device float* KS [[buffer(11)]], device float* VS [[buffer(12)]],
+    device bfloat* KC [[buffer(8)]], device bfloat* VC [[buffer(9)]], device bfloat* IK [[buffer(10)]],
     uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
   const uint unit = tg.x, row = tg.y;
   const uint nq = a.heads, nk = a.kv_heads, ni = a.index_heads;
@@ -284,7 +272,7 @@ template <bool KV8>
   const uint D = a.dim; // 128: four values a lane
   const device bfloat* src = X + (size_t)row * a.stride;
   const device bfloat* w;
-  device bfloat* y = nullptr; // a bf16 row's place; an int8 key's is KC's
+  device bfloat* y;
   const size_t slot = a.pos + row;
   const bool key = unit >= nq && unit < nq + nk;
   uint head;
@@ -297,7 +285,7 @@ template <bool KV8>
     head = unit - nq;
     src += (size_t)(nq + head) * D;
     w = kw;
-    if (!KV8) y = (device bfloat*)KC + (slot * nk + head) * D;
+    y = KC + (slot * nk + head) * D;
   } else if (unit < nq + nk + ni) {
     head = unit - nq - nk;
     src += (size_t)(nq + 2 * nk + head) * D;
@@ -332,22 +320,12 @@ template <bool KV8>
     const float rot = d < half_r ? -nrm[d + half_r] : nrm[d - half_r];
     out[j] = float(bfloat(float(bfloat(nrm[d] * c)) + float(bfloat(rot * s))));
   }
-  if (KV8 && key) mm_put8(out, (device char*)KC + (slot * nk + head) * D, KS + slot * nk + head, lane);
-  else for (uint j = 0; j < 4; ++j) y[lane + 32 * j] = bfloat(out[j]);
+  for (uint j = 0; j < 4; ++j) y[lane + 32 * j] = bfloat(out[j]);
   if (!key) return;
   const device bfloat* vs = X + (size_t)row * a.stride + (size_t)(nq + nk + head) * D;
-  if (KV8) {
-    float vv[4];
-    for (uint j = 0; j < 4; ++j) vv[j] = float(vs[lane + 32 * j]);
-    mm_put8(vv, (device char*)VC + (slot * nk + head) * D, VS + slot * nk + head, lane);
-    return;
-  }
-  device bfloat* vd = (device bfloat*)VC + (slot * nk + head) * D;
+  device bfloat* vd = VC + (slot * nk + head) * D;
   for (uint j = 0; j < 4; ++j) vd[lane + 32 * j] = vs[lane + 32 * j];
 }
-
-template [[host_name("mm_prep")]] [[kernel]] decltype(mm_prep<false>) mm_prep<false>;
-template [[host_name("mm_prep8")]] [[kernel]] decltype(mm_prep<true>) mm_prep<true>;
 
 struct mm_index_args { uint rows, pos, heads, blocks, first_row; };
 
@@ -445,11 +423,9 @@ struct mm_index_args { uint rows, pos, heads, blocks, first_row; };
 struct mm_vec_args { uint rows, pos, heads, groups, topk; float scale; uint sel, all; };
 
 // Decode attention partials: a threadgroup a (key head, row, 32-key quarter of a kept block), a simdgroup a query head.
-template <bool KV8>
-[[kernel]] void mm_decode_vec(const device bfloat* Q [[buffer(0)]], const device uchar* K [[buffer(1)]],
-    const device uchar* V [[buffer(2)]], constant mm_vec_args& a [[buffer(3)]], const device int* SEL [[buffer(4)]],
+[[kernel]] void mm_decode_vec(const device bfloat* Q [[buffer(0)]], const device bfloat* K [[buffer(1)]],
+    const device bfloat* V [[buffer(2)]], constant mm_vec_args& a [[buffer(3)]], const device int* SEL [[buffer(4)]],
     device float* PM [[buffer(5)]], device float* PL [[buffer(6)]], device float* PO [[buffer(7)]],
-    const device float* KS [[buffer(8)]], const device float* VS [[buffer(9)]],
     uint3 tg [[threadgroup_position_in_grid]], uint g [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
   const uint kv = tg.x, row = tg.y, z = tg.z;
@@ -474,14 +450,8 @@ template <bool KV8>
     for (uint u = 0; u < 4; ++u) {
       const bool live = i0 + u < to; // past the row's position: a masked key (read at the block's first, weight 0)
       const size_t key = (size_t)(live ? i0 + u : from), at = key * ld + kv * 128 + 4 * lane;
-      float sc;
-      if (KV8) { // int8 rows: q . (s k8) = s (q . k8), and s v8
-        vr[u] = VS[key * a.groups + kv] * float4(*(const device char4*)(V + at));
-        sc = KS[key * a.groups + kv] * simd_sum(dot(qv, float4(*(const device char4*)(K + at))));
-      } else {
-        vr[u] = float4(*(const device bfloat4*)((const device bfloat*)V + at));
-        sc = simd_sum(dot(qv, float4(*(const device bfloat4*)((const device bfloat*)K + at))));
-      }
+      vr[u] = float4(*(const device bfloat4*)(V + at));
+      const float sc = simd_sum(dot(qv, float4(*(const device bfloat4*)(K + at))));
       score[u] = live ? sc : -INFINITY;
     }
     const float peak = max(max(top, max(score[0], score[1])), max(score[2], score[3]));
@@ -499,9 +469,6 @@ template <bool KV8>
   if (lane == 0) { PM[slot] = top; PL[slot] = mass; }
   *(device float4*)(PO + slot * 128 + 4 * lane) = acc;
 }
-
-template [[host_name("mm_decode_vec")]] [[kernel]] decltype(mm_decode_vec<false>) mm_decode_vec<false>;
-template [[host_name("mm_decode_vec8")]] [[kernel]] decltype(mm_decode_vec<true>) mm_decode_vec<true>;
 
 // The partials' merge in block order: a simdgroup a (head, row), the row's max first, then its mass and outputs.
 [[kernel]] void mm_merge_vec(const device float* PM [[buffer(0)]], const device float* PL [[buffer(1)]],
