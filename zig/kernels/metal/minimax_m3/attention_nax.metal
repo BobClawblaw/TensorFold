@@ -2,12 +2,7 @@
 #include "../nax.h"
 using namespace tfp;
 
-// Defines: DH, NQ, G (query heads a key head), KVH, WORDS (bitmap words a row and head), SCALE, KV8 (an int8 cache).
-#ifdef KV8
-using KT = char;
-#else
-using KT = bfloat;
-#endif
+// Defines: DH, NQ, G (query heads a key head), KVH, WORDS (bitmap words a row and head), SCALE.
 
 constant constexpr int LD = KVH * DH;
 constant constexpr float kMasked = -3.402823466e+38f;
@@ -76,10 +71,9 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
 
 // Q, O [R, NQ, DH] at P.y..; K, V the cache; SEL: a row's key head keeps block b; a tile: G heads on RT / G rows.
 [[max_total_threads_per_threadgroup(256)]]
-[[kernel]] void mm_prompt_attention(const device bfloat* Q [[buffer(0)]], const device KT* K [[buffer(1)]],
-                                    const device KT* V [[buffer(2)]], device bfloat* O [[buffer(3)]],
+[[kernel]] void mm_prompt_attention(const device bfloat* Q [[buffer(0)]], const device bfloat* K [[buffer(1)]],
+                                    const device bfloat* V [[buffer(2)]], device bfloat* O [[buffer(3)]],
                                     constant int2& P [[buffer(4)]], const device uint* SEL [[buffer(5)]],
-                                    const device float* KSC [[buffer(6)]], const device float* VSC [[buffer(7)]],
                                     uint sg [[simdgroup_index_in_threadgroup]],
                                     uint lane [[thread_index_in_simdgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
   static_assert(G == 16, "a 16-row fragment is one row's query heads");
@@ -89,8 +83,8 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
   const int t_rows = min(RT / G, R - r0); // positions in the tile
   const int qs = NQ * DH;
   const device bfloat* q = Q + r0 * qs + kv * G * DH;
-  const device KT* kc = K + kv * DH;
-  const device KT* vc = V + kv * DH + int(sg) * 64;
+  const device bfloat* kc = K + kv * DH;
+  const device bfloat* vc = V + kv * DH + int(sg) * 64;
   const short2 home = frag_home(ushort(lane));
   threadgroup PT pt[RT * PP];
   threadgroup float rowmax[NS][RT];
@@ -112,7 +106,7 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
       kept[j] = rl < t_rows && ((sel[long(rl) * KVH * WORDS + ib / 32] >> (ib % 32)) & 1u);
     }
     const int kpos = kb * BKT + int(sg) * KS;
-    const device KT* kblk = kc + long(kpos) * LD;
+    const device bfloat* kblk = kc + long(kpos) * LD;
     frag<float> s[4];
     TF_UNROLL
     for (short i = 0; i < 4; i++) s[i] = frag<float>(0);
@@ -132,11 +126,7 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
         const int local = 16 * (i >> 1) + home.y + (e >> 2) * 8, row = first_pos + local / G;
         const int col = kpos + 16 * (i & 1) + home.x + TF_COL(e);
         const bool out = col > row || !kept[2 * (i >> 1) + (e >> 2)];
-#ifdef KV8
-        s[i][e] = out ? kMasked : s[i][e] * KSC[long(col) * KVH + kv] * (SCALE * kLog2e);
-#else
         s[i][e] = out ? kMasked : s[i][e] * (SCALE * kLog2e);
-#endif
       }
     }
     float top_new[4] = {top[0], top[1], top[2], top[3]};
@@ -167,16 +157,6 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
     }
     TF_UNROLL
     for (short i = 0; i < 4; i++) fold<false>(s[i], total + 2 * (i >> 1));
-#ifdef KV8
-    TF_UNROLL
-    for (short i = 0; i < 4; i++) {
-      TF_UNROLL
-      for (short e = 0; e < 8; e++) { // a masked key's probability is 0, and its scale may never have been written
-        const int col = kpos + 16 * (i & 1) + home.x + TF_COL(e);
-        s[i][e] = s[i][e] == 0.0f ? 0.0f : s[i][e] * VSC[long(col) * KVH + kv];
-      }
-    }
-#endif
     TF_UNROLL
     for (short i = 0; i < 8; i++) {
       TF_UNROLL
@@ -193,7 +173,7 @@ inline void prob_put(threadgroup PT* pt, int r, int c, short2 home, thread const
         const int kp = kb * BKT + ph * PH + 16 * kk;
         if (kp > last_pos) break; // keys past the tile's rows: masked, and their cache rows may hold anything
         const int valid = min(16, last_pos + 1 - kp); // a value row never written would poison the tile as 0 x NaN
-        const device KT* vblk = vc + long(kp) * LD;
+        const device bfloat* vblk = vc + long(kp) * LD;
         frag<bfloat> v0, v1;
         TF_UNROLL
         for (short d = 0; d < 4; d += 2) {

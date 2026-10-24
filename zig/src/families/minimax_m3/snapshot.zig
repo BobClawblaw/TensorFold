@@ -24,19 +24,15 @@ pub const Snap = struct {
 /// One contiguous piece of a cache's kv buffer (offset) and its length.
 const Piece = struct { off: usize, len: usize };
 
-/// Most pieces a state holds: a layer's keys, values, their scales (int8) and index keys.
-const max_pieces = 5 * cfg.max_layers;
+/// Most pieces a state holds: a layer's keys, values and index keys.
+const max_pieces = 3 * cfg.max_layers;
 
-/// A state's pieces at `at`, in order: every layer's first `at` keys, values, scales and index keys.
+/// A state's pieces at `at`, in order: every layer's first `at` keys, values and index keys.
 fn pieces(c: *const cfg.Config, cache: *const st.Cache, at: usize, out: *std.ArrayList(Piece)) void {
-    const row: usize = c.kvWidth() * c.kvBytes();
+    const row: usize = @as(usize, c.kvWidth()) * 2;
     for (0..c.layers) |i| {
         out.appendAssumeCapacity(.{ .off = cache.keys(i), .len = at * row });
         out.appendAssumeCapacity(.{ .off = cache.values(c, i), .len = at * row });
-        if (c.kv8) {
-            out.appendAssumeCapacity(.{ .off = cache.keyScales(c, i), .len = at * @as(usize, c.kv_heads) * 4 });
-            out.appendAssumeCapacity(.{ .off = cache.valueScales(c, i), .len = at * @as(usize, c.kv_heads) * 4 });
-        }
         out.appendAssumeCapacity(.{ .off = cache.indexKeys(c, i), .len = at * @as(usize, c.index_dim) * 2 });
     }
 }

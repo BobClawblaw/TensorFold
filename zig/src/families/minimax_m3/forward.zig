@@ -347,11 +347,8 @@ fn attention(x: Enc, cache: *st.Cache, w: wts.Attention, i: usize, base: usize, 
     const keys = bo(cache.kv, cache.keys(i));
     const values = bo(cache.kv, cache.values(c, i));
     const ikeys = bo(cache.kv, cache.indexKeys(c, i));
-    // an int8 cache's scales (a bf16 cache's kernels never read them: the keys stand in)
-    const kscale = if (c.kv8) bo(cache.kv, cache.keyScales(c, i)) else keys;
-    const vscale = if (c.kv8) bo(cache.kv, cache.valueScales(c, i)) else keys;
     const pa = PArgs{ .rows = nr, .heads = c.heads, .kv_heads = c.kv_heads, .index_heads = c.index_heads, .dim = c.head_dim, .pos = @intCast(start), .rotary = c.rotary, .stride = c.qkvRows(), .eps = c.eps, .theta = c.theta };
-    x.glue(if (c.kv8) .prep8 else .prep, pa, &.{ bo(s.q, base * c.qkvRows() * 2), t(w.q_norm), t(w.k_norm), t(w.iq_norm), t(w.ik_norm), A, qn, iq, keys, values, ikeys, kscale, vscale }, .{ c.heads + c.kv_heads + c.index_heads + 1, n, 1 }, .{ 32, 1, 1 }, true);
+    x.glue(.prep, pa, &.{ bo(s.q, base * c.qkvRows() * 2), t(w.q_norm), t(w.k_norm), t(w.iq_norm), t(w.ik_norm), A, qn, iq, keys, values, ikeys }, .{ c.heads + c.kv_heads + c.index_heads + 1, n, 1 }, .{ 32, 1, 1 }, true);
     // the selection: every block while a row sees at most topk_blocks of them, else the indexer's best and its own
     const nb = c.blocks(start + n);
     const prompt = n > st.window_rows;
@@ -382,7 +379,7 @@ fn attention(x: Enc, cache: *st.Cache, w: wts.Attention, i: usize, base: usize, 
     }
     if (prompt) { // a prompt chunk: a key head's query heads on two rows a tile, over the blocks either row keeps
         e.setPipeline(x.m.prompt_attn);
-        for ([_]B{ qn, keys, values, o, A, bits, kscale, vscale }, 0..) |r, slot| {
+        for ([_]B{ qn, keys, values, o, A, bits }, 0..) |r, slot| {
             if (r.args) e.setValue([2]i32{ @intCast(n), @intCast(start) }, slot) else e.setBuffer(r.buf, r.off, slot);
         }
         const per: usize = 32 / (c.heads / c.kv_heads); // rows a tile
@@ -391,13 +388,11 @@ fn attention(x: Enc, cache: *st.Cache, w: wts.Attention, i: usize, base: usize, 
     }
     // decode rows: a key head's query heads a threadgroup over each kept block, then the merge in block order
     const va = VArgs{ .rows = nr, .pos = @intCast(start), .heads = c.heads, .groups = c.kv_heads, .topk = c.topk_blocks * 4, .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))), .sel = c.topk_blocks, .all = @intFromBool(all) };
-    e.setPipeline(x.m.pipe(if (c.kv8) .decode_vec8 else .decode_vec));
+    e.setPipeline(x.m.pipe(.decode_vec));
     for ([_]B{ qn, keys, values }, 0..) |r, slot| e.setBuffer(r.buf, r.off, slot);
     e.setValue(va, 3);
     e.setBuffer(sel.buf, sel.off, 4);
     for ([_]mtl.Buffer{ s.pm, s.pl, s.po }, 5..) |r, slot| e.setBuffer(r, 0, slot);
-    e.setBuffer(kscale.buf, kscale.off, 8);
-    e.setBuffer(vscale.buf, vscale.off, 9);
     e.dispatchGroups(mtl.Size.of(c.kv_heads, n, c.topk_blocks * 4), mtl.Size.of(32, c.heads / c.kv_heads, 1));
     e.setPipeline(x.m.pipe(.merge_vec));
     for ([_]mtl.Buffer{ s.pm, s.pl, s.po }, 0..) |r, slot| e.setBuffer(r, 0, slot);
