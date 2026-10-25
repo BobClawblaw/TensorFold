@@ -74,6 +74,7 @@ pub const LaneHost = struct {
     /// opt-in: a family round planner (prompt pieces, decode rows in one pass); null: whole or `prefill_step` prompts
     rounds: ?Rounds = null,
     pieces: std.ArrayList(Rounds.Piece) = .empty,
+    prefix: @import("lane_host_prefix.zig").Wait = .{}, // a request's wait for a cut another prompt is filling
     finals: std.ArrayList(usize) = .empty,
 
     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
@@ -85,7 +86,7 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .prefix = .fromEnv() };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -458,6 +459,7 @@ pub const LaneHost = struct {
         recalls.release(job);
         job.started = false;
         job.fill_began = false;
+        job.reached = 0;
         job.entry = null; // looked up again at its next admission
         h.gpa.free(job.marks);
         job.marks = &.{};
