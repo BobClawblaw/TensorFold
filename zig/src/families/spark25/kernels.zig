@@ -1,4 +1,4 @@
-//! Spark2.5's launches on CUDA, every one a shared operator: projections, rows, attention, argmax, draws (Gemma 4's set).
+//! Spark2.5's launches on CUDA, all shared operators: projections, rows, attention, argmax, draws (Gemma 4's set).
 const std = @import("std");
 const cuda = @import("cuda");
 

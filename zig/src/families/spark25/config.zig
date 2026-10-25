@@ -1,4 +1,4 @@
-//! Spark-X2.5/2.6 (model_type spark2_5) admission: the 4B's geometry exactly, MLX affine widths, its RoPE per layer kind.
+//! Spark-X2.5/2.6 (spark2_5) admission: the 4B's geometry exactly, MLX affine widths, its RoPE per layer kind.
 const std = @import("std");
 
 pub const vocab = 131072;

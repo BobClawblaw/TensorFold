@@ -1,8 +1,4 @@
-"""Spark-X2.5/2.6 (spark2_5) bf16 to the native checkpoint: every linear and the tied embedding MLX affine, norms bf16.
-
-numpy only (no MLX): MLX's affine rule in float32, the bias at the larger-magnitude edge of a group, a signed scale that
-puts zero on the grid, codes clipped to [0, 2^bits - 1] from the unrounded scale and bias, bf16 only for storage.
-"""
+"""Spark-X2.5/2.6 (spark2_5) bf16 to the native checkpoint: linears and the tied embedding MLX affine, norms bf16."""
 
 from __future__ import annotations
 
@@ -51,7 +47,7 @@ def round_away(x: np.ndarray) -> np.ndarray:
 
 
 def quantize(w: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """w [n, k] fp32 to words u32 [n, k bits / 32], scales and biases bf16 [n, k / 64]."""
+    """MLX's affine rule in fp32 (bias at the larger edge, zero on the grid): w [n, k] to words, scales, biases."""
     n, k = w.shape
     if k % GROUP:
         raise SystemExit(f"width {k} is not a multiple of {GROUP}")

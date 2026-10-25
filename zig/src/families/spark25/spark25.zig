@@ -1,4 +1,4 @@
-//! Spark-X2.5/2.6 (spark2_5) on CUDA: Gemma 4's CUDA structure with Spark's fused QKV, head gate, GELU and fp32 residual.
+//! Spark-X2.5/2.6 (spark2_5) on CUDA: Gemma 4's CUDA layout with Spark's fused QKV, head gate, GELU, fp32 residual.
 pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
 pub const kernels = @import("kernels.zig");

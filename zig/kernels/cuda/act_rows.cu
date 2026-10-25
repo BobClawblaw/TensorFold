@@ -165,8 +165,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_softcap_rows(const __nv_bflo
     tf_act_round::softcap_rows(x, out, n, cap, tf_act_round::SOFTCAP_ALL);
 }
 
-// Spark2.5's per-head gate: out[r, h * d + e] = bf16(o[r, h * d + e] * bf16(sigmoid(g[r * g_ld + h]))), the gate
-// rounded first as the reference casts it; o packed [rows, heads * d] (d % 64 == 0); xs (or null) out's sums.
+// Spark2.5's head gate: out[r, h d + e] = bf16(o * bf16(sigmoid(g[r * g_ld + h]))) (d % 64 == 0); xs: out's sums.
 extern "C" __global__ void __launch_bounds__(NT) tf_head_gate_rows(const __nv_bfloat16* __restrict__ o,
                                                                    const __nv_bfloat16* __restrict__ g, long long g_ld,
                                                                    __nv_bfloat16* __restrict__ out,
@@ -191,8 +190,7 @@ extern "C" __global__ void __launch_bounds__(NT) tf_head_gate_rows(const __nv_bf
     }
 }
 
-// out = bf16(bf16(gelu(gate)) * up), gelu the exact erf form as PyTorch's (x / 2 (1 + erf(x / sqrt 2)), fp32, then
-// rounded): Spark2.5's MLP; rows as tf_swiglu_rows', xs (or null) out's sums.
+// out = bf16(bf16(gelu(gate)) * up), PyTorch's exact erf GELU in fp32 (Spark2.5's MLP); xs (or null) out's sums.
 extern "C" __global__ void __launch_bounds__(NT) tf_gelu_erf_rows(const __nv_bfloat16* __restrict__ gate, long long g_ld,
                                                                   const __nv_bfloat16* __restrict__ up, long long u_ld,
                                                                   __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
