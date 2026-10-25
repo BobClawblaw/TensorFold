@@ -5,6 +5,10 @@ pub const nemotron = @import("nemotron/kernels.zig");
 
 pub const qwen35 = @import("qwen3_5/kernels.zig");
 pub const qwen35_layout = @embedFile("qwen3_5/layout.metal");
+/// The core KV pool's page address (core/metal_kv_pages.zig checks its page size).
+pub const kv_pages = @embedFile("core/kv_pages.h");
+/// Qwen3.5-2B's KV in pages of the core pool: its layout kernels' helpers, the page address, the paged kernels.
+pub const qwen35_paged = @embedFile("qwen3_5/layout.metal") ++ kv_pages ++ @embedFile("qwen3_5/paged.metal");
 /// Gemma 4 dense decode glue around the core lane projections (families/gemma4/kernels.zig).
 pub const gemma4_glue = @embedFile("gemma4/glue.metal");
 /// Gemma 4 decode glue as the reg lane kernel's prologues and epilogue (families/gemma4/weights.zig).
@@ -70,11 +74,16 @@ pub const flashnext_qmmw = @embedFile("prefill/qmmw_nax.metal");
 pub const flashnext_prompt = @embedFile("prefill/fn_prompt.metal");
 /// Flash Next block selection in GPU-side rounds: per-row metadata from the arena and pooling at absolute blocks.
 pub const flashnext_select = @embedFile("prefill/fn_select.metal");
+/// Flash Next indexer pooling at an image stream's block positions (the standard frame on the shared sessions).
+pub const flashnext_pool_pos = @embedFile("prefill/fn_pool_pos.metal");
 /// Flash Next prompt rows' block scores and sparse attention on the tensor units.
 pub const flashnext_attn = @embedFile("prefill/fn_attn.metal");
 /// Flash Next's attention prep at three positions a row, for prompt rows up to an image prompt's last image.
 pub const flashnext_mrope = @embedFile("prefill/fn_mrope.metal");
 pub const flashnext_rotary_sweep = @embedFile("prefill/fn_rotary_sweep.metal");
+pub const flashnext_rotary_scalar = @embedFile("prefill/fn_rotary_scalar.metal");
+pub const flashnext_rotary_lookup = @embedFile("prefill/fn_rotary_lookup.metal");
+pub const flashnext_rotary_prepare = @embedFile("prefill/fn_rotary_prepare.metal");
 
 /// A source file of MLX-exact kernels: compiled as one library, its kernels found by name.
 pub const File = struct { name: []const u8, text: []const u8 };
@@ -100,6 +109,8 @@ pub const flashnext_gdn = @embedFile("decode/fn_gdn.metal");
 /// Flash Next decode products one input row a simdgroup, for GPUs without tensor units (0.6.6's rows.py).
 pub const flashnext_rows = @embedFile("decode/fn_rows.metal");
 pub const flashnext_rows_hc = @embedFile("decode/fn_rows_hc.metal");
+/// Flash Next experts grouped by expert for wide decode windows, the recorded expert kernels' bits (gx.zig).
+pub const flashnext_gx = @embedFile("decode/fn_gx.metal");
 
 /// GLM-5.3-Flash's decode kernels from our Python family (tools/zig/gen_glm_kernels.py).
 pub const glm = @import("glm/kernels.zig");
@@ -171,6 +182,8 @@ pub const drama3 = struct {
     pub const gdn = @embedFile("drama3/gdn.metal");
     pub const attn = @embedFile("drama3/attn.metal");
     pub const moe = @embedFile("drama3/moe.metal");
+    pub const nvfp4 = @embedFile("drama3/nvfp4.metal");
+    pub const guidance = @embedFile("drama3/guidance.metal");
     pub const sample = @embedFile("drama3/sample.metal");
     pub const codec = @embedFile("drama3/codec.metal");
 };

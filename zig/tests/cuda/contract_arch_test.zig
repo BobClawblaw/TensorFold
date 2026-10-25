@@ -10,10 +10,10 @@ test "contract architecture: older SMs omit the standalone cluster kernels" {
         for (std.enums.values(mm.Kind)) |kind| {
             var m: mm.Mm = .{ .rig = undefined, .kind = kind, .sm = sm };
             const k = m.kernel();
-            try std.testing.expectEqual((kind == .qmm_group or kind == .verify32_bits or kind == .verify32_fp64), k == null);
+            try std.testing.expectEqual((kind == .qmm_group or mm.verifyTile(kind) > 0), k == null);
             if (k != null) count += 1;
         }
-        try std.testing.expectEqual(@as(usize, 6), count);
+        try std.testing.expectEqual(@as(usize, 7), count);
     }
 }
 
@@ -24,9 +24,10 @@ test "contract architecture: SM90 and Blackwell retain every kernel and the GEMV
             var m: mm.Mm = .{ .rig = undefined, .kind = kind, .sm = sm };
             const k = m.kernel().?;
             count += 1;
-            try std.testing.expectEqual(kind == .lane_gemv or kind == .lane_gemv_split or kind == .verify32_bits, k.spec.replaces != null);
+            const bits = kind == .verify32_bits or kind == .verify64_bits or kind == .verify128_bits;
+            try std.testing.expectEqual(kind == .lane_gemv or kind == .lane_gemv_split or kind == .lane_gemv_seg or bits, k.spec.replaces != null);
         }
-        try std.testing.expectEqual(@as(usize, 9), count);
+        try std.testing.expectEqual(@as(usize, 14), count);
     }
 }
 
@@ -38,6 +39,13 @@ test "contract architecture: legacy GEMV keeps every field except the unavailabl
         want.replaces = null;
         try std.testing.expectEqualDeep(want, legacy.kernel().?.spec);
     };
+}
+
+test "contract architecture: the segmented launch keeps decode() as its replacement on every SM" {
+    for ([_]u32{ 80, 86, 89, 90, 120, 121 }) |sm| {
+        var m: mm.Mm = .{ .rig = undefined, .kind = .lane_gemv_seg, .sm = sm };
+        try std.testing.expectEqualStrings("affine-4 decode()", m.kernel().?.spec.replaces.?);
+    }
 }
 
 test "contract architecture: the legacy FP4 lane names the reduction fallback it actually selects" {

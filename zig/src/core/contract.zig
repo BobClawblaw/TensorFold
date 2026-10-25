@@ -6,13 +6,19 @@ pub const gates = @import("contract/gates.zig");
 pub const rows = @import("contract/rows.zig");
 pub const affine = @import("contract/affine.zig");
 pub const dense = @import("contract/dense.zig");
+pub const bf16_round = @import("bf16_round.zig");
 pub const limits = @import("contract/limits.zig");
 pub const registry = @import("contract/registry.zig");
 pub const cubin = @import("contract/cubin.zig");
+pub const hsaco = @import("contract/hsaco.zig");
+pub const hip_records = @import("contract/hip_records.zig");
 
 test {
     _ = @import("contract/qwen_served_records.zig");
     _ = @import("contract/delta_slots_records.zig");
+    _ = @import("contract/vit_records.zig");
+    _ = @import("contract/simd_pairs_records.zig");
+    _ = @import("contract/glm_rows_records.zig");
     _ = spec;
     _ = gates;
     _ = rows;
@@ -21,5 +27,11 @@ test {
     _ = limits;
     _ = registry;
     _ = cubin;
+    _ = hsaco;
+    _ = hip_records;
     _ = @import("contract/fakes.zig");
+}
+
+test {
+    _ = @import("contract/seed_test.zig");
 }

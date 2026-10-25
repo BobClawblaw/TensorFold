@@ -22,6 +22,7 @@ pub const split_rows = 8;
 pub const attn_rows = 16;
 
 pub const Storage = struct {
+    residency: ?mtl.ResidencySet.Follow = null,
     gpa: std.mem.Allocator,
     device: mtl.Device,
     buffers: std.ArrayList(mtl.Buffer) = .empty,
@@ -30,10 +31,20 @@ pub const Storage = struct {
         const b = try self.device.buffer(@max(bytes, 16), opts);
         errdefer b.deinit();
         try self.buffers.append(self.gpa, b);
+        if (self.residency) |f| f.join(f.ctx, b);
         return b;
     }
 
+    pub fn setResident(self: *Storage, hook: ?mtl.ResidencySet.Follow) void {
+        for (self.buffers.items) |b| {
+            if (self.residency) |f| f.leave(f.ctx, b);
+            if (hook) |f| f.join(f.ctx, b);
+        }
+        self.residency = hook;
+    }
+
     pub fn deinit(self: *Storage) void {
+        self.setResident(null);
         for (self.buffers.items) |b| b.deinit();
         self.buffers.deinit(self.gpa);
     }
@@ -195,4 +206,19 @@ test "the served window stays inside the attention's 131,072 positions" {
     try std.testing.expectEqual(@as(?usize, null), window(131074, 131073));
     try std.testing.expectEqual(@as(?usize, null), window(8192, 8193));
     try std.testing.expectEqual(@as(?usize, null), window(131072, 0));
+}
+
+/// Bytes a stream's Cache takes at `capacity` rows: its logits, conv layers' windows, attention layers' KV.
+pub fn cacheBytes(attention: *const [c.layers]bool, capacity: usize) u64 {
+    var bytes: u64 = c.vocab * 2;
+    for (attention) |a| bytes += if (a) 2 * capacity * c.kv_heads * c.head_dim * 2 else conv_bytes;
+    return bytes;
+}
+
+test "a stream's cache bytes: logits and conv windows at any length, keys and values a row on attention layers" {
+    var attention: [c.layers]bool = @splat(false);
+    try std.testing.expectEqual(@as(u64, c.vocab * 2 + c.layers * conv_bytes), cacheBytes(&attention, 4096));
+    attention[1] = true;
+    attention[3] = true;
+    try std.testing.expectEqual(@as(u64, 2 * 2 * c.kv_heads * c.head_dim * 2), cacheBytes(&attention, 1) - cacheBytes(&attention, 0));
 }

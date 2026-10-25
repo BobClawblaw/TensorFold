@@ -6,6 +6,7 @@ const prompt = @import("cuda_prompt.zig");
 const wt = @import("cuda_prompt_wt.zig");
 const gdn = @import("cuda_gdn.zig");
 const Draft = @import("cuda_mtp_draft.zig").Draft;
+const pages = @import("cuda_pages.zig");
 
 const conv_bytes = (gdn.taps - 1) * gdn.conv_dim * 2;
 const state_bytes = wt.state_n * 4;
@@ -59,8 +60,28 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
         pieces[7..11].* = attnPieces((&h.kc)[0..1], (&h.vc)[0..1], (&h.ikc)[0..1], (&h.pooled)[0..1], at);
         count = 11;
     }
-    for (pieces[0..count]) |p| for (p.bufs) |b| {
+    for (pieces[0..count], 0..) |p, pi| for (p.bufs, 0..) |b, layer| {
         if (p.n == 0) continue;
+        // the model's caches on the stream's pages; the head's too in a pool lane (the layer after the model's)
+        const head = pi >= 7 and d != null and d.?.pg.pt != 0;
+        if ((pi >= 2 and pi < 6) or head) if (seq.paged) |*pg| {
+            // the same bytes in the same order as a contiguous cache's, a run a page
+            const part: pages.Part = @fromBackingInt(@intCast(if (head) pi - 7 else pi - 2));
+            const at_layer = if (head) wt.attn_n else layer;
+            const row = pages.rowBytes(part);
+            const per = pages.rows(part, pg.tokens);
+            const n = p.n / row;
+            var r: usize = 0;
+            while (r < n) {
+                const run = @min(per - r % per, n - r);
+                const at_row = pg.rowAt(at_layer, part, r);
+                const dst, const src = if (way == .save) .{ base + off, at_row } else .{ at_row, base + off };
+                try dr.check(dr.api.cuMemcpyDtoDAsync_v2(dst, src, run * row, stream.handle), "cuMemcpyDtoDAsync");
+                off += run * row;
+                r += run;
+            }
+            continue;
+        };
         const dst, const src = if (way == .save) .{ base + off, b.ptr } else .{ b.ptr, base + off };
         try dr.check(dr.api.cuMemcpyDtoDAsync_v2(dst, src, p.n, stream.handle), "cuMemcpyDtoDAsync");
         off += p.n;
@@ -76,6 +97,7 @@ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Str
     errdefer gpa.destroy(snap);
     snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, d != null)), .at = at, .history = seq.history, .head = d != null };
     errdefer snap.buf.free();
+    errdefer cuda.completion.drain(driver, stream, "a failed snapshot save did not drain");
     try move(stream, seq, d, snap.buf.ptr, at, .save);
     try stream.synchronize();
     return snap;
@@ -97,7 +119,7 @@ pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const S
 }
 
 pub fn drop(gpa: std.mem.Allocator, stream: cuda.Stream, snap: *Snap) void {
-    stream.synchronize() catch {};
+    cuda.completion.drain(stream.d, stream, "a snapshot drop did not drain");
     snap.buf.free();
     gpa.destroy(snap);
 }
@@ -109,4 +131,8 @@ test "a state's bytes: about 110 MiB of DeltaNet states and the n-gram tail, the
     // the head's cache is one more attention layer's rows
     try std.testing.expectEqual(@as(usize, 13 * (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, true) - bytes(0, true));
     try std.testing.expect(bytes(0, false) > 100 << 20 and bytes(0, false) < 120 << 20);
+}
+
+test {
+    _ = @import("cuda_paging_snap_test.zig");
 }

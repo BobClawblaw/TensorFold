@@ -75,6 +75,7 @@ pub const Metal = struct {
     masks: ?Masks = null, // structured output's bits (grammar.zig), made at the first structured request
     living: ?@import("adapters.zig").Sites = null, // the saved lessons' gated blocks, until a learner takes them
     trace: bool = false, // TF_SLIDE_TRACE: each reply's lesson scores logged (dev)
+    residency: ?mtl.ResidencySet.Follow = null,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model, o: Options) !*Metal {
         const b = try gpa.create(Metal);
@@ -85,7 +86,7 @@ pub const Metal = struct {
             .gpa = gpa,
             .m = m,
             .o = o,
-            .pool = try st.Pool.init(gpa, m.device, m.config, rows + o.streams + 1, o.streams + 4),
+            .pool = try st.Pool.init(gpa, m.device, m.config, st.poolSlots(o.streams), o.streams + 2),
             .scratch = try st.Scratch.init(m.device, m.config, rows, o.capacity),
             .tokens = try m.device.buffer(ring * 4, opts),
             .prompt = try m.device.buffer(@max(o.capacity, 16) * 4, opts),
@@ -102,6 +103,7 @@ pub const Metal = struct {
 
     pub fn deinit(self: *Metal) void {
         self.drain() catch {};
+        @import("residency.zig").set(self, null);
         self.flights.deinit(self.gpa);
         var it = self.caches.valueIterator();
         while (it.next()) |c| {
@@ -246,13 +248,7 @@ pub const Metal = struct {
             self.gpa.destroy(old);
             _ = self.caches.remove(s);
         }
-        const c = try self.gpa.create(st.Cache);
-        c.* = try st.Cache.init(self.m.device, self.m.config, rows_needed, self.head != null);
-        c.rid = try self.pool.takeRid();
-        // a decision row only where lessons route on it: else the prompt's chunks stay as plain serving cuts them
-        c.decide = if (s.decide != null and layers.firstAdapter(&self.m.weights) != null) s.decide.? else lesson_route.none;
-        c.untaught = s.untaught;
-        try self.caches.put(self.gpa, s, c);
+        const c = try @import("residency.zig").openCache(self, s, rows_needed);
         @memcpy(self.prompt.slice(u32, ids.len), ids);
         const Chunks = struct {
             n: usize,
@@ -379,6 +375,7 @@ pub const Metal = struct {
         const out = self.take(1);
         if (c.len + 1 > c.kv[0].capacity) return error.ContextFull;
         const state = try self.slotFor(c, .full);
+        errdefer self.pool.give(@intCast(state));
         const Step = struct {
             in: u64,
             out: u64,
@@ -414,6 +411,8 @@ pub const Metal = struct {
         var fills: [st.max_rows]Fill = undefined;
         if (windows.len > segs.len) return error.WindowTooWide;
         var total: usize = 0;
+        var taken: usize = 0; // windows whose fresh slot segs holds until hold() hands it to their cache
+        errdefer for (segs[0..taken]) |g| if (g.slot >= 0) self.pool.give(@intCast(g.slot));
         for (windows, 0..) |w, i| {
             const c = try self.cacheOf(w.stream);
             self.settle(c);
@@ -428,7 +427,9 @@ pub const Metal = struct {
             staged[stage % ring] = w.pending;
             for (w.tokens, 0..) |t, r| staged[(stage + 1 + r) % ring] = t;
             fills[i] = .{ .stage = stage, .held = w.held, .n = w.tokens.len };
-            segs[i] = .{ .rows = rows, .cache = c, .store = .lag, .slot = try self.slotFor(c, .lag), .parents = w.parents, .draw = drawOf(w.stream, w.positions[0]), .mask_row = try grammar.stage(self, w, total) };
+            const mask_row = try grammar.stage(self, w, total);
+            segs[i] = .{ .rows = rows, .cache = c, .store = .lag, .slot = try self.slotFor(c, .lag), .parents = w.parents, .draw = drawOf(w.stream, w.positions[0]), .mask_row = mask_row };
+            taken = i + 1;
             c.start = total;
             c.rows = rows;
             total += rows;

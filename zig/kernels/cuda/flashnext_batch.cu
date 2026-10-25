@@ -332,3 +332,15 @@ extern "C" __global__ void fn_copy_cols(const uint16_t* __restrict__ src, long l
     const int col = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
     if (col < width) dst[r * dst_pitch + col] = src[r * src_pitch + col];
 }
+
+#include "flashnext_gdn_tpr.cuh"
+
+// The prompt chain on two threads a state row (gdn_tpr): fn_gdn_rows_to's bits, state_in == state_out in place.
+extern "C" __global__ void __launch_bounds__(256) fn_gdn_chain_tpr(const float* qn, const float* kn, const float* v,
+                                                                 const float* gb, const float* state_in, float* state_out,
+                                                                 int rows, float* ys_out) {
+    gdn_tpr::chain<2, 16>(qn, kn, v, gb, state_in, state_out, rows, ys_out);
+}
+
+// The prompt GDN block in one kernel a value head (front, chain, gated norm; their bits), no fp32 rows through memory.
+#include "flashnext_gdn_fused.cuh"

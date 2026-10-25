@@ -11,6 +11,7 @@ pub var scale_calls: usize = 0;
 pub var first_blit: ?struct { offset: usize, bytes: usize } = null;
 pub var blits: usize = 0;
 pub var draws: usize = 0;
+pub var rotary_calls: usize = 0;
 pub const Buffer = struct {
     id: usize,
     data: []align(256) u8,
@@ -26,10 +27,16 @@ pub const Buffer = struct {
     pub fn deinit(_: Buffer) void {}
 };
 pub const Device = struct {
+    pub fn allocated(_: Device) u64 {
+        return 0;
+    }
     pub fn buffer(_: Device, n: usize, _: usize) !Buffer {
         const data = try allocator.alignedAlloc(u8, .fromByteUnits(256), n);
         @memset(data, 0);
         return .{ .id = @intFromPtr(data.ptr), .data = data };
+    }
+    pub fn event(_: Device) !Event {
+        return .{};
     }
     pub fn tensorUnits(_: Device) bool {
         return true;
@@ -44,6 +51,7 @@ pub const CompileOptions = struct {
     }
 };
 pub const Library = struct {
+    id: usize = 0,
     text: []const u8,
     pub fn fromSource(_: Device, text: []const u8, _: CompileOptions) !Library {
         return .{ .text = text };
@@ -51,6 +59,7 @@ pub const Library = struct {
     pub fn deinit(_: Library) void {}
 };
 pub const Pipeline = struct {
+    id: usize = 0,
     name: []const u8 = "noop",
     text: []const u8 = "",
     pub fn init(_: Device, lib: Library, name: []const u8, _: bool) !Pipeline {
@@ -88,6 +97,10 @@ pub const ComputeEncoder = struct {
         };
     }
     pub fn dispatchThreads(_: ComputeEncoder, grid: Size, _: Size) void {
+        if (std.mem.eql(u8, pipe.name, "tf_rotary_prepare")) {
+            rotary_calls += 1;
+            return;
+        }
         if (std.mem.eql(u8, pipe.name, "fz_xgu") or std.mem.eql(u8, pipe.name, "fz_xdown")) {
             calls[if (std.mem.eql(u8, pipe.name, "fz_xgu")) @as(usize, 2) else 3] += 1;
             for (expected, [_]usize{ 6, 32, 6, 32 }) |want, actual| if (want != actual) {
@@ -105,15 +118,21 @@ pub const ComputeEncoder = struct {
             const b = bound[1];
             const out = @as([*]u32, @ptrCast(@alignCast(b.b.contents() + b.off)));
             for (0..grid.width / 1024) |i| out[i] = if (wrong == 0) 7 else 9;
+        } else if (std.mem.eql(u8, pipe.name, "fz_argmax_join")) { // the two-launch argmax: one group a row (dispatchGroups)
+            const b = bound[1];
+            const out = @as([*]u32, @ptrCast(@alignCast(b.b.contents() + b.off)));
+            for (0..grid.width) |i| out[i] = if (wrong == 0) 7 else 9;
         }
     }
     pub fn dispatchGroups(e: ComputeEncoder, grid: Size, threads: Size) void {
         e.dispatchThreads(grid, threads);
     }
+    pub fn dispatchIndirect(_: ComputeEncoder, _: Buffer, _: usize, _: Size) void {}
     pub fn barrier(_: ComputeEncoder) void {}
     pub fn end(_: ComputeEncoder) void {}
 };
 pub const Queue = struct {
+    pub fn deinit(_: @This()) void {}
     pub fn commandBuffer(_: Queue) CommandBuffer {
         return .{};
     }
@@ -133,6 +152,8 @@ pub const CommandBuffer = struct {
     pub fn failure(_: CommandBuffer) ?[]const u8 {
         return null;
     }
+    pub fn waitForEvent(_: CommandBuffer, _: Event, _: u64) void {}
+    pub fn signalEvent(_: CommandBuffer, _: Event, _: u64) void {}
 };
 pub const BlitEncoder = struct {
     pub fn copy(_: BlitEncoder, a: Buffer, ao: usize, b: Buffer, bo: usize, n: usize) void {
@@ -147,8 +168,17 @@ pub const BlitEncoder = struct {
 pub const ResidencySet = struct {
     pub const Follow = struct { ctx: *anyopaque, join: *const fn (*anyopaque, Buffer) void, leave: *const fn (*anyopaque, Buffer) void };
 };
-pub const SharedEvent = struct {};
+pub const SharedEvent = struct {
+    id: usize = 0,
+    pub fn deinit(_: @This()) void {}
+};
+pub const Event = struct {
+    id: usize = 0,
+    pub fn deinit(_: @This()) void {}
+};
 pub const objc = struct {
+    pub const Id = usize;
+    pub fn release(_: Id) void {}
     pub const Pool = struct {
         pub fn push() @This() {
             return .{};

@@ -56,13 +56,16 @@ fn server(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Step.Compi
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = engine }, .{ .name = "checkpoint_cli", .module = cli } },
+        .imports = &.{ .{ .name = "core", .module = engine.import_table.get("core").? }, .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = engine }, .{ .name = "checkpoint_cli", .module = cli } },
     });
     m.addImport("living", b.createModule(.{ .root_source_file = b.path("zig/src/living/living.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true }));
     m.addOptions("build_options", build_options);
     // the server's json and the family's text side share the engine's serving module (one `dsv41_serve`)
     m.addImport("json", engine.import_table.get("dsv41_serve").?.import_table.get("json").?);
     m.addImport("dsv41_serve", engine.import_table.get("dsv41_serve").?);
+    m.addImport("dsv41_chat", engine.import_table.get("dsv41_serve").?);
+    // the server's Drama voice catalog reads the prompt builder; this engine set has no drama3 family to share
+    m.addImport("drama_prompt", b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/prompt.zig"), .target = target, .optimize = .ReleaseSafe }));
     const exe = b.addExecutable(.{ .name = name, .root_module = m });
     _ = exe.getEmittedBin();
     return exe;

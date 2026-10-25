@@ -30,6 +30,7 @@ pub const Plan = struct {
     branch_from: u32 = 0, // the first row of suffix-match branches (0: none; lanes/fill.zig)
     cost_probe_rows: ?u32 = null, // an unseen width selected for calibration, confirmed by a matching completed round
     context_copy: bool = false, // branch_from names a copied continuation appended to the head
+    copy_trusted: bool = true, // the copy is priced from cfg.copy_rate's prior (trustedCopy), else from short_rate's
     tried: bool = false, // the planner read the head's chain back to graft branches
     lanes: ?*const shape.Shape = null, // the held drafts' tree shape (each lane's depth and rank)
     masks: []const u32 = &.{}, // structured output: the rows' allowed-token bits (constrain)
@@ -56,6 +57,7 @@ pub const Copy = struct { tokens: []const u32 = &.{}, recalled: bool = false };
 pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
     const a = e.arena.allocator();
     var p: Plan = .{ .stream = s, .position = s.cache_len, .kind = .none };
+    if (e.backend.proposals() and s.proposal_depth == 0) s.dropHeld(e.gpa);
     const queued = s.next;
     s.next = null;
     defer if (queued) |q| {
@@ -73,7 +75,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
     } else {
         var copy: Copy = .{};
         if (copied) |c| copy = c else if (s.drafts) copy = try copyProposal(e, s);
-        const extend = e.alone and e.cfg.context_copies and !copy.recalled and queued != null and queued.?.count > 0;
+        const extend = !e.cfg.root_copies and e.alone and e.cfg.context_copies and !copy.recalled and queued != null and queued.?.count > 0;
         if (copy.tokens.len > 0 and !extend) {
             p.kind = .copy;
             p.recalled = copy.recalled;
@@ -97,6 +99,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
             }
             if (p.count() > 0) p.kind = .head;
             if (extend and copy.tokens.len > 0) try @import("context_copy.zig").extend(e, &p, copy.tokens);
+            if (p.context_copy) p.copy_trusted = trustedCopy(s);
         }
     }
     if (!p.context_copy and e.cfg.fill_lanes > 0 and s.drafts and p.kind != .forced and (p.parents == null or p.lanes != null)) try fillLanes(e, s, &p);
@@ -137,6 +140,25 @@ fn fillLanes(e: *Engine, s: *Stream, p: *Plan) !void {
     if (p.kind == .none) p.kind = .fill;
 }
 
+/// The rows the context's matches and Recall's would graft this round, and the share it keeps (null: none).
+pub fn graftProspect(e: *Engine, s: *Stream) !?@import("plan_lanes.zig").Grafts {
+    if (e.cfg.fill_lanes == 0) return null;
+    const probe_round = s.rounds % 8 == 0;
+    const a = e.arena.allocator();
+    const room = e.cfg.fill_lanes -| 1;
+    const found = try candidates(e, s, room, probe_round);
+    if (found.len == 0) return null;
+    const b = try fill.graft(a, .{}, found, room);
+    // each source's recent share of grafted rows kept; every eighth round at least the floor, so grafts get retried
+    const own_hit = if (probe_round) @max(s.graft_hit, e.cfg.fill_floor) else s.graft_hit;
+    const recall_hit = if (probe_round) @max(s.recall_hit, e.cfg.fill_floor) else s.recall_hit;
+    var recalled: f64 = 0;
+    for (b.recalled) |x| recalled += @floatFromInt(@intFromBool(x));
+    const rows: f64 = @floatFromInt(b.tokens.len);
+    const hit = if (recalled == 0) own_hit else (own_hit * (rows - recalled) + recall_hit * recalled) / rows;
+    return .{ .rows = @intCast(b.tokens.len), .hit = hit };
+}
+
 /// Graft candidates: the context's while its rows land, then Recall's while its do (both on a probe round); own first.
 pub fn candidates(e: *Engine, s: *Stream, room: usize, probe_round: bool) ![]const fill.Proposal {
     const a = e.arena.allocator();
@@ -175,7 +197,7 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
 
 /// A copy from the context backed by `enter_match` ids (Python `_copy_proposal`), else Recall's when it should pay.
 pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
-    if (e.cfg.max_copy == 0 or s.force.items.len > 0) return .{};
+    if (e.cfg.max_copy == 0 or s.force.items.len > 0 or (e.cfg.root_copies and s.root_copy_miss)) return .{};
     const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
     const most = @min(@as(i64, width), s.draftRoom() - 1);
     if (s.proposer) |p| if (!e.alone or e.cfg.lone_copies) {
@@ -194,6 +216,7 @@ pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
 pub fn copyAhead(ptr: *anyopaque, w: *const depth.Who) bool {
     const e: *Engine = @ptrCast(@alignCast(ptr));
     const s: *Stream = @ptrCast(@alignCast(w.stream.?));
+    if (e.cfg.root_copies) return false;
     const copied = copyProposal(e, s) catch return false;
     return copied.tokens.len > 0;
 }
@@ -228,7 +251,7 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = try alloc.chainProbabilities(a, &.{e.cfg.copy_rate}, n);
         } else {
             fx.* = 1;
-            const chances = try nodeChances(e, p.stream, n);
+            const chances = try planChances(e, p, n);
             const controls = @import("mtp_policy.zig").Controls{ .cap = e.cfg.most_drafts, .floor = e.cfg.draft_confidence };
             pr.* = if (p.kind == .head and e.cfg.draft_confidence != null) chances[0..controls.prefix(chances)] else chances;
         }
@@ -236,6 +259,12 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     const untimed: @import("table.zig").Table = .{};
     const explicit = e.cfg.draft_confidence != null;
     const live = plans.len == 1 and lone_costs.enabled(e, plans[0]);
+    if (live and !plans[0].stream.prices_seeded) {
+        const s = plans[0].stream;
+        s.prices_seeded = true;
+        _ = try e.rule.rates(who(s));
+        try lone_costs.seed(e.gpa, lone_costs.slot(&e.lone_kept, s).*, s);
+    }
     const own = if (live) try lone_costs.prices(e, plans[0]) else untimed;
     const costs = if (explicit) &untimed else if (live) &own else &e.cfg.shared_costs;
     const overhead = if (explicit or live) 0 else e.rule.overheadMs(plans.len, anySampled(plans));
@@ -286,6 +315,121 @@ fn trimmed(e: *Engine, plans: []Plan, t: trim.Trim) !void {
         } else try cut.prefix(a, p, c.count);
         if (p.count() == 0) p.kind = .none;
     }
+}
+
+/// The weight a stream's copy history keeps a round, so its copies' landing rate follows its content.
+const copy_decay = 0.9;
+
+/// A context match this long earns cfg.copy_rate's prior (Qwen3.8-27B, 134 prompts: 85% of such copies' rows landed).
+pub const long_match = 20;
+/// A copy out of the prompt this early in the reply earns it too (89% on code: restating the asked-for function).
+pub const early_reply = 64;
+/// Any other copy's prior: about the share of their rows that landed (0 to 13%).
+const short_rate = 0.08;
+
+/// A copy after a long match, or out of the prompt within the reply's first early_reply tokens.
+fn trustedCopy(s: *const Stream) bool {
+    const pr = s.proposer orelse return true;
+    if (pr.lastMatch() >= long_match) return true;
+    const at = pr.lastEnd() orelse return false;
+    return at <= s.prompt_len and s.context.items.len -| s.prompt_len < early_reply;
+}
+
+/// A stream's copy history from its prior: sixteen rows' worth, cfg.copy_rate's share (trusted) or short_rate's landed.
+fn copyPrime(e: *const Engine, s: *Stream, trusted: bool) void {
+    const i = @intFromBool(trusted);
+    if (s.copy_landed[i] >= 0) return;
+    const rate = if (trusted) e.cfg.copy_rate else short_rate;
+    s.copy_landed[i] = 16 * rate;
+    s.copy_broke[i] = 16 * (1 - rate);
+}
+
+/// A copied row's landing rate for this stream's trusted copies or the others': landed rows over those plus breaks.
+pub fn copyRate(e: *const Engine, s: *Stream, trusted: bool) f64 {
+    copyPrime(e, s, trusted);
+    const i = @intFromBool(trusted);
+    return s.copy_landed[i] / (s.copy_landed[i] + s.copy_broke[i]);
+}
+
+/// A verified copy of `offered` rows (anchor landed), `kept` landing; a trusted one teaches both histories.
+pub fn observeCopy(e: *const Engine, s: *Stream, trusted: bool, kept: u64, offered: u64) void {
+    for ([_]bool{ false, true }) |which| {
+        if (which and !trusted) continue;
+        copyPrime(e, s, which);
+        const i = @intFromBool(which);
+        s.copy_landed[i] = copy_decay * s.copy_landed[i] + @as(f64, @floatFromInt(kept));
+        s.copy_broke[i] = copy_decay * s.copy_broke[i] + @as(f64, @floatFromInt(@intFromBool(kept < offered)));
+    }
+}
+
+/// A context copy's appended rows: each its parent's chance times the stream's copy rate; the drafts keep their own.
+fn planChances(e: *Engine, p: Plan, n: usize) ![]const f64 {
+    if (!p.context_copy or p.branch_from == 0 or p.parents == null or n < p.branch_from) return nodeChances(e, p.stream, n);
+    const drafts = p.branch_from - 1;
+    const out = try e.arena.allocator().alloc(f64, n);
+    if (drafts > 0) @memcpy(out[0..drafts], try nodeChances(e, p.stream, drafts));
+    const rate = copyRate(e, p.stream, p.copy_trusted);
+    for (out[drafts..], p.parents.?[drafts..n]) |*o, parent| o.* = rate * (if (parent >= 0) out[@intCast(parent)] else 1);
+    return out;
+}
+
+test "copy rows: each priced at its parent's chance times the stream's copy rate, which follows its copies" {
+    const a = std.testing.allocator;
+    var cfg = try @import("config.zig").Config.init(a, .{ .exact_width = 64, .drafts = 15, .batch_rows = 128 }, 64, 15);
+    defer cfg.deinit(a);
+    var target: @import("fake.zig").Fake = .{ .gpa = a };
+    defer target.deinit();
+    var clock: @import("fake.zig").FixedClock = .{};
+    var e = Engine.init(a, &cfg, target.backend(), clock.clock());
+    defer e.deinit();
+    var s = try Stream.init(a, .{ .id = "copy", .prompt = &.{ 1, 2 }, .max_new = 64 });
+    defer s.deinit(a);
+    // two drafts, then a copy of two rows from the second draft (row parents -1, 0, 1, 2)
+    const parents = [_]i32{ -1, 0, 1, 2 };
+    const ids = [_]u32{ 5, 6, 7, 8 };
+    const p: Plan = .{ .stream = &s, .position = 2, .kind = .head, .tokens = &ids, .parents = &parents, .branch_from = 3, .context_copy = true };
+    const drafts = try nodeChances(&e, &s, 2);
+    const out = try planChances(&e, p, 4);
+    const rate = copyRate(&e, &s, true);
+    try std.testing.expectApproxEqAbs(cfg.copy_rate, rate, 1e-12);
+    try std.testing.expectApproxEqAbs(drafts[1], out[1], 1e-12);
+    try std.testing.expectApproxEqAbs(rate * drafts[1], out[2], 1e-12);
+    try std.testing.expectApproxEqAbs(rate * rate * drafts[1], out[3], 1e-12);
+    // copies that land whole raise the rate toward 1; copies that break lower it below the prior
+    for (0..30) |_| observeCopy(&e, &s, true, 12, 12);
+    try std.testing.expect(copyRate(&e, &s, true) > 0.99);
+    for (0..80) |_| observeCopy(&e, &s, true, 1, 12); // one row landed, then a miss: toward 1 / (1 + 1)
+    try std.testing.expect(copyRate(&e, &s, true) < 0.55);
+    // an untrusted copy starts from short_rate; trusted copies teach both histories, untrusted ones only their own
+    var fresh = try Stream.init(a, .{ .id = "short", .prompt = &.{ 1, 2 }, .max_new = 64 });
+    defer fresh.deinit(a);
+    const short: Plan = .{ .stream = &fresh, .position = 2, .kind = .head, .tokens = &ids, .parents = &parents, .branch_from = 3, .context_copy = true, .copy_trusted = false };
+    try std.testing.expectApproxEqAbs(short_rate * drafts[1], (try planChances(&e, short, 4))[2], 1e-12);
+    for (0..3) |_| observeCopy(&e, &fresh, true, 12, 12);
+    try std.testing.expect(copyRate(&e, &fresh, false) > 0.6);
+    for (0..60) |_| observeCopy(&e, &fresh, false, 0, 12);
+    try std.testing.expect(copyRate(&e, &fresh, false) < 0.1 and copyRate(&e, &fresh, true) > 0.95);
+    // a window without a copy keeps the head's own chances
+    const plain: Plan = .{ .stream = &s, .position = 2, .kind = .head, .tokens = ids[0..2] };
+    try std.testing.expectEqualSlices(f64, try nodeChances(&e, &s, 2), try planChances(&e, plain, 2));
+}
+
+test "a copy is trusted after a long match, or out of the prompt early in the reply" {
+    const a = std.testing.allocator;
+    var look = try @import("proposer.zig").SuffixLookup.init(a, .{});
+    defer look.deinit();
+    var s = try Stream.init(a, .{ .id = "trust", .prompt = &.{ 1, 2, 3, 4 }, .max_new = 128 });
+    defer s.deinit(a);
+    s.proposer = look.proposer();
+    look.last_match = long_match;
+    look.last_end = 9;
+    try std.testing.expect(trustedCopy(&s));
+    look.last_match = long_match - 1;
+    try std.testing.expect(!trustedCopy(&s)); // a short match out of the reply
+    look.last_end = 2;
+    try std.testing.expect(trustedCopy(&s)); // out of the prompt, the reply not begun
+    for (0..early_reply) |_| try s.context.append(a, 7);
+    try std.testing.expect(!trustedCopy(&s)); // out of the prompt, past the reply's first tokens
 }
 
 /// The head's chance for each held draft, else chain chances from the stream's per-depth acceptance.

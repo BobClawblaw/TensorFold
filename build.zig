@@ -59,6 +59,7 @@ fn poolChecks(b: *std.Build, target: std.Build.ResolvedTarget, test_step: *std.B
 }
 
 pub fn build(b: *std.Build) void {
+    @import("zig/build/residency_host.zig").steps(b);
     @import("zig/build/lane_halt_host.zig").steps(b);
     @import("zig/build/dsv41_shared.zig").steps(b);
     @import("zig/build/dsv41_cuda.zig").steps(b);
@@ -82,6 +83,7 @@ pub fn build(b: *std.Build) void {
     const draft_ids = b.createModule(.{ .root_source_file = ids_files.add("draft_ids.zig", "pub const text = @embedFile(\"draft_ids.txt\");\n") });
     const test_step = b.step("test", "Unit tests (macOS includes available Metal device checks)");
     @import("zig/build/kernel_symbols.zig").tests(b, test_step);
+    @import("zig/build/checkpoint_security.zig").tests(b, test_step);
     if (b.graph.host.result.os.tag == .macos) {
         const step5_mods = metalEngineModules(b, b.graph.host, .Debug, draft_ids);
         const empty = b.addWriteFiles().add("step5-compile-only.metallib", "");
@@ -97,6 +99,7 @@ pub fn build(b: *std.Build) void {
         const budget_empty = b.addWriteFiles().add("budget-compile-only.metallib", "");
         budget_mods.sources.addImport("nemotron_packed_metallib", embedded(b, budget_empty, "nemotron_packed.metallib"));
         @import("zig/build/flashnext_budget.zig").compileHost(b, budget_mods.metal, budget_mods.engine, budget_mods.lanes);
+        @import("zig/build/residency_host.zig").compileHost(b, budget_mods.metal, budget_mods.engine, budget_mods.lanes);
     }
     // every tracked path checks out on Windows too
     const names_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/tests/portable_names.zig"), .target = target }) }));
@@ -115,15 +118,32 @@ pub fn build(b: *std.Build) void {
     const cost_run = b.addRunArtifact(cost_cases);
     b.step("test-cost-rule", "CPU scripted window and interleaved head timing").dependOn(&cost_run.step);
     test_step.dependOn(&cost_run.step);
+    const identity_cases = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/lanes/cost_identity.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+    }) });
+    const identity_run = b.addRunArtifact(identity_cases);
+    b.step("test-cost-identity", "Streamed window-cost identity matches legacy bytes with bounded memory").dependOn(&identity_run.step);
+    test_step.dependOn(&identity_run.step);
     merge_build.targets(b, target, optimize); // tensorfold merge's tests and tf-merge-check, host only on every OS
+    const voice_tool = b.createModule(.{ .root_source_file = b.path("zig/src/server/drama_voice_tool.zig"), .target = target, .optimize = optimize });
+    _ = server_build.addTo(b, voice_tool, target, optimize);
+    const voice_exe = b.addExecutable(.{ .name = "drama3-voice", .root_module = voice_tool });
+    b.step("drama3-voice", "Attested Drama voice files from reference WAVs, coded by drama3-generate --encode").dependOn(&b.addInstallArtifact(voice_exe, .{}).step);
+    // the backend options are declared for every target, so one build script may pass the same flags on every OS
+    const cuda_options = @import("zig/build/options.zig").cuda(b);
+    const tp_options = @import("zig/build/options.zig").tp(b);
     switch (target.result.os.tag) {
         .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step),
-        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options),
+        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options, cuda_options),
         else => {},
     }
     const gemma4_host_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig"), .target = b.graph.host });
     gemma4_host_sources.addAnonymousImport("nemotron_packed_metallib", .{ .root_source_file = b.addWriteFiles().add("gemma4-host-empty.metallib", "") });
     const gemma4_contract_host = @import("zig/build/gemma4_host.zig").tests(b, gemma4_host_sources);
+    gemma4_contract_host.dependOn(@import("zig/build/glm_rows_contract.zig").host(b, gemma4_host_sources));
     if (b.graph.host.result.os.tag == .macos) {
         const gemma4_host_mods = metalEngineModules(b, b.graph.host, .Debug, draft_ids);
         gemma4_host_mods.sources.addImport("nemotron_packed_metallib", embedded(b, b.addWriteFiles().add("gemma4-compile-empty.metallib", ""), "nemotron_packed.metallib"));
@@ -134,7 +154,7 @@ pub fn build(b: *std.Build) void {
     const xgrammar = grammar_build.option(b);
     dist_build.targets(b, draft_ids, build_options, release_version, xgrammar);
     @import("zig/build/sessions.zig").add(b, test_step);
-    @import("zig/build/tp.zig").add(b, target, optimize, test_step);
+    @import("zig/build/tp.zig").add(b, target, optimize, test_step, tp_options);
     @import("zig/build/gradient_host.zig").add(b);
     @import("zig/build/living_tools_host.zig").steps(b);
     cuda_build.hostTests(b, draft_ids, build_options, test_step, target.result.os.tag != .macos);
@@ -146,10 +166,13 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_mod })).step);
     }
     poolChecks(b, b.graph.host, test_step);
-    hip_build.steps(b, target, optimize, build_options, test_step);
+    const with_hip = b.option(bool, "hip", "Enable the opt-in HIP backend and its host/device targets") orelse false;
+    const hip_options = hip_build.options(b); // declared on every target (#1165), used only with -Dhip=true
+    hip_build.loaderTests(b, test_step);
+    if (with_hip) hip_build.steps(b, target, optimize, build_options, test_step, hip_options);
     exlr8_build.hostTests(b, target, test_step);
     xpu_build.steps(b, target, optimize, build_options);
-    video_build.steps(b, target);
+    video_build.steps(b, target, test_step);
     const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
     const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/glm_disk_tests.zig"),
@@ -174,7 +197,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&warning_run.step);
     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
     grammar_build.steps(b, target, xgrammar);
+    grammar_build.hostTests(b, test_step);
     contract_build.hostTests(b, gemma4_contract_host);
+    // the CPU-only fake server and engine-less CLI (zig build server-cpu), behind zig/tests/server/build.sh
+    @import("zig/build/server.zig").cpuArtefacts(b, b.graph.host, optimize, build_options);
     sys_build.wire(b);
     @import("zig/build/checkpoint_config.zig").wire(b);
     @import("zig/build/save_guard.zig").wire(b);

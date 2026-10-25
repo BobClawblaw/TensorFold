@@ -5,6 +5,7 @@ const lanes = @import("lanes");
 const fwd = @import("forward.zig");
 const kern = @import("kernels.zig");
 const snap = @import("snap.zig");
+const limits = @import("context.zig");
 
 const be = lanes.backend;
 const Stream = lanes.Stream;
@@ -14,7 +15,7 @@ pub const prompt_rows = fwd.prompt_rows;
 /// Window rows a round takes over every stream.
 pub const round_rows = fwd.round_rows;
 /// The widest window a stream verifies: one-row steps and every wider window give a row the same bits.
-pub const max_window = 16;
+pub const max_window = limits.reserve;
 /// Drawn tokens a handle names (a ring; read before the round loop could wrap it).
 const ring = 1024;
 
@@ -96,7 +97,7 @@ pub const Kolibri = struct {
         return .{ .ptr = x, .vtable = &vtable };
     }
 
-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true };
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .cancel_prefill = cancelPrefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true };
 
     /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
     pub fn facts(x: *const Kolibri) lanes.Model {
@@ -162,7 +163,7 @@ pub const Kolibri = struct {
     fn opening(x: *Kolibri, s: *Stream) !*Lane {
         const p = s.prompt();
         if (p.len == 0) return error.EmptyPrompt;
-        if (p.len + @as(usize, s.max_new) + max_window > x.m.context) return error.PastContext;
+        if (!limits.fits(x.m.context, p.len, @as(usize, s.max_new))) return error.PastContext;
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (!got.found_existing) {
             const slot = x.freeSlot() orelse {
@@ -205,7 +206,10 @@ pub const Kolibri = struct {
     fn chunk(x: *Kolibri, s: *Stream, l: *Lane) !bool {
         const p = s.prompt();
         const at = l.fill.?;
-        if (s.isCancelled()) return error.Cancelled;
+        if (s.isCancelled()) {
+            s.keepInterruptedPrefill(@intCast(at));
+            return error.Cancelled;
+        }
         var end = @min(p.len, (at / prompt_rows + 1) * prompt_rows);
         for (s.reuse.marks) |mk| if (mk > at and mk < end) {
             end = mk;
@@ -232,6 +236,11 @@ pub const Kolibri = struct {
         const l = if (going) x.lanes.getPtr(s).? else try x.opening(s);
         errdefer x.dropLane(s);
         return x.chunk(s, l);
+    }
+
+    fn cancelPrefill(ptr: *anyopaque, s: *Stream) !void {
+        const l = self(ptr).lanes.getPtr(s) orelse return;
+        if (l.fill) |at| s.keepInterruptedPrefill(@intCast(at));
     }
 
     fn handle(x: *Kolibri) usize {

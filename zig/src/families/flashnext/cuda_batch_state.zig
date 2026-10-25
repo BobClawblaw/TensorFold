@@ -5,8 +5,8 @@ const cuda = @import("cuda");
 const gdn = @import("cuda_gdn.zig");
 const ple = @import("cuda_ple.zig");
 const wt = @import("cuda_prompt_wt.zig");
+const tk = @import("cuda_tile_kernels.zig");
 const load = @import("cuda_prompt_load.zig");
-
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
 const dims = wt.dims;
@@ -45,13 +45,23 @@ pub const proj_row = @max(gdn.proj_width, proj_n);
 pub const att_rows: usize = 256;
 /// Neurons a pocket's activations take a row (fn_back's max_pocket).
 pub const pocket_stride: usize = 128;
+/// Prompt rows one fused attention launch takes (their selections staged att_rows at a time).
+pub const fused_rows: usize = 1024;
 /// Rows a pass holds at most unless asked for more.
 pub const default_chunk: usize = 1536;
+/// The most rows TF_FLASHNEXT_CHUNK may ask for (the largest measured pass; its scratch is about 13 GiB more).
+pub const max_chunk: usize = 16384;
 const ratio = wt.index_ratio;
 const top = wt.index_top;
 const idw = wt.index_idw;
-const cubin_qmm: [:0]const u8 = "_ZN6tf_qmm10qmm_kernelILi32ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii";
-const qmm_smem: u32 = 9472;
+pub const cubin_qmm: [:0]const u8 = "_ZN6tf_qmm10qmm_kernelILi32ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii";
+pub const qmm_smem: u32 = 9472;
+/// fn_gdn_chain_tpr's staged rows: 2 x 16 steps of q, k, v (128 fp32 each) and g, beta.
+pub const chain_tpr_smem: u32 = 2 * 16 * (3 * 128 * 4 + 16);
+/// fn_gdn_fused's shared memory (its SMEM): two chain stages, two readout batches, the conv rows and 16 norm scales.
+pub const gdn_fused_smem: u32 = chain_tpr_smem + 2 * 16 * 128 * 4 + 16 * 2 * 128 * 4 + 16 * 4;
+/// fn_gdn_fused's block: 256 chain threads and 128 producer threads.
+pub const gdn_fused_threads: u32 = 384;
 /// Pairs an expert item takes: the core rows kernel's tile.
 const rows_tile: usize = cuda.experts.RowsExperts.tile;
 const plan_small: usize = cuda.grouped.small;
@@ -140,11 +150,16 @@ pub const Kernels = struct {
     router: cuda.grouped.Router,
     moe: cuda.experts.RowsExperts,
     lane: cuda.Function,
+    /// The prompt tiles that keep #952's bits (cuda_tile_kernels.zig).
+    tiles: tk.TileKernels,
     native_lane: cuda.qmmf.Lane,
     nvfp4: cuda.experts.Nvfp4Experts,
     front: cuda.Function,
     chain: cuda.Function,
     chain_to: cuda.Function,
+    chain_tpr: cuda.Function,
+    /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
+    gdn_fused: cuda.Function,
     gnorm: cuda.Function,
     sum: cuda.Function,
     moe_sum: cuda.Function,
@@ -166,6 +181,8 @@ pub const Kernels = struct {
         errdefer k.batch.unload();
         k.lane = try k.qmm.function(cubin_qmm);
         try k.lane.allowDynamicShared(qmm_smem);
+        k.tiles = try tk.TileKernels.load(d);
+        errdefer k.tiles.unload();
         k.router = try cuda.grouped.Router.resolve(k.experts);
         k.moe = try cuda.experts.RowsExperts.resolve(k.rows);
         k.native_lane = try cuda.qmmf.Lane.load(d, (try d.capability(0)) / 10);
@@ -184,6 +201,10 @@ pub const Kernels = struct {
         k.front = try k.batch.function("fn_gdn_front");
         k.chain = try k.batch.function("fn_gdn_rows");
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
+        k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
+        try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
+        k.gdn_fused = try k.batch.function("fn_gdn_fused");
+        try k.gdn_fused.allowDynamicShared(gdn_fused_smem);
         k.gnorm = try k.batch.function("fn_gdn_norm");
         return k;
     }
@@ -194,6 +215,7 @@ pub const Kernels = struct {
         k.batch.unload();
         k.rows.unload();
         k.experts.unload();
+        k.tiles.unload();
         k.qmm.unload();
     }
 };
@@ -255,6 +277,7 @@ pub const Scratch = struct {
     h: u64 = 0,
     pss: u64 = 0,
     norm: u64 = 0,
+    rinv: u64 = 0,
     dn: u64 = 0,
     hc_part: u64 = 0,
     hc_up: u64 = 0,
@@ -266,6 +289,8 @@ pub const Scratch = struct {
     xsm: u64 = 0,
     proj: u64 = 0,
     part: u64 = 0,
+    /// part's second cap-stride slice is zeros (native lanes write only the first): a writeback adds it once.
+    part_zero: bool = false,
     gout: u64 = 0,
     gxs: u64 = 0,
     ys: u64 = 0,
@@ -371,14 +396,14 @@ pub const Scratch = struct {
         const items = cdiv(pairs, tile) + experts_n + 1;
         var n: usize = 0;
         n += cap * 4 + (cap + 1) * 16;
-        n += cap * wide * 2 * 2 + cap * pss_n * 4 + cap * (low + 4) * 2 + hc_sk * cap * (low + 4) * 4;
+        n += cap * streams * 4 + cap * wide * 2 * 2 + cap * pss_n * 4 + cap * (low + 4) * 2 + hc_sk * cap * (low + 4) * 4;
         n += cap * wide * 2 + 8 * cap * dims * 4;
         n += cap * low * 2 + cap * (low / 32) * 4 + cap * streams * 2 + cap * dims * 2 + cap * (dims / 32) * 4;
         n += cap * proj_row * 2 + out_sk * cap * dims * 4 + cap * gdn.value_dim * (2 + 4 + 4) + cap * (gdn.value_dim / 32) * 4;
         n += cap * (2 * gdn.nk * gdn.dk + 2 * gdn.nv) * 4;
         n += cap * q_heads * head_dim * 2 + cap * index_heads * index_dim * 2;
         n += att_rows * nch * q_heads * (head_dim + 2) * 4 + cap * out_k * 2 * 2 + cap * (out_k / 32) * 4;
-        n += att_rows * (idw + 2) * 4;
+        n += fused_rows * (idw + 2) * 4;
         n += cap * (experts_n + 1) * 4 + pairs * 4 * 2 + pairs * 4 + items * 3 * 4 + 8 + pairs * 4 + nblk * (experts_n + 1) * 4;
         n += cap * moe_w * 6 + cap * dims * 4;
         n += pairs * moe_w * 2 + pairs * dims * 4 + cap * dims * 2;
@@ -390,7 +415,10 @@ pub const Scratch = struct {
 
     pub fn alloc(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream, cap: usize) !Scratch {
         var s: Scratch = .{ .cap = cap };
-        errdefer s.free(gpa);
+        errdefer {
+            cuda.completion.drain(d, stream, "Flash Next scratch work did not drain before rollback");
+            s.free(gpa);
+        }
         const pairs = cap * slots;
         const nblk = cdiv(pairs, plan_small);
         const items = cdiv(pairs, tile) + experts_n + 1;
@@ -400,6 +428,7 @@ pub const Scratch = struct {
         s.h = try s.add(gpa, d, cap * wide * 2);
         s.pss = try s.add(gpa, d, cap * pss_n * 4);
         s.norm = try s.add(gpa, d, cap * wide * 2);
+        s.rinv = try s.add(gpa, d, cap * streams * 4);
         s.dn = try s.add(gpa, d, cap * (low + 4) * 2);
         s.hc_part = try s.add(gpa, d, hc_sk * cap * (low + 4) * 4);
         s.hc_up = try s.add(gpa, d, cap * wide * 2);
@@ -411,6 +440,8 @@ pub const Scratch = struct {
         s.xsm = try s.add(gpa, d, cap * (dims / 32) * 4);
         s.proj = try s.add(gpa, d, cap * proj_row * 2);
         s.part = try s.add(gpa, d, out_sk * cap * dims * 4);
+        try s.bufs.items[s.bufs.items.len - 1].fill8(0, stream.handle);
+        s.part_zero = true;
         s.gout = try s.add(gpa, d, cap * gdn.value_dim * 2);
         s.gxs = try s.add(gpa, d, cap * (gdn.value_dim / 32) * 4);
         s.ys = try s.add(gpa, d, cap * gdn.value_dim * 4);
@@ -423,9 +454,9 @@ pub const Scratch = struct {
         s.po = try s.add(gpa, d, att_rows * nch * q_heads * head_dim * 4);
         s.pm = try s.add(gpa, d, att_rows * nch * q_heads * 4);
         s.pl = try s.add(gpa, d, att_rows * nch * q_heads * 4);
-        s.qids = try s.add(gpa, d, att_rows * idw * 4);
-        s.qnk = try s.add(gpa, d, att_rows * 4);
-        s.qspr = try s.add(gpa, d, att_rows * 4);
+        s.qids = try s.add(gpa, d, fused_rows * idw * 4);
+        s.qnk = try s.add(gpa, d, fused_rows * 4);
+        s.qspr = try s.add(gpa, d, fused_rows * 4);
         s.ao = try s.add(gpa, d, cap * out_k * 2);
         s.gated = try s.add(gpa, d, cap * out_k * 2);
         s.gxs_attn = try s.add(gpa, d, cap * (out_k / 32) * 4);
@@ -497,6 +528,8 @@ pub const SeqState = struct {
     cap: usize,
     /// Block scores for an attention block's rows [min(rows, att_rows), scoreStride(cap)] fp32 (the engine's).
     scores: u64,
+    /// The attention caches' pages (pt 0: kc, vc, ikc and pooled are contiguous rows).
+    pg: @import("cuda_glue.zig").Pg = .{},
 };
 
 /// The block scores' row stride for a cache of `cap` tokens: its blocks rounded up to 16 (the captured _scores').
@@ -509,8 +542,8 @@ pub fn scoreBytes(cap: usize, rows: usize) usize {
     return @min(rows, att_rows) * scoreStride(cap) * 4;
 }
 
-/// One row of a decode round: its stream's next token, on that stream's own caches at its own position.
-pub const Lane = struct { seq: SeqState, pos: usize };
+/// One stream's rows in a shared pass from `pos` on its own caches, and its window's rollback, hidden rows and scores.
+pub const Lane = struct { seq: SeqState, pos: usize, rows: usize = 1, keep: ?*const Keep = null, streams: u64 = 0, logits: u64 = 0 };
 
 /// The engine's resident weights the pass reads.
 pub const Model = struct {
@@ -549,11 +582,13 @@ pub const Gather = struct {
             };
             return;
         }
-        for (g.lanes, 0..) |l, r| {
-            g.ngram.rows(l.seq.history[0..], g.ids[r..][0..1], g.emb[r * dims ..][0..dims], g.xs[r * (dims / 32) ..][0 .. dims / 32]) catch |err| {
+        var row0: usize = 0;
+        for (g.lanes) |l| {
+            g.ngram.rows(l.seq.history[0..], g.ids[row0..][0..l.rows], g.emb[row0 * dims ..][0 .. l.rows * dims], g.xs[row0 * (dims / 32) ..][0 .. l.rows * (dims / 32)]) catch |err| {
                 g.failed = err;
                 return;
             };
+            row0 += l.rows;
         }
     }
 };
@@ -561,3 +596,5 @@ pub const Gather = struct {
 test {
     _ = @import("cuda_batch_state_test.zig");
 }
+
+pub const Pg = @import("cuda_glue.zig").Pg;

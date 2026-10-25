@@ -7,13 +7,14 @@ const engine = @import("cuda_engine.zig");
 const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_mtp_weights.zig");
 const timing = @import("cuda_draft.zig").timing;
+const precision = @import("cuda_draft_precision.zig");
 
 const E = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
 const dr = lanes.drafter;
 const Stream = lanes.Stream;
 const head_dim = geometry.head_dim;
-const max_rows = engine.max_rows;
+const max_rows = engine.most_verify; // taps absorbed at most this many rows a call (a prompt chunk's in pieces)
 const most_window = engine.most_window;
 
 /// Drafts a round at most (the frozen engine's DEPTH); TF_MTP_DRAFTS=N sets it, up to a window's rows less one.
@@ -47,6 +48,7 @@ pub const Mtp = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     e: *E,
+    projection_role: precision.Role = .proposal,
     w: weights.Weights,
     mod: cuda.Module,
     dmod: cuda.Module,
@@ -246,8 +248,17 @@ pub const Mtp = struct {
     }
 
     /// out (rows, n) = x (rows, k) through `l`, as the target's decode tiles or prompt GEMM, with the drafter's sums.
-    fn proj(d: *Mtp, l: engine.Proj, x: u64, out: u64, rows: usize) !void {
-        return d.e.projSums(l, x, d.xs, out, rows, true, 0);
+    pub fn proj(d: *Mtp, l: engine.Proj, x: u64, out: u64, rows: usize) !void {
+        return precision.project(d.e, l, x, d.xs, out, rows, d.projection_role, precision.mtp_projection_prompt_cutoff);
+    }
+
+    pub fn routed(d: *Mtp, router: u64, experts: cuda.experts.Layer, x: u64, out: u64, rows: usize) !void {
+        return precision.routed(d.e, router, experts, x, out, rows, d.projection_role);
+    }
+
+    /// The layer's actual grouped Q/K/V dispatch, sharing only the input sums.
+    pub fn projQkv(d: *Mtp, rows: usize) !void {
+        try d.e.projManySums(&.{ d.w.q, d.w.k, d.w.v }, d.x, d.xs, &.{ d.qraw, d.kraw, d.vb }, rows, precision.prompt(d.projection_role, rows, precision.mtp_projection_prompt_cutoff), 0);
     }
 
     /// out = norm(h + r) with w; h takes the sum (r 0: no residual).
@@ -272,9 +283,7 @@ pub const Mtp = struct {
         try d.proj(.{ .a4 = w.fc_e }, d.en, d.h, rows);
         try d.proj(.{ .a4 = w.fc_h }, d.hn, d.r, rows);
         try d.norm(d.h, d.r, w.input_norm, d.x, rows);
-        try d.proj(w.q, d.x, d.qraw, rows);
-        try d.proj(w.k, d.x, d.kraw, rows);
-        try d.proj(w.v, d.x, d.vb, rows);
+        try d.projQkv(rows);
         try e.run(d.fns.norm_rope, .{ rows * g.q_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.qraw, w.q_norm, d.q, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), p0, step, g.eps, geometry.theta });
         try e.run(d.fns.norm_rope, .{ rows * g.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.kraw, w.k_norm, d.kb, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(kw)), @as(c_int, head_dim), p0, step, g.eps, geometry.theta });
         const heads: c_int = @intCast(g.q_heads);
@@ -287,7 +296,7 @@ pub const Mtp = struct {
         }
         try d.proj(w.o, d.att, d.r, rows);
         try d.norm(d.h, d.r, w.post_norm, d.x, rows);
-        try e.routedRows(w.mlp.moe.router, w.mlp.moe.experts, d.x, d.r, rows, rows > 16);
+        try d.routed(w.mlp.moe.router, w.mlp.moe.experts, d.x, d.r, rows);
         try d.norm(d.h, d.r, w.norm, d.x, rows);
         if (pass == .ring) try e.run(d.ring_fns.ring_put, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ d.kb, d.vb, d.ringK(ctx), d.ringV(ctx), @as(c_int, @intCast(kw)), p0, cap });
     }
@@ -323,6 +332,13 @@ pub const Mtp = struct {
 
     /// Target rows [start, start + n) from the tap ring with the token after each; `rows`, when given, picks them.
     pub fn absorb(d: *Mtp, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, follow: []const u32) !void {
+        return d.absorbRole(ctx, tap_ring, start_, n_, rows_, follow, true);
+    }
+
+    fn absorbRole(d: *Mtp, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, follow: []const u32, prompt: bool) !void {
+        const previous = d.projection_role;
+        defer d.projection_role = previous;
+        d.projection_role = if (prompt) .prompt else .live;
         const e = d.e;
         const g = e.g;
         var start = start_;
@@ -332,7 +348,7 @@ pub const Mtp = struct {
         if (rows_) |rs| if (rs.len != n or n > most_window) return error.BadDraftRows;
         if (start < ctx.end) ctx.end = start;
         if (start > ctx.end) ctx.begin = start; // a gap (a prompt restored from a cache): the context starts here
-        const held = engine.tap_rows - max_rows; // the target's ring holds this many rows behind its newest
+        const held = engine.tap_rows - engine.max_rows; // the target's ring holds this many rows behind its newest chunk
         if (n > held) {
             fi = n - held;
             start += n - held;
@@ -493,8 +509,8 @@ pub const Mtp = struct {
             if (it.features.space != .device or it.features.dtype != .bf16) return error.UnsupportedFeatures;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
             if (it.rows) |rs| {
-                try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.follow);
-            } else try d.absorb(ctx, it.features.buffer, it.features.offset, it.features.rows, null, it.follow);
+                try d.absorbRole(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.follow, it.prompt);
+            } else try d.absorbRole(ctx, it.features.buffer, it.features.offset, it.features.rows, null, it.follow, it.prompt);
         }
     }
 

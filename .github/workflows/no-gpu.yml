@@ -1,6 +1,8 @@
 name: No GPU
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -11,11 +13,11 @@ jobs:
   zig:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
       # zig build test is the host unit tests. No GPU. The Python suite is not this check.
@@ -27,17 +29,44 @@ jobs:
       # The frozen server goldens: request parsing, rendering and streaming against recorded answers.
       - name: zig build test-golden
         run: zig build test-golden
+      # Hostile HTTP framing, API keys and download paths, on the CPU.
+      - name: zig build test-server-security test-pull-security
+        run: zig build test-server-security test-pull-security
       # Cortheon's readers of untrusted web bytes under the fuzz harness: seeds, 100,000 edits, linear time.
       - name: zig build fuzz-cortheon
         run: zig build fuzz-cortheon
       - name: Served Flash Next gate regressions
         run: python3 -m unittest discover -s tools/zig -p flashnext_batch_serve_test.py
+      # The generated Engram tables: committing a table that its generator no longer reproduces is a silent drift.
+      # The generator refuses any unicodedata but the pinned 16.0.0, which 3.14 carries and 3.12/3.13 do not.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: nfkd-python
+        with:
+          python-version: "3.14"
+      - name: NFKD tables are current
+        env:
+          PYTHON: ${{ steps.nfkd-python.outputs.python-path }}
+        run: |
+          "$PYTHON" tools/zig/nfkd_tables.py --check --zig "$(command -v zig)" ||
+            { echo "regen: python3 tools/zig/nfkd_tables.py --zig zig"; exit 1; }
+      - name: NFKD generator tests
+        env:
+          PYTHON: ${{ steps.nfkd-python.outputs.python-path }}
+        run: cd tools/zig && "$PYTHON" -m unittest test_nfkd_tables
+      # Every build option is declared for every target, so one build script fits every OS.
+      - name: build options
+        run: python3 -m unittest discover -s tools/zig -p build_options_test.py
       # The lean rule (600-line files, one-line comments within 120 columns): no problem the base branch lacks.
       - name: lean check
         env:
           BASE_REF: ${{ github.base_ref }}
+          PUSH_BASE: ${{ github.event.before }}
         run: |
-          base=$(git merge-base HEAD "origin/$BASE_REF")
+          if [ -n "$BASE_REF" ]; then
+            base=$(git merge-base HEAD "origin/$BASE_REF")
+          else
+            base=$(git rev-parse "$PUSH_BASE^{commit}")
+          fi
           git worktree add --detach ../lean-base "$base"
           cp tools/zig/lean_check.py ../lean-base/tools/zig/lean_check.py
           (cd ../lean-base && python3 tools/zig/lean_check.py > ../lean-base.txt || true)
@@ -46,8 +75,10 @@ jobs:
   zig-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
       # The same host unit tests on Windows: the platform layer (zig/src/platform) over the UCRT, Win32 and Winsock.

@@ -15,10 +15,12 @@ pub const checkpoint = @import("core/checkpoint_metal.zig");
 pub const shard_edit = @import("core/shard_edit.zig");
 pub const lora_merge = @import("core/lora_merge_dir.zig");
 pub const npy = @import("core/npy.zig");
+pub const picture = @import("core/picture/picture.zig");
 pub const ids_json = @import("core/ids_json.zig");
 pub const lanes = @import("lanes");
 pub const segments = @import("core/segments.zig");
 pub const row_projection = @import("core/row_projection.zig");
+pub const frags = @import("core/frags.zig");
 pub const affine_mm = @import("core/affine_mm.zig");
 /// The checkpoint formats (MLX affine and its fp64 reader for the device checks, exact widen).
 pub const quant = @import("core/quant/quant.zig");
@@ -87,6 +89,8 @@ pub const lane_projection = @import("core/lane_projection.zig");
 pub const recurrent_forks = @import("core/recurrent_forks.zig");
 
 pub const shared_kv = @import("core/shared_kv.zig");
+
+pub const kv_pool = @import("core/kv_pool.zig");
 
 pub const shared_attention = @import("core/shared_attention.zig");
 

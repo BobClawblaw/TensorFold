@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const st = @import("safetensors.zig");
+const index_format = @import("checkpoint_index.zig");
 
 pub const Tensor = st.Tensor;
 pub const DType = st.DType;
@@ -22,14 +23,15 @@ pub fn shardFiles(gpa: std.mem.Allocator, io: Io, dir: []const u8) ![][:0]u8 {
         defer parsed.deinit();
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(gpa);
-        var it = parsed.value.object.get("weight_map").?.object.iterator();
+        var it = (try index_format.weightMap(parsed.value)).iterator();
         while (it.next()) |e| {
             const file = e.value_ptr.string;
             if ((try seen.getOrPut(gpa, file)).found_existing) continue;
             try names.ensureUnusedCapacity(gpa, 1);
             names.appendAssumeCapacity(try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, file }, 0));
         }
-    } else |_| {
+    } else |err| {
+        if (err != error.FileNotFound) return err;
         var d = try Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
         defer d.close(io);
         var it = d.iterate();
@@ -85,6 +87,7 @@ pub const Checkpoint = struct {
 
     /// One more file (an MTP head beside the model's files).
     pub fn add(self: *Checkpoint, dir: []const u8, name: []const u8) !void {
+        if (!index_format.plainName(name)) return error.BadIndex;
         const path = try std.fs.path.join(self.gpa, &.{ dir, name });
         defer self.gpa.free(path);
         try self.files.ensureUnusedCapacity(self.gpa, 1);
@@ -341,4 +344,27 @@ test "Save recovery: an unresolved partial save refuses actual checkpoint reopen
         ck.close();
         return error.UncertainCheckpointReopened;
     } else |err| try std.testing.expectEqual(error.CheckpointSaveUncertain, err);
+}
+
+test "a checkpoint whose index names shards in a folder opens and reads them" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // NVIDIA's own export writes `tensors/model-00001-of-00001.safetensors`.
+    try tmp.dir.createDirPath(io, "tensors");
+    const image = try testImage(gpa, "a", 4);
+    defer gpa.free(image);
+    try tmp.dir.writeFile(io, .{ .sub_path = "tensors/model-00001-of-00001.safetensors", .data = image });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"a\":\"tensors/model-00001-of-00001.safetensors\"}}" });
+    var buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const listed = try shardFiles(gpa, io, dir);
+    defer freeShardFiles(gpa, listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("tensors/model-00001-of-00001.safetensors", listed[0][dir.len + 1 ..]);
+    var ck = try Checkpoint.openModel(gpa, io, dir);
+    defer ck.close();
+    _ = try ck.get("a");
+    try std.testing.expectEqual(@as(usize, 0), ck.unused());
 }

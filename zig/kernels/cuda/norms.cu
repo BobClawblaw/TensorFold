@@ -503,3 +503,36 @@ extern "C" __global__ void __launch_bounds__(256) tf_gated_rms_rows_256(const __
                                                                          float* xs, int heads, float eps) {
     gated_rms<32>(y, y_ld, z, z_ld, w, out, xs, heads, eps);
 }
+
+// The bf16 residual's tails (norms_tail.cuh): a norm on the branch before the add, a bf16 scalar on the sum.
+#include "norms_tail.cuh"
+
+// h = bf16(r + bf16(rms(x) wb)) [* sc], y = bf16(rms(h) w), xs y's 64-value sums: each norm rounded once.
+extern "C" __global__ void __launch_bounds__(tf_rms_tail::NT) tf_add_rms_rows_bf16h_tail(
+    const __nv_bfloat16* x, const __nv_bfloat16* r, const __nv_bfloat16* wb, const __nv_bfloat16* sc,
+    const __nv_bfloat16* w, __nv_bfloat16* h, __nv_bfloat16* y, float* xs, int width, float eps) {
+    tf_rms_tail::tail<tf_rms_tail::ONCE>(x, r, wb, sc, w, h, y, xs, width, eps);
+}
+
+// The same rows with MLX's bf16 steps: each norm bf16(w * bf16(x * inv)), the sum rounded before the scalar.
+extern "C" __global__ void __launch_bounds__(tf_rms_tail::NT) tf_add_rms_rows_bf16h_tail_round(
+    const __nv_bfloat16* x, const __nv_bfloat16* r, const __nv_bfloat16* wb, const __nv_bfloat16* sc,
+    const __nv_bfloat16* w, __nv_bfloat16* h, __nv_bfloat16* y, float* xs, int width, float eps) {
+    tf_rms_tail::tail<tf_rms_tail::MLX>(x, r, wb, sc, w, h, y, xs, width, eps);
+}
+
+// nGPT rows (norms_l2.cuh): L2 norms with eps on the sum, and the normalized lerp residual (Dory).
+#include "norms_l2.cuh"
+
+// y = bf16(l2(s)), s = x, or bf16(x + r) with r (a loop's entry): a block a row, width % 64, at most 8,192.
+extern "C" __global__ void __launch_bounds__(tf_l2::NT) tf_l2_rows(const __nv_bfloat16* x, const __nv_bfloat16* r,
+                                                                   __nv_bfloat16* y, int width, float eps) {
+    tf_l2::l2_rows<tf_l2::SUM>(x, r, y, width, eps);
+}
+
+// h = bf16(l2(a + |alpha scale| (b - a))), a = bf16(l2(res)), b = bf16(l2(out)): dory.py's slerp_norm.
+extern "C" __global__ void __launch_bounds__(tf_l2::NT) tf_slerp_rows(const __nv_bfloat16* res, const __nv_bfloat16* out,
+                                                                      const __nv_bfloat16* alpha, float scale,
+                                                                      __nv_bfloat16* h, int width, float eps) {
+    tf_l2::slerp_rows<tf_l2::A | tf_l2::B>(res, out, alpha, scale, h, width, eps);
+}

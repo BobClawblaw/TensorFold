@@ -15,6 +15,7 @@ pub fn encode(e: *Engine, segs: []const Seg, rows: usize, ids: Buf, masks: ?*con
     const t = &m.t;
     if (r.tp != null or r.gpu_round) return error.BatchModeUnsupported;
     r.rows = rows;
+    try @import("rotary_cache.zig").prepare(r, t.log2base, t.pos8, rows);
     var cur: usize = 0;
     var ce: [2]variants.Const = undefined;
     try variants.callAs(r, "qa_embed_rows@embed", rows, &.{ ids, m.embed[0], m.embed[1], m.embed[2] }, &.{t.h[0]}, variants.width(&ce, "BITS", "GS", m.embed_w));
@@ -104,7 +105,7 @@ fn attention(e: *Engine, g: Seg, i: usize) !void {
     defer r.shapes.put(r.arena, "IDS_shape", old_ids) catch unreachable;
     if (g.s.select[i / 4]) |*sel| {
         if (sel.meta(g.s.m.pos, g.rows)) {
-            try sel.encode(r, sl, t.iq, t.eps, t.log2base, g.s.m.pos, g.rows);
+            try sel.encodeAt(r, sl, t.iq, t.eps, t.log2base, g.s.m.pos, g.rows, g.s.m.bpos);
             try r.shapes.put(r.arena, "IDS_shape", sel.ids_shape);
             try r.call("q4_attn_parts#[24, 256]", &.{ t.q, sl.keys, sl.vals, sel.keys, sel.counts, sel.sparse, t.scale }, &.{ t.po, t.pm });
             return;

@@ -9,13 +9,27 @@ pub fn host(b: *std.Build, core: *std.Build.Module, all: *std.Build.Step) void {
     }) }));
     b.step("test-qwen-served-contract-host", "FP64 Qwen contract references and corruption controls without GPU code").dependOn(&run.step);
     all.dependOn(&run.step);
+    const page_math = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/contract_qwen_pages_numerical.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{.{ .name = "core", .module = core }},
+    }) }));
+    b.step("test-qwen-pages-contract-host", "Paged Qwen FP32 stress and non-finite references without GPU code").dependOn(&page_math.step);
+    all.dependOn(&page_math.step);
+    const page_run_root = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_q35_page_runs.zig"), .target = b.graph.host, .link_libc = true });
+    page_run_root.addIncludePath(b.path("zig/kernels/cuda"));
+    page_run_root.addCSourceFile(.{ .file = b.path("zig/tests/cuda/contract_q35_page_runs.c"), .flags = &.{"-std=c11"} });
+    const page_run = b.addRunArtifact(b.addTest(.{ .root_module = page_run_root }));
+    b.step("test-qwen35-page-runs-host", "Actual CUDA page-run helper and table-read controls without devices").dependOn(&page_run.step);
+    all.dependOn(&page_run.step);
     imageTests(b, core, all);
 }
 
 pub fn images(b: *std.Build, runner: *std.Build.Step.Compile, controls: ?std.Build.LazyPath, h3: ?std.Build.LazyPath, kernels: anytype, files: []const ?std.Build.LazyPath) *std.Build.Step {
     const install = @import("kernel_contract.zig").cuda(b, runner, controls, h3);
     for (kernels, files) |k, file| {
-        if (std.mem.eql(u8, k.name, "moe") or std.mem.eql(u8, k.name, "qwen36_mtp") or std.mem.eql(u8, k.name, "sample") or std.mem.eql(u8, k.name, "glm_glue")) {
+        if (std.mem.eql(u8, k.name, "moe") or std.mem.eql(u8, k.name, "experts") or std.mem.eql(u8, k.name, "qwen36_mtp") or std.mem.eql(u8, k.name, "sample") or std.mem.eql(u8, k.name, "glm_glue")) {
             if (file) |image| install.dependOn(&b.addInstallFile(image, b.fmt("fatbin/{s}.fatbin", .{k.name})).step);
         }
     }

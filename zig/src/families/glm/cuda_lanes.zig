@@ -93,6 +93,7 @@ pub const Lanes = struct {
     const steps_vt: be.Backend.VTable = vt: {
         var v = whole_vt;
         v.prefill_step = prefillStepFn;
+        v.cancel_prefill = cancelPrefillFn;
         v.prefill_many = null;
         v.many_rows = 0;
         break :vt v;
@@ -221,7 +222,7 @@ pub const Lanes = struct {
         for (ss, firsts) |s, t| self.lanes.getPtr(s).?.first = self.take(t);
     }
 
-    /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
+    /// One chunk of the stream's prompt pass (other rounds run between); true once the first token is drawn.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
@@ -244,21 +245,67 @@ pub const Lanes = struct {
         return false;
     }
 
+    fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
+        const self = of(ptr);
+        const l = self.lanes.getPtr(s) orelse return;
+        const at = l.fill orelse return;
+        if (at <= s.cached or s.reuse.hook == null) return;
+        try self.x.bind(l.slot);
+        _ = self.x.chunk(s.prompt(), at, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
+            if (err == error.Cancelled) return;
+            return err;
+        };
+        return error.CancellationIgnored;
+    }
+
+    fn cancelNow(_: ?*anyopaque) bool {
+        return true;
+    }
+
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
+        const pages = try self.seat(s, ids.len, s.max_new);
+        errdefer {
+            self.x.e.release(self.lanes.get(s).?.slot);
+            _ = self.lanes.remove(s);
+        }
+        if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
+        try self.x.beginOn(s.sampling, pages);
+        s.cached = 0;
+        s.prompt_rows.clearRetainingCapacity();
+        return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+    }
+
+    /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
+    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
         const l = try self.claim(s);
         l.pending_rows = null;
         l.held_n = 0;
         l.fill = null;
         l.first = null;
+        errdefer {
+            if (self.x.e.pages) |p| p.close(l.slot);
+            _ = self.lanes.remove(s);
+        }
+        const pages = try self.pagesFor(l.slot, prompt, max_new);
         try self.x.bind(l.slot);
-        if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
-        try self.x.begin(s.sampling);
-        s.cached = 0;
-        s.prompt_rows.clearRetainingCapacity();
-        return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+        return pages;
+    }
+
+    /// A slot's pages for a prompt and its reply (none without a pool); LaneMemory: the pool lacks them now.
+    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize) ![]const u32 {
+        const p = self.x.e.pages orelse return &.{};
+        if (!p.paged(slot)) return error.LaneMemory; // every paged sequence is taken
+        p.close(slot); // a stream that opens again gives its earlier pages back first
+        return p.open(slot, prompt, max_new);
+    }
+
+    /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
+    pub fn fits(self: *const Lanes, prompt: usize, max_tokens: usize) bool {
+        const p = self.x.e.pages orelse return true;
+        return p.fits(prompt, max_tokens);
     }
 
     /// A prompt pass with images: rank 0's tower encodes those past `from`, then every rank holds their rows.
@@ -271,7 +318,12 @@ pub const Lanes = struct {
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
     fn marksOf(s: *lanes.Stream) ?engine.Marks {
-        return if (s.reuse.marks.len == 0) null else .{ .at = s.reuse.marks, .ctx = s, .call = keptAt };
+        return if (s.reuse.hook == null) null else .{
+            .at = s.reuse.marks,
+            .ctx = s,
+            .call = keptAt,
+            .interrupted = keptInterrupted,
+        };
     }
 
     /// The stream's kept state, where its prompt pass starts (null: none, off the chunk grid, or no longer held).
@@ -291,6 +343,11 @@ pub const Lanes = struct {
     fn keptAt(ctx: *anyopaque, at: u32) void {
         const s: *lanes.Stream = @ptrCast(@alignCast(ctx));
         if (s.reuse.hook) |k| k.at(k.ptr, s, at);
+    }
+
+    fn keptInterrupted(ctx: *anyopaque, at: u32) void {
+        const s: *lanes.Stream = @ptrCast(@alignCast(ctx));
+        s.keepInterruptedPrefill(at);
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -479,11 +536,12 @@ pub const Lanes = struct {
         return true;
     }
 
-    /// The stream left the rounds: its sequence is freed on every rank (slot 0 stays for the next stream).
+    /// The stream left the rounds: its sequence is freed, or its pages given back, on every rank (slot 0 stays).
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
+        if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
     }
 };
 

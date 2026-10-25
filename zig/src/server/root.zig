@@ -10,24 +10,36 @@ pub const hf_text = @import("hf_text.zig");
 pub const listener = @import("listener.zig");
 pub const server = @import("server.zig");
 pub const serve = @import("serve.zig");
+pub const idle_unload = @import("idle_unload.zig");
 pub const hub = @import("hub.zig");
 pub const tool_specs = @import("tool_specs.zig");
 pub const Server = server.Server;
 pub const Config = server.Config;
 
 test {
+    _ = @import("vision_markers_test.zig");
+    _ = @import("embedding_protocol_test.zig");
+    _ = @import("embedding_service_test.zig");
+    _ = @import("http_limits_test.zig");
     _ = @import("done_times_test.zig");
     _ = @import("drain_test.zig");
     _ = @import("keepalive_test.zig");
+    _ = @import("idle_unload.zig");
+    _ = @import("idle_unload_test.zig");
+    _ = @import("name_priority_http_test.zig");
     @import("std").testing.refAllDecls(@This());
     _ = @import("json");
     _ = @import("std_options.zig");
     _ = @import("fields.zig");
     _ = @import("reply_text.zig");
     _ = @import("tool_parse.zig");
+    _ = @import("tool_lfm2.zig");
+    _ = @import("tool_lfm2_stream_test.zig");
     _ = @import("tool_stream.zig");
     _ = @import("tool_params.zig");
     _ = @import("tool_grammar.zig");
+    _ = @import("tool_grammar_lfm2.zig");
+    _ = @import("tool_grammar_lfm2_test.zig");
     _ = @import("tool_required_test.zig");
     _ = @import("grammar.zig");
     _ = @import("pyrepr.zig");
@@ -42,7 +54,13 @@ test {
     _ = @import("chunk_plan.zig");
     _ = @import("status_routes.zig");
     _ = @import("speech.zig");
-    _ = @import("speech_stream_test.zig");
+    _ = @import("drama_cfg.zig");
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_cfg_test.zig");
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_stream_test.zig"); // over a Unix socket pair
+    _ = @import("drama_voice_tool.zig");
+    _ = @import("speech_redraw.zig");
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_redraw_test.zig"); // over a Unix socket pair
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_register_test.zig"); // over a Unix socket pair
     _ = @import("drama_prompt.zig");
     _ = @import("health_test.zig");
     _ = @import("memory_routes.zig");
@@ -58,19 +76,27 @@ test {
     _ = @import("videos.zig");
     _ = @import("stream_preflight_test.zig");
     _ = @import("stream_dsml_test.zig");
+    _ = @import("tool_cut_test.zig");
     _ = @import("logprobs_test.zig");
+    _ = @import("think_split_test.zig");
+    _ = @import("thinking_reserve_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("request_log.zig");
     _ = @import("completion_prompt_test.zig");
+    _ = @import("hf_eos_http_test.zig");
     _ = @import("server_init_test.zig");
+    _ = @import("connection_arena_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
     _ = @import("systemone.zig");
     _ = @import("systemone_test.zig");
     _ = @import("slide_context_test.zig");
-    _ = @import("slide_stream_test.zig");
-    _ = @import("slide_save_stream_test.zig");
+    // both run over Unix socket pairs
+    if (comptime @import("builtin").os.tag != .windows) {
+        _ = @import("slide_stream_test.zig");
+        _ = @import("slide_save_stream_test.zig");
+    }
     _ = @import("slide_writer_test.zig");
     _ = @import("slide.zig");
     _ = @import("slide_cli.zig");
@@ -91,6 +117,8 @@ test {
     _ = @import("slide_forget_test.zig");
     _ = @import("slide_supplied.zig");
     _ = @import("slide_questions_test.zig");
+    _ = @import("slide_teacher_test.zig");
+    _ = @import("slide_learn_path_test.zig");
     _ = @import("slide_whom.zig");
     _ = @import("slide_subject.zig");
     _ = @import("slide_span.zig");
@@ -116,7 +144,9 @@ test {
         _ = @import("benchmark_stream_test.zig");
         _ = @import("benchmark_server_test.zig");
         _ = @import("benchmark_facts_test.zig");
+        _ = @import("benchmark_rocm_test.zig");
         _ = @import("benchmark_manifest.zig");
+        _ = @import("benchmark_drafts.zig");
         _ = @import("benchmark_upload.zig");
         _ = @import("benchmark_upload_test.zig");
         _ = @import("benchmark_args.zig");
@@ -125,11 +155,11 @@ test {
         _ = @import("benchmark_early_test.zig");
         _ = @import("benchmark_publication_test.zig");
         _ = @import("benchmark_chat_only_test.zig");
+        _ = @import("benchmark_config_test.zig");
     }
 }
 
 test {
-    _ = @import("benchmark_config_test.zig");
     _ = @import("slide_retention_test.zig");
 }
 
@@ -139,4 +169,16 @@ test {
 
 test {
     _ = @import("slide_subject_guard_test.zig");
+    _ = @import("server_recovery_test.zig");
+}
+
+test {
+    _ = @import("cortheon/gate_test.zig");
+    _ = @import("cortheon/gate_http_test.zig");
+}
+
+test {
+    _ = @import("control_tokens_http_test.zig");
+    _ = @import("request_provenance_test.zig");
+    _ = @import("request_cost_test.zig");
 }

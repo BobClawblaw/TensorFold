@@ -372,17 +372,13 @@ __device__ Mark nucleus(const Row& r, float m, float lo, float top_p, float near
     return keep > 0u ? last : extend(r, m, norm, lo, top_p, cum, last, top, s);
 }
 
-// tf_gpu_sample: the top_k candidates, the top_p and min_p cuts, then the race; PROB (if any) gets the pick's share.
+// tf_gpu_sample's cuts and race over the sorted candidates in s.ck / s.ci (z: the row's mass, used with top_k off).
 template <bool MAP>
-__device__ void gpu_sample(const __nv_bfloat16* L, unsigned V, const Rule& rl, unsigned position, const long long* IDS,
-                           unsigned* TOK, float* PROB, Shared& s) {
+__device__ void pick(const Rule& rl, float m, float z, unsigned n_cand, unsigned position, const long long* IDS, unsigned* TOK,
+                     float* PROB, Shared& s) {
     const unsigned t = threadIdx.x, lane = t & 31u, sg = t >> 5;
-    const Row r{L, V, rl.inv_t, t, lane, sg};
     const unsigned kc = rl.top_k;
     const unsigned cap = (kc == 0u || kc > C) ? C : kc;
-    const float m = row_max(r, s);
-    float z = 0.0f;
-    const unsigned n_cand = first_block(r, m, rl.top_p, rl.near, kc, z, s);
     if (t == 0) {
         const unsigned n = min(n_cand, cap);
         float norm = z;
@@ -440,6 +436,18 @@ __device__ void gpu_sample(const __nv_bfloat16* L, unsigned V, const Rule& rl, u
         *TOK = MAP ? static_cast<unsigned>(IDS[s.ci[bj]]) : s.ci[bj];
         if (PROB) *PROB = expf(val(s.ck[bj]) - m) / norm;
     }
+}
+
+// tf_gpu_sample: the top_k candidates, the top_p and min_p cuts, then the race; PROB (if any) gets the pick's share.
+template <bool MAP>
+__device__ void gpu_sample(const __nv_bfloat16* L, unsigned V, const Rule& rl, unsigned position, const long long* IDS,
+                           unsigned* TOK, float* PROB, Shared& s) {
+    const unsigned t = threadIdx.x, lane = t & 31u, sg = t >> 5;
+    const Row r{L, V, rl.inv_t, t, lane, sg};
+    const float m = row_max(r, s);
+    float z = 0.0f;
+    const unsigned n_cand = first_block(r, m, rl.top_p, rl.near, rl.top_k, z, s);
+    pick<MAP>(rl, m, z, n_cand, position, IDS, TOK, PROB, s);
 }
 
 // The kept tokens' race over the whole row (value - log(-log(u)), ties to the earlier in the order).
@@ -515,14 +523,14 @@ __device__ void sample_full(const __nv_bfloat16* L, unsigned V, const Rule& rl, 
     if (r.t == 0) *PROB = expf(pick - m) / z; // the pick's share of the top_k mass at T
 }
 
-// The Metal engine's choice: tf_sample_full for top_k off or past 1,024, tf_gpu_sample for the rest.
-template <bool MAP>
+// The Metal engine's choice: tf_sample_full for top_k off or past 1,024, else tf_gpu_sample; OWN: rule[r] and meta[r].
+template <bool MAP, bool OWN = false>
 __device__ void draw(const __nv_bfloat16* L, unsigned V, const Rule* rule, const int* meta, int offset, unsigned* TOK,
                      const long long* IDS, float* PROB) {
     __shared__ Shared s;
     const unsigned row = blockIdx.x;
-    const Rule rl = *rule;
-    const unsigned position = static_cast<unsigned>(meta[0] + static_cast<int>(row) + 1 + offset);
+    const Rule rl = rule[OWN ? row : 0u];
+    const unsigned position = static_cast<unsigned>(meta[OWN ? row : 0u] + static_cast<int>(OWN ? 0u : row) + 1 + offset);
     const __nv_bfloat16* L_row = L + static_cast<size_t>(row) * V;
     if (rl.top_k == 0u || rl.top_k > C) {
         sample_full<MAP>(L_row, V, rl, position, IDS, TOK + row, PROB ? PROB + row : nullptr, s);
@@ -530,6 +538,7 @@ __device__ void draw(const __nv_bfloat16* L, unsigned V, const Rule* rule, const
         gpu_sample<MAP>(L_row, V, rl, position, IDS, TOK + row, PROB ? PROB + row : nullptr, s);
     }
 }
+
 
 }  // namespace tf_sample
 
@@ -539,11 +548,23 @@ extern "C" __global__ void __launch_bounds__(1024) tf_draw(const __nv_bfloat16* 
     tf_sample::draw<false>(L, V, rule, meta, offset, TOK, nullptr, PROB);
 }
 
+#include "sample_rows.cuh"
+
 // The same over a column subset whose token ids are IDS (int64, a draft head's vocabulary): noise and token by id.
 extern "C" __global__ void __launch_bounds__(1024) tf_draw_ids(const __nv_bfloat16* L, unsigned V, const tf_sample::Rule* rule,
                                                                const int* meta, int offset, unsigned* TOK, const long long* IDS,
                                                                float* PROB) {
     tf_sample::draw<true>(L, V, rule, meta, offset, TOK, IDS, PROB);
+}
+
+#include "pitched_draw.cuh"
+
+// Logical-width sampling over pitched rows; both ID mappings use the same block-owned buffer.
+extern "C" __global__ void __launch_bounds__(1024) tf_draw_pitched(const __nv_bfloat16* L, unsigned V, unsigned pitch,
+    const tf_sample::Rule* rule, const int* meta, int offset, unsigned* TOK, const long long* IDS, float* PROB) {
+    __shared__ tf_sample::Shared s;
+    if (IDS) tf_sample::draw_pitched<true>(L, V, rule, meta, offset, TOK, IDS, PROB, pitch, s);
+    else tf_sample::draw_pitched<false>(L, V, rule, meta, offset, TOK, nullptr, PROB, pitch, s);
 }
 
 // Rows of bf16 logits [rows, V]: row r's LP_WORDS words at OUT + r * LP_WORDS for PICK[r], k (at most 20) best, rank.
@@ -575,3 +596,5 @@ extern "C" __global__ void __launch_bounds__(256) tf_grammar_mask(__nv_bfloat16*
         }
     }
 }
+
+#include "sample_slices.cuh"

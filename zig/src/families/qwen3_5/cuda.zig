@@ -2,7 +2,9 @@
 pub const config = @import("config.zig");
 pub const geometry = @import("cuda_geometry.zig");
 pub const round = @import("cuda_round.zig");
+pub const prompt_int8 = @import("cuda_prompt_int8.zig");
 pub const engine = @import("cuda_engine.zig");
+pub const signatures = @import("cuda_signatures.zig");
 pub const native = @import("cuda_native.zig");
 pub const native_moe = @import("cuda_native_moe.zig");
 pub const mtp = @import("cuda_mtp.zig");
@@ -12,6 +14,7 @@ pub const vision = @import("cuda_vision.zig");
 pub const reuse = @import("cuda_reuse.zig");
 
 test {
+    _ = @import("cuda_attention.zig");
     _ = @import("cuda_forward.zig");
     _ = engine;
     _ = native;
@@ -26,6 +29,9 @@ test {
     _ = @import("cuda_vision_prompt.zig");
     _ = reuse;
     _ = native;
+    _ = @import("cuda_pages.zig");
+    _ = @import("cuda_pages_init_test.zig");
+    _ = @import("cuda_pages_lifetime_test.zig");
 }
 
 pub const slide = @import("cuda_slide.zig");

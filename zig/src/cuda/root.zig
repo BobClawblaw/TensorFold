@@ -4,6 +4,7 @@ pub const abi = @import("abi.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const copy_source = @import("copy_source.zig");
 pub const completion = @import("completion.zig");
+pub const paging_test_device = if (@import("builtin").is_test) @import("paging_test_device.zig") else struct {};
 pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
@@ -38,6 +39,7 @@ pub const nvfp4 = @import("nvfp4.zig");
 pub const segments = @import("segments.zig");
 pub const grouped = @import("grouped.zig");
 pub const qlinear = @import("qlinear.zig");
+pub const w4a8 = @import("w4a8.zig");
 pub const norms = @import("norms.zig");
 pub const embed_rows = @import("embed_rows.zig");
 pub const route_rows = @import("route_rows.zig");
@@ -70,6 +72,7 @@ pub const pack = @import("pack.zig");
 pub const graph_cache = @import("graph_cache.zig");
 
 test {
+    _ = nccl;
     _ = exl3_grouped;
     _ = gdn_train;
     _ = train_q4;
@@ -78,6 +81,7 @@ test {
     _ = memory_receipt;
     _ = @import("grouped.zig");
     _ = @import("qlinear.zig");
+    _ = @import("proposal_head_test.zig");
     _ = @import("norms.zig");
     _ = @import("embed_rows.zig");
     _ = @import("route_rows.zig");
@@ -90,6 +94,7 @@ test {
     _ = @import("experts.zig");
     _ = @import("sample.zig");
     _ = @import("roce.zig");
+    _ = @import("roce_nap.zig");
     _ = @import("rank_scatter.zig");
     _ = @import("relay_plan.zig");
     _ = launch;
@@ -144,3 +149,12 @@ test {
     _ = exl3.block.lin2;
     _ = exl3.block.x3gm;
 }
+
+test {
+    _ = @import("context_health.zig");
+}
+
+test {
+    _ = @import("graph_instantiate_failure_test.zig");
+}
+pub const qwen35_bf16_rows = @import("qwen35_bf16_rows.zig");

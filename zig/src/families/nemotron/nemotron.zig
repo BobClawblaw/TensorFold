@@ -3,6 +3,7 @@ pub const config = @import("config.zig");
 pub const weights = @import("weights.zig");
 pub const kernels = @import("kernels.zig");
 pub const state = @import("state.zig");
+pub const residency = @import("residency.zig");
 pub const forward = @import("forward.zig");
 pub const layers = @import("layers.zig");
 pub const tree = @import("tree.zig");
@@ -33,6 +34,8 @@ pub const learned_prompts = @import("learned_prompts.zig");
 pub const Model = model.Model;
 
 test {
+    _ = @import("state.zig");
+    _ = @import("backend_slots_test.zig");
     _ = @import("train_check.zig");
     _ = @import("model.zig");
     _ = @import("timing.zig");

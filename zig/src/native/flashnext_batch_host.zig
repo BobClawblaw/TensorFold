@@ -61,7 +61,19 @@ pub fn openConfigured(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump:
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const capacity: usize = @intCast(@min(@as(i64, @intCast(settings.capacity)), window + fx.MARGIN));
-    const eng = try fx.Engine.loadConfigured(gpa, io, dir, dump, null, settings);
+    const tiers = slotContexts(gpa, capacity) catch |err| {
+        std.log.err("flash next: FLASHNEXT_SLOT_CONTEXTS is not a list of sessions: token counts of 1024 or more, CONTEXTxN for N alike, at most {d} sessions past the engine's own", .{tf.flashnext_replay.MAXR - 1});
+        return err;
+    };
+    defer if (tiers) |t| gpa.free(t);
+    var budget_settings = try @import("flashnext_memory").withCache(settings, cache_gib);
+    var more: u64 = 0;
+    if (tiers) |ts| {
+        for (ts) |c| more = try std.math.add(u64, more, Session.bytes(c));
+    } else if (streams_fixed and streams > 1) more = try std.math.mul(u64, streams - 1, Session.bytes(capacity));
+    if (more > 0) budget_settings.startup_extra = try std.math.add(u64, budget_settings.startup_extra, try std.math.add(u64, more, Session.overhead(settings.capacity) + tf.flashnext_replay.MAXR * tf.flashnext_replay.WIDE * 2));
+    budget_settings = try images.budgetSettings(io, dir, vision, std.c.getenv("TF_FLASHNEXT_TP") != null, a, why, budget_settings);
+    const eng = try fx.Engine.loadConfigured(gpa, io, dir, dump, null, budget_settings);
     errdefer eng.deinit();
     if (eng.r.tp != null) return error.BatchSpeedUpUnsupported;
     try eng.warm();
@@ -69,14 +81,9 @@ pub fn openConfigured(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump:
     errdefer if (vis) |v| v.deinit();
     const ready = fit.footprint() orelse return error.NoMemoryReading;
     const total = fit.ram() orelse return error.NoMemoryReading;
-    const cap = try ceiling(total, eng.r.device.maxWorkingSet());
+    const cap = @min(eng.r.load_limit, try ceiling(total, eng.r.device.maxWorkingSet()));
     var plan = try fit.budgetUnder(cap, cache_gib, over, 0, a, why, "");
     const sizing = budgets.reserve(cap, ready, fit.MARGIN, plan.budget_bytes, cache_gib != null, over);
-    const tiers = slotContexts(gpa, capacity) catch |err| {
-        std.log.err("flash next: FLASHNEXT_SLOT_CONTEXTS is not a list of sessions: token counts of 1024 or more, CONTEXTxN for N alike, at most {d} sessions past the engine's own", .{tf.flashnext_replay.MAXR - 1});
-        return err;
-    };
-    defer if (tiers) |t| gpa.free(t);
     const overhead = Session.overhead(eng.r.window.capacity) + tf.flashnext_replay.MAXR * tf.flashnext_replay.WIDE * 2;
     const available = sizing.sessions;
     if (available < overhead) {
@@ -130,12 +137,10 @@ pub fn openConfigured(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump:
     plan.over_cap = final.over_cap;
     eng.snap_pool.max = plan.budget_bytes;
     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "flashnext-zig", .lanes = slots, .context_window = @intCast(window), .prefill_step = @intCast(eng.pr.step), .prompt_cache_plan = plan, .structures = true, .admit = if (h.back.sized) .{ .ctx = &h.back, .fits = Backend.fits } else null });
-    // FLASHNEXT_NO_LONE=1 keeps even lone requests on shared rounds.
-    if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun };
-    if (vis) |v| {
-        h.host.info_.vision = images.offer(v, h, prepareImage, prepareVideo);
-        h.host.frame_key = tf.flashnext_replay.vis_prompt.frameKey; // the shifted frame: an image moves the rows before it
-    }
+    // FLASHNEXT_NO_LONE=1 keeps lone requests on shared rounds; image streams always (engine rounds: slot positions).
+    if (eng.r.gdn_kept == null and std.c.getenv("FLASHNEXT_NO_LONE") == null) h.host.lone = .{ .ctx = h, .run = loneRun, .images = false };
+    // The standard frame (buildImages): an image moves no row before it, so the cache keys carry no frame.
+    if (vis) |v| h.host.info_.vision = images.offer(v, h, prepareImage, prepareVideo);
     h.cache = null;
     if (plan.budget_bytes > 0) {
         h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = &h.back, .vtable = &.{ .bytes = Backend.snapBytes, .save = Backend.snapSave, .restore = Backend.snapRestore, .drop = Backend.snapDrop, .charged = Backend.snapCharged, .spare = Backend.snapSpare, .trim = Backend.snapTrim, .reuses = Backend.snapReuses } }, .{ .lookahead = 1, .planned = true, .warm = .on }, plan.budget_bytes);
@@ -166,7 +171,7 @@ pub fn openConfigured(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, dump:
 
 fn buildImages(ctx: *anyopaque, a: std.mem.Allocator, imgs: []const lanes.stream.Image, prompt_len: usize, from: usize) anyerror!*VisPrompt {
     const h: *Host = @ptrCast(@alignCast(ctx));
-    return images.build(h.vis.?, h.eng, a, imgs, prompt_len, from);
+    return images.build(h.vis.?, h.eng, a, imgs, prompt_len, from, true); // the standard frame
 }
 
 fn releaseImages(_: *anyopaque, p: *VisPrompt) void {
@@ -216,33 +221,13 @@ fn memory(ctx: ?*anyopaque, reset_peak: bool) ?api.Memory {
 }
 
 /// Session-owned buffers stay allocated until close, beside the runner's buffers and shared hidden rows.
-fn holdResident(h: *Host) !void {
-    var buffers: std.ArrayList(mtl.Buffer) = .empty;
-    defer buffers.deinit(h.gpa);
-    try buffers.appendSlice(h.gpa, h.eng.r.held.items);
-    for (h.back.sessions) |s| try buffers.appendSlice(h.gpa, s.owned.items);
-    try buffers.append(h.gpa, h.back.hidden.b);
-    if (h.vis) |v| try buffers.appendSlice(h.gpa, &v.buffers());
-    h.resident = try Resident.holdUnder(h.gpa, h.host.io, h.eng.r.device, h.eng.r.queue, buffers.items, "flash next shared", h.load_limit) orelse return;
-    const r = &h.resident.?;
-    h.warm = r.target();
-    h.eng.r.follow = r.follow();
-    h.eng.snap_pool.follow = r.follow();
-}
-
-/// Stop reporting new buffers before releasing the set and then the session/backend buffers it held.
-fn dropResident(h: *Host) void {
-    const r = if (h.resident) |*x| x else return;
-    h.eng.r.follow = null;
-    h.eng.snap_pool.follow = null;
-    r.deinit();
-    h.resident = null;
-    h.warm = .{ .queue = h.eng.r.queue };
-}
+const holdResident = @import("flashnext_residency.zig").holdShared;
+const dropResident = @import("flashnext_residency.zig").dropShared;
 
 /// Auto with room for only one session transfers the loaded engine, preserving the chosen footprint limit.
 fn single(gpa: std.mem.Allocator, io: std.Io, eng: *fx.Engine, window: i64, cache_gib: ?f64, over: bool, cap: u64, vis: ?*images.Vision, a: std.mem.Allocator, why: *[]const u8) !api.Opened {
     const host = @import("flashnext_host.zig");
+    try eng.keepStates(); // no shared rounds here, so no hand-off a kept state would refuse
     const h = try host.openWarmed(gpa, io, eng, window, cache_gib, over, null, cap, vis, a, why);
     return .{ .engine = h.engine(), .close = host.close, .ctx = h };
 }

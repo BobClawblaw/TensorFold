@@ -8,9 +8,10 @@ const vcfg = @import("vision_config.zig");
 const sampler = @import("cuda_sampler.zig");
 const prompt_wire = @import("cuda_prompt_wire.zig");
 const dflash = @import("dflash.zig");
+const pages_mod = @import("cuda_pages.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -45,6 +46,7 @@ pub const Link = struct {
     ids: []u32, // host copy of the last step's ids
     gpa: std.mem.Allocator,
     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
+    asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, asked_ids: usize) !Link {
         const max_ids = @max(asked_ids, prompt_wire.words);
@@ -126,12 +128,23 @@ pub const Leader = struct {
     fn send(x: Leader, h: Header, ids: []const u32) !void {
         var hh = h;
         hh.slot = x.e.slot;
+        if (x.link.asleep) { // the other ranks wait on their lines, not in NCCL: wake them for this step
+            cuda.tp_watch.wake();
+            x.link.asleep = false;
+        }
         try x.link.send(x.e.m.glue.put_words, hh, ids);
     }
 
     /// A prompt step's flags: 1 when its rows go through the head (the other ranks join each pass's broadcasts).
     fn rows(x: Leader) u32 {
         return @intFromBool(x.e.prompt_logprobs != null);
+    }
+
+    /// No stream is left: the other ranks sleep on their lines until the next step instead of spinning in NCCL.
+    pub fn idle(x: Leader) !void {
+        if (x.link.asleep or !cuda.tp_watch.open()) return;
+        try x.send(.{ .kind = @backingInt(Kind.idle) }, &.{});
+        x.link.asleep = true;
     }
 
     /// The stream's sequence for the steps that follow (each step names it, so the other ranks bind it too).
@@ -158,6 +171,11 @@ pub const Leader = struct {
     }
 
     pub fn begin(x: Leader, s: ?sampler.Sampling) !void {
+        return x.beginOn(s, &.{});
+    }
+
+    /// `begin` on a paged sequence: the page ids it maps (rank 0's lease) go with the step, to every rank's table.
+    pub fn beginOn(x: Leader, s: ?sampler.Sampling, pages: []const u32) !void {
         try x.flush();
         const c = sampler.check(s);
         var h: Header = .{ .kind = @backingInt(Kind.begin) };
@@ -169,8 +187,19 @@ pub const Leader = struct {
             h.min_p = v.min_p;
             h.top_k = v.top_k;
         }
-        try x.send(h, &.{});
+        try x.send(h, pages);
         try x.e.begin(c);
+    }
+
+    /// Every rank's prompt cache at rank 0's budget (snapshots.agree): the others make theirs on this step.
+    pub fn snapshots(x: Leader, budget: u64) !void {
+        try x.send(.{ .kind = @backingInt(Kind.snapshots), .a = budget }, &.{});
+        try @import("cuda_snapshots.zig").agree(x.e, budget);
+    }
+
+    /// The other ranks make rank 0's pool: `streams` paged sequences and `pages` pages, each page's bytes checked.
+    pub fn pool(x: Leader, streams: u32, pages: usize, page_bytes: u64) !void {
+        try x.send(.{ .kind = @backingInt(Kind.pool), .depth = streams, .a = pages, .seed = page_bytes }, &.{});
     }
 
     /// The prompt pass's image rows (rank 0 encoded them for the bound slot) to every rank: spans, then the rows.
@@ -281,15 +310,23 @@ fn structuredStep(h: Header) bool {
 pub fn follow(e: *Engine, link: *Link) !void {
     var drafts: [engine.max_drafts]u32 = undefined;
     var sampled: [16]u32 = undefined;
+    cuda.tp_watch.sleep(e.io); // rank 0 starts with no stream: its first step wakes this rank
     while (true) {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many) try e.bind(h.slot);
+        if (kind != .end and kind != .drop and kind != .shared and kind != .block and kind != .many and kind != .idle and kind != .snapshots and kind != .pool) try e.bind(h.slot);
         e.prompt_logprobs = if (promptRows(h)) .{} else null;
         e.structured = structuredStep(h); // rank 0 alone masks them
         switch (kind) {
-            .begin => try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
+            .begin => {
+                if (step.ids.len > 0) try (e.pages orelse return error.BadStep).map(h.slot, step.ids);
+                try e.beginFollowing(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null);
+            },
+            .pool => {
+                if (e.pages != null) return error.BadStep;
+                e.pages = try pages_mod.Pages.follow(e.gpa, e, h.depth, @intCast(h.a), h.seed);
+            },
             .prefill => {
                 const ids = try e.gpa.dupe(u32, step.ids);
                 defer e.gpa.free(ids);
@@ -350,8 +387,10 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try v.take(h.slot, step.ids);
                 try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
             },
+            .snapshots => try @import("cuda_snapshots.zig").agree(e, h.a),
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),
+            .idle => cuda.tp_watch.sleep(e.io),
             .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
         }
     }

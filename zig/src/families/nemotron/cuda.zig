@@ -7,6 +7,7 @@ pub const weights = @import("cuda_weights.zig");
 pub const kernels = @import("cuda_kernels.zig");
 pub const state = @import("cuda_state.zig");
 pub const Forward = @import("cuda_forward.zig").Forward;
+pub const Seg = @import("cuda_forward.zig").Seg;
 pub const Walk = @import("cuda_forward.zig").Walk;
 pub const Marks = @import("cuda_forward.zig").Marks;
 pub const Class = @import("cuda_forward.zig").Class;
@@ -62,6 +63,7 @@ test {
 
 test {
     _ = @import("cuda_vision_test.zig");
+    _ = @import("cuda_vision_lanes_test.zig");
 }
 
 test {

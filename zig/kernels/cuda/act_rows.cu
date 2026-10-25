@@ -141,3 +141,60 @@ extern "C" __global__ void __launch_bounds__(NT) tf_dconv_rows(const __nv_bfloat
     }
     *reinterpret_cast<uint4*>(out + r * d + 8 * c) = pack8(y);
 }
+
+// MLX's bf16-op-by-op activations (act_round.cuh), the same rows and sums as tf_swiglu_rows.
+#include "act_round.cuh"
+
+// out = bf16(gelu_tanh(gate) * up) as mlx_lm's geglu in MLX's bf16 ops (Gemma 4's MLP); xs (or null) out's sums.
+extern "C" __global__ void __launch_bounds__(NT) tf_geglu_rows(const __nv_bfloat16* gate, long long g_ld,
+                                                               const __nv_bfloat16* up, long long u_ld,
+                                                               __nv_bfloat16* out, float* xs, int n) {
+    tf_act_round::rows<true>(gate, g_ld, up, u_ld, out, xs, n, tf_act_round::GEGLU_ALL);
+}
+
+// out = bf16(silu(gate) * up) in MLX's bf16 steps (tf_draft_swiglu's, Gemma 4's DFlash drafter); xs (or null) its sums.
+extern "C" __global__ void __launch_bounds__(NT) tf_swiglu_rows_round(const __nv_bfloat16* gate, long long g_ld,
+                                                                      const __nv_bfloat16* up, long long u_ld,
+                                                                      __nv_bfloat16* out, float* xs, int n) {
+    tf_act_round::rows<false>(gate, g_ld, up, u_ld, out, xs, n, tf_act_round::SWIGLU_ALL);
+}
+
+// out = bf16(cap * tanh(x / cap)) in MLX's bf16 steps: a soft-capped head's logits (final_logit_softcapping).
+extern "C" __global__ void __launch_bounds__(NT) tf_softcap_rows(const __nv_bfloat16* x, __nv_bfloat16* out, int n,
+                                                                 float cap) {
+    tf_act_round::softcap_rows(x, out, n, cap, tf_act_round::SOFTCAP_ALL);
+}
+
+// Spark2.5's head gate: out[r, h d + e] = bf16(o * bf16(sigmoid(g[r * g_ld + h]))) (d % 64 == 0); xs: out's sums.
+extern "C" __global__ void __launch_bounds__(NT) tf_head_gate_rows(const __nv_bfloat16* __restrict__ o,
+                                                                   const __nv_bfloat16* __restrict__ g, long long g_ld,
+                                                                   __nv_bfloat16* __restrict__ out,
+                                                                   float* __restrict__ xs, int heads, int d) {
+    tf_act_round::head_gate_rows(o, g, g_ld, out, xs, heads, d, tf_act_round::HEAD_GATE_ALL);
+}
+
+// out = bf16(bf16(gelu(gate)) * up), PyTorch's exact erf GELU in fp32 (Spark2.5's MLP); xs (or null) out's sums.
+extern "C" __global__ void __launch_bounds__(NT) tf_gelu_erf_rows(const __nv_bfloat16* __restrict__ gate, long long g_ld,
+                                                                  const __nv_bfloat16* __restrict__ up, long long u_ld,
+                                                                  __nv_bfloat16* __restrict__ out, float* __restrict__ xs,
+                                                                  int n) {
+    tf_act_round::gelu_erf_rows(gate, g_ld, up, u_ld, out, xs, n, tf_act_round::GELU_ERF_ALL);
+}
+
+// Dory's nGPT activations (act_l2.cuh): a scaled sigmoid gate and a scaled SwiGLU, each row then L2-normed.
+#include "act_l2.cuh"
+
+// out = bf16(l2(bf16(o * sigmoid(g * sg)))) over a row's n values (all heads), sg fp32 [n]: dory.py's output gate.
+extern "C" __global__ void __launch_bounds__(tf_act_l2::NT) tf_gate_l2_rows(const __nv_bfloat16* o, const __nv_bfloat16* g,
+                                                                           long long g_ld, const float* sg, __nv_bfloat16* out,
+                                                                           int n, float eps) {
+    tf_act_l2::gate_rows<tf_act_l2::GATED>(o, g, g_ld, sg, out, n, eps);
+}
+
+// out = bf16(l2(bf16(silu(bf16(g * sug)) * bf16(u * suu)))), sug and suu fp32 [n]: dory.py's MLP before down.
+extern "C" __global__ void __launch_bounds__(tf_act_l2::NT) tf_swiglu_l2_rows(const __nv_bfloat16* g, long long g_ld,
+                                                                             const __nv_bfloat16* u, long long u_ld,
+                                                                             const float* sug, const float* suu,
+                                                                             __nv_bfloat16* out, int n, float eps) {
+    tf_act_l2::swiglu_rows<tf_act_l2::GS | tf_act_l2::US | tf_act_l2::PROD>(g, g_ld, u, u_ld, sug, suu, out, n, eps);
+}

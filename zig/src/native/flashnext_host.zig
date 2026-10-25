@@ -364,7 +364,7 @@ pub const Host = struct {
         h.prompt = r.prompt; // a learned state read back in `begin` is named by these tokens
         job.key = if (r.images.len > 0) images.key(arena.allocator(), r) catch r.prompt else r.prompt; // a state fits its frame alone
         if (h.cache) |*store| if (r.prompt.len + r.max_tokens + fx.MARGIN <= h.eng.r.window.capacity) {
-            plan = store.beginRewind(arena.allocator(), job.key, r.history_len, r.rewind_len, r.shared_prefixes, &.{}, null, &.{}) catch .{};
+            plan = store.beginUser(arena.allocator(), job.key, r.history_len, r.rewind_len, r.user_end, r.shared_prefixes, &.{}, null, &.{}) catch .{};
         };
         var vis: ?*tf.flashnext_replay.vis_prompt.VisPrompt = null;
         defer images.release(h.eng, vis);
@@ -374,7 +374,7 @@ pub const Host = struct {
                 fin.message = "this server reads no images (start it with --vision)";
                 return;
             };
-            vis = images.build(v, h.eng, arena.allocator(), r.images, r.prompt.len, plan.from) catch |e| {
+            vis = images.build(v, h.eng, arena.allocator(), r.images, r.prompt.len, plan.from, false) catch |e| {
                 emit(job, .{ .prefilled = 0 });
                 fin.message = @errorName(e);
                 return;
@@ -448,19 +448,21 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, wind
 }
 
 pub fn openConfigured(gpa: Allocator, io: std.Io, dir: []const u8, dump: ?[]const u8, window: i64, speed_up: ?[]const u8, cache_gib: ?f64, over_cap: bool, learn: ?Learn, vision: ?api.VisionOpen, a: Allocator, why: *[]const u8, settings: tf.flashnext_replay.WindowSettings) !*Host {
-    const eng = try fx.Engine.loadConfigured(gpa, io, dir, dump, speed_up, settings);
+    const budget_settings = try images.budgetSettings(io, dir, vision, speed_up != null or std.c.getenv("TF_FLASHNEXT_TP") != null, a, why, try @import("flashnext_memory").withCache(settings, cache_gib));
+    const eng = try fx.Engine.loadConfigured(gpa, io, dir, dump, speed_up, budget_settings);
     errdefer eng.deinit();
     if (learn != null and eng.r.tp != null) {
         why.* = "--learn is not kept across a Flash Next pair yet: leave it out, or serve on one Mac";
         return error.LearnOnPair;
     }
+    try eng.keepStates(); // a lone reply is never handed to shared rounds, and its cached states come from prompt passes
     eng.warm() catch |err| {
         std.log.err("flash next: warm-up failed: {s}", .{@errorName(err)});
         return err;
     };
     const vis: ?*images.Vision = if (vision) |o| try images.open(gpa, io, eng, dir, o, a, why) else null;
     errdefer if (vis) |v| v.deinit();
-    return openWarmed(gpa, io, eng, window, cache_gib, over_cap, learn, null, vis, a, why);
+    return openWarmed(gpa, io, eng, window, cache_gib, over_cap, learn, eng.r.load_limit, vis, a, why);
 }
 
 /// Takes a warmed engine and its image tower, if any, without loading or warming; the caller keeps both on error.

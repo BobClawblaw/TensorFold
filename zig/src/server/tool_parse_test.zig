@@ -3,6 +3,7 @@ const std = @import("std");
 const json = @import("json");
 const tool_parse = @import("tool_parse.zig");
 const tool_closers = @import("tool_closers.zig");
+const witness = @import("tool_union_witness.zig");
 const parse = tool_parse.parse;
 const closeCall = tool_parse.closeCall;
 const repairGlmKeys = tool_parse.repairGlmKeys;
@@ -27,6 +28,69 @@ test "families" {
     const kept = try parse(a, "hi <tool_call>{\"name\":\"other tool\"}</tool_call>", tools, null);
     try std.testing.expect(kept.calls == null);
     try std.testing.expectEqualStrings("hi <tool_call>{\"name\":\"other tool\"}</tool_call>", kept.content);
+}
+
+test "a parameter whose schema is a union comes back as the value the model wrote" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a quoted string under a union stays the text the model wrote" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.quoted_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a parameter whose schema points at a definition comes back as the value the model wrote" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.ref_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a parameter whose schema combines branches comes back as the value the model wrote" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.combined_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a parameter whose schema names a number and an integer takes the integer" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.number_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a parameter whose schema constrains the value with every keyword comes back as the value the model wrote" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.keyword_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a parameter whose schema points at a definition by pointer comes back as the value the model wrote" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.pointer_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+test "a parameter whose schema names no kinds constrains nothing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (witness.unconstrained_cases) |c| try std.testing.expectEqualStrings(c.expected, try caseArguments(a, c));
+}
+
+/// The arguments the parser gives the client for one case.
+fn caseArguments(a: std.mem.Allocator, c: witness.Case) ![]const u8 {
+    const tools = try witness.toolsWith(a, c.schema, c.defs);
+    const r = try parse(a, try witness.reply(a, c.value), tools, null);
+    return r.calls.?[0].get("function").?.get("arguments").?.string;
 }
 
 test "a reply of many calls searches each opener once, not again after every call" {
@@ -131,7 +195,7 @@ test "a call to a tool the request did not declare stays text" {
         try std.testing.expectEqualStrings(text, parallel.content);
         const single = try parse(a, text, tools, 1);
         try std.testing.expect(single.calls == null);
-        try std.testing.expectEqualStrings("", single.content);
+        try std.testing.expectEqualStrings(text, single.content);
     }
     // an unclosed envelope is not a call in either mode, so the reply keeps it
     const open = "<tool_call>{\"name\":\"launch\",\"arguments\":{\"when\":\"now\"}";
@@ -141,7 +205,7 @@ test "a call to a tool the request did not declare stays text" {
         try std.testing.expectEqualStrings(open, k.content);
     }
     const prose = "Launching. <tool_call><function=launch><parameter=when>now</function></tool_call>";
-    try std.testing.expectEqualStrings("Launching.", (try parse(a, prose, tools, 1)).content);
+    try std.testing.expectEqualStrings(prose, (try parse(a, prose, tools, 1)).content);
     // an offered tool keeps its offered spelling; bare JSON naming one not offered stays content
     const offered = try parse(a, "<tool_call>{\"name\":\"LOOKUP\"}</tool_call>", tools, null);
     try std.testing.expectEqualStrings("lookup", offered.calls.?[0].get("function").?.get("name").?.string);
@@ -516,4 +580,8 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own 
         }
     }
     try std.testing.expect(compared > 1000);
+}
+
+test {
+    _ = @import("tool_parse_visibility_test.zig");
 }

@@ -5,8 +5,9 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const weights = @import("cuda_draft_weights.zig");
-const tree = @import("cuda_draft_tree.zig");
+pub const tree = @import("cuda_draft_tree.zig");
 const profile = @import("cuda_startup_profile.zig");
+pub const precision = @import("cuda_draft_precision.zig");
 
 const E = engine.Engine;
 const DeviceBuffer = cuda.DeviceBuffer;
@@ -14,7 +15,7 @@ const dr = lanes.drafter;
 const Stream = lanes.Stream;
 
 /// Rows an absorb runs at once (the target's prompt chunks are at most this).
-const max_rows = engine.max_rows;
+const max_rows = engine.most_verify; // taps absorbed at most this many rows a call (a prompt chunk's in pieces)
 /// The logprob row's words (sample.cu's LP_WORDS) and its best-token capacity.
 const lp_words = 3 + 2 * 20;
 /// A hold's rows: the reference's 16-row blocks (dflash2.block), past the 8 the checkpoint was trained with.
@@ -39,18 +40,23 @@ pub const Ctx = struct {
     parents: [engine.most_window]i32 = undefined,
     own: [engine.most_window]f64 = undefined,
     grown: usize = 0,
+    // the stream's tokens draft_frame has read, and whether one lay outside its spans (then drafts take the whole head)
+    scanned: usize = 0,
+    wide: bool = false,
 };
 
 pub const Draft = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     e: *E,
+    projection_role: precision.Role = .proposal,
     c: Config,
     w: weights.Weights,
     mod: cuda.Module,
     fns: Fns,
     scratch: DeviceBuffer,
     selection_base: usize = 0,
+    drawn: struct { sampling: ?lanes.Sampling = null, position: u64 = 0 } = .{},
     segments: u64 = 0,
     pm: u64 = 0,
     pl: u64 = 0,
@@ -100,6 +106,10 @@ pub const Draft = struct {
     frame_streams: usize = 1,
     scratch_one: usize = 0,
     target_taps: usize = 0,
+    /// TF_QWEN_KV_PAGES: a stream's ring is a view of its target lane's run (null: the contexts own theirs).
+    ring_of: ?RingOf = null,
+
+    pub const RingOf = struct { ctx: *anyopaque, ring: *const fn (*anyopaque, *Stream) ?u64 };
 
     const words_at = frame.words_at;
     const hp_at = frame.hp_at;
@@ -129,7 +139,7 @@ pub const Draft = struct {
         errdefer d.drop(ctx);
         try e.stream.synchronize();
         const warm_start = profile.now(io);
-        try d.absorb(ctx, d.taps_in, 0, 1, null);
+        try d.absorb(ctx, d.taps_in, 0, 1, null, true);
         var quickest: f64 = std.math.inf(f64);
         for (0..8) |_| {
             ctx.end = 1;
@@ -223,7 +233,7 @@ pub const Draft = struct {
         try ctx.ring.fill8(0, null);
         d.startup.reserve += profile.elapsed(d.io, started);
         const warm_start = profile.now(d.io);
-        try d.absorb(ctx, d.taps_in, 0, 1, null); // any tap rows do: the drafter's own zeroed staging
+        try d.absorb(ctx, d.taps_in, 0, 1, null, true); // any tap rows do: the drafter's own zeroed staging
         try d.hold(ctx, 0, 1, d.c.block - 1, null);
         ctx.* = .{ .ring = ctx.ring };
         d.startup.warmups += profile.elapsed(d.io, warm_start);
@@ -235,8 +245,9 @@ pub const Draft = struct {
         const started = profile.now(d.io);
         const previous_times = d.startup;
         try memory.resize(d, n);
-        try d.pool.ensureTotalCapacity(d.gpa, n);
-        while (d.pool.items.len < n) d.pool.appendAssumeCapacity(try d.create());
+        const own = if (d.ring_of != null) @min(n, 1) else n; // with a pool the other streams' rings are lane runs
+        try d.pool.ensureTotalCapacity(d.gpa, own);
+        while (d.pool.items.len < own) d.pool.appendAssumeCapacity(try d.create());
         d.startup.reserve += profile.elapsed(d.io, started) - (d.startup.warmups - previous_times.warmups) - (d.startup.reserve - previous_times.reserve);
     }
 
@@ -258,11 +269,21 @@ pub const Draft = struct {
         return d.projSums(l, x, out, rows, false);
     }
 
-    pub fn projSums(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize, sums: bool) !void {
+    /// proj of each of `ls` into `outs` over one x, its group sums taken once; decode() keeps each one's bits.
+    pub fn projMany(d: *Draft, ls: []const cuda.qlinear.Affine4, x: u64, outs: []const u64, rows: usize) !void {
         const e = d.e;
-        if (rows > 16) return e.affine.prompt(e.stream, x, l, out, rows);
-        if (sums) try e.run(e.fns.sums, .{ rows, (l.k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(l.k)), @as(u64, 0) });
-        try e.affine.decode(e.stream, x, d.xs, l, out, rows);
+        if (rows > 16 or ls.len > cuda.qlinear.Affine4Kernels.segs_max) {
+            for (ls, outs, 0..) |l, out, i| try d.projSums(l, x, out, rows, i == 0);
+            return;
+        }
+        try e.run(e.fns.sums, .{ rows, (ls[0].k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, d.xs, @as(c_int, @intCast(ls[0].k)), @as(u64, 0) });
+        var many: [cuda.qlinear.Affine4Kernels.segs_max]cuda.qlinear.Affine4Kernels.Out = undefined;
+        for (ls, outs, many[0..ls.len]) |l, out, *m| m.* = .{ .q = l, .out = out };
+        try e.affine.decodeMany(e.stream, x, d.xs, many[0..ls.len], rows);
+    }
+
+    pub fn projSums(d: *Draft, l: cuda.qlinear.Affine4, x: u64, out: u64, rows: usize, sums: bool) !void {
+        return precision.affine(d.e, l, x, d.xs, out, rows, sums, d.projection_role);
     }
 
     /// out = the normed h, and its group sums into xs for a projAgain over out.
@@ -280,7 +301,10 @@ pub const Draft = struct {
     }
 
     /// Target rows [start, start + n) from the tap ring into the context; with `rows`, ring rows start + rows[i].
-    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32) !void {
+    fn absorb(d: *Draft, ctx: *Ctx, tap_ring: u64, start_: u64, n_: usize, rows_: ?[]const u32, prompt: bool) !void {
+        const previous = d.projection_role;
+        defer d.projection_role = previous;
+        d.projection_role = if (prompt) .prompt else .live;
         const c = d.c;
         var start = start_;
         var n = n_;
@@ -324,7 +348,7 @@ pub const Draft = struct {
 
     fn candidates(d: *const Draft, rows: usize) tree.Candidates {
         const base = d.selection_base;
-        return .{ .words = d.staged.bytes[words_at + base * lp_words * 4 ..][0 .. rows * lp_words * 4], .projected = d.staged.bytes[hp_at + base * d.c.rank * 2 ..][0 .. rows * d.c.rank * 2], .topk = d.c.topk, .rank = d.c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor };
+        return .{ .words = d.staged.bytes[words_at + base * lp_words * 4 ..][0 .. rows * lp_words * 4], .projected = d.staged.bytes[hp_at + base * d.c.rank * 2 ..][0 .. rows * d.c.rank * 2], .topk = d.c.topk, .rank = d.c.rank, .predecessor = d.w.predecessor, .successor = d.w.successor, .sampling = d.drawn.sampling, .position = d.drawn.position };
     }
 
     pub fn select(d: *Draft, ctx: *Ctx, pending: u32, rows: usize) void {
@@ -340,10 +364,14 @@ pub const Draft = struct {
     pub fn selectHold(d: *Draft, ctx: *Ctx, it: dr.Hold) !void {
         const rows = d.c.block - 1;
         ctx.grown = 0;
+        // a sampled hold's candidates ranked as its target draw ranks them (its seed, each draft's position)
+        d.drawn = .{ .sampling = it.sampling, .position = it.position };
+        defer d.drawn = .{};
         if (it.lanes) |shape| return d.selectLanes(ctx, it.pending, rows, shape);
         const limit = if (d.c.block == 16) tree.nodes() else 0;
         if (limit > 0) {
-            const n = @min(it.depth, limit);
+            // the whole budget whenever drafts are asked: the block's forward costs the same at any depth
+            const n = if (it.depth == 0) 0 else limit;
             ctx.grown = tree.grow(d.candidates(rows), it.pending, rows, n, &ctx.held, &ctx.parents, &ctx.own);
             ctx.held_n = ctx.grown;
         } else {
@@ -376,6 +404,12 @@ pub const Draft = struct {
     fn openFn(p: *anyopaque, s: *Stream) anyerror!void {
         const d = cast(p);
         if (d.streams.contains(s)) return error.StreamOpen;
+        if (d.ring_of) |r| if (r.ring(r.ctx, s)) |ptr| { // the lane's run holds it: a context borrowing it
+            const ctx = try d.gpa.create(Ctx);
+            errdefer d.gpa.destroy(ctx);
+            ctx.* = .{ .ring = .{ .d = d.e.d, .ptr = ptr, .len = d.c.ringBytes(), .borrowed = true } };
+            return d.streams.put(d.gpa, s, ctx);
+        };
         const ctx = d.pool.pop() orelse try d.create();
         errdefer d.pool.append(d.gpa, ctx) catch d.drop(ctx);
         ctx.* = .{ .ring = ctx.ring };
@@ -398,8 +432,8 @@ pub const Draft = struct {
             ctx.grown = 0;
             // the target's features: its ring, `offset` the first row's position (cuda_native.zig's featuresFn)
             if (it.rows) |rs| {
-                try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs);
-            } else try d.absorb(ctx, it.features.buffer, it.features.offset, it.features.rows, null);
+                try d.absorb(ctx, it.features.buffer, it.features.offset, rs.len, rs, it.prompt);
+            } else try d.absorb(ctx, it.features.buffer, it.features.offset, it.features.rows, null, it.prompt);
         }
     }
 
@@ -410,7 +444,10 @@ pub const Draft = struct {
         if (items.len == 0) return;
         if (items.len > d.frame_streams) return error.BadDraftFrame;
         var contexts: [frame.max_streams]*Ctx = undefined;
-        for (items, contexts[0..items.len]) |it, *ctx| ctx.* = d.streams.get(it.stream) orelse return error.UnknownStream;
+        for (items, contexts[0..items.len]) |it, *ctx| {
+            ctx.* = d.streams.get(it.stream) orelse return error.UnknownStream;
+            frame.scan(ctx.*, it.tokens);
+        }
         try frame.forward(d, items, contexts[0..items.len]);
     }
 
@@ -444,7 +481,10 @@ pub const Draft = struct {
 
     fn releaseFn(p: *anyopaque, s: *Stream) void {
         const d = cast(p);
-        if (d.streams.fetchRemove(s)) |kv| d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
+        if (d.streams.fetchRemove(s)) |kv| {
+            if (kv.value.ring.borrowed) return d.gpa.destroy(kv.value); // its lane's run goes back with the lane
+            d.pool.append(d.gpa, kv.value) catch d.drop(kv.value);
+        }
     }
 };
 

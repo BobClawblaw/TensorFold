@@ -5,6 +5,16 @@ Python 0.6.6 stays available at the `v0.6.6` tag and takes no further changes; P
 Start from `main`, the only branch, and keep one change per pull request.
 Open an issue before a new model family, backend or arithmetic change so we can agree on its gate.
 
+## Coordinate before editing
+
+TensorFold uses [ATC](https://github.com/ashhart/ATC) to coordinate contributors and coding agents; check the [agent radar](https://tensorfold.dev/atc) before choosing an issue.
+Follow the [README workflow](README.md#contributing-with-agents) to check, claim, publish your session, pulse while working and land when you finish.
+With ATC 0.7.0 or later, a successful new claim automatically starts an anonymous public session; keep its returned session number and avoid starting a second one.
+Showing a GitHub name is an explicit opt-in with `--github-name`; `--local` keeps a new session on your machine.
+If an issue is taken, offer to pair, split or review instead of opening a competing implementation.
+Run `atc overlap --json` before opening a pull request and resolve conflicts with overlapping work.
+Agents must also read the [ATC contributor instructions](docs/atc/SKILL.md).
+
 ## Build and host tests
 
 Use the exact Zig version in `.zig-version`, currently 0.17.0.
@@ -29,6 +39,17 @@ zig build test-cuda-host
 ```
 
 This subset does not replace the complete `test` suite.
+
+HIP is an explicit build opt-in. Add `-Dhip=true` to enable its host tests and named HIP targets:
+
+```sh
+zig build test -Dhip=true
+zig build native-hip -Dhip=true -Dhipcc=/opt/rocm/bin/hipcc -Dhip-arch=gfx1100
+```
+
+The default graph omits HIP. Enabling it does not select another backend or change CUDA, Metal or XPU runtime options.
+The HIP backend uses the same shared core and serving contracts. Device qualification remains specific to its
+checkpoint, compiler, runtime and architecture; a host build does not establish those receipts.
 
 Linux release builds use the CUDA backend and qualified GPU kernel assets.
 [Packaging](packaging/README.md) lists the flat fatbin set and optional captured CUDA files required by `dist`.

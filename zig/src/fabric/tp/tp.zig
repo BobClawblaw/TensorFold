@@ -14,6 +14,8 @@ pub const nccl = @import("nccl.zig");
 pub const mailbox = @import("mailbox.zig");
 pub const hybrid = @import("hybrid.zig");
 pub const roce = @import("roce.zig");
+pub const roce_multi = @import("roce_multi.zig");
+pub const RoceLink = @import("roce_link.zig").Link;
 pub const roce_verbs = @import("roce_verbs.zig");
 pub const roce_pick = @import("roce_pick.zig");
 pub const planlink = @import("planlink.zig");
@@ -33,6 +35,7 @@ pub const Session = struct {
     nccl: nccl.Nccl,
     mail: ?mailbox.Mailbox = null,
     roce: ?*roce.Roce = null,
+    roce_multi: ?*roce_multi.Roce = null,
     route: hybrid.Hybrid = undefined,
     /// The round plan's link (rank 0 sends, the others receive), on its own TCP connection.
     plan: planlink.PlanLink = undefined,
@@ -56,6 +59,7 @@ pub const Session = struct {
         errdefer s.nccl.deinit();
         errdefer if (s.mail) |*m| m.deinit();
         errdefer if (s.roce) |rr| rr.deinit();
+        errdefer if (s.roce_multi) |rr| rr.deinit();
         switch (cfg.backend) {
             .nccl => {},
             .mailbox => if (try mailboxPossible(&b, kernel_image)) {
@@ -64,7 +68,7 @@ pub const Session = struct {
             } else if (cfg.rank == 0) {
                 log.warn("[tensorfold] tp: TF_COMM_BACKEND=mailbox needs two ranks on one host and the kernel; every rank uses NCCL", .{});
             },
-            .roce => try s.openRoce(d, &b, kernel_image),
+            .roce => if (cfg.world == 2) try s.openRoce(d, &b, kernel_image) else try @import("roce_multi_session.zig").open(s, d, &b, kernel_image),
         }
         try s.agreeVar(&b);
         s.plan = planlink.PlanLink.init(cfg.rank, cfg.world, b.releasePlan());
@@ -115,7 +119,7 @@ pub const Session = struct {
         const all = try b.allGather(&.{@intFromBool(s.comm().varFits(16))}, &buf, &blobs);
         var ok = true;
         for (all) |x| ok = ok and x[0] == 1;
-        if (s.mail != null or s.roce != null) s.route.var_agreed = ok;
+        if (s.mail != null or s.roce != null or s.roce_multi != null) s.route.var_agreed = ok;
     }
 
     fn roceFallback(s: *Session, e: anyerror) !void {
@@ -170,8 +174,14 @@ pub const Session = struct {
 
     /// The communicator the model uses: NCCL, or the hybrid route over the mailbox / RoCE.
     pub fn comm(s: *Session) Collective {
-        if (s.mail != null or s.roce != null) return s.route.iface();
+        if (s.mail != null or s.roce != null or s.roce_multi != null) return s.route.iface();
         return s.nccl.iface();
+    }
+
+    pub fn roceLink(s: *Session) ?RoceLink {
+        if (s.roce) |p| return .{ .two = p };
+        if (s.roce_multi) |p| return .{ .many = p };
+        return null;
     }
 
     /// This rank failed inside a round: every rank goes down (exit 70). Without fail-fast it only aborts.
@@ -194,10 +204,12 @@ pub const Session = struct {
     /// A normal stop: every rank calls it (rank 0 first marks the stop as expected with `fate.expectStop`).
     pub fn close(s: *Session) void {
         // a failed transport: every rank goes down (the peers stop posting) before this one lets go of anything
+        if (s.roce_multi) |r| if (r.failed()) if (s.fate) |*f| f.fatal("transport", error.BackendFailed);
         if (s.roce) |r| if (r.failed()) if (s.fate) |*f| f.fatal("transport", error.BackendFailed);
         if (s.fate) |*f| f.close();
         s.plan.close();
         if (s.roce) |r| r.deinit();
+        if (s.roce_multi) |r| r.deinit();
         if (s.mail) |*m| m.deinit();
         s.nccl.deinit();
         s.lib.close();
@@ -215,9 +227,14 @@ test {
     _ = roce_pick;
     _ = planlink;
     _ = @import("roce_guard.zig");
+    _ = @import("roce_multi_guard.zig");
+    _ = @import("roce_verbs_test.zig");
+    _ = @import("roce_multi_wire_test.zig");
+    _ = @import("roce_multi_route_test.zig");
     _ = @import("roce_test.zig");
     _ = @import("roce_post_test.zig");
     _ = @import("roce_inflight_test.zig");
     _ = @import("host_test.zig");
     _ = @import("fate_test.zig");
+    _ = @import("fate_lifetime_test.zig");
 }

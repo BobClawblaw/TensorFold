@@ -14,6 +14,7 @@ const glm_dsa = @import("glm_dsa_host.zig");
 const slide_adapter = @import("slide_adapter.zig");
 const Slide = slide_adapter.Adapter(nemotron.slide);
 const cache_fit = @import("cache_fit.zig");
+const metal_admit = @import("metal_admit.zig");
 const Resident = @import("resident.zig").Resident;
 const nemo_disk = @import("nemotron_disk.zig");
 
@@ -141,7 +142,7 @@ const Host = struct {
         if (h.learned) |*m| m.deinit();
         h.core.deinit();
         h.cfg.deinit(h.gpa);
-        if (h.resident) |*r| r.deinit();
+        nemotron.residency.drop(h);
         h.metal.deinit();
         h.m.deinit();
         h.gpa.destroy(h);
@@ -152,7 +153,15 @@ const Host = struct {
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const report = @import("sys").optional_libraries.atBoundary();
     defer report.deinit();
+    if (o.prompt_int8) {
+        problem.* = prompt_int8_refusal;
+        return null;
+    }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return @import("drama_open.zig").openMetal(a, gpa, io, o, problem);
+    if (o.cfg_enabled or o.cfg_batched) {
+        problem.* = "--cfg-* guidance requires a Drama 3 speech model";
+        return null;
+    }
     if (@import("save_admission.zig").refused(io, o.dir, problem)) return null;
     // the 27B engine serves the dense 27B class and the routed Qwen3.5-MoE class (Ornith-1.5-122B)
     const dense = (std.mem.eql(u8, o.model_type, "qwen3_5") and qwen27Engine(a, io, o.dir)) or std.mem.eql(u8, o.model_type, "qwen3_5_moe");
@@ -208,12 +217,21 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.resident = null;
     const step = prefillStep(h.m.device);
     const capacity: usize = @intCast(if (window > 0) window else 1 << 18);
+    const positions = capacity + nemotron.backend.max_lanes + 1;
+    const mamba = nemotron.state.Pool;
+    const per_stream = nemotron.state.Cache.bytes(m.config, positions, o.drafts and m.weights.mtp != null);
+    const left = metal_admit.room(m.device) -| mamba.bytes(m.config, 3, 2); // the pool's spare slots and two replay ids
+    const served = try metal_admit.streams(a, "nemotron", per_stream + mamba.bytes(m.config, 2, 1), left, o, positions, problem) orelse {
+        m.deinit();
+        gpa.destroy(h);
+        return null;
+    };
     h.metal = try nemotron.backend.Metal.init(gpa, h.m, .{
-        .capacity = capacity + nemotron.backend.max_lanes + 1,
+        .capacity = positions,
         .chunk = step,
         .drafts = o.drafts,
-        .streams = @max(o.lanes, 2),
-        .batch_rows = @min(128, @max(64, 4 * o.lanes)), // four rows a lane, so 32 and 64 sessions keep their drafts
+        .streams = @max(served, 2),
+        .batch_rows = @min(128, @max(64, 4 * served)), // four rows a lane, so 32 and 64 sessions keep their drafts
     });
     errdefer h.metal.deinit();
     nemotron.slide.loadLiving(gpa, io, h.metal) catch |e| {
@@ -227,12 +245,13 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.clock = .{ .b = h.metal, .wall = .{ .io = io } };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(@max(window, 0)), .prefill_step = step, .structures = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = served, .context_window = @intCast(@max(window, 0)), .prefill_step = step, .structures = true });
     h.host.memory = .{ .ctx = h, .read = readMemory };
     h.round = .{ .depth = 8 };
     h.cache = null;
     var why: []const u8 = "";
-    const plan = cache_fit.budget(o.prompt_cache_gib, o.prompt_cache_over_cap, h.m.device.maxWorkingSet() -| h.m.device.allocated() -| (8 << 30), a, &why, "") catch |e| {
+    const later = @as(u64, served) * per_stream;
+    const plan = cache_fit.budgetBeside(o.prompt_cache_gib, o.prompt_cache_over_cap, h.m.device.maxWorkingSet() -| h.m.device.allocated() -| (8 << 30), later, a, &why, "") catch |e| {
         if (e == error.CacheOverCap) problem.* = why;
         return e;
     };
@@ -267,15 +286,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     errdefer if (h.learned) |*im| im.deinit();
     errdefer if (h.cache) |*store| if (store.disk) |r| r.deinit();
     if (h.metal.head != null) h.host.lone = .{ .ctx = h, .run = Host.lone };
-    {
-        var list: std.ArrayList(mtl.Buffer) = .empty; // the shards and the weights in the kernels' layouts
-        defer list.deinit(gpa);
-        for (h.m.checkpoint.shards.items) |sh| try list.append(gpa, sh.buffer);
-        try list.appendSlice(gpa, h.m.weights.owned.items);
-        h.resident = try Resident.hold(gpa, io, h.m.device, h.m.queue, list.items, "nemotron");
-    }
-    errdefer if (h.resident) |*r| r.deinit();
-    h.warm = if (h.resident) |*r| r.target() else .{ .queue = h.m.queue };
+    try nemotron.residency.hold(h, io);
+    errdefer nemotron.residency.drop(h);
     h.host.keepalive_target = .{ .ctx = &h.warm, .tick = mtl.keepalive.Target.tick };
     h.slide = null;
     if (o.slide) {
@@ -294,6 +306,8 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .halt = Host.halt };
 }
 
+const prompt_int8_refusal = "--prompt-precision int8 is the CUDA Qwen3.5 engine's; the Metal engines prompt in bf16: serve without it";
+
 /// --slide writes 4-bit codes into the shards: a checkpoint with any other width is refused by its first such matrix.
 fn slideWidths(a: Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
     const c = nemotron.config.Config.read(a, io, dir) catch return null; // the load names a config.json it cannot read
@@ -311,6 +325,7 @@ const recall_refusal = "--recall drafts from a record in the lane engine's round
 fn refusal(a: Allocator, o: api.Open, dense: bool) !?[]const u8 {
     const t = o.model_type;
     if (o.kv8) return "--kv-cache fp8 keeps fp8 caches on CUDA; the Metal engines keep bf16: serve without it";
+    if (o.prompt_int8) return prompt_int8_refusal;
     if (o.slide and !std.mem.eql(u8, t, "nemotron_h")) return try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on Macs yet", .{t});
     const one_mac: ?[]const u8 = if (std.mem.eql(u8, t, "nemotron_h")) "Nemotron" else if (std.mem.eql(u8, t, "lfm2_moe")) "LFM2.5-24B-A2B" else if (isGemma4(t)) "Gemma 4" else if (std.mem.eql(u8, t, "step5_vl")) "Step-5" else if (!std.mem.eql(u8, t, "qwen3_5")) null else if (dense) "Qwen3.8-27B" else "Qwen3.5-2B";
     if (o.speed_up != null) if (one_mac) |name| return try std.fmt.allocPrint(a, "--speed-up joins two Macs for Flash Next, GLM-5.3-Flash and GLM-5.3 only: serve {s} without it", .{name});
@@ -416,6 +431,7 @@ test {
     _ = glm_dsa;
     _ = qwen27;
     _ = @import("cache_fit.zig");
+    _ = metal_admit;
     _ = @import("resident.zig");
     _ = @import("metal_identity.zig");
     _ = @import("qwen27_landing.zig");
@@ -449,7 +465,7 @@ fn openGlm(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]co
     }
     const learn: ?glm.Learn = if (o.learn) |root| .{ .root = root, .cap = gibBytes(o.learn_gib), .floor = gibBytes(o.learn_min_free_gib), .daily = gibBytes(o.learn_daily_gib), .conversations = o.learn_conversations } else null;
     const h = glm.open(gpa, io, o.dir, @intCast(window), o.speed_up, o.lanes, o.lanes_fixed, o.prompt_cache_gib, learn, o.vision) catch |e| {
-        if (e == error.LearnConversationsOnPair) problem.* = "--learn-conversations keeps states on one Mac only: serve GLM-5.3-Flash without --speed-up, or without the flag" else if (e == error.BadLoadLimit) problem.* = "GLM_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0, or unset it for 70% of RAM" else problem.* = if (linkProblem(e)) |link| try std.fmt.allocPrint(a, "the native GLM-5.3-Flash engine cannot load {s}: {s}", .{ o.dir, link }) else try std.fmt.allocPrint(a, "the native GLM-5.3-Flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
+        if (e == error.BadResidency) problem.* = mtl.residency_policy.invalid_flag else if (e == error.LearnConversationsOnPair) problem.* = "--learn-conversations keeps states on one Mac only: serve GLM-5.3-Flash without --speed-up, or without the flag" else if (e == error.BadLoadLimit) problem.* = "GLM_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0, or unset it for 70% of RAM" else problem.* = if (linkProblem(e)) |link| try std.fmt.allocPrint(a, "the native GLM-5.3-Flash engine cannot load {s}: {s}", .{ o.dir, link }) else try std.fmt.allocPrint(a, "the native GLM-5.3-Flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
         return null;
     };
     return .{ .engine = h.engine(), .close = glm.close, .ctx = h };
@@ -555,5 +571,14 @@ test "--slide is refused by every family but Nemotron, which learns into its wei
     for ([_][]const u8{ "glm_moe_dsa", "qwen4_exp", "glm5_next", "qwen3_5" }) |t| {
         const why = (try refusal(a, .{ .dir = "d", .model_type = t, .slide = true }, true)) orelse return error.TestExpectedRefusal;
         try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on Macs yet", .{t}), why);
+    }
+}
+
+test "prompt precision: Metal refuses int8 before any model or family-specific load" {
+    for ([_][]const u8{ "qwen3_5", "fish_omni", "nemotron_h", "gemma4", "unknown" }) |model| {
+        var why: []const u8 = "";
+        const opened = try open(std.testing.allocator, std.testing.allocator, std.testing.io, .{ .dir = "missing-prompt-int8-model", .model_type = model, .prompt_int8 = true }, &why);
+        try std.testing.expect(opened == null);
+        try std.testing.expectEqualStrings(prompt_int8_refusal, why);
     }
 }
