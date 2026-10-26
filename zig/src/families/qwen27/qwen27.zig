@@ -24,6 +24,8 @@ pub const image_rows = @import("image_rows.zig");
 pub const gpu_weights = @import("gpu_weights.zig");
 pub const gpu_frame = @import("gpu_frame.zig");
 pub const model = @import("model.zig");
+/// The routed block's kernels (the kernel contract builds its row kernel's source as the engine does).
+pub const moe_gpu = @import("moe_gpu.zig");
 pub const projection = @import("projection.zig");
 pub const prompt_glue = @import("prompt_glue.zig");
 pub const prompt_gpu = @import("prompt_gpu.zig");

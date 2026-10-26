@@ -196,13 +196,13 @@ const Left = struct {
     }
 };
 
-/// One slot's caches at `context` tokens: its K/V rows, its taps ring when drafting, DeltaNet states and scratch.
-fn slotCost(model: *const q.model.Model, context: u32, drafting: bool) usize {
+/// One slot's caches at `context` tokens: K/V rows, the drafter's ring of `taps` planes (0: none), states and scratch.
+fn slotCost(model: *const q.model.Model, context: u32, taps: u32) usize {
     const c = model.config;
     var attention: usize = 0;
     for (0..c.layers) |i| attention += @intFromBool(c.kind(i) == .attention);
     const kv = attention * 2 * @as(usize, context) * c.kvDim() * 2;
-    const ring_bytes: usize = if (drafting) 2048 * 5 * c.hidden * 2 else 0;
+    const ring_bytes: usize = 2048 * @as(usize, taps) * c.hidden * 2; // the drafter's window of its taps
     return kv + ring_bytes + (256 << 20); // DeltaNet states, conv tails and scratch, generously
 }
 
@@ -311,7 +311,9 @@ pub fn attach(gpa: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q.df
     defer pool.pop();
     const capacity = if (o.context == 0) @min(model.config.max_position, 32768) else o.context;
     if (capacity == 0 or capacity > model.config.max_position) return error.ContextFull;
-    const per = slotCost(model, capacity + lb.max_rows, drafter != null or o.drafter != null); // a last window's rows past prompt + max_tokens
+    // the drafter's taps size its ring: a config that does not parse here fails at the drafter's load, below
+    const taps: u32 = if (drafter) |d| d.graph.config.tap_count else if (o.drafter) |d| q.dflash.config.tapCountAt(a, io, d) catch q.dflash.config.max_taps else 0;
+    const per = slotCost(model, capacity + lb.max_rows, taps); // a last window's rows past prompt + max_tokens
     const left = room(model);
     const slots = fit(left, per, o.streams, o.streams_fixed) catch |err| {
         why.* = try std.fmt.allocPrint(a, "--parallel {d} needs {d:.1} GiB for its streams' caches at a {d}-token context, and this Mac leaves {d:.1} GiB beside the weights and an 8 GiB margin: serve --parallel {d}, or lower --context", .{ o.streams, cache_fit.gibs(per * o.streams), capacity, cache_fit.gibs(left), @max(1, left / per) });
@@ -336,7 +338,7 @@ pub fn attach(gpa: Allocator, io: std.Io, model: *q.model.Model, drafter: ?*q.df
     errdefer if (h.draft) |d| d.deinit();
     h.back = try lb.Metal.init(gpa, &h.runner, h.draft);
     errdefer h.back.deinit();
-    h.back.chunk = h.runner.promptRows(q.model.promptRows());
+    h.back.chunk = h.runner.promptRows(q.model.promptRows(h.runner.model.config));
     h.back.grow = .{ .ctx = h, .room = Host.roomFor, .added = Host.added };
     h.back.vision = o.images;
     if (h.draft != null) try h.back.measure(io);
