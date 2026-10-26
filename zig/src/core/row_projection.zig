@@ -96,6 +96,36 @@ pub const Pipelines = struct {
     }
 };
 
+/// Most experts a route-folded call picks among (the kernel's lanes hold 8 logits each).
+pub const route_experts = 256;
+
+/// A softmax router's route as the folded kernel takes it: PICK and WEIGHT [rows, topk + 1], the writing launch alone filling them.
+pub const Route = extern struct { experts: i32, topk: i32, ld: i32, renorm: i32, write: i32 };
+
+/// The indexed-with-extra kernels that pick each slot's expert from the router's logits as they start (buffers 10-12: logits, weights, the route).
+pub const RoutePipelines = struct {
+    indexed_route: [variants]mtl.Pipeline,
+
+    pub fn load(device: mtl.Device) !RoutePipelines {
+        const pool = mtl.objc.Pool.push();
+        defer pool.pop();
+        const lib = try mtl.Library.fromSource(device, sources.core_row_route, mtl.CompileOptions.mlx());
+        defer lib.deinit();
+        var p: RoutePipelines = undefined;
+        var made: usize = 0;
+        errdefer for (p.indexed_route[0..made]) |x| x.deinit();
+        inline for (bit_widths, 0..) |bits, b| inline for (.{ "f32", "bf16" }, 0..) |sum, m| {
+            p.indexed_route[b * 2 + m] = try mtl.Pipeline.init(device, lib, std.fmt.comptimePrint("tf_row_projection_indexed_route_q{d}_{s}", .{ bits, sum }), false);
+            made += 1;
+        };
+        return p;
+    }
+
+    pub fn deinit(p: *RoutePipelines) void {
+        for (p.indexed_route) |x| x.deinit();
+    }
+};
+
 /// One dispatch: its pipeline, dims (K, N, group, rows or slots, experts, repeat) and the grid; buffers x, W, S, B, dims, out at 0-5, ids at 6.
 pub const Call = struct { pipeline: mtl.Pipeline, dims: [6]i32, groups: usize, slots: usize = 1, threads: usize = 32 * groups };
 
@@ -133,9 +163,37 @@ pub fn callIndexedExtra(p: *const Pipelines, x: Experts, extra: Weights, slots: 
     return .{ .pipeline = p.indexed_extra[one.variant()], .dims = .{ @intCast(one.k), @intCast(one.n), @intCast(one.group), @intCast(slots), @intCast(x.experts), @intCast(x.repeat) }, .groups = one.n / (columns * groups), .slots = slots };
 }
 
+/// `callIndexedExtra` picking slot i's expert itself: the row's pick i % repeat from `route` (repeat = topk + 1), the last slot the extra matrix.
+pub fn callIndexedRoute(p: *const RoutePipelines, x: Experts, extra: Weights, slots: usize, route: Route) !Call {
+    try x.validate();
+    try extra.validate();
+    const one = x.one;
+    if (extra.n != one.n or extra.k != one.k or extra.group != one.group or extra.bits != one.bits or extra.sum != one.sum) return error.UnsupportedExpertShape;
+    if (route.experts <= 0 or route.experts != x.experts or route.experts > route_experts or route.topk < 1 or route.topk + 1 != x.repeat or route.ld <= route.experts) return error.UnsupportedRouteShape;
+    if (slots == 0 or slots % x.repeat != 0 or slots > std.math.maxInt(u16)) return error.NoRows;
+    return .{ .pipeline = p.indexed_route[one.variant()], .dims = .{ @intCast(one.k), @intCast(one.n), @intCast(one.group), @intCast(slots), @intCast(x.experts), @intCast(x.repeat) }, .groups = one.n / (columns * groups), .slots = slots };
+}
+
 test {
     _ = simd;
     _ = simd_bits;
+}
+
+test "a route-folded call takes a softmax router of whole top-k groups and a wider logits row" {
+    const p: RoutePipelines = undefined;
+    const one = Weights{ .w = undefined, .scales = undefined, .biases = undefined, .n = 64, .k = 128 };
+    const x = Experts{ .one = one, .experts = 256, .repeat = 9 };
+    const r = Route{ .experts = 256, .topk = 8, .ld = 320, .renorm = 1, .write = 1 };
+    const c = try callIndexedRoute(&p, x, one, 18, r);
+    try std.testing.expectEqual([6]i32{ 128, 64, 64, 18, 256, 9 }, c.dims);
+    try std.testing.expectEqual(@as(usize, 18), c.slots);
+    try std.testing.expectError(error.NoRows, callIndexedRoute(&p, x, one, 10, r));
+    try std.testing.expectError(error.UnsupportedRouteShape, callIndexedRoute(&p, x, one, 9, .{ .experts = 256, .topk = 7, .ld = 320, .renorm = 1, .write = 1 }));
+    try std.testing.expectError(error.UnsupportedRouteShape, callIndexedRoute(&p, x, one, 9, .{ .experts = 256, .topk = 8, .ld = 256, .renorm = 1, .write = 1 }));
+    const wide = Experts{ .one = one, .experts = 1024, .repeat = 9 };
+    try std.testing.expectError(error.UnsupportedRouteShape, callIndexedRoute(&p, wide, one, 9, .{ .experts = 1024, .topk = 8, .ld = 1088, .renorm = 1, .write = 1 }));
+    const other = Weights{ .w = undefined, .scales = undefined, .biases = undefined, .n = 64, .k = 128, .bits = 8 };
+    try std.testing.expectError(error.UnsupportedExpertShape, callIndexedRoute(&p, x, other, 9, r));
 }
 
 test "an indexed call takes whole top-k groups of slots" {

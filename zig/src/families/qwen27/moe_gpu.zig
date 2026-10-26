@@ -28,6 +28,8 @@ pub const Kernels = struct {
     glu: mtl.Pipeline,
     combine: mtl.Pipeline,
     rows: ?row.Pipelines = null,
+    /// The experts' kernels with the route folded in: decode windows pick each slot's expert as the products start.
+    route_rows: ?row.RoutePipelines = null,
     /// core.affine_mm's pipelines by the experts' width, built when a prompt first takes the tensor units.
     nax: std.AutoHashMapUnmanaged(Key, am.Pipes) = .empty,
     profiler: ?*profile.Trace = null,
@@ -48,6 +50,7 @@ pub const Kernels = struct {
     pub fn deinit(k: *Kernels) void {
         inline for (.{ k.route, k.sort, k.gather, k.glu, k.combine }) |p| p.deinit();
         if (k.rows) |*p| p.deinit();
+        if (k.route_rows) |*p| p.deinit();
         var it = k.nax.valueIterator();
         while (it.next()) |pipes| for (pipes) |p| p.deinit();
         k.nax.deinit(k.allocator);
@@ -56,6 +59,11 @@ pub const Kernels = struct {
     fn rowPipelines(k: *Kernels) !*const row.Pipelines {
         if (k.rows == null) k.rows = try row.Pipelines.load(k.device);
         return &k.rows.?;
+    }
+
+    fn routePipelines(k: *Kernels) !*const row.RoutePipelines {
+        if (k.route_rows == null) k.route_rows = try row.RoutePipelines.load(k.device);
+        return &k.route_rows.?;
     }
 
     fn naxPipes(k: *Kernels, key: Key) !am.Pipes {
@@ -116,13 +124,17 @@ pub const Kernels = struct {
             enc.dispatchGroups(.{ .width = call.groups }, .{ .width = call.threads });
         }
         enc.barrier();
-        enc.setPipeline(k.route);
-        enc.setBuffer(f.get(.router).buffer, 0, 0);
-        enc.setBuffer(f.get(.picks).buffer, 0, 1);
-        enc.setBuffer(f.get(.route_weights).buffer, 0, 2);
-        enc.setValue(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .ld = @intCast(ld), .renorm = @intFromBool(c.renorm) }, 3);
-        enc.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(@max(32, (experts + 31) / 32 * 32), 1, 1));
-        enc.barrier();
+        // the row path's products pick each slot's expert from the logits themselves; the sorted path needs the picks first
+        const folded = !units and experts <= row.route_experts;
+        if (!folded) {
+            enc.setPipeline(k.route);
+            enc.setBuffer(f.get(.router).buffer, 0, 0);
+            enc.setBuffer(f.get(.picks).buffer, 0, 1);
+            enc.setBuffer(f.get(.route_weights).buffer, 0, 2);
+            enc.setValue(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .ld = @intCast(ld), .renorm = @intFromBool(c.renorm) }, 3);
+            enc.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(@max(32, (experts + 31) / 32 * 32), 1, 1));
+            enc.barrier();
+        }
         try span.end();
         var products = profile.begin(k.profiler, e, .experts);
         errdefer products.cancel();
@@ -161,8 +173,16 @@ pub const Kernels = struct {
             am.gatherTo(enc2, p, act, sums, matrix(mo.down.one), offsets, R{ .buf = f.get(.expert_out).buffer }, R{ .buf = f.get(.order).buffer }, routed, experts);
         } else {
             // every slot through the experts' kernel, the shared expert as the extra matrix of each product
-            try k.indexed(enc2, pipes, mo.gate, mo.shared_gate, slots, f.get(.input), f.get(.picks), f.get(.expert_gate));
-            try k.indexed(enc2, pipes, mo.up, mo.shared_up, slots, f.get(.input), f.get(.picks), f.get(.expert_up));
+            if (folded) {
+                // gate and up each pick their slots' experts from the logits; gate's first threadgroup a row writes the picks and weights for down and the combine
+                var route = row.Route{ .experts = @intCast(experts), .topk = @intCast(topk), .ld = @intCast(ld), .renorm = @intFromBool(c.renorm), .write = 1 };
+                try k.indexedRoute(enc2, mo.gate, mo.shared_gate, slots, f, f.get(.expert_gate), route);
+                route.write = 0;
+                try k.indexedRoute(enc2, mo.up, mo.shared_up, slots, f, f.get(.expert_up), route);
+            } else {
+                try k.indexed(enc2, pipes, mo.gate, mo.shared_gate, slots, f.get(.input), f.get(.picks), f.get(.expert_gate));
+                try k.indexed(enc2, pipes, mo.up, mo.shared_up, slots, f.get(.input), f.get(.picks), f.get(.expert_up));
+            }
             enc2.barrier();
             k.activation(enc2, f, slots, inter);
             enc2.barrier();
@@ -201,6 +221,27 @@ pub const Kernels = struct {
         e.setBuffer(extra.w, extra.w_off, 7);
         e.setBuffer(extra.scales, extra.s_off, 8);
         e.setBuffer(extra.biases, extra.b_off, 9);
+        e.dispatchThreads(mtl.Size.of(call.groups * call.threads, call.slots, 1), mtl.Size.of(call.threads, 1, 1));
+    }
+
+    /// `indexed` over f.input with the slots' experts picked from the router's logits in the kernel (buffers 10-12).
+    fn indexedRoute(k: *Kernels, e: mtl.ComputeEncoder, x: row.Experts, extra: row.Weights, slots: u32, f: *const Frame, out: Ref, route: row.Route) !void {
+        const call = try row.callIndexedRoute(try k.routePipelines(), x, extra, slots, route);
+        const in = f.get(.input);
+        e.setPipeline(call.pipeline);
+        e.setBuffer(in.buffer, in.offset, 0);
+        e.setBuffer(x.one.w, x.one.w_off, 1);
+        e.setBuffer(x.one.scales, x.one.s_off, 2);
+        e.setBuffer(x.one.biases, x.one.b_off, 3);
+        e.setValue(call.dims, 4);
+        e.setBuffer(out.buffer, out.offset, 5);
+        e.setBuffer(f.get(.picks).buffer, 0, 6);
+        e.setBuffer(extra.w, extra.w_off, 7);
+        e.setBuffer(extra.scales, extra.s_off, 8);
+        e.setBuffer(extra.biases, extra.b_off, 9);
+        e.setBuffer(f.get(.router).buffer, 0, 10);
+        e.setBuffer(f.get(.route_weights).buffer, 0, 11);
+        e.setValue(route, 12);
         e.dispatchThreads(mtl.Size.of(call.groups * call.threads, call.slots, 1), mtl.Size.of(call.threads, 1, 1));
     }
 };

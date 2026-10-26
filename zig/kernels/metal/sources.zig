@@ -26,6 +26,8 @@ pub const lfm2_attn_nax = @embedFile("lfm2/lfm2_attn_nax.metal");
 /// Our glue kernels around them: embedding, MLX's RMS arithmetic, argmax, layout moves.
 pub const nemotron_glue = @embedFile("nemotron_glue.metal");
 pub const core_row_projection = @embedFile("core/row_projection.metal");
+/// The indexed row projection with the route folded in (its templates, then row_route.metal's kernel).
+pub const core_row_route = @embedFile("core/row_projection.metal") ++ @embedFile("core/row_route.metal");
 pub const core_tile_qmm = @embedFile("core/tile_qmm.metal") ++ @embedFile("core/tile_qmv.metal") ++
     @embedFile("core/tile_qmv_rows.metal");
 pub const core_exl3_projection = @embedFile("core/exl3_projection.metal");
