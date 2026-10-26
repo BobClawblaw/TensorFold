@@ -38,6 +38,9 @@ pub const Kernels = struct {
     mark_conv: metal.Pipeline,
     /// tf_delta_gdn_pre for one-row segments kept in place: the conv window written to history, no commit or publish.
     pre_step: metal.Pipeline,
+    /// The step's prepare and scan in one launch, and its gate moving the conv windows (dk = dv = 128).
+    chain_step: metal.Pipeline,
+    post_step: metal.Pipeline,
 
     pub fn init(device: metal.Device) !Kernels {
         const library = try metal.Library.fromSource(device, source.core_deltanet, metal.CompileOptions.mlx());
@@ -61,6 +64,8 @@ pub const Kernels = struct {
             "tree_slots_4",
             "tree_slots_8",
             "tree_slots_16",
+            "chain_step",
+            "post_step",
         };
         var pipelines: [names.len]metal.Pipeline = undefined;
         var done: usize = 0;
@@ -88,6 +93,8 @@ pub const Kernels = struct {
             .chain_wide_marks = pipelines[10],
             .mark_conv = pipelines[11],
             .pre_step = pipelines[12],
+            .chain_step = pipelines[18],
+            .post_step = pipelines[19],
         };
     }
 
@@ -106,6 +113,8 @@ pub const Kernels = struct {
             k.chain_wide_marks,
             k.mark_conv,
             k.pre_step,
+            k.chain_step,
+            k.post_step,
         }) |p| p.deinit();
         for (k.pipelines.tree_slots) |p| p.deinit();
         k.library.deinit();

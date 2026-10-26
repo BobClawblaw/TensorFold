@@ -586,3 +586,145 @@ kernel void tf_delta_gdn_clear(device uint* state [[buffer(0)]],
   if (at.x < state_width) state[row * state_width + at.x] = 0u;
   if (at.x < conv_width) conv[row * conv_width + at.x] = 0u;
 }
+
+// tf_delta_gdn_pre_step4's conv and activation for one channel of row `row`: the window's taps from history or the projection.
+inline float tf_delta_step_channel(device const bfloat* projection, device const bfloat* history, device const void* weights,
+                                   device const uint* windows, device const uint* row_slot, constant TfDeltaParams& p,
+                                   uint row, uint channel, uint channels, thread float* inputs) {
+  const uint keep = p.taps - 1;
+  float result = 0.0f;
+  for (uint tap = 0; tap < p.taps; ++tap) {
+    const uint source = windows[row * p.taps + tap];
+    const float input = source < keep ? float(history[(row_slot[row] * keep + source) * channels + channel]) : float(projection[(source - keep) * channels + channel]);
+    inputs[tap] = input;
+    result += tf_delta_weight(weights, channel * p.taps + tap, p.weight_flags, 0) * input;
+  }
+  const float rounded = float(bfloat(result));
+  const float sigmoid = float(bfloat(1.0f / (1.0f + metal::exp(-rounded))));
+  return float(bfloat(rounded * sigmoid));
+}
+
+// tf_delta_gdn_pre_step and tf_delta_gdn_chain in one launch for one-row segments kept in place (dk = dv = 128): a threadgroup
+// (four value columns of one head, four simdgroups) prepares its key head's q and k itself in tf_delta_gdn_pre_step4's thread
+// order, and its own value columns; one threadgroup a head writes the buffers. The conv windows move in tf_delta_gdn_post_step.
+kernel void tf_delta_gdn_chain_step(device const bfloat* projection [[buffer(0)]],
+                              device const bfloat* a [[buffer(1)]],
+                              device const bfloat* b [[buffer(2)]],
+                              device const bfloat* history [[buffer(3)]],
+                              device const void* weights [[buffer(4)]],
+                              device const void* decay_weight [[buffer(5)]],
+                              device const void* time_bias [[buffer(6)]],
+                              device const uint* windows [[buffer(7)]],
+                              device const uint* row_slot [[buffer(8)]],
+                              constant TfDeltaParams& p [[buffer(9)]],
+                              device bfloat* query [[buffer(10)]],
+                              device bfloat* key [[buffer(11)]],
+                              device bfloat* value [[buffer(12)]],
+                              device float* decay [[buffer(13)]],
+                              device bfloat* mixing [[buffer(14)]],
+                              device const float* committed [[buffer(15)]],
+                              device const TfDeltaSegment* segments [[buffer(16)]],
+                              device bfloat* output [[buffer(17)]],
+                              device float* next_state [[buffer(18)]],
+                              uint3 position [[thread_position_in_grid]],
+                              uint3 tg [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float shared[129];
+  threadgroup float qk[2][128];
+  const uint segment_index = position.z / p.nv, head = position.z % p.nv;
+  const uint dimension = position.y, group = p.nv / p.nk, key_head = head / group;
+  const TfDeltaSegment span = segments[segment_index];
+  const uint row = span.first;
+  const uint channels = 2 * p.nk * p.dk + p.nv * p.dv;
+  const bool writes_head = tg.y == 0; // this head's first threadgroup writes its value, decay and mixing
+  const bool writes_qk = writes_head && head % group == 0; // and the key head's first its q and k
+  float inputs[8];
+  for (uint which = 0; which < 2; ++which) {
+    const uint h = which * p.nk + key_head;
+    const uint channel = h * p.dk + lane * 4 + sg;
+    const float activated = tf_delta_step_channel(projection, history, weights, windows, row_slot, p, row, channel, channels, inputs);
+    if (which == 1) threadgroup_barrier(mem_flags::mem_threadgroup);
+    shared[sg * 32 + lane] = activated;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      float square = 0.0f;
+      for (uint part = 0; part < 4; ++part) square += shared[part * 32 + lane] * shared[part * 32 + lane];
+      square = simd_sum(square);
+      if (lane == 0) shared[128] = metal::rsqrt(square / float(p.dk) + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inverse = shared[128];
+    const float scale = which == 0 ? float(bfloat(1.0f / float(p.dk))) : float(bfloat(metal::rsqrt(float(p.dk))));
+    const bfloat normalized = bfloat(scale * float(bfloat(activated * inverse)));
+    qk[which][lane * 4 + sg] = float(normalized);
+    if (writes_qk) {
+      const uint at = (row * p.nk + key_head) * p.dk + lane * 4 + sg;
+      if (which == 0) query[at] = normalized;
+      else key[at] = normalized;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // this column's value (every lane the same arithmetic) and the head's decay and mixing
+  const uint at = row * p.nv + head;
+  const float incoming = tf_delta_step_channel(projection, history, weights, windows, row_slot, p, row, 2 * p.nk * p.dk + head * p.dv + dimension, channels, inputs);
+  const uint gate_at = p.zba_stride ? row * p.zba_stride + head : at;
+  const float shifted = float(bfloat(float(a[gate_at]) + tf_delta_weight(time_bias, head, p.weight_flags, 2)));
+  const float softplus = float(bfloat(metal::max(shifted, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(shifted)))));
+  const float forget = metal::exp(-metal::exp(tf_delta_weight(decay_weight, head, p.weight_flags, 1)) * softplus);
+  const float mix = float(bfloat(1.0f / (1.0f + metal::exp(-float(b[gate_at])))));
+  if (lane == 0) value[at * p.dv + dimension] = bfloat(incoming);
+  if (writes_head && sg == 0 && lane == 0) {
+    decay[at] = forget;
+    mixing[at] = bfloat(mix);
+  }
+  // tf_delta_gdn_chain_body<4> over the one row, its key and query from the threadgroup
+  const uint state_stride = p.nv * p.dv * p.dk;
+  const uint column = (head * p.dv + dimension) * p.dk + lane * 4;
+  float state[4];
+  for (uint part = 0; part < 4; ++part) state[part] = committed[span.state_slot * state_stride + column + part];
+  float remembered = 0.0f;
+  for (uint part = 0; part < 4; ++part) {
+    state[part] = state[part] * forget;
+    remembered += state[part] * qk[1][lane * 4 + part];
+  }
+  remembered = simd_sum(remembered);
+  const float correction = (incoming - remembered) * mix;
+  for (uint part = 0; part < 4; ++part) state[part] = state[part] + qk[1][lane * 4 + part] * correction;
+  float result = 0.0f;
+  for (uint part = 0; part < 4; ++part) result += state[part] * qk[0][lane * 4 + part];
+  result = simd_sum(result);
+  if (lane == 0) output[at * p.dv + dimension] = bfloat(result);
+  for (uint part = 0; part < 4; ++part) next_state[span.next_slot * state_stride + column + part] = state[part];
+}
+
+// tf_delta_gdn_post for the fused step, then the conv windows tf_delta_gdn_pre_step would have moved: the head's value channels
+// by its own threadgroup, the key head's q and k channels by its first head's (each channel read and written by one thread).
+kernel void tf_delta_gdn_post_step(device const bfloat* recurrence [[buffer(0)]],
+                             device const bfloat* gate [[buffer(1)]],
+                             device const void* norm [[buffer(2)]],
+                             constant TfDeltaParams& p [[buffer(3)]],
+                             device bfloat* output [[buffer(4)]],
+                             device const bfloat* projection [[buffer(5)]],
+                             device bfloat* history [[buffer(6)]],
+                             device const uint* windows [[buffer(7)]],
+                             device const uint* row_slot [[buffer(8)]],
+                             uint3 group [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  tf_delta_gdn_post_body<4>(recurrence, gate, norm, p, output, group, lane);
+  const uint row = group.z, head = group.y, keep = p.taps - 1, channels = 2 * p.nk * p.dk + p.nv * p.dv;
+  const uint key_head = head / (p.nv / p.nk);
+  const uint firsts[3] = {2 * p.nk * p.dk + head * p.dv, key_head * p.dk, (p.nk + key_head) * p.dk};
+  const uint spans = head % (p.nv / p.nk) == 0 ? 3 : 1;
+  for (uint which = 0; which < spans; ++which) {
+    for (uint part = 0; part < 4; ++part) {
+      const uint channel = firsts[which] + lane * 4 + part;
+      float inputs[8];
+      for (uint tap = 0; tap < p.taps; ++tap) {
+        const uint source = windows[row * p.taps + tap];
+        inputs[tap] = source < keep ? float(history[(row_slot[row] * keep + source) * channels + channel]) : float(projection[(source - keep) * channels + channel]);
+      }
+      for (uint tap = 0; tap < keep; ++tap) history[(row_slot[row] * keep + tap) * channels + channel] = bfloat(inputs[tap + 1]);
+    }
+  }
+}

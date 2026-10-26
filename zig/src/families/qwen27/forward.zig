@@ -22,6 +22,8 @@ pub const Stages = struct {
     rows: u32,
     hooks: Mixer,
     pending: ?Ref = null,
+    /// The pending output was added and normed by the block's combine (the next layer's input, hidden and sums are written).
+    normed: bool = false,
     hidden: Ref = undefined,
     residual: Ref = undefined,
     head: Head = .all,
@@ -49,8 +51,11 @@ pub const Stages = struct {
         const e = lane.enc;
         const layer = m.weights.layers[index];
         const h: u32 = @intCast(m.config.hidden);
-        try m.kernels.norm(e, s.hidden, s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
-        e.barrier();
+        if (!s.normed) {
+            try m.kernels.norm(e, s.hidden, s.pending, wts.ref(layer.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), h, s.rows);
+            e.barrier();
+        }
+        s.normed = false;
         if (s.pending != null) {
             std.mem.swap(Ref, &s.hidden, &s.residual);
             if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, index - 1, s.hidden, s.rows);
@@ -81,7 +86,7 @@ pub const Stages = struct {
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (layer.moe) |*mo| if (!m.moe.?.sorted(mo, s.rows, m.kernels.prompt)) {
             // decode rows: the routed block runs the shared expert as one more slot of the experts' kernel
-            try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+            try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt, s.nextNorm(index));
             lane.enc.barrier();
             s.pending = f.get(.output);
             return;
@@ -111,7 +116,7 @@ pub const Stages = struct {
             }
             lane.enc.barrier();
             if (layer.moe) |*mo| {
-                try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+                try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt, s.nextNorm(index));
                 lane.enc.barrier();
             }
             s.pending = f.get(.output);
@@ -126,17 +131,29 @@ pub const Stages = struct {
         lane.enc.barrier();
         if (layer.moe) |*mo| {
             // the shared expert's rows in f.output take the routed experts' weighted rows and the shared gate
-            try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt);
+            try m.moe.?.block(lane.enc, m.config, mo, f, s.rows, m.kernels.prompt, s.nextNorm(index));
             lane.enc.barrier();
         }
         s.pending = f.get(.output);
+    }
+    /// The norm after layer `index`'s block, for its combine to fuse: the next layer's or the final one; null where it cannot.
+    fn nextNorm(s: *Stages, index: usize) ?@import("moe_gpu.zig").Norm {
+        const m = s.model;
+        if (!@import("moe_gpu.zig").Kernels.fusesNorm(m.config)) return null;
+        const f = &m.frame;
+        const weight = if (index + 1 < m.config.layers) wts.ref(m.weights.layers[index + 1].norm) else wts.ref(m.weights.norm);
+        s.normed = true;
+        return .{ .h = s.hidden, .weight = weight, .eps = f.get(.eps), .dims = f.get(.dims), .ho = s.residual, .xo = f.get(.input), .xs = f.get(.sums) };
     }
     pub fn finish(s: *Stages, lane: *@import("core").segments.Lane) !void {
         const m = s.model;
         const f = &m.frame;
         const e = lane.enc;
-        try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
-        e.barrier();
+        if (!s.normed) {
+            try m.kernels.norm(e, s.hidden, s.pending, wts.ref(m.weights.norm), f.get(.eps), f.get(.dims), s.residual, f.get(.input), f.get(.sums), @intCast(m.config.hidden), s.rows);
+            e.barrier();
+        }
+        s.normed = false;
         std.mem.swap(Ref, &s.hidden, &s.residual);
         if (s.hooks.tap) |tap| try tap(s.hooks.ptr, e, m.config.layers - 1, s.hidden, s.rows);
         if (s.head == .all and s.rows > @import("gpu_frame.zig").logit_rows) return error.BadFrameRows;

@@ -10,6 +10,7 @@ const Config = @import("config.zig").Config;
 const wts = @import("gpu_weights.zig");
 const Frame = @import("gpu_frame.zig").Frame;
 const Ref = @import("projection.zig").Ref;
+const quant = @import("quant_gpu.zig");
 
 const RouteArgs = extern struct { experts: i32, topk: i32, ld: i32, renorm: i32 };
 const SortArgs = extern struct { slots: i32, experts: i32 };
@@ -18,6 +19,9 @@ const CombineArgs = extern struct { hidden: i32, topk: i32, shared_in_out: i32, 
 const R = struct { buf: mtl.Buffer, off: usize = 0 };
 const Matrix = struct { w: R, s: R, b: R, n: u32, k: u32 };
 const Key = struct { bits: u8, group: u16 };
+
+/// The norm that follows the block, fused into its combine: HO = H + the block's output, XO its norm by `weight`, XS the group sums.
+pub const Norm = struct { h: Ref, weight: Ref, eps: Ref, dims: Ref, ho: Ref, xo: Ref, xs: Ref };
 
 pub const Kernels = struct {
     allocator: std.mem.Allocator,
@@ -28,6 +32,7 @@ pub const Kernels = struct {
     gather: mtl.Pipeline,
     glu: mtl.Pipeline,
     combine: mtl.Pipeline,
+    combine_norm: mtl.Pipeline,
     rows: ?row.Pipelines = null,
     /// core.affine_mm's pipelines by the experts' width, built when a prompt first takes the tensor units.
     nax: std.AutoHashMapUnmanaged(Key, am.Pipes) = .empty,
@@ -36,18 +41,18 @@ pub const Kernels = struct {
     pub fn init(a: std.mem.Allocator, device: mtl.Device) !Kernels {
         const lib = try mtl.Library.fromSource(device, source.moe, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        var pipes: [6]mtl.Pipeline = undefined;
+        var pipes: [7]mtl.Pipeline = undefined;
         var made: usize = 0;
         errdefer for (pipes[0..made]) |p| p.deinit();
-        for ([_][:0]const u8{ "q27_route", "q27_route_count", "q27_route_place", "q27_route_gather", "q27_expert_glu", "q27_expert_combine" }, &pipes) |name, *p| {
+        for ([_][:0]const u8{ "q27_route", "q27_route_count", "q27_route_place", "q27_route_gather", "q27_expert_glu", "q27_expert_combine", "q27_expert_combine_norm" }, &pipes) |name, *p| {
             p.* = try mtl.Pipeline.init(device, lib, name, false);
             made += 1;
         }
-        return .{ .allocator = a, .device = device, .route = pipes[0], .count = pipes[1], .place = pipes[2], .gather = pipes[3], .glu = pipes[4], .combine = pipes[5] };
+        return .{ .allocator = a, .device = device, .route = pipes[0], .count = pipes[1], .place = pipes[2], .gather = pipes[3], .glu = pipes[4], .combine = pipes[5], .combine_norm = pipes[6] };
     }
 
     pub fn deinit(k: *Kernels) void {
-        inline for (.{ k.route, k.count, k.place, k.gather, k.glu, k.combine }) |p| p.deinit();
+        inline for (.{ k.route, k.count, k.place, k.gather, k.glu, k.combine, k.combine_norm }) |p| p.deinit();
         if (k.rows) |*p| p.deinit();
         var it = k.nax.valueIterator();
         while (it.next()) |pipes| for (pipes) |p| p.deinit();
@@ -83,8 +88,14 @@ pub const Kernels = struct {
         return g.bits == mo.up.one.bits and g.group == mo.up.one.group and g.bits == mo.down.one.bits and g.group == mo.down.one.group;
     }
 
-    /// f.output becomes the weighted experts plus the gated shared expert (f.output for a prompt chunk, else a slot).
-    pub fn block(k: *Kernels, e: mtl.ComputeEncoder, c: Config, mo: *const wts.Moe, f: *const Frame, rows: u32, prompt: bool) !void {
+    /// Whether `block` can fuse the next norm into its combine: a row a threadgroup of whole simdgroups.
+    pub fn fusesNorm(c: Config) bool {
+        return c.hidden % 512 == 0 and c.hidden <= 4096;
+    }
+
+    /// f.output becomes the weighted experts plus the gated shared expert (f.output for a prompt chunk, else a slot); with `norm`, the
+    /// combine also adds it to norm.h and writes the next layer's normed input (norm.ho, norm.xo, norm.xs).
+    pub fn block(k: *Kernels, e: mtl.ComputeEncoder, c: Config, mo: *const wts.Moe, f: *const Frame, rows: u32, prompt: bool, norm: ?Norm) !void {
         var span = profile.begin(k.profiler, e, .route);
         errdefer span.cancel();
         const enc = span.encoder;
@@ -180,12 +191,16 @@ pub const Kernels = struct {
             try k.indexed(enc2, pipes, mo.down, mo.shared_down, slots, f.get(.expert_act), f.get(.picks), f.get(.expert_out));
         }
         enc2.barrier();
-        enc2.setPipeline(k.combine);
+        enc2.setPipeline(if (norm != null) k.combine_norm else k.combine);
         enc2.setBuffer(f.get(.expert_out).buffer, 0, 0);
         enc2.setBuffer(f.get(.route_weights).buffer, 0, 1);
         enc2.setBuffer(f.get(.output).buffer, 0, 2);
         enc2.setValue(CombineArgs{ .hidden = @intCast(hidden), .topk = @intCast(topk), .shared_in_out = @intFromBool(units) }, 3);
-        enc2.dispatchThreads(mtl.Size.of(hidden, rows, 1), mtl.Size.of(256, 1, 1));
+        if (norm) |n| {
+            if (!fusesNorm(c)) return error.UnsupportedNormFusion;
+            for ([_]Ref{ n.h, n.weight, n.eps, n.dims, n.ho, n.xo, n.xs }, 4..) |r, i| enc2.setBuffer(r.buffer, r.offset, i);
+            enc2.dispatchGroups(mtl.Size.of(1, quant.padded(rows), 1), mtl.Size.of(1024, 1, 1));
+        } else enc2.dispatchThreads(mtl.Size.of(hidden, rows, 1), mtl.Size.of(256, 1, 1));
         try products.end();
     }
 

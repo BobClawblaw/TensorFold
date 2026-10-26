@@ -177,21 +177,26 @@ pub const Pool = struct {
         // one row a slot kept in place: its prepare writes the next conv window, so no commit or publication follows
         const step = step_rounds and in_place and !prompt and oneRowSegments(plan.host);
         try plan.metadata.upload(plan.host);
+        const fused = step and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv == 128; // the prepare in the scan's launch
         var pre = profile.begin(pool.profiler, input_encoder, .gdn_prepare);
         errdefer pre.cancel();
-        if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepare(pre.encoder);
+        if (!fused) {
+            if (step) prepared.prepareStep(pre.encoder, pool.kernels.pre_step) else prepared.prepare(pre.encoder);
+        }
         try pre.end();
         var scan = profile.begin(pool.profiler, input_encoder, .gdn_scan);
         errdefer scan.cancel();
         const wide = prompt and pool.budget.shape.c.dk == 128 and pool.budget.shape.c.dv % 4 == 0;
-        if (pool.marks) |m| {
+        if (fused) {
+            prepared.chainStep(scan.encoder, pool.kernels.chain_step);
+        } else if (pool.marks) |m| {
             if (!wide) return error.BadPromptMarks;
             try m.scan(layer, prepared, scan.encoder, pool.kernels.chain_wide_marks);
         } else prepared.scanChain(scan.encoder, if (wide) pool.kernels.chain_wide else pool.kernels.chain, wide);
         try scan.end();
         var gate = profile.begin(pool.profiler, input_encoder, .gdn_gate);
         errdefer gate.cancel();
-        prepared.gate(gate.encoder);
+        if (fused) prepared.gateStep(gate.encoder, pool.kernels.post_step) else prepared.gate(gate.encoder);
         try gate.end();
         if (step) return;
         var publication = profile.begin(pool.profiler, input_encoder, .state_publish);

@@ -139,6 +139,26 @@ pub const Round = struct {
         e.barrier();
     }
 
+    /// tf_delta_gdn_chain_step: prepareStep and scanChain in one launch (one row a slot in place, dk = dv = 128).
+    pub fn chainStep(r: Round, e: metal.ComputeEncoder, step: metal.Pipeline) void {
+        e.setPipeline(step);
+        bind(e, .{ r.b.qkv, r.b.a, r.b.b, r.b.history, r.b.conv_weight, r.b.a_log, r.b.dt, r.b.windows, r.b.row_slots }, 0);
+        e.setValue(r.p, 9);
+        bind(e, .{ r.b.query, r.b.key, r.b.value, r.b.decay, r.b.mixing, r.b.state, r.b.segments, r.b.recurrent, r.b.next_state }, 10);
+        r.stateGrid(e);
+        e.barrier();
+    }
+
+    /// tf_delta_gdn_post_step: `gate`, then each slot's next conv window into its history.
+    pub fn gateStep(r: Round, e: metal.ComputeEncoder, step: metal.Pipeline) void {
+        e.setPipeline(step);
+        bind(e, .{ r.b.recurrent, r.b.z, r.b.norm }, 0);
+        e.setValue(r.p, 3);
+        bind(e, .{ r.b.output, r.b.qkv, r.b.history, r.b.windows, r.b.row_slots }, 4);
+        e.dispatchGroups(.{ .width = 1, .height = r.p.nv, .depth = r.p.rows }, .{ .width = 32 });
+        e.barrier();
+    }
+
     pub fn usesSlots(r: Round) bool {
         return r.p.dk == 128 and r.compact and r.tree_mode != .snapshot;
     }

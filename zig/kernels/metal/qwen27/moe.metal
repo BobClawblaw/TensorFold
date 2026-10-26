@@ -145,3 +145,86 @@ struct CombineArgs { int hidden, topk, shared_in_out, pad; };
   const float row = a.shared_in_out ? float(OUT[r * a.hidden + j]) : float(Y[(r * stride + a.topk) * a.hidden + j]);
   OUT[r * a.hidden + j] = bfloat(float(bfloat(routed)) + float(bfloat(sigma * row)));
 }
+
+// Eight bf16 at a 16-byte aligned address as floats.
+inline void q27_load8(const device bfloat* at, thread float* out) {
+  const uint4 v = *(const device uint4*)at;
+  const uint words[4] = {v.x, v.y, v.z, v.w};
+  for (int i = 0; i < 4; i++) {
+    out[2 * i] = as_type<float>(words[i] << 16);
+    out[2 * i + 1] = as_type<float>(words[i] & 0xffff0000u);
+  }
+}
+
+// q27_expert_combine for a row a threadgroup of 1,024 threads (hidden / 1,024 columns each, into the threadgroup), then the next
+// norm by the first hidden / 16 threads as norm_xs.metal computes it: HO = bf16(H + out), XO = bf16(Wt * (HO * rsqrt(mean(HO^2) +
+// eps))) and XS its 64-value group sums in the lane projection's order. hidden at most 4,096.
+[[kernel]] void q27_expert_combine_norm(const device bfloat* Y [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
+                                        device bfloat* OUT [[buffer(2)]], constant CombineArgs& a [[buffer(3)]],
+                                        const device bfloat* H [[buffer(4)]], const device bfloat* Wt [[buffer(5)]],
+                                        const constant float* eps [[buffer(6)]], const device int* dims [[buffer(7)]],
+                                        device bfloat* HO [[buffer(8)]], device bfloat* XO [[buffer(9)]], device float* XS [[buffer(10)]],
+                                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                        uint3 tpos [[thread_position_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {
+  const uint t = tpos.x, m = tg.y;
+  const int M = dims[0], MP = dims[1], K = a.hidden;
+  constexpr int E = 16;
+  const int TPG = K / E;
+  threadgroup float red[32];
+  threadgroup bfloat outs[4096];
+  if (int(m) >= M) {
+    if (int(t) < TPG && (t & 3) == 0) XS[(t >> 2) * MP + m] = 0.0f;
+    return;
+  }
+  const size_t r = m, stride = a.topk + 1;
+  const float sigma = WEIGHT[r * stride + a.topk];
+  for (int j = int(t); j < K; j += 1024) {
+    float routed = 0.0f;
+    for (int k = 0; k < a.topk; k++)
+      routed += float(bfloat(float(Y[(r * stride + k) * K + j]) * WEIGHT[r * stride + k]));
+    const float row = a.shared_in_out ? float(OUT[r * K + j]) : float(Y[(r * stride + a.topk) * K + j]);
+    const bfloat out = bfloat(float(bfloat(routed)) + float(bfloat(sigma * row)));
+    OUT[r * K + j] = out;
+    outs[j] = out;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // the norm's threads (every thread reaches the barriers; the rest hold zeros)
+  const bool norms = int(t) < TPG;
+  const int base = int(m) * K + int(t) * E;
+  float hin[E];
+  if (norms) {
+    q27_load8(H + base, hin);
+    q27_load8(H + base + 8, hin + 8);
+  }
+  float hv[E];
+  float ss = 0.0f;
+  for (int i = 0; i < E; i++) {
+    const bfloat h = norms ? bfloat(hin[i] + float(outs[int(t) * E + i])) : bfloat(0.0f);
+    if (norms) HO[base + i] = h;
+    hv[i] = float(h);
+    ss = fma(hv[i], hv[i], ss);
+  }
+  ss = simd_sum(ss);
+  if (lane == 0) red[sg] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!norms) return;
+  float total = 0.0f;
+  for (int i = 0; i < TPG / 32; i++) total += red[i];
+  const float inv = metal::rsqrt(total / float(K) + eps[0]);
+  float wn[E];
+  q27_load8(Wt + int(t) * E, wn);
+  q27_load8(Wt + int(t) * E + 8, wn + 8);
+  float xv[E];
+  for (int i = 0; i < E; i++) {
+    const bfloat x = bfloat(wn[i] * (hv[i] * inv));
+    XO[base + i] = x;
+    xv[i] = float(x);
+  }
+  // a group's 64 values summed in order from zero, as the lane projection's sums are: its four threads take turns
+  float gs = 0.0f;
+  for (uint turn = 0; turn < 4; turn++) {
+    if ((t & 3) == turn) for (int i = 0; i < E; i++) gs += xv[i];
+    gs = simd_shuffle(gs, ushort((lane & ~3u) | turn));
+  }
+  if ((t & 3) == 0) XS[(t >> 2) * MP + m] = gs;
+}
