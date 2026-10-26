@@ -23,7 +23,8 @@ pub const Kernels = struct {
     allocator: std.mem.Allocator,
     device: mtl.Device,
     route: mtl.Pipeline,
-    sort: mtl.Pipeline,
+    count: mtl.Pipeline,
+    place: mtl.Pipeline,
     gather: mtl.Pipeline,
     glu: mtl.Pipeline,
     combine: mtl.Pipeline,
@@ -35,18 +36,18 @@ pub const Kernels = struct {
     pub fn init(a: std.mem.Allocator, device: mtl.Device) !Kernels {
         const lib = try mtl.Library.fromSource(device, source.moe, mtl.CompileOptions.mlx());
         defer lib.deinit();
-        var pipes: [5]mtl.Pipeline = undefined;
+        var pipes: [6]mtl.Pipeline = undefined;
         var made: usize = 0;
         errdefer for (pipes[0..made]) |p| p.deinit();
-        for ([_][:0]const u8{ "q27_route", "q27_route_sort", "q27_route_gather", "q27_expert_glu", "q27_expert_combine" }, &pipes) |name, *p| {
+        for ([_][:0]const u8{ "q27_route", "q27_route_count", "q27_route_place", "q27_route_gather", "q27_expert_glu", "q27_expert_combine" }, &pipes) |name, *p| {
             p.* = try mtl.Pipeline.init(device, lib, name, false);
             made += 1;
         }
-        return .{ .allocator = a, .device = device, .route = pipes[0], .sort = pipes[1], .gather = pipes[2], .glu = pipes[3], .combine = pipes[4] };
+        return .{ .allocator = a, .device = device, .route = pipes[0], .count = pipes[1], .place = pipes[2], .gather = pipes[3], .glu = pipes[4], .combine = pipes[5] };
     }
 
     pub fn deinit(k: *Kernels) void {
-        inline for (.{ k.route, k.sort, k.gather, k.glu, k.combine }) |p| p.deinit();
+        inline for (.{ k.route, k.count, k.place, k.gather, k.glu, k.combine }) |p| p.deinit();
         if (k.rows) |*p| p.deinit();
         var it = k.nax.valueIterator();
         while (it.next()) |pipes| for (pipes) |p| p.deinit();
@@ -121,6 +122,7 @@ pub const Kernels = struct {
         enc.setBuffer(f.get(.picks).buffer, 0, 1);
         enc.setBuffer(f.get(.route_weights).buffer, 0, 2);
         enc.setValue(RouteArgs{ .experts = @intCast(experts), .topk = @intCast(topk), .ld = @intCast(ld), .renorm = @intFromBool(c.renorm) }, 3);
+        enc.setBuffer(f.get(.expert_counts).buffer, 0, 4);
         enc.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(@max(32, (experts + 31) / 32 * 32), 1, 1));
         enc.barrier();
         try span.end();
@@ -129,14 +131,23 @@ pub const Kernels = struct {
         const enc2 = products.encoder;
         if (units) {
             const p = try k.naxPipes(.{ .bits = mo.gate.one.bits, .group = @intCast(mo.gate.one.group) });
-            enc2.setPipeline(k.sort);
+            // the routed slots sorted by expert: counted to their experts, then a thread an expert places its slots
+            const sort_args = SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }; // shared slots skip
+            enc2.setPipeline(k.count);
+            enc2.setBuffer(f.get(.picks).buffer, 0, 0);
+            enc2.setBuffer(f.get(.expert_counts).buffer, 0, 1);
+            enc2.setValue(sort_args, 2);
+            enc2.dispatchThreads(mtl.Size.of(slots, 1, 1), mtl.Size.of(256, 1, 1));
+            enc2.barrier();
+            enc2.setPipeline(k.place);
             enc2.setBuffer(f.get(.picks).buffer, 0, 0);
             enc2.setBuffer(f.get(.route_weights).buffer, 0, 1);
-            enc2.setBuffer(f.get(.offsets).buffer, 0, 2);
-            enc2.setBuffer(f.get(.order).buffer, 0, 3);
-            enc2.setBuffer(f.get(.sorted_weights).buffer, 0, 4);
-            enc2.setValue(SortArgs{ .slots = @intCast(slots), .experts = @intCast(experts) }, 5); // the shared slots skipped
-            enc2.dispatchThreads(mtl.Size.of(1, 1, 1), mtl.Size.of(1, 1, 1));
+            enc2.setBuffer(f.get(.expert_counts).buffer, 0, 2);
+            enc2.setBuffer(f.get(.offsets).buffer, 0, 3);
+            enc2.setBuffer(f.get(.order).buffer, 0, 4);
+            enc2.setBuffer(f.get(.sorted_weights).buffer, 0, 5);
+            enc2.setValue(sort_args, 6);
+            enc2.dispatchThreads(mtl.Size.of(experts, 1, 1), mtl.Size.of(32, 1, 1));
             enc2.barrier();
             enc2.setPipeline(k.gather);
             enc2.setBuffer(f.get(.input).buffer, 0, 0);

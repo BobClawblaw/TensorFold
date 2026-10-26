@@ -10,10 +10,15 @@ struct CombineArgs { int hidden, topk, shared_in_out, pad; };
 // A row a threadgroup: fp32 softmax (to bf16) over LOGITS[row, 0..experts), top-k by logit (lower id on ties).
 [[kernel]] void q27_route(const device bfloat* LOGITS [[buffer(0)]], device uint* PICK [[buffer(1)]],
                           device float* WEIGHT [[buffer(2)]], constant RouteArgs& a [[buffer(3)]],
+                          device atomic_uint* COUNTS [[buffer(4)]],
                           uint r [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                           uint nsg [[simdgroups_per_threadgroup]]) {
   threadgroup float part[32];
+  if (r == 0) { // the first threadgroup clears the experts' slot counts for q27_route_count
+    if (int(t) < a.experts) atomic_store_explicit(COUNTS + t, 0u, memory_order_relaxed);
+    if (t == 0) atomic_store_explicit(COUNTS + a.experts, 0u, memory_order_relaxed);
+  }
   threadgroup float best_v[32];
   threadgroup int best_i[32];
   threadgroup int sel[16];
@@ -84,28 +89,32 @@ struct CombineArgs { int hidden, topk, shared_in_out, pad; };
   }
 }
 
-// Routed slots (id < experts) sorted by expert (stable) for core/affine_mm: OFFS (first slots, the end), ORDER, WS.
-[[kernel]] void q27_route_sort(const device uint* PICK [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
-                               device int* OFFS [[buffer(2)]], device int* ORDER [[buffer(3)]],
-                               device float* WS [[buffer(4)]], constant SortArgs& a [[buffer(5)]],
-                               uint t [[thread_position_in_grid]]) {
-  if (t != 0) return;
-  for (int e = 0; e <= a.experts; e++) OFFS[e] = 0;
-  for (int i = 0; i < a.slots; i++) if (PICK[i] < uint(a.experts)) OFFS[PICK[i]]++;
+// Each routed slot (id < experts) counted to its expert; q27_route cleared the counts.
+[[kernel]] void q27_route_count(const device uint* PICK [[buffer(0)]], device atomic_uint* COUNTS [[buffer(1)]],
+                                constant SortArgs& a [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (int(i) < a.slots && PICK[i] < uint(a.experts)) atomic_fetch_add_explicit(COUNTS + PICK[i], 1u, memory_order_relaxed);
+}
+
+// A thread an expert: the routed slots sorted by expert (stable) for core/affine_mm: OFFS (starts, the end), ORDER, WS.
+[[kernel]] void q27_route_place(const device uint* PICK [[buffer(0)]], const device float* WEIGHT [[buffer(1)]],
+                                const device uint* COUNTS [[buffer(2)]], device int* OFFS [[buffer(3)]],
+                                device int* ORDER [[buffer(4)]], device float* WS [[buffer(5)]],
+                                constant SortArgs& a [[buffer(6)]], uint e [[thread_position_in_grid]]) {
+  if (int(e) >= a.experts) return;
   int at = 0;
-  for (int e = 0; e < a.experts; e++) {
-    const int n = OFFS[e];
-    OFFS[e] = at;
-    at += n;
+  for (int j = 0; j < int(e); j++) at += int(COUNTS[j]);
+  OFFS[e] = at;
+  if (e == 0) {
+    int total = 0;
+    for (int j = 0; j < a.experts; j++) total += int(COUNTS[j]);
+    OFFS[a.experts] = total;
   }
   for (int i = 0; i < a.slots; i++) {
-    if (PICK[i] >= uint(a.experts)) continue;
-    const int at2 = OFFS[PICK[i]]++;
-    ORDER[at2] = i;
-    WS[at2] = WEIGHT[i];
+    if (PICK[i] != e) continue;
+    ORDER[at] = i;
+    WS[at] = WEIGHT[i];
+    at++;
   }
-  for (int e = a.experts; e > 0; e--) OFFS[e] = OFFS[e - 1];
-  OFFS[0] = 0;
 }
 
 // Sorted slot i's input row: X[ORDER[i] / topk] (a row for each of its picks).
