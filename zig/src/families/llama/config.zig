@@ -4,6 +4,11 @@ const std = @import("std");
 pub const head_dim = 128;
 pub const max_layers = 128;
 pub const max_eos = 4;
+/// `bits` of the release as published: bf16 weights, no quantization table.
+pub const bf16: u8 = 16;
+/// The MLX affine conversions' group (llama_convert.py), and the widths the row kernels read here.
+pub const group = 64;
+pub const bit_widths = [_]u8{ 4, 8 };
 /// Query heads a key head at most: a decode attention threadgroup holds a simdgroup each.
 pub const max_group = 32;
 
@@ -28,6 +33,8 @@ pub const Config = struct {
     context: usize,
     eos: [max_eos]u32 = @splat(0),
     eos_count: usize = 0,
+    /// 16 for the release's bf16, else the affine conversion's width (4 or 8).
+    bits: u8 = bf16,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -135,6 +142,21 @@ fn eosIds(v: std.json.Value, c: *Config) Error!void {
     }
 }
 
+/// One uniform MLX affine table: bits the row kernels read, groups of 64, mode affine, no per-module entries.
+fn width(v: std.json.Value) Error!u8 {
+    const q = try object(v);
+    var it = q.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (!std.mem.eql(u8, k, "bits") and !std.mem.eql(u8, k, "group_size") and !std.mem.eql(u8, k, "mode")) return error.UnsupportedLlamaPrecision;
+    }
+    if (q.get("mode")) |m| if (!isString(m, "affine")) return error.UnsupportedLlamaPrecision;
+    if (try integer(q, "group_size") != group) return error.UnsupportedLlamaPrecision;
+    const bits = try integer(q, "bits");
+    for (bit_widths) |b| if (bits == b) return b;
+    return error.UnsupportedLlamaPrecision;
+}
+
 pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer parsed.deinit();
@@ -143,7 +165,8 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
     if (isTrue(root, "attention_bias") or isTrue(root, "mlp_bias") or isTrue(root, "tie_word_embeddings")) return error.UnsupportedLlamaGeometry;
     if (root.get("hidden_act")) |act| if (!isString(act, "silu")) return error.UnsupportedLlamaGeometry;
     for ([_][]const u8{ "torch_dtype", "dtype" }) |key| if (root.get(key)) |d| if (!isString(d, "bfloat16")) return error.UnsupportedLlamaPrecision;
-    if (root.get("quantization") != null or root.get("quantization_config") != null) return error.UnsupportedLlamaPrecision;
+    const bits: u8 = if (root.get("quantization")) |q| try width(q) else bf16;
+    if (root.get("quantization_config")) |q| if (try width(q) != bits) return error.UnsupportedLlamaPrecision;
     var c: Config = .{
         .hidden = try size(root, "hidden_size"),
         .intermediate = try size(root, "intermediate_size"),
@@ -154,6 +177,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
         .eps = @floatCast(try number(root.get("rms_norm_eps") orelse return error.BadLlamaConfig)),
         .theta = try number(root.get("rope_theta") orelse .{ .float = 10000.0 }),
         .context = 0,
+        .bits = bits,
     };
     const kv_heads = try integerOr(root, "num_key_value_heads", @intCast(c.heads));
     if (kv_heads < 1 or kv_heads > c.heads) return error.UnsupportedLlamaGeometry;
@@ -204,7 +228,11 @@ test "other layouts are refused by name" {
         .{ "\"eos_token_id\": 166101", "\"eos_token_id\": [166101, 166102, 166103, 166104, 166105]", error.BadLlamaEos },
         .{ "\"rope_scaling\": null", "\"rope_scaling\": {\"rope_type\": \"llama3\", \"factor\": 8.0}", error.UnsupportedLlamaRotary },
         .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"float16\"", error.UnsupportedLlamaPrecision },
-        .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"bfloat16\", \"quantization\": {\"bits\": 4, \"group_size\": 64}", error.UnsupportedLlamaPrecision },
+        .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"bfloat16\", \"quantization\": {\"bits\": 3, \"group_size\": 64}", error.UnsupportedLlamaPrecision },
+        .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"bfloat16\", \"quantization\": {\"bits\": 8, \"group_size\": 32}", error.UnsupportedLlamaPrecision },
+        .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"bfloat16\", \"quantization\": {\"bits\": 8, \"group_size\": 64, \"mode\": \"mxfp4\"}", error.UnsupportedLlamaPrecision },
+        .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"bfloat16\", \"quantization\": {\"bits\": 8, \"group_size\": 64, \"linear_class\": \"affine\"}", error.UnsupportedLlamaPrecision },
+        .{ "\"torch_dtype\": \"bfloat16\"", "\"torch_dtype\": \"bfloat16\", \"quantization\": {\"bits\": 8, \"group_size\": 64}, \"quantization_config\": {\"bits\": 4, \"group_size\": 64}", error.UnsupportedLlamaPrecision },
         .{ "\"model_type\": \"llama\"", "\"model_type\": \"mistral\"", error.BadLlamaConfig },
         .{ "\"max_position_embeddings\": 524288", "\"max_position_embeddings\": 0", error.BadLlamaContext },
     };
@@ -215,6 +243,18 @@ test "other layouts are refused by name" {
         try std.testing.expectError(c[2], parse(gpa, bytes));
     }
 }
+
+test "the release's config is bf16; llama_convert.py's uniform affine table sets the width" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(cfg_bf16, (try parse(gpa, fixture)).bits);
+    inline for (.{ 8, 4 }) |bits| {
+        const table = std.fmt.comptimePrint("\"torch_dtype\": \"bfloat16\", \"quantization\": {{\"group_size\": 64, \"bits\": {d}, \"mode\": \"affine\"}}, \"quantization_config\": {{\"group_size\": 64, \"bits\": {d}, \"mode\": \"affine\"}}", .{ bits, bits });
+        const bytes = try std.mem.replaceOwned(u8, gpa, fixture, "\"torch_dtype\": \"bfloat16\"", table);
+        defer gpa.free(bytes);
+        try std.testing.expectEqual(@as(u8, bits), (try parse(gpa, bytes)).bits);
+    }
+}
+const cfg_bf16 = bf16;
 
 test "absent fields take HF's defaults: head_dim from the hidden size, every head its own key head, default rope" {
     const gpa = std.testing.allocator;

@@ -78,7 +78,7 @@ pub const Cache = struct {
     }
 };
 
-pub const fields = [_][]const u8{ "ids", "resid", "x", "q", "qn", "att", "y", "gu", "act", "logits_all", "pm", "pl", "po" };
+pub const fields = [_][]const u8{ "ids", "resid", "x", "q", "qn", "att", "y", "gu", "act", "logits_all", "pm", "pl", "po", "sums" };
 
 /// Bytes of each Scratch buffer for `rows` rows at once, in `fields` order.
 fn sizes(c: *const cfg.Config, rows: usize) [fields.len]usize {
@@ -88,10 +88,10 @@ fn sizes(c: *const cfg.Config, rows: usize) [fields.len]usize {
     const qw = r * c.queryWidth() * 2;
     const partials = @as(usize, @min(r, window_rows)) * c.heads * max_blocks * 4; // decode attention's maxima, sums, outputs (fp32)
     return .{
-        r * 4,                                       r * h * 2,                                     r * h * 2,                    r * c.qkvWidth() * 2,
-        qw,                                          qw,                                            r * h * 2,                    r * 2 * c.intermediate * 2,
-        r * c.intermediate * 2,                      @as(usize, @min(r, batch_rows)) * c.vocab * 2, if (prompt) 16 else partials, if (prompt) 16 else partials,
-        if (prompt) 16 else partials * cfg.head_dim,
+        r * 4,                                       r * h * 2,                                                  r * h * 2,                    r * c.qkvWidth() * 2,
+        qw,                                          qw,                                                         r * h * 2,                    r * 2 * c.intermediate * 2,
+        r * c.intermediate * 2,                      @as(usize, @min(r, batch_rows)) * c.vocab * 2,              if (prompt) 16 else partials, if (prompt) 16 else partials,
+        if (prompt) 16 else partials * cfg.head_dim, if (prompt) r * (@max(h, c.intermediate) / 32) * 4 else 16,
     };
 }
 
@@ -116,6 +116,7 @@ pub const Scratch = struct {
     pm: mtl.Buffer, // decode attention's partials by block: maxima, sums, outputs
     pl: mtl.Buffer,
     po: mtl.Buffer,
+    sums: mtl.Buffer, // a prompt chunk's fp32 group sums, an affine conversion's bias operand
     rows: usize,
 
     /// Buffers for `rows` rows at once (batch_rows for decode, prompt_rows for prompt chunks).

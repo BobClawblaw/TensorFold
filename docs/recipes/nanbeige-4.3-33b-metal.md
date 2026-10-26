@@ -96,6 +96,32 @@ Each keeps the replies' bits.
   compiled for a 131,072-token vocabulary): sampled replies decode at the greedy speed.
 - **Not offered.** No int8 or fp8 cache, no fast-math, no reduced-precision sums, no quantized weights.
 
+## 8-bit and 4-bit conversions
+
+`tools/zig/llama_convert.py` writes an MLX affine conversion of the release (groups of 64, `--bits 8` or `4`): every
+projection quantized, q|k|v and gate|up fused into one matrix each so a projection is one call, the embedding and
+norms bf16 as released; `config.json` gains the uniform `quantization` table the family admits. The engine serves the
+folder with the core's row kernels (`row_projection.zig`) for decode windows and its tensor-unit affine matmul
+(`affine_mm.zig`) for prompt chunks, the kernels the other affine families use.
+
+```sh
+python3 tools/zig/llama_convert.py models/nanbeige4.3-33b models/nanbeige4.3-33b-8bit --bits 8   # 33.8 GiB, about 2 minutes
+LLAMA_LOAD_LIMIT_GB=150 zig-out/native/bin/tensorfold-native serve models/nanbeige4.3-33b-8bit --name nanbeige --port 8888 --context 131072 --parallel 2
+```
+
+Measured on the M5 Ultra against the same HF reference and harness plans as the release (bf16 figures from above):
+
+| | bf16 | 8-bit | 4-bit |
+|---|---:|---:|---:|
+| mean KL over 1,500 positions, top-1 | 0.0015, 99.1% | 0.0023, 98.9% | 0.082, 91.1% |
+| greedy chats equal to HF's (64 tokens, 6 chats) | 3 | 4 | 0 (all part within 16 tokens) |
+| decode, 1 stream / 2 streams | 16.4 / 28-32 tok/s | 28.4-28.9 / 52.5-54.1 | 48.1-48.8 / 81.3-84.8 |
+| cold prompt 2.1k / 8.3k / 33k / 61k tokens | 1,259 / 1,313 / 1,074 / 866 tok/s | 1,269 / 1,254 / 1,009 / 815 | 1,344 / 1,312 / 1,044 / 836 |
+
+Windows and one-row steps agree bit for bit on each; every serving check passes. The conversions are lossy, so the
+release stays the recipe's default; the 4-bit one costs a mean KL of 0.082 and parts from the release's greedy text
+within 16 tokens on every chat, and is offered for its speed with that said.
+
 ## Not done
 
 No quality suite was run. No drafter is served (the family has no draft head; copy drafts come from the lane core).

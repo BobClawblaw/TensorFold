@@ -7,6 +7,8 @@ const ck = @import("../../core/checkpoint_metal.zig");
 const shards = @import("../../core/checkpoint.zig");
 const frags = @import("../../core/frags.zig");
 const weights = @import("weights.zig");
+const rows = @import("../../core/row_projection.zig");
+const affine_mm = @import("../../core/affine_mm.zig");
 
 pub const glue_names = [_][:0]const u8{ "ll_embed", "ll_norm", "ll_add", "ll_add_norm", "ll_prep", "ll_silu_gu", "ll_decode_vec", "ll_merge_vec", "ll_argmax", "ll_matvec_1", "ll_matvec_2", "ll_matvec_4", "ll_matvec_8", "ll_matvec_16", "ll_matvec_32" };
 pub const Glue = enum { embed, norm, add, add_norm, prep, silu_gu, decode_vec, merge_vec, argmax, matvec_1, matvec_2, matvec_4, matvec_8, matvec_16, matvec_32 };
@@ -25,6 +27,9 @@ pub const Model = struct {
     sample_full: mtl.Pipeline,
     /// Prompt chunks' bf16 GEMM on the tensor units, by whole M and N tiles.
     gemm: [2][2]mtl.Pipeline,
+    /// An affine conversion's row kernels (decode windows) and tensor-unit matmul (prompt chunks); null for bf16.
+    rows: ?rows.Pipelines,
+    mm: ?affine_mm.Pipes,
     /// RoPE's inverse frequencies: fp32 [head_dim / 2].
     inv: mtl.Buffer,
 
@@ -91,6 +96,25 @@ pub const Model = struct {
             }
         }
         errdefer for (m.gemm) |row| for (row) |p| p.deinit();
+        const quantized = m.config.bits != cfg.bf16;
+        m.rows = if (quantized) try rows.Pipelines.load(m.device) else null;
+        errdefer if (m.rows) |*r| r.deinit();
+        m.mm = null;
+        if (quantized) {
+            const text = try affine_mm.source(m.device, gpa, .{ .bits = m.config.bits, .group = cfg.group });
+            defer gpa.free(text);
+            const lib = try mtl.Library.fromSource(m.device, text, mtl.CompileOptions.mlx());
+            defer lib.deinit();
+            var pipes: affine_mm.Pipes = undefined;
+            var made: usize = 0;
+            errdefer for (pipes[0..made]) |p| p.deinit();
+            for (affine_mm.names, 0..) |n, i| {
+                pipes[i] = try mtl.Pipeline.init(m.device, lib, n, false);
+                made += 1;
+            }
+            m.mm = pipes;
+        }
+        errdefer if (m.mm) |pipes| for (pipes) |p| p.deinit();
         m.inv = try m.device.buffer(cfg.head_dim / 2 * 4, mtl.ResourceOptions.shared);
         m.config.inverseFrequencies(m.inv.slice(f32, cfg.head_dim / 2));
         return m;
@@ -102,6 +126,8 @@ pub const Model = struct {
 
     pub fn deinit(m: *Model) void {
         m.inv.deinit();
+        if (m.mm) |pipes| for (pipes) |p| p.deinit();
+        if (m.rows) |*r| r.deinit();
         for (m.gemm) |row| for (row) |p| p.deinit();
         m.sample_full.deinit();
         m.prompt_attn.deinit();
