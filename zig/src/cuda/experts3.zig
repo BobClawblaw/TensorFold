@@ -22,6 +22,9 @@ pub const Affine3Experts = struct {
     down_fn: Function,
     pre_pair_fn: Function,
     pre_down_fn: Function,
+    oai_pair_fn: Function, // the pair forms under SwiGLU-OAI (Layer.oai)
+    oai_split_fn: Function,
+    oai_pre_pair_fn: Function,
     widen_fn: Function,
     planes_fn: Function,
     resident: [2]usize, // blocks the decode pair and down kernels fill: per SM times SMs
@@ -39,6 +42,9 @@ pub const Affine3Experts = struct {
         pub const down = "_ZN11tf_experts313expert_kernelILi1ELi0ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i";
         pub const pre_pair = "_ZN19tf_experts3_prefill14prefill_kernelILi2ELi2ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i";
         pub const pre_down = "_ZN19tf_experts3_prefill14prefill_kernelILi1ELi3ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i";
+        pub const oai_pair = "_ZN11tf_experts313expert_kernelILi2ELi4ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i";
+        pub const oai_split = "_ZN11tf_experts312split_kernelILi2ELi4ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i";
+        pub const oai_pre_pair = "_ZN19tf_experts3_prefill14prefill_kernelILi2ELi4ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i";
         pub const widen = "tf_experts3_widen";
         pub const planes = "tf_experts3_planes";
     };
@@ -53,6 +59,10 @@ pub const Affine3Experts = struct {
         a.planes_fn = try decode_mod.function(symbols.planes);
         a.pre_pair_fn = try prompt_mod.function(symbols.pre_pair);
         a.pre_down_fn = try prompt_mod.function(symbols.pre_down);
+        a.oai_pair_fn = try decode_mod.function(symbols.oai_pair);
+        a.oai_split_fn = try decode_mod.function(symbols.oai_split);
+        a.oai_pre_pair_fn = try prompt_mod.function(symbols.oai_pre_pair);
+        try a.oai_pre_pair_fn.allowDynamicShared(pair_prompt_smem);
         try a.pre_pair_fn.allowDynamicShared(pair_prompt_smem);
         try a.pre_down_fn.allowDynamicShared(prompt_smem);
         a.resident = .{ @max(1, try a.pair_fn.occupancy(128, 0)) * sms, @max(1, try a.down_fn.occupancy(128, 0)) * sms };
@@ -61,7 +71,7 @@ pub const Affine3Experts = struct {
         return a;
     }
 
-    fn args(x: u64, x_stride: usize, slots: usize, w: u64, kg: usize, nb: usize, p: Plan, out: u64, n: usize, w4: u64, e4: i32) launch_.Args {
+    fn args(x: u64, x_stride: usize, slots: usize, w: u64, kg: usize, nb: usize, p: Plan, out: u64, n: usize, limit: f32, w4: u64, e4: i32) launch_.Args {
         var a: launch_.Args = .{};
         a.add(x);
         a.add(int(x_stride));
@@ -71,7 +81,7 @@ pub const Affine3Experts = struct {
         a.add(int(nb));
         for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
         a.add(int(n));
-        a.add(@as(f32, 0.0));
+        a.add(limit);
         a.add(w4);
         a.add(e4);
         return a;
@@ -84,9 +94,10 @@ pub const Affine3Experts = struct {
         const split = pair and units < e.split_below;
         const grid = if (split) @min(units, e.split_resident) else @min((units + 3) / 4, e.resident[@intFromBool(!pair)]);
         if (grid < 1) return;
-        var a = args(in.x, in.stride, if (pair) in.slots else 0, v.w, v.kg, v.nb, p, out, v.n, v.w4, l.shared);
+        var a = args(in.x, in.stride, if (pair) in.slots else 0, v.w, v.kg, v.nb, p, out, v.n, if (pair) l.limit else 0.0, v.w4, l.shared);
         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = 0 };
-        try launch_.launch(if (split) e.split_fn else if (pair) e.pair_fn else e.down_fn, cfg, s, &a);
+        const f = if (split) (if (l.oai) e.oai_split_fn else e.split_fn) else if (pair) (if (l.oai) e.oai_pair_fn else e.pair_fn) else e.down_fn;
+        try launch_.launch(f, cfg, s, &a);
     }
 
     /// Prompt rows, 64 pairs x 128 columns a CTA: `pair` SwiGLU over the pair tables, else down to bf16 sums.
@@ -94,10 +105,10 @@ pub const Affine3Experts = struct {
         const v = view(l, pair);
         const grid = items * ((v.nb + 3) / 4);
         if (grid < 1) return;
-        var a = args(in.x, in.stride, if (pair) in.slots else 0, v.w, v.kg, v.nb, p, out, v.n, v.w4, l.shared);
+        var a = args(in.x, in.stride, if (pair) in.slots else 0, v.w, v.kg, v.nb, p, out, v.n, if (pair) l.limit else 0.0, v.w4, l.shared);
         const smem = if (pair) pair_prompt_smem else prompt_smem;
         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = smem };
-        try launch_.launch(if (pair) e.pre_pair_fn else e.pre_down_fn, cfg, s, &a);
+        try launch_.launch(if (pair) (if (l.oai) e.oai_pre_pair_fn else e.pre_pair_fn) else e.pre_down_fn, cfg, s, &a);
     }
 
     /// The tables a call reads: the pair form takes D inputs to NI outputs, down NI to D; K in groups of 64.

@@ -569,6 +569,8 @@ pub fn run(gpu: check.Gpu) !void {
     };
     defer for (&contiguous) |*x| x.deinit();
     for (&contiguous) |*x| try kernels.append(a, x.kernel());
+    const minimax = try @import("contract_minimax.zig").Set.init(gpu, s, a, &kernels);
+    defer minimax.deinit();
     var t: g.Tally = .{};
     try @import("contract_dump.zig").run(a, kernels.items);
     const t0 = check.now(gpu.io);

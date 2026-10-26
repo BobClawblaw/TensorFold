@@ -159,6 +159,9 @@ __global__ void __launch_bounds__(WM * WN * 32)
 template __global__ void tf_experts3_prefill::prefill_kernel<2, 2, 2, 2, 4>(const __nv_bfloat16* __restrict__, int,
     int, const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
     void* __restrict__, int, float, const uint4* __restrict__, int);
+template __global__ void tf_experts3_prefill::prefill_kernel<2, 4, 2, 2, 4>(const __nv_bfloat16* __restrict__, int,
+    int, const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
+    void* __restrict__, int, float, const uint4* __restrict__, int);
 template __global__ void tf_experts3_prefill::prefill_kernel<1, 3, 2, 2, 4>(const __nv_bfloat16* __restrict__, int,
     int, const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
     void* __restrict__, int, float, const uint4* __restrict__, int);

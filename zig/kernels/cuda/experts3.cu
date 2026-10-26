@@ -249,15 +249,15 @@ __device__ __forceinline__ void split_loop(float (&acc)[M][4], Part<M> (&parts)[
 }
 
 // epilogue's SwiGLU stores for tile j alone.
-template <int M>
+template <int M, int EPI>
 __device__ __forceinline__ void store_tile(const float (&acc)[M][4], __nv_bfloat16* out, int N, int col, int pr0,
                                            int pr1, bool v0, bool v1, float limit) {
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
     if (!(h ? v1 : v0)) continue;
     const size_t row = (size_t)(h ? pr1 : pr0) * N;
-    const float o0 = swiglu(acc[0][2 * h], acc[M - 1][2 * h], limit);
-    const float o1 = swiglu(acc[0][2 * h + 1], acc[M - 1][2 * h + 1], limit);
+    const float o0 = EPI == 4 ? swiglu_oai(acc[0][2 * h], acc[M - 1][2 * h], limit) : swiglu(acc[0][2 * h], acc[M - 1][2 * h], limit);
+    const float o1 = EPI == 4 ? swiglu_oai(acc[0][2 * h + 1], acc[M - 1][2 * h + 1], limit) : swiglu(acc[0][2 * h + 1], acc[M - 1][2 * h + 1], limit);
     *reinterpret_cast<__nv_bfloat162*>(out + row + col) = __floats2bfloat162_rn(o0, o1);
   }
 }
@@ -269,7 +269,7 @@ __global__ void __launch_bounds__(WARPS * 32)
                  int NB, const int* __restrict__ items, const int* __restrict__ counts,
                  const int* __restrict__ members, void* __restrict__ out, int N, float limit,
                  const uint4* __restrict__ W4, int e4) {
-  static_assert(WARPS == NTW && M == 2 && EPI == 2, "the SwiGLU pair, a warp a tile in the chain");
+  static_assert(WARPS == NTW && M == 2 && (EPI == 2 || EPI == 4), "a SwiGLU pair, a warp a tile in the chain");
   __shared__ Part<M> parts[WARPS];
   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3, w = threadIdx.x >> 5;
   const int units = __ldg(counts) * NB;
@@ -292,7 +292,7 @@ __global__ void __launch_bounds__(WARPS * 32)
       const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * Lane<3>::BLOCK);
       split_loop<M, D, WARPS, 3>(acc, parts, blk, KG, w, lane, t, x0, x1, v0, v1);
     }
-    store_tile<M>(acc, reinterpret_cast<__nv_bfloat16*>(out), N, cb * COLS + 2 * t + 8 * w, pr0, pr1, v0, v1, limit);
+    store_tile<M, EPI>(acc, reinterpret_cast<__nv_bfloat16*>(out), N, cb * COLS + 2 * t + 8 * w, pr0, pr1, v0, v1, limit);
   }
 }
 
@@ -339,9 +339,15 @@ extern "C" __global__ void tf_experts3_planes(const uint32_t* __restrict__ in, u
 template __global__ void tf_experts3::expert_kernel<2, 2, 2, 4>(const __nv_bfloat16* __restrict__, int, int,
     const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
     void* __restrict__, int, float, const uint4* __restrict__, int);
+template __global__ void tf_experts3::expert_kernel<2, 4, 2, 4>(const __nv_bfloat16* __restrict__, int, int,
+    const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
+    void* __restrict__, int, float, const uint4* __restrict__, int);
 template __global__ void tf_experts3::expert_kernel<1, 0, 2, 4>(const __nv_bfloat16* __restrict__, int, int,
     const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
     void* __restrict__, int, float, const uint4* __restrict__, int);
 template __global__ void tf_experts3::split_kernel<2, 2, 2, 4>(const __nv_bfloat16* __restrict__, int, int,
+    const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
+    void* __restrict__, int, float, const uint4* __restrict__, int);
+template __global__ void tf_experts3::split_kernel<2, 4, 2, 4>(const __nv_bfloat16* __restrict__, int, int,
     const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__,
     void* __restrict__, int, float, const uint4* __restrict__, int);

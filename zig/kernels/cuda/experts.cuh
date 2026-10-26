@@ -62,6 +62,16 @@ __device__ __forceinline__ float swiglu(float g, float u, float limit) {
   return bf(gv / (1.f + expf(-gv))) * uv;
 }
 
+// SwiGLU-OAI (MiniMax-M3.1-Flash): (clamp(u) + 1) * g * sigmoid(1.702 g), g = min(gate, limit), in bf16 steps.
+__device__ __forceinline__ float swiglu_oai(float g, float u, float limit) {
+  const float gv = fminf(bf(g), limit), uv = fminf(fmaxf(bf(u), -limit), limit);
+  const float e = expf(-fabsf(bf(gv * 1.702f)));
+  const float y = 1.f / (1.f + e);
+  const float s = bf(gv * 1.702f < 0.f ? 1.f - y : y);
+  const float glu = bf(gv * s);
+  return bf(uv + 1.f) * glu;
+}
+
 __device__ __forceinline__ float relu2(float a) {
   const float u = fmaxf(bf(a), 0.f);
   return u * u;
@@ -88,6 +98,9 @@ __device__ __forceinline__ void epilogue(const float (&acc)[M][RT][NTW][4], int 
         } else if constexpr (EPI == 2) {
           o0 = swiglu(a0, acc[M - 1][r][j][2 * h], limit);
           o1 = swiglu(a1, acc[M - 1][r][j][2 * h + 1], limit);
+        } else if constexpr (EPI == 4) {
+          o0 = swiglu_oai(a0, acc[M - 1][r][j][2 * h], limit);
+          o1 = swiglu_oai(a1, acc[M - 1][r][j][2 * h + 1], limit);
         } else {
           o0 = a0;
           o1 = a1;
