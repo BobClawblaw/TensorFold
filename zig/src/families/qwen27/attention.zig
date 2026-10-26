@@ -12,8 +12,8 @@ const CachePtrs = extern struct { keys: u64, values: u64 };
 const PackArgs = extern struct { rows: u32, packed_rows: u32, heads: u32 = 24, kv_heads: u32 = 4, dim: u32 = 256, group: u32 = 6 };
 const PromptArgs = extern struct { start: i32, rows: i32, chunks: i32, rp: i32, key_stride: i32, value_stride: i32, scale2: f32, tile0: i32, prp: i32, end: i32 };
 
-/// Rows of a prompt chunk the partials hold at once: a wider chunk takes the prompt kernel in slices of this many rows.
-pub const prompt_slice_rows: u32 = 1024;
+/// Rows of a prompt chunk the partials hold at once (they grow with the keys too); a chunk goes through in such slices.
+pub const prompt_slice_rows: u32 = 256;
 pub const Limits = struct {
     rows: u32 = 128,
     streams: u32 = 8,
