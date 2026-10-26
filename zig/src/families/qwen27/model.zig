@@ -93,7 +93,7 @@ pub const Model = struct {
         errdefer m.glue.deinit();
         m.moe = if (c.moe()) try moe_gpu.Kernels.init(a, m.device) else null;
         errdefer if (m.moe) |*k| k.deinit();
-        m.frame = try Frame.init(m.device, c, @max(rows, promptRows(c)));
+        m.frame = try Frame.init(m.device, c, @max(rows, promptRows(c, m.device.tensorUnits())));
         errdefer m.frame.deinit();
         m.ane = null;
         m.share_pending = true;
@@ -157,9 +157,9 @@ pub const Model = struct {
     }
 };
 
-/// A prompt pass's rows: 512, or 1,024 with experts (a chunk reads every expert once); TF_PROMPT_ROWS: 16 to 2048.
-pub fn promptRows(c: cfg.Config) u32 {
-    const default: u32 = if (c.moe()) 1024 else 512;
+/// A prompt pass's rows: 512; 1,024 with experts, 4,096 on tensor units (a chunk reads every expert); TF_PROMPT_ROWS.
+pub fn promptRows(c: cfg.Config, units: bool) u32 {
+    const default: u32 = if (!c.moe()) 512 else if (units) 4096 else 1024;
     const v = std.c.getenv("TF_PROMPT_ROWS") orelse return default;
     const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return default;
     return if (n >= 16 and n <= @import("gpu_frame.zig").max_rows and n % 16 == 0) n else default;

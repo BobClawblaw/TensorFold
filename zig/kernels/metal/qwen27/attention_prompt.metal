@@ -4,7 +4,8 @@
 using namespace metal;
 using namespace mpp::tensor_ops;
 constant constexpr int PG = Q27_G, PKVH = Q27_KVH, PD = 256, PH = 128, PCK = 512, PTK = 32; // after attention_mpp.metal's G
-struct Q27PromptArgs { int start, rows, chunks, rp, key_stride, value_stride; float scale2; };
+// A slice of the packed rows (tiles from tile0, prp of them, rows through end) indexes its own partials.
+struct Q27PromptArgs { int start, rows, chunks, rp, key_stride, value_stride; float scale2; int tile0, prp, end; };
 typedef vec<float, 8> q27f8;
 typedef vec<bfloat, 8> q27b8;
 typedef vec<half, 8> q27h8;
@@ -112,15 +113,15 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
     uint3 tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
   const short qid = lane >> 2, fm = (qid & 4) | ((lane >> 1) & 3), fn = ((qid & 2) | (lane & 1)) * 4;
   const short h = sg & 1;
-  const int tile = int(tg.z) * (SG / 2) + (sg >> 1);
+  const int tile = int(tg.z) * (SG / 2) + (sg >> 1), gtile = args.tile0 + tile;
   const int hk = int(tg.x), c = int(tg.y);
-  const bool live = tile * 16 < args.rp;
+  const bool live = tile * 16 < args.prp;
   threadgroup float xs[SG][32][16];
-  const int r0 = tile * 16 + fm, r1 = r0 + 8;
+  const int r0 = gtile * 16 + fm, r1 = r0 + 8;
   const int n0 = live && r0 < args.rows * PG ? args.start + r0 / PG + 1 : 0;
   const int n1 = live && r1 < args.rows * PG ? args.start + r1 / PG + 1 : 0;
-  const int kbeg = c * PCK, kend = min(kbeg + PCK, args.start + args.rows);
-  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? tile * 16 : 0)) * PD + h * PH;
+  const int kbeg = c * PCK, kend = min(kbeg + PCK, args.start + args.end);
+  const device bfloat* q = QA + ((int64_t)hk * args.rp + (live ? gtile * 16 : 0)) * PD + h * PH;
   const device bfloat* k = caches[0].keys + (int64_t)hk * args.key_stride + h * PH;
   const device bfloat* v = caches[0].values + (int64_t)hk * args.value_stride + h * PH;
   Q27PromptRun r;
@@ -131,7 +132,7 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
   for (; kt + PTK <= kend; kt += PTK) q27_prompt_step<false>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
   if (kt < kend) q27_prompt_step<true>(r, kt, kend, q, k, v, xs, sg, lane, fm, fn, h, n0, n1, args.scale2);
   if (!live) return;
-  const int64_t base = ((int64_t)hk * args.chunks + c) * args.rp + tile * 16;
+  const int64_t base = ((int64_t)hk * args.chunks + c) * args.prp + tile * 16;
   _Pragma("clang loop unroll(full)")
   for (int j = 0; j < 8; j++) {
     device float* dst = PO + (base + fm) * PD + h * PH + j * 16 + fn;
@@ -146,7 +147,7 @@ kernel void q27_attn_prompt(device const bfloat* QA [[buffer(0)]], device const 
 #define Q27_PROMPT(SG) template [[host_name("q27_attn_prompt_" #SG)]] kernel void q27_attn_prompt<SG>(device const bfloat*, device const Q27AttnReadPtrs*, constant Q27PromptArgs&, device float*, device float*, device float*, uint3, ushort, ushort);
 Q27_PROMPT(8)
 
-// A packed row's chunks merged in key order, normalized and written as the row's head output.
+// A slice's packed row: its chunks merged in key order, normalized and written as the row's head output.
 kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device const float* PM [[buffer(1)]], device const float* PL [[buffer(2)]],
     constant Q27PromptArgs& args [[buffer(3)]], device bfloat* OUT [[buffer(4)]],
     uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
@@ -155,7 +156,7 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
   float m = -INFINITY, l = 0.0f, o[DP];
   for (int i = 0; i < DP; i++) o[i] = 0.0f;
   for (int c = 0; c < args.chunks; c++) {
-    const int64_t row = ((int64_t)hk * args.chunks + c) * args.rp + r;
+    const int64_t row = ((int64_t)hk * args.chunks + c) * args.prp + r;
     const float mc = PM[row];
     if (mc == -INFINITY) continue;
     const float lc = PL[row];
@@ -165,6 +166,6 @@ kernel void q27_attn_prompt_merge(device const float* PO [[buffer(0)]], device c
     for (int i = 0; i < DP; i++) o[i] = o[i] * f1 + PO[row * PD + lane * DP + i] * f2;
     m = nm;
   }
-  const int node = r / PG, head = hk * PG + r % PG;
+  const int pr = args.tile0 * 16 + r, node = pr / PG, head = hk * PG + pr % PG;
   for (int i = 0; i < DP; i++) OUT[((int64_t)node * (PG * PKVH) + head) * PD + lane * DP + i] = static_cast<bfloat>(o[i] / l);
 }

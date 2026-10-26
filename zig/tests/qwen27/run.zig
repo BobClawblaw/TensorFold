@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
         const value = args[i];
         if (std.mem.eql(u8, arg, "--model")) model = value else if (std.mem.eql(u8, arg, "--tokens")) file = value else if (std.mem.eql(u8, arg, "--reference")) reference = value else if (std.mem.eql(u8, arg, "--max-tokens")) count = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--chunk")) chunk = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--profile-steps")) profile_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--compare-chunk")) compare = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seams")) seam_every = try std.fmt.parseInt(usize, value, 10) else return error.UnknownOption;
     }
-    if (!run or model == null or file == null or chunk == 0 or chunk > 2048 or compare > 2048 or count > 65536 or (seam_every > 0 and compare == 0)) return error.BadOptions;
+    if (!run or model == null or file == null or chunk == 0 or chunk > q.gpu_frame.max_rows or compare > q.gpu_frame.max_rows or count > 65536 or (seam_every > 0 and compare == 0)) return error.BadOptions;
     const ids = try tokens(a, io, file.?);
     if (ids.len == 0 or ids.len + count > 262144) return error.BadPrompt;
     const expected = if (reference) |path| try tokens(a, io, path) else null;
