@@ -173,6 +173,10 @@ CUDA also checks GLM-5.3-Flash's KV page kernels on a page table out of order: t
 `tf_glm_dsa_tokens`), and the MLA chunks through their merge (`tf_glm_chunks_16` and `tf_glm_chunks_32`, dense and
 sparse).
 
+Ornith-1.5-122B's routed block on Metal registers the experts' decode rows with the shared expert as an extra matrix
+(`q27_rows_extra`, 4 and 8 bits), the router's softmax and top-k with renormalized bf16 weights (`q27_route`: picks
+equal to the host's, each weight within float64's range at its bf16 points), the tensor units' expert sort and gather
+(bit for bit), the experts' SwiGLU, and the weighted combine with the gated shared expert (in place and from its slot).
 GLM's Metal window projections register narrow and wide rows at 2, 3, 4, 5, 6 and 8 bits, plus both gathered paths.
 Independent FP64 linear cases accompany byte replacements against frozen pre-window-optimization kernels.
 The gathered SwiGLU keeps its predecessor's clipped BF16 output and nonfinite rules; gate/up taps qualify its dots separately.
