@@ -5,11 +5,15 @@ const lanes = @import("lanes");
 const cfg = @import("config.zig");
 const st = @import("state.zig");
 const wts = @import("weights.zig");
+const rows = @import("../../core/row_projection.zig");
+const affine_mm = @import("../../core/affine_mm.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
 
 /// The glue kernels' constants (glue.metal's ll_args).
 const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, eps: f32 = 0 };
+/// The affine embedding's constants (glue.metal's ll_qargs).
+const QArgs = extern struct { rows: u32, width: u32, bits: u32, group: u32 };
 /// The q, k and v preparation's constants (glue.metal's ll_prep_args).
 const PArgs = extern struct { rows: u32, heads: u32, kv_heads: u32, pos: u32, stride: u32 };
 /// The bf16 row projection's constants (glue.metal's ll_mv_args).
@@ -30,6 +34,34 @@ const Enc = struct {
         const g3 = mtl.Size.of(grid[0], grid[1], grid[2]);
         const t3 = mtl.Size.of(group[0], group[1], group[2]);
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
+    }
+
+    /// y = x W^T (rows `ldy` apart, from byte `out_off`): bf16 rows through `dense`, MLX's through `affine`.
+    fn project(x: Enc, l: wts.Linear, in: mtl.Buffer, out: mtl.Buffer, out_off: usize, n_rows: usize, ldy: usize) !void {
+        switch (l) {
+            .bf16 => |d| x.dense(d, in, out, out_off, n_rows, ldy),
+            .affine => |w| try x.affine(w, in, out, out_off, n_rows, ldy),
+        }
+    }
+
+    /// y = x W^T over affine weights (rows `ldy` apart): the core's row kernels a window, its affine matmul a chunk.
+    fn affine(x: Enc, w: rows.Weights, in: mtl.Buffer, out: mtl.Buffer, out_off: usize, n_rows: usize, ldy: usize) !void {
+        if (n_rows > st.batch_rows) {
+            const p = x.m.mm orelse return error.UnsupportedLlamaWeights;
+            affine_mm.rowSums(x.e, p, @intCast(w.group), b(in), b(x.s.sums), @intCast(n_rows), @intCast(w.k));
+            affine_mm.denseBatch(x.e, p, b(in), b(x.s.sums), mat(w), bo(out, out_off), @intCast(n_rows), 1, .{ .x_row = @intCast(w.k), .y_row = @intCast(ldy) });
+            return;
+        }
+        const pipes = if (x.m.rows) |*r| r else return error.UnsupportedLlamaWeights;
+        const call = if (ldy == w.n) try rows.call(pipes, w, n_rows, false) else try rows.callStrided(pipes, w, n_rows, ldy);
+        x.e.setPipeline(call.pipeline);
+        x.e.setBuffer(in, 0, 0);
+        x.e.setBuffer(w.w, w.w_off, 1);
+        x.e.setBuffer(w.scales, w.s_off, 2);
+        x.e.setBuffer(w.biases, w.b_off, 3);
+        x.e.setValue(call.dims, 4);
+        x.e.setBuffer(out, out_off, 5);
+        x.e.dispatchGroups(mtl.Size.of(call.groups, 1, 1), mtl.Size.of(call.threads, 1, 1));
     }
 
     /// y [rows, d.n] (rows `ldy` apart, from byte `out_off`) = x W^T: gemm_nax a prompt chunk, ll_matvec a window.
@@ -72,6 +104,11 @@ fn t(x: wts.Tensor) B {
     return .{ .buf = x.buffer, .off = x.offset };
 }
 const A = B{ .args = true };
+
+/// A matrix as affine_mm takes it.
+fn mat(w: rows.Weights) struct { w: B, s: B, b: B, n: u32, k: u32 } {
+    return .{ .w = bo(w.w, w.w_off), .s = bo(w.scales, w.s_off), .b = bo(w.biases, w.b_off), .n = @intCast(w.n), .k = @intCast(w.k) };
+}
 
 /// All rows' logits or the last's; ids on the GPU; the last row drawn on the GPU; committed unwaited into `flight`.
 pub const Out = struct { all: bool = false, timing: ?*Timing = null, ids: ?B = null, draw: ?Draw = null, flight: ?*mtl.CommandBuffer = null };
@@ -118,16 +155,20 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
     const cb = m.queue.commandBuffer();
     const x = Enc{ .e = cb.compute(.serial), .m = m, .s = s };
     const W = m.weights;
-    x.glue(.embed, Args{ .rows = nr, .width = @intCast(h) }, &.{ out.ids orelse b(s.ids), bo(W.embed.buf, W.embed.off), A, b(s.resid) }, .{ h, n, 1 }, .{ 256, 1, 1 }, false);
+    const tokens = out.ids orelse b(s.ids);
+    switch (W.embed) {
+        .bf16 => |d| x.glue(.embed, Args{ .rows = nr, .width = @intCast(h) }, &.{ tokens, bo(d.buf, d.off), A, b(s.resid) }, .{ h, n, 1 }, .{ 256, 1, 1 }, false),
+        .affine => |w| x.glue(.embed_affine, QArgs{ .rows = nr, .width = @intCast(h), .bits = w.bits, .group = @intCast(w.group) }, &.{ tokens, bo(w.w, w.w_off), bo(w.scales, w.s_off), bo(w.biases, w.b_off), A, b(s.resid) }, .{ h, n, 1 }, .{ 256, 1, 1 }, false),
+    }
     const normed = Args{ .rows = nr, .width = @intCast(h), .eps = c.eps };
     x.glue(.norm, normed, &.{ b(s.resid), t(W.layers[0].input_norm), A, b(s.x) }, .{ n, 1, 1 }, .{ 256, 1, 1 }, true);
     for (W.layers, 0..) |l, i| try layer(x, segments, l, i, n, if (i + 1 < W.layers.len) W.layers[i + 1].input_norm else null);
     if (out.all) {
         x.glue(.norm, normed, &.{ b(s.resid), t(W.norm), A, b(s.x) }, .{ n, 1, 1 }, .{ 256, 1, 1 }, true);
-        x.dense(W.head, s.x, s.logits_all, 0, n, c.vocab);
+        try x.project(W.head, s.x, s.logits_all, 0, n, c.vocab);
     } else {
         x.glue(.norm, normed, &.{ bo(s.resid, (n - 1) * h * 2), t(W.norm), A, b(s.x) }, .{ 1, 1, 1 }, .{ 256, 1, 1 }, true);
-        x.dense(W.head, s.x, segments[0].cache.logits, 0, 1, c.vocab);
+        try x.project(W.head, s.x, segments[0].cache.logits, 0, 1, c.vocab);
         if (out.draw) |d| pick(x, segments[0].cache.logits, d);
     }
     x.e.end();
@@ -195,20 +236,20 @@ fn layer(x: Enc, segments: []const Segment, l: wts.Layer, i: usize, n: usize, ne
     const nr: u32 = @intCast(n);
     const normed = Args{ .rows = nr, .width = @intCast(h), .eps = c.eps };
     const qkvw = c.qkvWidth();
-    x.dense(l.attn.q, s.x, s.q, 0, n, qkvw);
-    x.dense(l.attn.k, s.x, s.q, c.queryWidth() * 2, n, qkvw);
-    x.dense(l.attn.v, s.x, s.q, (c.queryWidth() + c.kvWidth()) * 2, n, qkvw);
+    try x.project(l.attn.q, s.x, s.q, 0, n, qkvw);
+    try x.project(l.attn.k, s.x, s.q, c.queryWidth() * 2, n, qkvw);
+    try x.project(l.attn.v, s.x, s.q, (c.queryWidth() + c.kvWidth()) * 2, n, qkvw);
     var base: usize = 0;
     for (segments) |seg| {
         try attention(x, seg.cache, i, base, seg.rows);
         base += seg.rows;
     }
-    x.dense(l.attn.o, s.att, s.y, 0, n, h);
+    try x.project(l.attn.o, s.att, s.y, 0, n, h);
     x.glue(.add_norm, normed, &.{ b(s.resid), b(s.y), t(l.post_norm), A, b(s.x) }, .{ n, 1, 1 }, .{ 256, 1, 1 }, true);
-    x.dense(l.mlp.gate, s.x, s.gu, 0, n, 2 * c.intermediate);
-    x.dense(l.mlp.up, s.x, s.gu, c.intermediate * 2, n, 2 * c.intermediate);
+    try x.project(l.mlp.gate, s.x, s.gu, 0, n, 2 * c.intermediate);
+    try x.project(l.mlp.up, s.x, s.gu, c.intermediate * 2, n, 2 * c.intermediate);
     x.glue(.silu_gu, Args{ .rows = nr, .width = @intCast(c.intermediate) }, &.{ b(s.gu), A, b(s.act) }, .{ c.intermediate, n, 1 }, .{ 256, 1, 1 }, false);
-    x.dense(l.mlp.down, s.act, s.y, 0, n, h);
+    try x.project(l.mlp.down, s.act, s.y, 0, n, h);
     if (next) |w| {
         x.glue(.add_norm, normed, &.{ b(s.resid), b(s.y), t(w), A, b(s.x) }, .{ n, 1, 1 }, .{ 256, 1, 1 }, true);
     } else x.glue(.add, Args{ .rows = nr, .width = @intCast(h) }, &.{ b(s.resid), b(s.y), A }, .{ h, n, 1 }, .{ 256, 1, 1 }, false);

@@ -68,6 +68,7 @@ const common = [_]Reg{
     .{ .v = .{ .kind = .affine_mm, .bits = 4, .group = 64 }, .name = "metal affine_mm q4 g64" },
     .{ .v = .{ .kind = .affine_mm, .bits = 4, .group = 64, .f32_out = true }, .name = "metal affine_mm q4 g64 fp32 out" },
     .{ .v = .{ .kind = .affine_mm, .bits = 8, .group = 32 }, .name = "metal affine_mm q8 g32" },
+    .{ .v = .{ .kind = .affine_mm, .bits = 8, .group = 64 }, .name = "metal affine_mm q8 g64" },
     .{ .v = .{ .kind = .simd, .bits = 4, .group = 64 }, .name = "metal simd_qmm q4 g64" },
     .{ .v = .{ .kind = .simd_bits, .bits = 3, .group = 64 }, .name = "metal simd_qmm_bits q3 g64" },
     .{ .v = .{ .kind = .simd_bits, .bits = 6, .group = 64 }, .name = "metal simd_qmm_bits q6 g64" },

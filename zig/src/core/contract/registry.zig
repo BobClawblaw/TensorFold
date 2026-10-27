@@ -396,6 +396,7 @@ pub const metal = @import("fsr_records.zig").metal ++ [_]M{
     .{ .name = "affine_mm q4 g64 tf_affine_row_sums", .threads = 64, .tg_memory = 0, .m1 = 1024, .m2 = 1024 },
     .{ .name = "affine_mm q4 g64 tf_affine_mm", .threads = 128, .tg_memory = 9728, .offline = false },
     .{ .name = "affine_mm q8 g32 tf_affine_mm", .threads = 128, .tg_memory = 10240, .offline = false },
+    .{ .name = "affine_mm q8 g64 tf_affine_mm", .threads = 128, .tg_memory = 9728, .offline = false },
     .{ .name = "simd_qmm tf_sq_mma_16_4_1", .threads = 512, .tg_memory = 16384, .m1 = 768, .m2 = 768, .adapts = true },
     .{ .name = "simd_qmm tf_sq_mma_16_2_2", .threads = 512, .tg_memory = 16384, .m1 = 704, .m2 = 704, .adapts = true },
     .{ .name = "simd_qmm tf_sq_mma_8_4_1", .threads = 256, .tg_memory = 8192, .m1 = 768, .m2 = 768, .adapts = true },

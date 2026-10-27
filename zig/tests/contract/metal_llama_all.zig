@@ -64,7 +64,7 @@ pub const Set = struct {
 
     /// Every registration whose name holds `only`; the roll call checks the registrations cover every pipeline.
     pub fn collect(s: *Set, a: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, tensor: bool, kernels: *std.ArrayList(g.Kernel), only: ?[]const u8) !void {
-        var functions: [family.pipelines + 1][]const u8 = undefined;
+        var functions: [family.pipelines + 1][]const u8 = undefined; // ll_embed_affine registers twice: q4 and q8
         var n: usize = 0;
         for (std.enums.values(llama.Which)) |w| {
             functions[n] = llama.function(w);
@@ -149,6 +149,7 @@ pub fn limits(a: std.mem.Allocator, device: mtl.Device, tensor: bool, only: ?[]c
     const Decl = struct { name: []const u8, threads: u32, tg: u32 };
     const decls = [_]Decl{
         .{ .name = "llama glue ll_embed", .threads = 256, .tg = 0 },
+        .{ .name = "llama glue ll_embed_affine", .threads = 256, .tg = 0 },
         .{ .name = "llama glue ll_norm", .threads = 256, .tg = 128 },
         .{ .name = "llama glue ll_add", .threads = 256, .tg = 0 },
         .{ .name = "llama glue ll_add_norm", .threads = 256, .tg = 128 },

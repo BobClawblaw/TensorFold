@@ -16,6 +16,10 @@ const G3 = family.nanbeige41;
 /// glue.metal's argument structs, as forward.zig fills them.
 pub const Args = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, eps: f32 = 0 };
 const PArgs = extern struct { rows: u32, heads: u32, kv_heads: u32, pos: u32, stride: u32 };
+const QArgs = extern struct { rows: u32, width: u32, bits: u32, group: u32 };
+
+/// MLX's affine group: a scale and a bias each 64 codes.
+const GROUP = 64;
 
 /// A value through fp32 and then bf16, as the kernels round.
 pub fn bf(v: f64) f64 {
@@ -43,11 +47,17 @@ pub fn pipelineOf(lib: mtl.Library, device: mtl.Device, name: []const u8) !mtl.P
     return mtl.Pipeline.init(device, lib, z, false);
 }
 
-pub const Which = enum { embed, norm, add, add_norm, silu, prep };
+pub const Which = enum { embed, embed_q4, embed_q8, norm, add, add_norm, silu, prep };
+
+/// An affine embedding's code width.
+fn bitsOf(w: Which) u32 {
+    return if (w == .embed_q4) 4 else 8;
+}
 
 pub fn function(w: Which) []const u8 {
     return switch (w) {
         .embed => "ll_embed",
+        .embed_q4, .embed_q8 => "ll_embed_affine",
         .norm => "ll_norm",
         .add => "ll_add",
         .add_norm => "ll_add_norm",
@@ -61,6 +71,9 @@ pub fn spec(w: Which) c.Spec {
     const anyk: [3]c.Tile = .{ .{}, .{}, .{ .size = 256, .step = 1, .min = 1 } };
     return switch (w) {
         .embed => .{ .name = "llama glue ll_embed", .accum = .none, .depth = none, .out = .bf16, .served = widths, .sums = no_sums },
+        // bf16(scale * code) then the bias: the product is exact in fp32, the sum rounds in fp32 then to bf16
+        .embed_q4 => .{ .name = "llama glue ll_embed_affine q4", .accum = .none, .depth = none, .ops = 1, .mids = 1, .out = .bf16, .served = widths, .sums = no_sums },
+        .embed_q8 => .{ .name = "llama glue ll_embed_affine q8", .accum = .none, .depth = none, .ops = 1, .mids = 1, .out = .bf16, .served = widths, .sums = no_sums },
         .norm => .{ .name = "llama glue ll_norm", .accum = .f32, .depth = normDepth, .ops = 3, .mids = 3, .out = .bf16, .tiles = anyk, .served = widths, .sums = rms_sums },
         .add => .{ .name = "llama glue ll_add", .accum = .none, .depth = none, .out = .bf16, .in_place = true, .served = widths, .sums = no_sums },
         .add_norm => .{ .name = "llama glue ll_add_norm", .accum = .f32, .depth = normDepth, .ops = 3, .mids = 3, .out = .bf16, .in_place = true, .tiles = anyk, .served = widths, .sums = rms_sums },
@@ -82,7 +95,8 @@ pub const Glue = struct {
     r: ?rows_in.Rows = null,
     x: []u16 = &.{}, // the residual's first contents (add, add_norm), gu (silu), q|k|v (prep), the logits (argmax)
     y: []u16 = &.{}, // the added rows (add, add_norm)
-    table: []u16 = &.{},
+    table: []u16 = &.{}, // the embedding (embed), its scales then its biases (embed_q4, embed_q8)
+    words: []u32 = &.{}, // the affine embedding's packed codes
     ids: []u32 = &.{},
     inv: []f32 = &.{},
     in: [3]rig_.Ref = undefined,
@@ -103,6 +117,8 @@ pub const Glue = struct {
         }
         p.a.free(p.ids);
         p.ids = &.{};
+        p.a.free(p.words);
+        p.words = &.{};
         p.a.free(p.inv);
         p.inv = &.{};
         p.rig.reset();
@@ -155,6 +171,23 @@ pub const Glue = struct {
                 for (p.ids, 0..) |*id, i| id.* = @intCast(i % 8);
                 p.in[0] = try p.rig.input(std.mem.sliceAsBytes(p.ids));
                 p.in[1] = try p.rig.input(std.mem.sliceAsBytes(p.table));
+                p.out[0] = try p.rig.output(n * 2);
+            },
+            .embed_q4, .embed_q8 => {
+                if (w % GROUP != 0) return false;
+                const bits = bitsOf(p.which);
+                const groups = 8 * w / GROUP;
+                p.words = try p.a.alloc(u32, 8 * w * bits / 32);
+                for (p.words) |*v| v.* = rng.int(u32);
+                p.table = try p.a.alloc(u16, 2 * groups);
+                random16(rng, p.table[0..groups], 0.001, 0.05);
+                random16(rng, p.table[groups..], -1, 1);
+                if (fill == .nonfinite) plant(p.table[0..groups], w / GROUP, 8);
+                p.ids = try p.a.alloc(u32, s.rows);
+                for (p.ids, 0..) |*id, i| id.* = @intCast((i * 5) % 8);
+                p.in[0] = try p.rig.input(std.mem.sliceAsBytes(p.ids));
+                p.in[1] = try p.rig.input(std.mem.sliceAsBytes(p.words));
+                p.in[2] = try p.rig.input(std.mem.sliceAsBytes(p.table));
                 p.out[0] = try p.rig.output(n * 2);
             },
             .norm, .add_norm => {
@@ -244,6 +277,16 @@ pub const Glue = struct {
                 e.setBuffer(p.out[0].buf, p.out[0].off, 3);
                 e.dispatchThreads(grid, threads);
             },
+            .embed_q4, .embed_q8 => {
+                const groups = 8 * p.width() / GROUP;
+                e.setBuffer(p.in[0].buf, p.in[0].off, 0);
+                e.setBuffer(p.in[1].buf, p.in[1].off, 1);
+                e.setBuffer(p.in[2].buf, p.in[2].off, 2);
+                e.setBuffer(p.in[2].buf, p.in[2].off + groups * 2, 3);
+                e.setValue(QArgs{ .rows = rows, .width = w, .bits = bitsOf(p.which), .group = GROUP }, 4);
+                e.setBuffer(p.out[0].buf, p.out[0].off, 5);
+                e.dispatchThreads(grid, threads);
+            },
             .norm => {
                 e.setBuffer(p.in[0].buf, p.in[0].off, 0);
                 e.setBuffer(p.in[1].buf, p.in[1].off, 1);
@@ -309,6 +352,19 @@ pub const Glue = struct {
             .embed => for (0..s.rows) |r| for (0..w) |i| {
                 want[r * w + i] = xv(p.table, p.ids[r] * w + i);
                 mag[r * w + i] = @abs(want[r * w + i]);
+            },
+            .embed_q4, .embed_q8 => {
+                const bits = bitsOf(p.which);
+                const groups = 8 * w / GROUP;
+                for (0..s.rows) |r| for (0..w) |i| {
+                    const id = p.ids[r];
+                    const bit = (id * w + i) * bits; // MLX packs a row's codes low bits first, rows end on a word
+                    const code = (p.words[bit / 32] >> @intCast(bit % 32)) & ((@as(u32, 1) << @intCast(bits)) - 1);
+                    const gi = id * (w / GROUP) + i / GROUP;
+                    const scaled = xv(p.table, gi) * @as(f64, @floatFromInt(code));
+                    want[r * w + i] = bf(bf(scaled) + xv(p.table, groups + gi));
+                    mag[r * w + i] = @abs(scaled) + @abs(xv(p.table, groups + gi));
+                };
             },
             .norm => {
                 const x = try p.a.alloc(f64, w);

@@ -13,6 +13,22 @@ struct ll_args { uint rows, width, heads; float eps; };
   R[(size_t)p.y * a.width + p.x] = E[(size_t)ids[p.y] * a.width + p.x];
 }
 
+// An MLX affine embedding's rows (mlx_lm's QuantizedEmbedding): bf16(bf16(scale * q) + bias), as MLX's dequantize.
+struct ll_qargs { uint rows; uint width; uint bits; uint group; };
+[[kernel]] void ll_embed_affine(const device uint* ids [[buffer(0)]], const device uint* W [[buffer(1)]],
+    const device bfloat* S [[buffer(2)]], const device bfloat* Z [[buffer(3)]], constant ll_qargs& a [[buffer(4)]],
+    device bfloat* R [[buffer(5)]], uint2 p [[thread_position_in_grid]]) {
+  if (p.x >= a.width || p.y >= a.rows) return;
+  const size_t id = ids[p.y];
+  const device uint* row = W + id * (size_t(a.width) * a.bits / 32);
+  const uint bit = p.x * a.bits, shift = bit % 32;
+  uint code = row[bit / 32] >> shift;
+  if (shift + a.bits > 32) code |= row[bit / 32 + 1] << (32 - shift);
+  code &= (1u << a.bits) - 1u;
+  const size_t g = id * (a.width / a.group) + p.x / a.group;
+  R[(size_t)p.y * a.width + p.x] = bfloat(float(bfloat(float(S[g]) * float(code))) + float(Z[g]));
+}
+
 // LlamaRMSNorm on a row: out = bf16(w * bf16(x * rsqrt(mean(x^2) + eps))), the mean in fp32 over the bf16 row.
 inline void ll_norm_row(const device bfloat* x, const device bfloat* w, constant ll_args& a, device bfloat* out,
     float sum, uint t, uint n, threadgroup float* part) {

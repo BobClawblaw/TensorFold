@@ -47,11 +47,11 @@ calls take the template's XML form (its `tool_call_format` default), which the s
   copy drafts and the prompt cache.
 
 Every kernel is registered with the kernel contract (`zig/tests/contract/metal_llama*.zig`, the roll call in
-`contracts.zig`): the glue, the six row-projection forms, the four GEMM forms and the prompt attention at both served
-geometries. `tf-kernel-contract --only llama` on the M5 Ultra:
+`contracts.zig`): the glue, the affine embedding at 4 and 8 bits, the six row-projection forms, the four GEMM forms and
+the prompt attention at both served geometries. `tf-kernel-contract --only llama` on the M5 Ultra:
 
 ```
-SUMMARY 21 kernels: 21 pass gates 1-4, 0 fail, 0 known findings; 0 controls: 0 red as planted, 0 missed; 0 limit problems; gates 432063 ms, limits 105 ms
+SUMMARY 23 kernels: 23 pass gates 1-4, 0 fail, 0 known findings; 0 controls: 0 red as planted, 0 missed; 0 limit problems; gates 412040 ms, limits 90 ms
 ```
 
 ## Measured (M5 Ultra, the bf16 release, 26 Oct 2026)
@@ -157,7 +157,45 @@ Each keeps the replies' bits.
   harness's prompts and gave no measurable decode gain (drafted 16 tokens/s, undrafted 16).
 - **Sampling.** Draws run `tf_sample_full` over the whole 166,912-token vocabulary (the 1,024-candidate kernel is
   compiled for a 131,072-token vocabulary): sampled replies decode at the greedy speed.
-- **Not offered.** No int8 or fp8 cache, no fast-math, no reduced-precision sums, no quantized weights.
+- **Not offered.** No int8 or fp8 cache, no fast-math, no reduced-precision sums; no quantization of our own (the
+  MLX quants below are served as published).
+
+## Published MLX quants (8-bit and 4-bit)
+
+Nanbeige publishes no quantized checkpoint. The family reads MLX affine checkpoints as `mlx_lm` writes them, in place:
+a uniform `quantization` table (groups of 64, 4 or 8 bits, `affine`), every projection and the embedding and head
+quantized, the norms bf16. Decode windows run the core's row kernels (`row_projection.zig`), prompt chunks its
+tensor-unit affine matmul (`affine_mm.zig`), the kernels the other affine families use; the embedding's rows come from
+`ll_embed_affine`, MLX's dequantize (`bf16(bf16(scale * q) + bias)`). Checked on two community quants, pinned:
+
+```sh
+hf download pratikgx/Nanbeige4.3-33B-MLX-4bit --revision 883c8bda53b2062ff7e37f178ccf503c79674797 \
+  --local-dir models/nanbeige4.3-33b-4bit
+hf download fcmeyer/Nanbeige4.3-33B-MLX-8bit --revision 5b206655a9974094df4258cc2381765ee6329af2 \
+  --local-dir models/nanbeige4.3-33b-8bit
+LLAMA_LOAD_LIMIT_GB=150 zig-out/native/bin/tensorfold-native serve models/nanbeige4.3-33b-8bit --name nanbeige --port 8888 \
+  --context 131072 --parallel 2
+```
+
+Measured on the M5 Ultra against the same HF reference as above, and against MLX 0.32.4 with `mlx_lm` 0.32.2 running
+the same quant:
+
+| | bf16 | 8-bit | 4-bit |
+|---|---:|---:|---:|
+| mean KL against HF over 1,500 positions, top-1 | 0.0015, 99.1% | 0.00234, 98.7% | 0.0849, 91.1% |
+| the same for MLX on the quant | | 0.00272, 98.7% | 0.0851, 90.7% |
+| mean KL against MLX on the quant, top-1 | | 0.00255, 98.7% | 0.00166, 98.5% |
+| greedy chats equal to MLX's on the quant (64 tokens, 6 chats) | | 2 | 3 |
+| greedy chats equal to HF's bf16 (64 tokens, 6 chats) | 3 | 4 | 0 (all part within 16 tokens) |
+| decode, 1 stream / 2 streams | 16.4 / 28-32 tok/s | 27.9-28.4 / 49.2-51.5 tok/s | 46.0-46.7 / 76.5-79.3 tok/s |
+| cold prompt 2.1k / 8.3k / 33k / 61k tokens | 1,259 / 1,313 / 1,074 / 866 tok/s | 1,268 / 1,253 / 1,022 / 832 tok/s | 1,369 / 1,348 / 1,080 / 872 tok/s |
+
+Speeds come from the same harness plans as the bf16 rows (greedy 256-token replies, all streams together; the range
+covers the four prompts), again beside an idle server of another model. The engine is as close to the release as MLX
+is on each quant (closer on the 8-bit one). Windows of 16 and 7 rows and one-row steps agree bit for bit on each;
+every serving check passes. The quants are lossy, so the release stays the recipe's default; the 4-bit one costs a
+mean KL of 0.0849 and parts from the release's greedy text within 16 tokens on every chat, and is offered for its
+speed with that said.
 
 ## Not done
 
@@ -171,4 +209,6 @@ served untested.
 ## Licence
 
 Nanbeige4.3-33B is published under Apache-2.0 at the revision measured here
-(`c1093c501cc6460427c0ac634db7223d0450c0ee`, the licence in its model card).
+(`c1093c501cc6460427c0ac634db7223d0450c0ee`, the licence in its model card). The MLX quants named here
+(`pratikgx/Nanbeige4.3-33B-MLX-4bit`, `fcmeyer/Nanbeige4.3-33B-MLX-8bit`) state the same Apache-2.0 licence in their
+model cards.
