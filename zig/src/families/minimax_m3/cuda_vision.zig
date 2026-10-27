@@ -264,7 +264,6 @@ pub const Images = struct {
     pub fn streamBytes(v: *const Images) usize {
         return @as(usize, v.limits.image_tokens) * hidden * 2;
     }
-
 };
 
 /// A sequence's image rows over prompt rows [lo, hi) of its pass, into the residual rows at `resid` (row lo first).

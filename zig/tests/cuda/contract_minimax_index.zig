@@ -166,7 +166,6 @@ pub const Scores = struct {
             out[(r * hh + h) * self.nb + b] = if (std.math.isFinite(v)) @as(f32, @floatCast(v)) else v;
         };
     }
-
 };
 
 /// rows x topk x the blocks the last row sees: the selection, then its bitmap.

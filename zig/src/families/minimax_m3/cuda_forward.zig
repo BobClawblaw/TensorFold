@@ -92,7 +92,7 @@ pub const Prof = struct {
         }
         try p.ev[1].record(stream);
         try p.ev[1].synchronize();
-        p.ms[@intFromEnum(s)] += try cuda.Event.elapsedMs(p.ev[0], p.ev[1]);
+        p.ms[@backingInt(s)] += try cuda.Event.elapsedMs(p.ev[0], p.ev[1]);
         try p.ev[0].record(stream);
     }
 

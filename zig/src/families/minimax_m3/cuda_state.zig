@@ -52,7 +52,7 @@ pub fn rowBytes(c: *const cfg.Config, kv_heads: usize) usize {
 
 /// Bytes a stream of `capacity` positions holds on this rank.
 pub fn cacheBytes(c: *const cfg.Config, kv_heads: usize, capacity: usize) usize {
-    return arenaBytes(&.{ @as(usize, c.layers) * slots(c, capacity) * rowBytes(c, kv_heads) });
+    return arenaBytes(&.{@as(usize, c.layers) * slots(c, capacity) * rowBytes(c, kv_heads)});
 }
 
 /// One stream's caches: each layer's keys [slots][kv][128], values, then index keys [slots][128], at layer_at.
@@ -180,13 +180,13 @@ pub const Buffers = struct {
         part = @max(part, lane.partBytes(rows, w.head));
         for (extra) |x| part = @max(part, lane.partBytes(rows, x));
         const sizes = [fields.len]usize{
-            rows * 4,                                 rows * h * 4,                  rows * h * 2,                       rows * qkv_rows * 2,    rows * hq * c.head_dim * 2,
-            rows * hi * c.index_dim * 2,              rows * hq * c.head_dim * 2,    world * rows * 2 * h * 4,           rows * 2 * inter * 2,   rows * inter * 2,
-            rows * h * 4,                             rows * c.experts * 4,          pairs * 4,                          pairs * 4,              pairs * 4,
-            max_items * 3 * 4 + 16,                   16,                            pairs * 4 + 16,                     (c.experts + 1) * 4 * ((pairs + 1023) / 1024 + 1), pairs * s.moe.len() * 2,
-            pairs * h * (if (prefill) @as(usize, 2) else 4), part,                 rows * hi * nb * 4,                 rows * hi * c.topk_blocks * 4, rows * hi * words * 4,
-            @max(decode * 4, 16),                     @max(decode * 4, 16),          @max(decode * c.head_dim * 4, 16),  rows * h * 2,           rows * s.vocab.len() * 2,
-            rows * 4,                                 rows * 4,                      if (taps) rows * 5 * h * 2 else 16,
+            rows * 4,                                        rows * h * 4,               rows * h * 2,                       rows * qkv_rows * 2,                               rows * hq * c.head_dim * 2,
+            rows * hi * c.index_dim * 2,                     rows * hq * c.head_dim * 2, world * rows * 2 * h * 4,           rows * 2 * inter * 2,                              rows * inter * 2,
+            rows * h * 4,                                    rows * c.experts * 4,       pairs * 4,                          pairs * 4,                                         pairs * 4,
+            max_items * 3 * 4 + 16,                          16,                         pairs * 4 + 16,                     (c.experts + 1) * 4 * ((pairs + 1023) / 1024 + 1), pairs * s.moe.len() * 2,
+            pairs * h * (if (prefill) @as(usize, 2) else 4), part,                       rows * hi * nb * 4,                 rows * hi * c.topk_blocks * 4,                     rows * hi * words * 4,
+            @max(decode * 4, 16),                            @max(decode * 4, 16),       @max(decode * c.head_dim * 4, 16),  rows * h * 2,                                      rows * s.vocab.len() * 2,
+            rows * 4,                                        rows * 4,                   if (taps) rows * 5 * h * 2 else 16,
         };
         var ptrs: [fields.len]u64 = undefined;
         var a = try arena(d, &sizes, &ptrs);
