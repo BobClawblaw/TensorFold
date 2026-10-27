@@ -209,6 +209,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
         error.Closed => cx.fail(.capacity, "the engine is unavailable; retry after it restarts", .{}),
         error.InvalidSpans => cx.fail(.request, "the prompt span layout is invalid", .{}),
         error.Stale => cx.fail(.server, "{s}", .{api.stale_message}),
+        error.MemoryPressure => cx.fail(.capacity, "{s}", .{api.pressure_message}),
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;

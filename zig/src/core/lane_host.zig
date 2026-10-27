@@ -11,6 +11,7 @@ const admit = @import("lane_host_admit.zig");
 const recalls = @import("lane_host_recall.zig");
 const ends = @import("lane_host_end.zig");
 const rows_host = @import("lane_host_rows.zig");
+const pressure = @import("lane_host_pressure.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -76,6 +77,7 @@ pub const LaneHost = struct {
     pieces: std.ArrayList(Rounds.Piece) = .empty,
     prefix: @import("lane_host_prefix.zig").Wait = .{}, // a request's wait for a cut another prompt is filling
     finals: std.ArrayList(usize) = .empty,
+    pressure: ?@import("memory_pressure.zig").Governor = null, // macOS memory pressure (lane_host_pressure.zig); null: off
 
     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
 
@@ -86,7 +88,7 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .prefix = .fromEnv() };
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .prefix = .fromEnv(), .pressure = .fromEnv() };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -149,9 +151,9 @@ pub const LaneHost = struct {
         h.mutex.lockUncancelable(h.io);
         defer h.mutex.unlock(h.io);
         const unavailable = h.closing or (if (h.health) |source| !source.read(source.ctx) else false);
-        if (unavailable or h.stale) {
+        if (unavailable or h.stale or pressure.refuses(h)) {
             h.gpa.destroy(job);
-            return if (unavailable) error.Closed else error.Stale;
+            return if (unavailable) error.Closed else if (h.stale) error.Stale else error.MemoryPressure;
         }
         // foreground before background, each in arrival order (the Python job queue's priority)
         var at = h.queued.items.len;
@@ -284,7 +286,7 @@ pub const LaneHost = struct {
     pub fn takeJob(h: *LaneHost) Taken {
         h.lock();
         // a stale device takes no reply: `learn.refuse` ends the queued ones instead
-        if (h.stale or h.queued.items.len == 0 or h.admitted.items.len >= @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes)) {
+        if (h.stale or h.queued.items.len == 0 or h.admitted.items.len >= @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes) or pressure.holds(h)) {
             h.unlock();
             return .none;
         }
@@ -507,6 +509,7 @@ pub const LaneHost = struct {
         if (h.rounds) |rd| return rounds.run(h, rd);
         while (true) {
             ends.takeCancels(h);
+            pressure.step(h);
             rows_host.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}

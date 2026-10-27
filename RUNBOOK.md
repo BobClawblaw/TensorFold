@@ -230,6 +230,29 @@ On one Mac, GLM loads only when its weights and caches fit in 70% of RAM, 179.2 
 `GLM_LOAD_LIMIT_GB=N` sets that limit in GB, up to the GPU's recommended working set; a value that isn't a number above 0 stops the server.
 Past 70% of RAM the server warns at startup: a load that wires most of the RAM can stall macOS until its watchdog restarts the Mac, so run nothing else large beside it.
 
+### Memory pressure on a shared Mac
+
+Engines served through the shared lane host, including Flash Next with `--parallel` above one, Qwen3.8-27B and GLM, read the macOS memory pressure level (`kern.memorystatus_vm_pressure_level`).
+The engine thread reads it at most four times a second and acts on the level:
+
+- Warning: a queued request starts only when no other stream runs, so the server serves one stream at a time.
+  New prompt states are not kept.
+  The prompt cache gives back kept states, least valuable first and one per round, until it holds no more than its soft watermark.
+  A state that a request is restoring is never dropped.
+- Critical: as warning, and new requests get 503 with a message saying the Mac is under critical memory pressure.
+  Requests already queued or running continue.
+- Normal: admission and kept states behave as before.
+
+A rise takes effect at the next reading; a fall waits for five seconds of lower readings, so admission does not flap near a threshold.
+Each change of level is logged once.
+At normal pressure the server behaves exactly as it does without the governor.
+Under pressure only admission and kept states change: every request served returns the same tokens, and a resumed request equals a fresh one.
+
+`TENSORFOLD_PRESSURE_CACHE_PERCENT=N` sets the soft watermark to N% of the prompt cache budget (default 50; 0 sheds every state not being restored).
+`TENSORFOLD_MEMORY_PRESSURE=0` (or `off`) disables the governor.
+Flash Next's single-reply driver (`--parallel 1` or `auto`) does not read pressure yet, and Linux and Windows builds never do.
+
+
 ## Access, context and updates
 
 To accept remote clients, choose `--host 0.0.0.0` and configure `--api-key-file` with a file readable only by its owner.
