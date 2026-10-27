@@ -66,7 +66,9 @@ On two ranks the layers' small gathers go by RoCE writes (as GLM's); `TF_ROCE=0`
   softmax, bf16 probabilities into P.V); a row's result does not depend on the window it is in, so drafted replies
   equal plain ones. `TF_MINIMAX_DECODE_ATTN=rows` runs decode by kept-block quarters instead.
 - Drafts: DSpark's block over the anchor's 4,096-key window, the Markov walk kept on the device (one host read a
-  block). The lane costs (`cuda_lanes.zig`) were timed on two GB10s with `TF_MINIMAX_TIME_WINDOWS=<position>`, which
+  block). Several streams' blocks share one pass (`Drafter.blocks`, as many as a 16-row decode window holds: two
+  blocks of 7): their rows go through the projections, MLPs and head together, so the drafter's weights are read
+  once, while each block attends to its own stream's cache and walks its own picks. The lane costs (`cuda_lanes.zig`) were timed on two GB10s with `TF_MINIMAX_TIME_WINDOWS=<position>`, which
   logs a verify window's ms by width and a draft block's at boot.
 - Rounding follows the Metal backend's: Gemma norms rounded once, the residual rounded to bf16 after every add, cos
   and sin rounded to bf16; the MoE sums its picks in fp32 before one rounding.
