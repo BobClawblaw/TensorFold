@@ -27,6 +27,29 @@ python3 tools/zig/minimax_m3_nvfp4_mix.py --check ~/models/mm-mix
 The layers were ranked by each MoE layer's routed output on captured rows, the 3-bit refit against the release:
 `tools/zig/minimax_m3_ref.py --capture DIR` saves the rows, `tools/zig/minimax_m3_requant_study.py` ranks the layers.
 
+### Dense FP4 (optional, lossy)
+
+`--dense-fp4` also converts the decoder's MXFP8 projections (`qkv`: q, k, v and the index q/k; `o`; `mlp`: the
+dense layers' and the shared experts' MLPs; `all` by default, or a list) to NVFP4 in the release's expert layout
+(`.weight_packed`, `.weight_scale`, `.weight_global_scale`), and the bf16 head to MXFP8 (`.weight`,
+`.weight_scale_inv`). Each block's e4m3 scale is the one, among its largest value's code, the next above and six
+below, that leaves the least squared error (summed in fp64 in a fixed order, so a CPU and a GPU write the same
+bytes); the projections the backend stacks into one matmul (q|k|v|index q|index k, gate|up) share one global scale.
+`config.json`'s `nvfp4_mix` names the kinds converted (`dense_fp4`) and the head's format (`head_format`), and the
+loader takes every tensor at its stored width and refuses a folder whose tensors and config disagree. The model comes
+to 194 GiB across the two ranks, and decode reads about a third fewer bytes a token. `--affine-from DIR` copies the
+3-bit experts of an earlier conversion of the same revision instead of refitting them.
+
+The conversion moves the logits: against the release's own weights on a 2,406-token chat (all 60 layers in fp32
+reference code, `tools/zig/minimax_m3_kl_study.py --round 3`, corpus from `tools/zig/minimax_m3_kl_corpus.py`), the
+3-bit refit alone is 0.105 nats a token from the release (top-1 88.6%), the refit with dense FP4 and the MXFP8 head
+0.143 (86.9%), and the same with `o` kept MXFP8 0.121 (87.6%); the MXFP8 head alone adds 0.0009.
+
+Served on two GB10s at three 32k streams (recipe harness): decode 27.0 prose, 45.2 code tokens a second for one stream
+(23.0 and 40.5 on the release formats), 36.5 and 57.6 in total for two, 42.5 and 61.5 for three; thinking off, tools
+0.950, GSM8K 0.968, MGSM 0.817, MMLU 0.819, IFEval 0.620, JSON schema 1.000 (the release formats: 0.950, 0.972, 0.838,
+0.836, 0.587, 1.000); thinking on, GSM8K 0.968 at a 28,672-token budget.
+
 ## Run
 
 `TF_MINIMAX_RANK` of `TF_MINIMAX_WORLD` places each rank (at most four: a rank takes whole key heads), and

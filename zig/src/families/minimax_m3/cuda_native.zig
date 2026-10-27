@@ -87,22 +87,29 @@ pub fn tensorWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, visi
 fn modelBytes(c: *const cfg.Config, mix: *const weights.Mix) u64 {
     const h: u64 = c.hidden;
     const d: u64 = c.head_dim;
-    const mx = struct {
-        fn of(n: u64, k: u64) u64 {
+    const f = struct {
+        fn mx(n: u64, k: u64) u64 {
             return n * k + n * k / 32;
         }
-    }.of;
-    const attn = mx((c.heads + 2 * c.kv_heads) * d + (c.index_heads + 1) * c.index_dim, h) + mx(h, c.heads * d);
-    var total: u64 = 2 * @as(u64, c.vocab) * h * 2 + h * 2;
+        fn nv(n: u64, k: u64) u64 {
+            return n * k / 2 + n * k / 16 + 4;
+        }
+        fn of(fp4: bool, n: u64, k: u64) u64 {
+            return if (fp4) nv(n, k) else mx(n, k);
+        }
+    };
+    const proj = f.of(mix.fp4_qkv, (c.heads + 2 * c.kv_heads) * d + (c.index_heads + 1) * c.index_dim, h) + f.of(mix.fp4_o, h, c.heads * d);
+    const head: u64 = if (mix.fp8_head) f.mx(c.vocab, h) else @as(u64, c.vocab) * h * 2;
+    var total: u64 = @as(u64, c.vocab) * h * 2 + head + h * 2;
     const inter: u64 = c.moe_intermediate;
     const e: u64 = c.experts;
     for (0..c.layers) |i| {
-        total += attn + 4 * h * 2 + 4 * d * 2;
+        total += proj + 4 * h * 2 + 4 * d * 2;
         if (!c.layer[i].moe) {
-            total += mx(2 * @as(u64, c.dense_intermediate), h) + mx(h, c.dense_intermediate);
+            total += f.of(mix.fp4_mlp, 2 * @as(u64, c.dense_intermediate), h) + f.of(mix.fp4_mlp, h, c.dense_intermediate);
             continue;
         }
-        total += mx(2 * @as(u64, c.shared_intermediate), h) + mx(h, c.shared_intermediate) + e * h * 4 + e * 4;
+        total += f.of(mix.fp4_mlp, 2 * @as(u64, c.shared_intermediate), h) + f.of(mix.fp4_mlp, h, c.shared_intermediate) + e * h * 4 + e * 4;
         const mats = 3 * inter * h; // gate, up and down weights of one expert
         total += if (mix.nvfp4[i]) e * (mats / 2 + mats / 16 + 12) else e * (mats * 3 / 8 + 2 * 2 * (mats / 64));
     }
@@ -334,6 +341,20 @@ test "the model's bytes under a mix: every layer NVFP4 is the release's 231 GiB 
     try std.testing.expect(bytes > 230 * (1 << 30) and bytes < 233 * (1 << 30));
     const none: weights.Mix = .{};
     try std.testing.expect(modelBytes(&c, &none) < 190 * (1 << 30));
+}
+
+test "the dense FP4 conversion's bytes: the projections about half, the head about half" {
+    var c = cfg.Config{};
+    for (0..c.layers) |i| c.layer[i] = .{ .sparse = true, .moe = i >= 3 };
+    var mix: weights.Mix = .{};
+    for ([_]usize{ 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31, 49, 52, 57, 59 }) |i| mix.nvfp4[i] = true;
+    var dense = mix;
+    dense.fp4_qkv = true;
+    dense.fp4_o = true;
+    dense.fp4_mlp = true;
+    dense.fp8_head = true;
+    const saved = modelBytes(&c, &mix) - modelBytes(&c, &dense);
+    try std.testing.expect(saved > 5 * (1 << 30) and saved < 8 * (1 << 30));
 }
 
 comptime {

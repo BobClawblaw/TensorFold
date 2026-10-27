@@ -16,12 +16,16 @@ const max_held = 7;
 
 /// A window's forward and draw ms by rows, two GB10s at TP=2 (TF_MINIMAX_TIME_WINDOWS: mean of positions 1k and 8k).
 const gb10_ms = [_]f64{ 58.6, 69.2, 81.2, 88.9, 98.2, 106.2, 115.2, 119.1, 122.9, 128.5, 135.5, 140.9, 148.2, 152.6, 154.5, 157.7, 157.7, 161.3, 166.1, 168.5, 173.6, 178.2, 184.1, 189.2, 189.2, 191.2, 194.8, 198.6, 201.6, 203.1, 213.7, 213.7 };
-const gb10_window_costs = costTable(max_rows);
-const gb10_shared_costs = costTable(engine.shared_rows);
+/// The same on the dense FP4 conversion: every projection NVFP4, the head MXFP8.
+const gb10_fp4_ms = [_]f64{ 45.4, 55.4, 66.4, 73.7, 87.4, 91.0, 97.9, 102.9, 108.0, 114.1, 121.2, 127.9, 132.8, 135.7, 139.9, 143.8, 143.8, 149.4, 152.4, 156.2, 161.8, 166.8, 172.5, 174.1, 176.8, 178.8, 181.5, 183.3, 188.9, 189.7, 191.9, 196.0 };
+const gb10_window_costs = costTable(max_rows, &gb10_ms);
+const gb10_shared_costs = costTable(engine.shared_rows, &gb10_ms);
+const fp4_window_costs = costTable(max_rows, &gb10_fp4_ms);
+const fp4_shared_costs = costTable(engine.shared_rows, &gb10_fp4_ms);
 
-fn costTable(comptime n: usize) [n]lanes.config.Cost {
+fn costTable(comptime n: usize, comptime table: []const f64) [n]lanes.config.Cost {
     var c: [n]lanes.config.Cost = undefined;
-    for (&c, gb10_ms[0..n], 0..) |*x, ms, i| x.* = .{ .width = i + 1, .ms = ms };
+    for (&c, table[0..n], 0..) |*x, ms, i| x.* = .{ .width = i + 1, .ms = ms };
     return c;
 }
 
@@ -88,6 +92,7 @@ pub const Lanes = struct {
     pub fn facts(self: *const Lanes) lanes.Model {
         const sharing = !self.alone;
         const head = self.x.e.drafter != null;
+        const fp4 = self.x.e.w.denseFp4();
         return .{
             .exact_width = max_rows,
             .gpu_tokens = false,
@@ -96,9 +101,10 @@ pub const Lanes = struct {
             .speculate_early = false,
             .drafts = if (head) max_held else 0,
             .draft_streams = head,
-            .mtp_step_ms = if (head) 12.9 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (12.9 ms timed)
-            .window_costs = if (head) &gb10_window_costs else &.{},
-            .shared_costs = if (head) &gb10_shared_costs else &.{},
+            // a block's 7 drafts in one pass: 12.9 ms timed, 9.6 ms on the MXFP8 head
+            .mtp_step_ms = if (head) @as(f64, if (fp4) 9.6 else 12.9) / @as(f64, max_held) else 0,
+            .window_costs = if (!head) &.{} else if (fp4) &fp4_window_costs else &gb10_window_costs,
+            .shared_costs = if (!head) &.{} else if (fp4) &fp4_shared_costs else &gb10_shared_costs,
             .hidden_rows = sharing,
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,

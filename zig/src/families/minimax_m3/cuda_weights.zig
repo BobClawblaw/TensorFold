@@ -1,4 +1,4 @@
-//! A TP rank's MiniMax-M3.1-Flash weights from the release's tensors: MXFP8 lanes, NVFP4 or 3-bit experts.
+//! A TP rank's MiniMax-M3.1-Flash weights: MXFP8 or NVFP4 lanes, NVFP4 or 3-bit experts, a bf16 or MXFP8 head.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -21,20 +21,35 @@ pub const Mlp = struct { gu: Linear, down: Linear };
 pub const Moe = struct { router: u64, bias: u64, routed: cuda.experts.Layer, shared: Mlp };
 pub const Layer = struct { in_norm: u64, post_norm: u64, attn: Attention, ffn: union(enum) { dense: Mlp, moe: Moe } };
 
-/// Which MoE layers keep NVFP4 experts: config.json's nvfp4_mix, or TF_MINIMAX_NVFP4_LAYERS (ranges, all, none).
+/// config.json's nvfp4_mix: the MoE layers with NVFP4 experts (or TF_MINIMAX_NVFP4_LAYERS), the converted formats.
 pub const Mix = struct {
     nvfp4: [cfg.max_layers]bool = @splat(false),
+    fp4_qkv: bool = false,
+    fp4_o: bool = false,
+    fp4_mlp: bool = false,
+    fp8_head: bool = false,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const cfg.Config, override: ?[]const u8) !Mix {
         var m: Mix = .{};
-        if (override) |text| return m.parse(text, c);
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
         defer gpa.free(path);
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
         defer gpa.free(bytes);
         var doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
         defer doc.deinit();
-        const mix = doc.value.object.get("nvfp4_mix") orelse return error.NoMix;
+        const mix = doc.value.object.get("nvfp4_mix") orelse return if (override) |text| m.parse(text, c) else error.NoMix;
+        if (mix.object.get("dense_fp4")) |kinds| {
+            if (kinds != .array) return error.BadMix;
+            for (kinds.array.items) |v| {
+                if (v != .string) return error.BadMix;
+                if (std.mem.eql(u8, v.string, "qkv")) m.fp4_qkv = true else if (std.mem.eql(u8, v.string, "o")) m.fp4_o = true else if (std.mem.eql(u8, v.string, "mlp")) m.fp4_mlp = true else return error.BadMix;
+            }
+        }
+        if (mix.object.get("head_format")) |v| {
+            if (v != .string) return error.BadMix;
+            if (std.mem.eql(u8, v.string, "mxfp8")) m.fp8_head = true else if (!std.mem.eql(u8, v.string, "bf16")) return error.BadMix;
+        }
+        if (override) |text| return m.parse(text, c);
         const list = (mix.object.get("nvfp4_layers") orelse return error.NoMix).array;
         for (list.items) |v| {
             if (v != .integer or v.integer < 0 or v.integer >= c.layers) return error.BadMix;
@@ -75,7 +90,10 @@ pub const Weights = struct {
     mix: Mix,
     embed: u64 = 0, // bf16 [vocab][hidden], whole on every rank
     norm: u64 = 0, // the final norm, bf16 [hidden]
-    head: Linear = undefined, // bf16 on the lane: this rank's vocabulary rows
+    head: Linear = undefined, // bf16 or MXFP8 as stored: this rank's vocabulary rows
+    fp4_projections: u32 = 0, // decoder projections stored NVFP4
+    fp8_projections: u32 = 0, // and MXFP8
+    fp8_head: bool = false,
     layers: []Layer = &.{},
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     bytes: u64 = 0, // device bytes the weights hold
@@ -85,6 +103,11 @@ pub const Weights = struct {
         w.buffers.deinit(w.gpa);
         w.gpa.free(w.layers);
         w.* = undefined;
+    }
+
+    /// Whether the decoder's projections are all NVFP4 and the head MXFP8 (the dense FP4 conversion).
+    pub fn denseFp4(w: *const Weights) bool {
+        return w.fp4_projections > 0 and w.fp8_projections == 0 and w.fp8_head;
     }
 };
 
@@ -143,6 +166,66 @@ pub const Loader = struct {
     fn vector(L: *Loader, comptime fmt: []const u8, args: anytype, n: usize) !u64 {
         const t = try L.expect(fmt, args, .bf16, &.{n});
         return L.put(t.bytes);
+    }
+
+    /// A decoder projection's parts in their stored format: NVFP4 (`.weight_packed`) or MXFP8.
+    fn proj(L: *Loader, parts: []const MxPart) !Linear {
+        if (L.ck.has(try L.name("{s}.weight_packed", .{parts[0].name}))) {
+            L.w.fp4_projections += 1;
+            return L.fp4(parts);
+        }
+        L.w.fp8_projections += 1;
+        return L.mx(parts);
+    }
+
+    /// NVFP4 parts (`.weight_packed`, `.weight_scale`, the dividing `.weight_global_scale`) stacked, one global.
+    fn fp4(L: *Loader, parts: []const MxPart) !Linear {
+        var total: usize = 0;
+        var k: usize = 0;
+        var global: ?u32 = null;
+        for (parts, 0..) |p, i| {
+            const w = try L.get("{s}.weight_packed", .{p.name});
+            if (w.dtype != .u8 or w.rank != 2) return error.UnexpectedMiniMaxTensor;
+            const g = try L.get("{s}.weight_global_scale", .{p.name});
+            if (g.dtype != .f32 or g.numel() != 1) return error.UnexpectedMiniMaxTensor;
+            const bits = std.mem.readInt(u32, g.bytes[0..4], .little);
+            if (global != null and global.? != bits) return error.UnexpectedMiniMaxTensor;
+            global = bits;
+            const kk = w.dim(1) * 2;
+            const rows = p.rows orelse [2]usize{ 0, w.dim(0) };
+            const cols = p.cols orelse [2]usize{ 0, kk };
+            if (rows[1] > w.dim(0) or cols[1] > kk or rows[0] >= rows[1] or cols[0] >= cols[1]) return error.UnexpectedMiniMaxTensor;
+            if (cols[0] % 64 != 0 or (cols[1] - cols[0]) % 64 != 0 or (rows[1] - rows[0]) % 64 != 0) return error.UnexpectedMiniMaxTensor;
+            if (i == 0) k = cols[1] - cols[0] else if (k != cols[1] - cols[0]) return error.UnexpectedMiniMaxTensor;
+            total += rows[1] - rows[0];
+        }
+        const gs: f32 = @bitCast(global.?);
+        if (!(gs > 0)) return error.UnexpectedMiniMaxTensor;
+        const codes = try L.gpa.alloc(u8, total * k / 2);
+        defer L.gpa.free(codes);
+        const scales = try L.gpa.alloc(u8, total * k / 16);
+        defer L.gpa.free(scales);
+        var at: usize = 0;
+        for (parts) |p| {
+            const w = try L.get("{s}.weight_packed", .{p.name});
+            const s = try L.get("{s}.weight_scale", .{p.name});
+            const kk = w.dim(1) * 2;
+            if (s.dtype != .f8_e4m3 or s.rank != 2 or s.dim(0) != w.dim(0) or s.dim(1) != kk / 16) return error.UnexpectedMiniMaxTensor;
+            const rows = p.rows orelse [2]usize{ 0, w.dim(0) };
+            const cols = p.cols orelse [2]usize{ 0, kk };
+            for (rows[0]..rows[1]) |r| {
+                @memcpy(codes[at * (k / 2) ..][0 .. k / 2], w.bytes[r * (kk / 2) + cols[0] / 2 ..][0 .. k / 2]);
+                @memcpy(scales[at * (k / 16) ..][0 .. k / 16], s.bytes[r * (kk / 16) + cols[0] / 16 ..][0 .. k / 16]);
+                at += 1;
+            }
+        }
+        const words = try L.gpa.alloc(u32, cuda.nvfp4.padded(total) / 64 * (k / 64) * 512);
+        defer L.gpa.free(words);
+        const tiles = try L.gpa.alloc(u8, cuda.nvfp4.padded(total) * (k / 16));
+        defer L.gpa.free(tiles);
+        cuda.nvfp4.packWords(words, codes, total, k);
+        cuda.nvfp4.packScales(tiles, scales, total, k);
+        return cuda.nvfp4.weight(try L.put(std.mem.sliceAsBytes(words)), try L.put(tiles), 1.0 / gs, total, k);
     }
 
     /// MXFP8 parts (e4m3 `.weight` [n, k], e8m0 `.weight_scale_inv` [n, k/32]) cut and stacked as one lane weight.
@@ -207,9 +290,9 @@ pub const Loader = struct {
             .{ .name = iqn, .rows = .{ s.kv.lo * c.index_dim, s.kv.hi * c.index_dim } },
             .{ .name = ikn },
         };
-        const qkv = try L.mx(&parts);
+        const qkv = try L.proj(&parts);
         var on: [96]u8 = undefined;
-        const o = try L.mx(&.{.{ .name = try std.fmt.bufPrint(&on, prefix ++ "model.layers.{d}.self_attn.o_proj", .{i}), .cols = .{ q.lo * D, q.hi * D } }});
+        const o = try L.proj(&.{.{ .name = try std.fmt.bufPrint(&on, prefix ++ "model.layers.{d}.self_attn.o_proj", .{i}), .cols = .{ q.lo * D, q.hi * D } }});
         return .{
             .qkv = qkv,
             .o = o,
@@ -227,8 +310,8 @@ pub const Loader = struct {
         const u = try std.fmt.bufPrint(&names[1], "{s}.up_proj", .{module});
         const d = try std.fmt.bufPrint(&names[2], "{s}.down_proj", .{module});
         return .{
-            .gu = try L.mx(&.{ .{ .name = g, .rows = .{ span.lo, span.hi } }, .{ .name = u, .rows = .{ span.lo, span.hi } } }),
-            .down = try L.mx(&.{.{ .name = d, .cols = .{ span.lo, span.hi } }}),
+            .gu = try L.proj(&.{ .{ .name = g, .rows = .{ span.lo, span.hi } }, .{ .name = u, .rows = .{ span.lo, span.hi } } }),
+            .down = try L.proj(&.{.{ .name = d, .cols = .{ span.lo, span.hi } }}),
         };
     }
 
@@ -273,14 +356,24 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, tools: Tools, dir: []const u8, c
     const embed = try L.expect(prefix ++ "model.embed_tokens.weight", .{}, .bf16, &.{ c.vocab, c.hidden });
     w.embed = try L.put(embed.bytes);
     w.norm = try L.vector(prefix ++ "model.norm.weight", .{}, c.hidden);
-    const head = try L.expect(prefix ++ "lm_head.weight", .{}, .bf16, &.{ c.vocab, c.hidden });
-    const n = share.vocab.len();
-    const h: usize = c.hidden;
-    const rows: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, head.bytes[share.vocab.lo * h * 2 .. share.vocab.hi * h * 2]));
-    const tiles = try gpa.alloc(u16, cuda.mxfp8.padded(n) * h);
-    defer gpa.free(tiles);
-    cuda.qmmf.packBf16(tiles, rows, n, h);
-    w.head = cuda.modelopt.bf16Weight(try L.put(std.mem.sliceAsBytes(tiles)), n, h);
+    if (ck.has(prefix ++ "lm_head.weight_scale_inv")) { // MXFP8, from the dense FP4 conversion
+        w.head = try L.mx(&.{.{ .name = prefix ++ "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } }});
+        w.fp8_head = true;
+    } else {
+        const head = try L.expect(prefix ++ "lm_head.weight", .{}, .bf16, &.{ c.vocab, c.hidden });
+        const n = share.vocab.len();
+        const h: usize = c.hidden;
+        const rows: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, head.bytes[share.vocab.lo * h * 2 .. share.vocab.hi * h * 2]));
+        const tiles = try gpa.alloc(u16, cuda.mxfp8.padded(n) * h);
+        defer gpa.free(tiles);
+        cuda.qmmf.packBf16(tiles, rows, n, h);
+        w.head = cuda.modelopt.bf16Weight(try L.put(std.mem.sliceAsBytes(tiles)), n, h);
+    }
+    if ((w.fp4_projections > 0) != (mix.fp4_qkv or mix.fp4_o or mix.fp4_mlp) or w.fp8_head != mix.fp8_head) {
+        std.log.err("minimax_m3: config.json's nvfp4_mix (dense_fp4, head_format) does not name the formats stored", .{});
+        return error.BadMix;
+    }
+    if (w.fp4_projections > 0) std.log.info("minimax_m3: {d} projections NVFP4, {d} MXFP8; head {s}", .{ w.fp4_projections, w.fp8_projections, if (w.fp8_head) "MXFP8" else "bf16" });
     try tools.stream.synchronize();
     return w;
 }
