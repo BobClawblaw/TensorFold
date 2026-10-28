@@ -382,8 +382,8 @@ struct PlanStage {
     half *x0, *x1;
     const float* z;
     void* out;
-    int k, n, p, sk, slots, stride, skip, epi, act_mode;
-    float limit;
+    int k, n, p, sk, slots, stride, skip, epi, act_mode;  // act_mode 2: SwiGLU-OAI in bf16 steps (needs limit > 0)
+    float limit, alpha;
 };
 
 extern "C" __global__ void tf_exl3_plan_rotate(const PlanStage a) {
@@ -424,6 +424,14 @@ extern "C" __global__ void tf_exl3_plan_finish(const PlanStage a) {
             float v = g[q] * tf_exl3::HAD_SCALE * __half2float(a.sv0[(size_t)e * a.n + n + q]);
             if (a.epi == 2) {
                 float up = u[q] * tf_exl3::HAD_SCALE * __half2float(a.sv1[(size_t)e * a.n + n + q]);
+                if (a.act_mode == 2) {  // (clamp(up) + 1) * g * sigmoid(alpha * g), g = min(gate, limit), MiniMax's
+                    const float g2 = tf_exl3::upTo(tf_exl3::bf16r(v), a.limit), u2 = tf_exl3::within(tf_exl3::bf16r(up), a.limit);
+                    const float sg = tf_exl3::bf16r(1.f / (1.f + expf(-tf_exl3::bf16r(g2 * a.alpha))));
+                    v = tf_exl3::bf16r(u2 + 1.f) * tf_exl3::bf16r(g2 * sg);
+                    const size_t at = (size_t)p * a.n + n + q;
+                    reinterpret_cast<__nv_bfloat16*>(a.out)[at] = __float2bfloat16_rn(v);
+                    continue;
+                }
                 if (a.act_mode == 0) { v = tf_exl3::bf16r(v); up = tf_exl3::bf16r(up); }
                 if (a.limit > 0) { v = tf_exl3::upTo(v, a.limit); up = tf_exl3::within(up, a.limit); }
                 v = v / (1.f + expf(-v));
