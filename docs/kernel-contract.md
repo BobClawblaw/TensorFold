@@ -194,6 +194,9 @@ CUDA also checks the affine-3 experts' split decode pair, bit-equal to the pair 
 one dropping a last round of K groups short of the warps, one chaining the groups in reverse).
 CUDA also checks Flash Next's NVFP4 experts on prompt tiles with the decode form's sums (SwiGLU gate-up and fp32
 down, each bit-equal to the decode instance it replaces; the scaled-code prompt tile is the planted control).
+CUDA also checks the grouped EXL3 experts' `tf_exl3_plan_finish`: its bf16 and fp32 SwiGLU and its fp32 and bf16 down
+epilogues bit-equal to main's kernel (kept in `contract_controls.cu`), and its SwiGLU-OAI (`act_mode` 2,
+MiniMax-M3.1-Flash's) against float64 at its rounding points (two controls: the up without its + 1, alpha 1).
 
 ## CUDA records per nvcc release
 
