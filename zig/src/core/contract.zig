@@ -22,6 +22,7 @@ test {
     _ = @import("contract/glm_rows_records.zig");
     _ = @import("contract/nemotron_experts_records.zig");
     _ = @import("contract/moss_image_records.zig");
+    _ = @import("contract/flint_records.zig");
     _ = spec;
     _ = gates;
     _ = rows;
