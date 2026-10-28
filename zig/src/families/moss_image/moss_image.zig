@@ -8,6 +8,7 @@ pub const encoder_config = @import("encoder_config.zig");
 pub const encoder_weights = @import("encoder_weights.zig");
 pub const encoder = @import("encoder.zig");
 pub const Encoder = encoder.Encoder;
+pub const reference = @import("reference.zig");
 pub const Model = model.Model;
 pub const Prompt = model.Prompt;
 pub const Timing = model.Timing;
@@ -21,4 +22,5 @@ test {
     _ = encoder_config;
     _ = encoder_weights;
     _ = encoder;
+    _ = reference;
 }
