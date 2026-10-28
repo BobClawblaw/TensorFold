@@ -104,7 +104,9 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     var doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer doc.deinit();
     if (doc.value != .object) return error.BadMiniMaxConfig;
-    const t = doc.value.object;
+    // the release's (and its packs') language model sits under text_config, a flattened one at the top
+    const root = doc.value.object;
+    const t = if (root.get("text_config")) |tc| (if (tc == .object) tc.object else return error.BadMiniMaxConfig) else root;
     var c = Config{};
     c.hidden = try int(t, "hidden_size");
     c.layers = try int(t, "num_hidden_layers");
@@ -124,7 +126,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Config {
     c.swiglu_alpha = @floatCast(try number(try field(t, "swiglu_alpha")));
     c.swiglu_limit = @floatCast(try number(try field(t, "swiglu_limit")));
     c.context = try int(t, "max_position_embeddings");
-    if (t.get("image_token_index")) |v| if (v == .integer and v.integer > 0) {
+    if (root.get("image_token_index") orelse t.get("image_token_index")) |v| if (v == .integer and v.integer > 0) {
         c.image_token = @intCast(v.integer);
     };
     if (c.layers > max_layers) return error.BadMiniMaxConfig;
@@ -183,6 +185,19 @@ test "minimax_m3 config: the release's shape, three dense layers, every layer sp
     try std.testing.expectEqual(@as(u32, 9856), c.qkvRows());
     try std.testing.expectEqual(@as(usize, 17), c.blocks(2049));
     try std.testing.expectEqual(@as(f32, 2.0), c.routed_scale);
+}
+
+test "minimax_m3 config: the release's own layout (text_config, the image token beside it) reads as the flattened" {
+    const a = std.testing.allocator;
+    const flat = @embedFile("config_fixture.json");
+    const nested = try std.fmt.allocPrint(a, "{{\"model_type\": \"minimax_m3_vl\", \"image_token_index\": 200025, \"text_config\": {s}}}", .{flat});
+    defer a.free(nested);
+    const x = try parse(a, flat);
+    const y = try parse(a, nested);
+    try std.testing.expectEqual(x.hidden, y.hidden);
+    try std.testing.expectEqual(x.qkvRows(), y.qkvRows());
+    try std.testing.expectEqual(@as(u32, 200025), y.image_token);
+    for (0..x.layers) |i| try std.testing.expectEqual(x.layer[i], y.layer[i]);
 }
 
 test "minimax_m3 config: softmax scores, init blocks, an index-value branch or a dense layer are refused" {
