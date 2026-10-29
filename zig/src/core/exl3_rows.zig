@@ -9,7 +9,7 @@ pub const Matrix = projection.Matrix;
 pub const View = projection.View;
 
 /// K a threadgroup splits over simdgroups (the kernel's KS); a threadgroup is 8 * splits simdgroups.
-pub const splits = 2;
+pub const splits = 1;
 /// Rows a dense dispatch's threadgroup carries (the widest instantiation).
 pub const max_rows = 8;
 
@@ -78,6 +78,8 @@ const threads = 8 * splits * 32;
 pub fn job(m: Matrix, y_col: usize) !Job {
     try m.validate();
     if (m.codebook != .mul1 or m.suh_format != .f16 or m.svh_format != .f16 or m.bias != null) return error.UnsupportedExl3Rows;
+    // whole bits 2 to 8, 7 excepted (the kernel's widths)
+    if (m.width.halves % 2 != 0 or m.width.halves == 14) return error.UnsupportedExl3Rows;
     // the kernel reads tiles as words
     const k_stride = try m.kStride();
     if (m.trellis.offset % 4 != 0 or k_stride % 4 != 0 or m.nStride() % 4 != 0) return error.UnalignedExl3Rows;
@@ -108,7 +110,7 @@ pub fn number(jobs: []Job) usize {
 pub fn ranges(blocks: usize, k: usize) usize {
     const most = @max(1, k / 128 / splits);
     var r: usize = 1;
-    while (r < most and blocks * r < 384) r *= 2;
+    while (r < most and blocks * r < 192) r *= 2;
     return @min(r, most);
 }
 

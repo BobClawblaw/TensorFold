@@ -4,7 +4,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-#define KS 2
+#define KS 1
 
 // A resident matrix (Metal 3 argument-buffer pointers), placed at column `y_col` of the output rows.
 struct TfExl3Job {
@@ -30,6 +30,22 @@ inline float tf_xr_mul1(uint state) {
   const uint pairs = (x & 0x00FF00FFu) + ((x >> 8) & 0x00FF00FFu); // two 16-bit lanes of byte sums
   const uint h = 1024 + ((pairs * 0x00010001u) >> 16);
   return float(fma(half(h), as_type<half>(ushort(0x1EEE)), as_type<half>(ushort(0xC931))));
+}
+
+// The codebook from a 16-bit state: 1024 + the byte sum of state * 0x83DCD12D, then the table of its 1,021 values.
+inline float tf_xr_book(threadgroup const float* book, uint state) {
+  const uint x = state * 0x83DCD12Du;
+  const uint pairs = (x & 0x00FF00FFu) + ((x >> 8) & 0x00FF00FFu);
+  return book[(pairs * 0x00010001u) >> 16];
+}
+
+// The table: book[s] = tf_xr_mul1's value at byte sum s, filled by a threadgroup before its first lookup.
+inline void tf_xr_fill(threadgroup float* book, uint t, uint threads) {
+  for (uint s = t; s < 1024; s += threads) {
+    const uint h = 1024 + min(s, 1020u);
+    book[s] = float(fma(half(h), as_type<half>(ushort(0x1EEE)), as_type<half>(ushort(0xC931))));
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 // Lane l holds indices l, l+32, l+64, l+96 of a 128-block; the butterfly order is fixed.
@@ -59,45 +75,32 @@ inline void tf_xr_finish(const device TfExl3Job& j, device uchar* y, constant Tf
   }
 }
 
-// Rows src[0..R) through job j's column block cb over K range `range`; partials or finished rows out.
-template <uint R>
+// 16 bits of the MSB-first stream A:B:C from bit S (S < 48, a constant).
+template <uint S>
+inline uint tf_xr_window(uint A, uint B, uint C) {
+  if (S == 0) return A >> 16;
+  if (S < 32) return ((A << S) | (B >> (32 - S))) >> 16;
+  if (S == 32) return B >> 16;
+  return ((B << (S - 32)) | (C >> (64 - S))) >> 16;
+}
+
+// Rows through job j's block cb, K range `range`, K bits: lane l decodes tile weights 8l..8l+7 from one run.
+template <uint R, uint K>
 inline void tf_xr_block(const device bfloat* x, const device TfExl3Job& j, device uchar* y, device float* partial,
                         device atomic_uint* arrive, constant TfExl3RowsArgs& a, uint cb, uint gb, uint range,
                         thread const uint (&src)[R], thread const uint (&dst)[R], uint live,
-                        uint lane, uint sg, threadgroup float* part, threadgroup uint* words) {
+                        uint lane, uint sg, threadgroup float* part, threadgroup const float* book) {
   const uint ct = sg % 8, ks = sg / 8;
-  const uint halves = j.halves, count = 4 * halves; // words a tile
-  threadgroup uint* tw = words + sg * 64;
-  // each weight's 16-bit window: words lo and hi of the tile, lo << off joined by hi >> rs (nothing when off is 0)
-  ushort lo_at[8], hi_at[8];
-  uchar off_at[8], rs_at[8];
-  uint keep[8];
-  for (uint q = 0; q < 8; ++q) {
-    const uint p = lane + 32 * q, ring = 128 * halves;
-    const uint end = ((p + 1) * halves - ((halves & 1u) ? ((p + 1) & 1u) : 0u)) / 2;
-    const uint start = (end + ring - 16) % ring;
-    const uint wi = start / 32, off = start % 32;
-    lo_at[q] = ushort(wi);
-    hi_at[q] = ushort(wi + 1 == count ? 0 : wi + 1);
-    off_at[q] = uchar(off);
-    rs_at[q] = uchar((32 - off) & 31u);
-    keep[q] = off != 0 ? 0xFFFFFFFFu : 0u;
-  }
-  // this lane's k row within a 16x16 tile; its eight weights are columns q + 8 * (lane bit 2)
-  const uint r = 2 * (lane / 8) + (lane & 1u) + 8 * ((lane >> 1) & 1u);
-  float acc[R][8];
-  for (uint i = 0; i < R; ++i) for (uint q = 0; q < 8; ++q) acc[i][q] = 0.0f;
+  constexpr uint count = 8 * K, ring = 256 * K; // a tile's words and bits
+  const uint start = ((8 * lane + 1) * K + ring - 16) % ring;
+  const uint w0 = start / 32, off = start % 32, back = (32 - off) & 31u, keep = off != 0 ? 0xFFFFFFFFu : 0u;
+  const uint i0 = w0, i1 = (w0 + 1) % count, i2 = (w0 + 2) % count, i3 = (w0 + 3) % count;
+  const uint r0 = 2 * (lane % 4);
+  float acc[R][2];
+  for (uint i = 0; i < R; ++i) acc[i][0] = acc[i][1] = 0.0f;
   const device uint* col = j.trellis + ulong(cb * 8 + ct) * j.tile_n_stride;
   const uint step = KS * a.ranges * 128;
-  uint kb = (range * KS + ks) * 128;
-  // the next tile's words, loaded a tile ahead
-  uint w0 = 0, w1 = 0;
-  if (kb < a.k) {
-    const device uint* tile = col + ulong(kb / 16) * j.tile_k_stride;
-    w0 = lane < count ? tile[lane] : 0;
-    w1 = lane + 32 < count ? tile[lane + 32] : 0;
-  }
-  for (; kb < a.k; kb += step) {
+  for (uint kb = (range * KS + ks) * 128; kb < a.k; kb += step) {
     float xv[R][4];
     for (uint i = 0; i < R; ++i) {
       for (uint q = 0; q < 4; ++q) {
@@ -108,39 +111,42 @@ inline void tf_xr_block(const device bfloat* x, const device TfExl3Job& j, devic
       for (uint q = 0; q < 4; ++q) xv[i][q] = float(half(xv[i][q] * 0.08838834764831845f));
     }
     for (uint t = 0; t < 8; ++t) {
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-      tw[lane] = w0;
-      tw[lane + 32] = w1;
-      simdgroup_barrier(mem_flags::mem_threadgroup);
-      const uint nk = t < 7 ? kb + 16 * (t + 1) : kb + step;
-      if (nk < a.k) {
-        const device uint* tile = col + ulong(nk / 16) * j.tile_k_stride;
-        w0 = lane < count ? tile[lane] : 0;
-        w1 = lane + 32 < count ? tile[lane + 32] : 0;
-      }
+      const device uint* tile = col + ulong(kb / 16 + t) * j.tile_k_stride;
+      const uint u0 = tile[i0], u1 = tile[i1], u2 = tile[i2], u3 = tile[i3];
+      // the lane's run from bit `start`, aligned: A:B:C
+      const uint A = (u0 << off) | ((u1 >> back) & keep);
+      const uint B = (u1 << off) | ((u2 >> back) & keep);
+      const uint C = (u2 << off) | ((u3 >> back) & keep);
       float w[8];
-      for (uint q = 0; q < 8; ++q) {
-        const uint lo = tw[lo_at[q]], hi = tw[hi_at[q]];
-        w[q] = tf_xr_mul1(((lo << off_at[q]) | ((hi >> rs_at[q]) & keep[q])) >> 16);
-      }
+      w[0] = tf_xr_book(book, tf_xr_window<0 * K>(A, B, C));
+      w[1] = tf_xr_book(book, tf_xr_window<1 * K>(A, B, C));
+      w[2] = tf_xr_book(book, tf_xr_window<2 * K>(A, B, C));
+      w[3] = tf_xr_book(book, tf_xr_window<3 * K>(A, B, C));
+      w[4] = tf_xr_book(book, tf_xr_window<4 * K>(A, B, C));
+      w[5] = tf_xr_book(book, tf_xr_window<5 * K>(A, B, C));
+      w[6] = tf_xr_book(book, tf_xr_window<6 * K>(A, B, C));
+      w[7] = tf_xr_book(book, tf_xr_window<7 * K>(A, B, C));
+      const ushort from = ushort(16 * (t & 1u) + r0);
       for (uint i = 0; i < R; ++i) {
-        const float xr = simd_shuffle(xv[i][t / 2], ushort(16 * (t & 1u) + r));
-        for (uint q = 0; q < 8; ++q) acc[i][q] = fma(xr, w[q], acc[i][q]);
+        const float x0 = simd_shuffle(xv[i][t / 2], from), x1 = simd_shuffle(xv[i][t / 2], ushort(from + 1));
+        const float x8 = simd_shuffle(xv[i][t / 2], ushort(from + 8)), x9 = simd_shuffle(xv[i][t / 2], ushort(from + 9));
+        acc[i][0] = fma(x9, w[3], fma(x8, w[2], fma(x1, w[1], fma(x0, w[0], acc[i][0]))));
+        acc[i][1] = fma(x9, w[7], fma(x8, w[6], fma(x1, w[5], fma(x0, w[4], acc[i][1]))));
       }
     }
   }
-  // lanes with the same column half (lane bit 2) hold one column's partial sums
+  // lanes 4m .. 4m + 3 hold columns m and m + 8
   for (uint i = 0; i < R; ++i) {
-    for (uint q = 0; q < 8; ++q) {
-      float v = acc[i][q];
+    for (uint h = 0; h < 2; ++h) {
+      float v = acc[i][h];
       v += simd_shuffle_xor(v, ushort(1));
       v += simd_shuffle_xor(v, ushort(2));
-      v += simd_shuffle_xor(v, ushort(8));
-      v += simd_shuffle_xor(v, ushort(16));
-      acc[i][q] = v;
+      acc[i][h] = v;
     }
-    if (lane == 0 || lane == 4)
-      for (uint q = 0; q < 8; ++q) part[(ks * R + i) * 128 + ct * 16 + q + 2 * lane] = acc[i][q];
+    if (lane % 4 == 0) {
+      part[(ks * R + i) * 128 + ct * 16 + lane / 4] = acc[i][0];
+      part[(ks * R + i) * 128 + ct * 16 + lane / 4 + 8] = acc[i][1];
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (sg < live) {
@@ -179,6 +185,17 @@ inline void tf_xr_block(const device bfloat* x, const device TfExl3Job& j, devic
   if (sg == 0 && lane == 0) atomic_store_explicit(arrive, 0u, memory_order_relaxed);
 }
 
+// The block at a job's width: whole bits 2 to 8 (job() refuses the half steps).
+#define TF_XR_BITS(R, halves, ARGS)                \
+  switch (halves) {                                \
+    case 4: tf_xr_block<R, 2> ARGS; break;         \
+    case 6: tf_xr_block<R, 3> ARGS; break;         \
+    case 8: tf_xr_block<R, 4> ARGS; break;         \
+    case 10: tf_xr_block<R, 5> ARGS; break;        \
+    case 12: tf_xr_block<R, 6> ARGS; break;        \
+    default: tf_xr_block<R, 8> ARGS; break;        \
+  }
+
 inline uint tf_xr_job(const device TfExl3Job* jobs, constant TfExl3RowsArgs& a, uint block) {
   uint ji = 0;
   while (ji + 1 < a.jobs && jobs[ji + 1].first_block <= block) ++ji;
@@ -198,13 +215,16 @@ kernel void tf_exl3_rows(const device bfloat* x [[buffer(0)]],
                          uint3 tg [[threadgroup_position_in_grid]],
                          uint3 groups [[threadgroups_per_grid]]) {
   threadgroup float part[KS * R * 128];
-  threadgroup uint words[KS * 8 * 64];
+  threadgroup float book[1024];
+  tf_xr_fill(book, sg * 32 + lane, KS * 8 * 32);
   const device TfExl3Job& j = jobs[tf_xr_job(jobs, a, tg.x)];
   const uint r0 = tg.y * R;
   const uint live = min(R, a.rows - r0);
   uint src[R], dst[R];
   for (uint i = 0; i < R; ++i) src[i] = dst[i] = r0 + min(i, live - 1);
-  tf_xr_block<R>(x, j, y, partial, counts + tg.y * groups.x + tg.x, a, tg.x - j.first_block, tg.x, tg.z, src, dst, live, lane, sg, part, words);
+  device atomic_uint* arrive = counts + tg.y * groups.x + tg.x;
+  const uint cb = tg.x - j.first_block;
+  TF_XR_BITS(R, j.halves, (x, j, y, partial, arrive, a, cb, tg.x, tg.z, src, dst, live, lane, sg, part, book));
 }
 
 // Routed: grid.y a slot (expert routes[slot], from routed_slots the shared one), grid.x its blocks, grid.z ranges.
@@ -219,14 +239,17 @@ kernel void tf_exl3_rows_routed(const device bfloat* x [[buffer(0)]],
                                 uint sg [[simdgroup_index_in_threadgroup]],
                                 uint3 tg [[threadgroup_position_in_grid]]) {
   threadgroup float part[KS * 128];
-  threadgroup uint words[KS * 8 * 64];
+  threadgroup float book[1024];
   const bool shared = tg.y >= a.routed_slots;
   const uint e = shared ? a.experts : routes[tg.y];
   if (!shared && e >= a.experts) return;
+  tf_xr_fill(book, sg * 32 + lane, KS * 8 * 32);
   const uint per = a.blocks / a.kinds;
   const device TfExl3Job& j = jobs[e * a.kinds + tg.x / per];
   uint src[1] = {shared ? tg.y - a.shared_base : tg.y / a.repeat}, dst[1] = {tg.y};
-  tf_xr_block<1>(x, j, y, partial, counts + tg.y * a.blocks + tg.x, a, tg.x % per, tg.x, tg.z, src, dst, 1, lane, sg, part, words);
+  device atomic_uint* arrive = counts + tg.y * a.blocks + tg.x;
+  const uint cb = tg.x % per;
+  TF_XR_BITS(1, j.halves, (x, j, y, partial, arrive, a, cb, tg.x, tg.z, src, dst, 1u, lane, sg, part, book));
 }
 
 template [[host_name("tf_exl3_rows_r1")]] kernel void tf_exl3_rows<1>(const device bfloat*, const device TfExl3Job*, device uchar*, constant TfExl3RowsArgs&, device float*, device atomic_uint*, uint, uint, uint3, uint3);
