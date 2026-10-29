@@ -142,12 +142,12 @@ pub fn scratchBytes(sets: []const Set, routeds: []const Routed, rows: usize, slo
     var partial: usize = 16;
     var counts: usize = 16;
     for (sets) |s| {
-        partial = @max(partial, xr.partialBytes(xr.ranges(s.blocks, s.k), rows, s.blocks));
+        partial = @max(partial, xr.partialBytes(xr.ranges(s.blocks, s.k, xr.dense_target), rows, s.blocks));
         counts = @max(counts, xr.countBytes(rows, s.blocks));
     }
     for (routeds) |r| {
         const blocks = r.kinds * r.n / 128;
-        partial = @max(partial, xr.partialBytes(xr.ranges(blocks, r.k), slots, blocks));
+        partial = @max(partial, xr.partialBytes(xr.ranges(blocks, r.k, xr.routed_target), slots, blocks));
         counts = @max(counts, xr.countBytes(slots, blocks));
     }
     return .{ .partial = partial, .counts = counts };

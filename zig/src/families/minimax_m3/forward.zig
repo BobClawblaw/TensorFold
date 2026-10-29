@@ -48,7 +48,7 @@ const Enc = struct {
                 const out_v = xr.View{ .buffer = out, .offset = out_off };
                 // window rows keep their bits in any window; a prompt chunk's take the tensor units
                 if (n_rows > st.batch_rows) return xr.encodeMm(&x.m.xm.?, x.e, d, in_v, set.k, out_v, set.stride, n_rows);
-                xr.encode(&x.m.xr.?, x.e, d, in_v, set.k, out_v, set.stride, n_rows, .bf16, xr.ranges(set.blocks, set.k), x.scratch());
+                xr.encode(&x.m.xr.?, x.e, d, in_v, set.k, out_v, set.stride, n_rows, .bf16, xr.ranges(set.blocks, set.k, xr.dense_target), x.scratch());
             },
         }
     }
@@ -61,7 +61,7 @@ const Enc = struct {
         x.e.setBuffer(h.jobs.buffer, h.jobs.offset, 1);
         x.e.setValue([5]u32{ @intCast(n), @intCast(h.k), @intCast(h.count), @intCast(h.k), c.qkvRows() }, 2);
         x.e.setBuffer(x.s.q, 0, 3);
-        x.e.dispatchGroups(mtl.Size.of(h.cols / 8, (n + 7) / 8, 1), mtl.Size.of(256, 1, 1));
+        x.e.dispatchGroups(mtl.Size.of(h.cols / 2, (n + 7) / 8, 1), mtl.Size.of(256, 1, 1));
     }
 
     fn scratch(x: Enc) xr.Scratch {
@@ -73,7 +73,7 @@ const Enc = struct {
         var w = routedOf(r);
         w.shared = true;
         const blocks = r.kinds * r.n / 128;
-        xr.encodeRouted(&x.m.xr.?, x.e, w, .{ .buffer = in }, r.k, .{ .buffer = x.s.pick }, repeat, .{ .buffer = out }, r.kinds * r.n, routed, routed + n_rows, shared_base, .bf16, xr.ranges(blocks, r.k), x.scratch());
+        xr.encodeRouted(&x.m.xr.?, x.e, w, .{ .buffer = in }, r.k, .{ .buffer = x.s.pick }, repeat, .{ .buffer = out }, r.kinds * r.n, routed, routed + n_rows, shared_base, .bf16, xr.ranges(blocks, r.k, xr.routed_target), x.scratch());
     }
 
     fn experts(x: Enc, w: rows.Experts, in: mtl.Buffer, out: mtl.Buffer, slots: usize) !void {

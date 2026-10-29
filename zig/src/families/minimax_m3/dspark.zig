@@ -397,7 +397,7 @@ pub const Drafter = struct {
             .affine => |a| return d.project(e, .{ .affine = a }, in, out, rows),
             .exl3 => |set| {
                 const dummy = xr.View{ .buffer = d.buf("sums") };
-                xr.encode(&m.xr.?, e, .{ .jobs = set.jobs, .count = set.count, .blocks = set.blocks, .k = set.k }, .{ .buffer = in.buf, .offset = in.off }, set.k, .{ .buffer = out.buf, .offset = out.off }, set.stride, rows, .bf16, xr.ranges(set.blocks, set.k), .{ .partial = dummy, .counts = dummy });
+                xr.encode(&m.xr.?, e, .{ .jobs = set.jobs, .count = set.count, .blocks = set.blocks, .k = set.k }, .{ .buffer = in.buf, .offset = in.off }, set.k, .{ .buffer = out.buf, .offset = out.off }, set.stride, rows, .bf16, xr.ranges(set.blocks, set.k, xr.dense_target), .{ .partial = dummy, .counts = dummy });
             },
         }
     }

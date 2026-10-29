@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
         defer y_ref.deinit();
         const y = try device.buffer(rows * s.n * 2, mtl.ResourceOptions.shared);
         defer y.deinit();
-        const kt = xr.ranges(s.n / 128, s.k);
+        const kt = xr.ranges(s.n / 128, s.k, xr.dense_target);
         const partial = try device.buffer(@max(16, xr.partialBytes(kt, rows, s.n / 128)), mtl.ResourceOptions.shared);
         defer partial.deinit();
         const counts = try device.buffer(@max(16, xr.countBytes(rows, s.n / 128)), mtl.ResourceOptions.shared);
@@ -191,7 +191,7 @@ fn routedCheck(gpa: std.mem.Allocator, device: mtl.Device, queue: mtl.Queue, ref
     const scratch = try device.buffer(try ex.scratchBytes(s.k, s.n, 1), mtl.ResourceOptions.shared);
     defer scratch.deinit();
     const blocks = kinds * s.n / 128;
-    const kt = xr.ranges(blocks, s.k);
+    const kt = xr.ranges(blocks, s.k, xr.routed_target);
     const partial = try device.buffer(@max(16, xr.partialBytes(kt, slots, blocks)), mtl.ResourceOptions.shared);
     defer partial.deinit();
     const counts = try device.buffer(@max(16, xr.countBytes(slots, blocks)), mtl.ResourceOptions.shared);

@@ -107,12 +107,16 @@ pub fn number(jobs: []Job) usize {
 }
 
 /// K ranges for a shape (never the rows, so a row's sums keep one order): enough threadgroups to fill the GPU.
-pub fn ranges(blocks: usize, k: usize) usize {
+pub fn ranges(blocks: usize, k: usize, target: usize) usize {
     const most = @max(1, k / 128 / splits);
     var r: usize = 1;
-    while (r < most and blocks * r < 192) r *= 2;
+    while (r < most and blocks * r < target) r *= 2;
     return @min(r, most);
 }
+
+/// Threadgroups the K ranges aim for: a dense set's blocks, a routed slot's blocks (measured on the M5 Ultra).
+pub const dense_target = 384;
+pub const routed_target = 192;
 
 /// The fp32 partials a call with `ranges` ranges needs (none for one range).
 pub fn partialBytes(ranges_: usize, rows: usize, blocks: usize) usize {
