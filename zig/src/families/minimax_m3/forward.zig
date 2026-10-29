@@ -73,6 +73,8 @@ const Enc = struct {
         var w = routedOf(r);
         w.shared = true;
         const blocks = r.kinds * r.n / 128;
+        // several rows: by expert (mm_route_groups' groups), each expert's weights decoded once for its rows
+        if (n_rows > 1) return xr.encodeGrouped(&x.m.xr.?, x.e, w, .{ .buffer = in }, r.k, .{ .buffer = x.s.groups }, .{ .buffer = x.s.members }, repeat, .{ .buffer = out }, r.kinds * r.n, routed, routed + n_rows, shared_base, .bf16, xr.ranges(blocks, r.k, xr.routed_target), x.scratch());
         xr.encodeRouted(&x.m.xr.?, x.e, w, .{ .buffer = in }, r.k, .{ .buffer = x.s.pick }, repeat, .{ .buffer = out }, r.kinds * r.n, routed, routed + n_rows, shared_base, .bf16, xr.ranges(blocks, r.k, xr.routed_target), x.scratch());
     }
 

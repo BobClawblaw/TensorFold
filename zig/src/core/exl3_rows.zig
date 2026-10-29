@@ -48,6 +48,7 @@ pub const Output = projection.Output;
 pub const Pipelines = struct {
     dense: [4]mtl.Pipeline, // 1, 2, 4, 8 rows a threadgroup
     routed: mtl.Pipeline,
+    grouped: mtl.Pipeline,
 
     pub fn load(device: mtl.Device) !Pipelines {
         const pool = mtl.objc.Pool.push();
@@ -62,13 +63,16 @@ pub const Pipelines = struct {
             made += 1;
         }
         p.routed = try mtl.Pipeline.init(device, lib, "tf_exl3_rows_routed", false);
-        for (p.dense ++ [_]mtl.Pipeline{p.routed}) |q| if (q.simdWidth() != 32 or q.maxThreads() < threads) return error.UnsupportedExl3Simd;
+        errdefer p.routed.deinit();
+        p.grouped = try mtl.Pipeline.init(device, lib, "tf_exl3_rows_grouped", false);
+        for (p.dense ++ [_]mtl.Pipeline{ p.routed, p.grouped }) |q| if (q.simdWidth() != 32 or q.maxThreads() < threads) return error.UnsupportedExl3Simd;
         return p;
     }
 
     pub fn deinit(p: *Pipelines) void {
         for (p.dense) |q| q.deinit();
         p.routed.deinit();
+        p.grouped.deinit();
     }
 };
 
@@ -170,6 +174,25 @@ pub fn encodeRouted(p: *const Pipelines, e: mtl.ComputeEncoder, r: Routed, x: Vi
     e.setBuffer(sc.counts.buffer, sc.counts.offset, 5);
     e.setBuffer(ids.buffer, ids.offset, 6);
     e.dispatchGroups(mtl.Size.of(blocks, slots, kt), mtl.Size.of(threads, 1, 1));
+}
+
+/// encodeRouted by expert (`groups`, `members`: mm_route_groups'), each expert decoded once; encodeRouted's bits.
+pub fn encodeGrouped(p: *const Pipelines, e: mtl.ComputeEncoder, r: Routed, x: View, x_stride: usize, groups: View, members: View, repeat: usize, y: View, y_stride: usize, routed: usize, slots: usize, shared_base: usize, out: Output, kt: usize, sc: Scratch) void {
+    std.debug.assert(r.shared);
+    const blocks = r.kinds * r.n / 128;
+    const a = Args{ .rows = @intCast(slots), .k = @intCast(r.k), .jobs = @intCast((r.experts + 1) * r.kinds), .kinds = @intCast(r.kinds), .repeat = @intCast(repeat), .output_f32 = @intFromBool(out == .f32), .experts = @intCast(r.experts), .ranges = @intCast(kt), .blocks = @intCast(blocks), .routed_slots = @intCast(routed), .shared_base = @intCast(shared_base), .x_stride = x_stride, .y_stride = y_stride };
+    const most: u32 = @intCast(@min(routed, r.experts)); // distinct experts a window can pick; the shared group after
+    e.setPipeline(p.grouped);
+    e.setBuffer(x.buffer, x.offset, 0);
+    e.setBuffer(r.jobs.buffer, r.jobs.offset, 1);
+    e.setBuffer(y.buffer, y.offset, 2);
+    e.setValue(a, 3);
+    e.setBuffer(sc.partial.buffer, sc.partial.offset, 4);
+    e.setBuffer(sc.counts.buffer, sc.counts.offset, 5);
+    e.setBuffer(groups.buffer, groups.offset, 6);
+    e.setBuffer(members.buffer, members.offset, 7);
+    e.setValue(most, 8);
+    e.dispatchGroups(mtl.Size.of(blocks, most + 1, kt), mtl.Size.of(threads, 1, 1));
 }
 
 const MmArgs = extern struct {

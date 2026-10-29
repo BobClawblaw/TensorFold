@@ -266,6 +266,50 @@ kernel void tf_exl3_rows_routed(const device bfloat* x [[buffer(0)]],
   TF_XR_BITS(1, j.halves, (x, j, y, partial, arrive, a, cb, tg.x, tg.z, src, dst, 1u, lane, sg, part, book, xs));
 }
 
+// A window's routed rows by expert (G, M: mm_route_groups'), the shared expert at y = shared_group, 8 rows a pass.
+
+// Each expert's weights decode once for all its rows; every row's sums are tf_exl3_rows_routed's.
+kernel void tf_exl3_rows_grouped(const device bfloat* x [[buffer(0)]],
+                                 const device TfExl3Job* jobs [[buffer(1)]],
+                                 device uchar* y [[buffer(2)]],
+                                 constant TfExl3RowsArgs& a [[buffer(3)]],
+                                 device float* partial [[buffer(4)]],
+                                 device atomic_uint* counts [[buffer(5)]],
+                                 const device uint* G [[buffer(6)]],
+                                 const device uint* M [[buffer(7)]],
+                                 constant uint& shared_group [[buffer(8)]],
+                                 uint lane [[thread_index_in_simdgroup]],
+                                 uint sg [[simdgroup_index_in_threadgroup]],
+                                 uint3 tg [[threadgroup_position_in_grid]]) {
+  threadgroup float part[KS * 8 * 128];
+  threadgroup float book[1024];
+  threadgroup float xs[2 * 8 * 128];
+  const uint g = tg.y, groups = G[0];
+  const bool shared = g == shared_group;
+  if (!shared && g >= groups) return;
+  // members [first, end): routed ones are M's slots, the shared group's are the rows after the routed slots
+  const uint e = shared ? a.experts : G[1 + 2 * g];
+  const uint first = shared ? 0u : G[2 + 2 * g];
+  const uint end = shared ? a.rows - a.routed_slots : (g + 1 < groups ? G[2 + 2 * (g + 1)] : a.routed_slots);
+  tf_xr_fill(book, sg * 32 + lane, KS * 8 * 32);
+  const uint per = a.blocks / a.kinds;
+  const device TfExl3Job& j = jobs[e * a.kinds + tg.x / per];
+  const uint cb = tg.x % per;
+  for (uint m = first; m < end; m += 8) {
+    const uint live = min(8u, end - m);
+    uint src[8], dst[8];
+    for (uint i = 0; i < 8; ++i) {
+      const uint at = m + min(i, live - 1);
+      dst[i] = shared ? a.routed_slots + at : M[at];
+      src[i] = shared ? (a.repeat == 1 ? dst[i] : at - a.shared_base + a.routed_slots) : dst[i] / a.repeat;
+    }
+    // one arrival counter a chunk: its first member's place (unique in M, or past it for the shared rows)
+    device atomic_uint* arrive = counts + (shared ? a.routed_slots + m : m) * a.blocks + tg.x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    TF_XR_BITS(8, j.halves, (x, j, y, partial, arrive, a, cb, tg.x, tg.z, src, dst, live, lane, sg, part, book, xs));
+  }
+}
+
 template [[host_name("tf_exl3_rows_r1")]] kernel void tf_exl3_rows<1>(const device bfloat*, const device TfExl3Job*, device uchar*, constant TfExl3RowsArgs&, device float*, device atomic_uint*, uint, uint, uint3, uint3);
 template [[host_name("tf_exl3_rows_r2")]] kernel void tf_exl3_rows<2>(const device bfloat*, const device TfExl3Job*, device uchar*, constant TfExl3RowsArgs&, device float*, device atomic_uint*, uint, uint, uint3, uint3);
 template [[host_name("tf_exl3_rows_r4")]] kernel void tf_exl3_rows<4>(const device bfloat*, const device TfExl3Job*, device uchar*, constant TfExl3RowsArgs&, device float*, device atomic_uint*, uint, uint, uint3, uint3);
