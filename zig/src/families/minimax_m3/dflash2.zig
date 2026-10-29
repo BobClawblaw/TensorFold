@@ -428,7 +428,7 @@ pub const Drafter = struct {
         ids[0] = pending;
         @memset(ids[1..n], c.mask);
         d.buf("seq").slice(u32, 16)[0] = pending;
-        const E = m.weights.embed;
+        const E = m.weights.embed.affine;
         const MArgs = extern struct { rows: u32 = 0, width: u32 = 0, heads: u32 = 0, dim: u32 = 0, pos: u32 = 0, stride: u32 = 0, bits: u32 = 0, group: u32 = 0, eps: f32 = 0, alpha: f32 = 0, limit: f32 = 0, scale: f32 = 0 };
         glue(e, m.pipe(.embed), MArgs{ .rows = @intCast(n), .width = c.hidden, .bits = E.bits, .group = @intCast(E.group) }, &.{ b(d.buf("ids")), bo(E.w, E.w_off), bo(E.scales, E.s_off), bo(E.biases, E.b_off), A, b(d.buf("resid")) }, .{ (h + 255) / 256, n, 1 }, .{ 256, 1, 1 });
         const lo = @max((anchor + 1) -| c.window, l.from);
@@ -462,7 +462,7 @@ pub const Drafter = struct {
         // rows 1-7: the head, each row's top 32 (three passes of 2048), the selector's projection and path
         const slots = n - 1;
         const xr = bo(d.buf("x"), h * 2);
-        try d.project(e, m.weights.head, xr, b(d.buf("logits")), slots);
+        try d.project(e, m.weights.head.affine, xr, b(d.buf("logits")), slots);
         try d.project(e, d.w.hproj, xr, b(d.buf("hid")), slots);
         const vocab: u32 = m.config.vocab;
         const chunks: u32 = (vocab + 2047) / 2048;

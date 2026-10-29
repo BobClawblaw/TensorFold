@@ -8,6 +8,8 @@ const vision = @import("vision.zig");
 const wts = @import("weights.zig");
 const rows = @import("../../core/row_projection.zig");
 const affine_mm = @import("../../core/affine_mm.zig");
+const xr = @import("../../core/exl3_rows.zig");
+const exl3 = @import("exl3.zig");
 const Model = @import("model.zig").Model;
 const Glue = @import("model.zig").Glue;
 
@@ -37,11 +39,44 @@ const Enc = struct {
         if (groups) x.e.dispatchGroups(g3, t3) else x.e.dispatchThreads(g3, t3);
     }
 
-    fn project(x: Enc, w: wts.Linear, in: mtl.Buffer, in_off: usize, out: mtl.Buffer, out_off: usize, n_rows: usize) !void {
-        return projectWith(x.e, x.m, x.s.sums, w, bo(in, in_off), bo(out, out_off), n_rows);
+    fn project(x: Enc, w: wts.Proj, in: mtl.Buffer, in_off: usize, out: mtl.Buffer, out_off: usize, n_rows: usize) !void {
+        switch (w) {
+            .affine => |a| return projectWith(x.e, x.m, x.s.sums, a, bo(in, in_off), bo(out, out_off), n_rows),
+            .exl3 => |set| {
+                const d = xr.Dense{ .jobs = set.jobs, .count = set.count, .blocks = set.blocks, .k = set.k };
+                const in_v = xr.View{ .buffer = in, .offset = in_off };
+                const out_v = xr.View{ .buffer = out, .offset = out_off };
+                // window rows keep their bits in any window; a prompt chunk's take the tensor units
+                if (n_rows > st.batch_rows) return xr.encodeMm(&x.m.xm.?, x.e, d, in_v, set.k, out_v, set.stride, n_rows);
+                xr.encode(&x.m.xr.?, x.e, d, in_v, set.k, out_v, set.stride, n_rows, .bf16, xr.ranges(set.blocks, set.k), x.scratch());
+            },
+        }
     }
 
-    fn experts(x: Enc, w: rows.Experts, in: mtl.Buffer, out: mtl.Buffer, ids: mtl.Buffer, slots: usize) !void {
+    /// An EXL3 pack's fp16 index pair from s.x into its columns of s.q.
+    fn index(x: Enc, h: exl3.Half, n: usize) void {
+        const c = &x.m.config;
+        x.e.setPipeline(x.m.half_rows.?);
+        x.e.setBuffer(x.s.x, 0, 0);
+        x.e.setBuffer(h.jobs.buffer, h.jobs.offset, 1);
+        x.e.setValue([5]u32{ @intCast(n), @intCast(h.k), @intCast(h.count), @intCast(h.k), c.qkvRows() }, 2);
+        x.e.setBuffer(x.s.q, 0, 3);
+        x.e.dispatchGroups(mtl.Size.of(h.cols / 8, (n + 7) / 8, 1), mtl.Size.of(256, 1, 1));
+    }
+
+    fn scratch(x: Enc) xr.Scratch {
+        return .{ .partial = .{ .buffer = x.s.partial.? }, .counts = .{ .buffer = x.s.counts.? } };
+    }
+
+    /// A decode window's routed slots [0, routed) and each row's shared-expert slot after them, in one call.
+    fn routedShared(x: Enc, r: exl3.Routed, in: mtl.Buffer, out: mtl.Buffer, routed: usize, n_rows: usize, repeat: usize, shared_base: usize) void {
+        var w = routedOf(r);
+        w.shared = true;
+        const blocks = r.kinds * r.n / 128;
+        xr.encodeRouted(&x.m.xr.?, x.e, w, .{ .buffer = in }, r.k, .{ .buffer = x.s.pick }, repeat, .{ .buffer = out }, r.kinds * r.n, routed, routed + n_rows, shared_base, .bf16, xr.ranges(blocks, r.k), x.scratch());
+    }
+
+    fn experts(x: Enc, w: rows.Experts, in: mtl.Buffer, out: mtl.Buffer, slots: usize) !void {
         const call = try rows.callIndexed(&x.m.rows, w, slots, false);
         if (w.one.bits == 3 or w.one.bits == 4) { // expert by expert: a weight read once for every row that picked it
             x.e.setPipeline(x.m.grouped[if (w.one.bits == 3) 0 else 1]);
@@ -53,7 +88,6 @@ const Enc = struct {
             x.e.dispatchGroups(mtl.Size.of(call.groups, slots, 1), mtl.Size.of(call.threads, 1, 1));
             return;
         }
-        _ = ids;
         x.e.setPipeline(call.pipeline);
         x.e.setBuffer(in, 0, 0);
         x.e.setBuffer(w.one.w, w.one.w_off, 1);
@@ -152,8 +186,10 @@ pub fn runShared(m: *const Model, s: *st.Scratch, segments: []const Segment, ids
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const t0 = if (out.timing != null) seconds() else 0;
+    if (m.weights.jobs != null) try s.exl3Scratch(m.device, m.weights.partial_bytes, m.weights.count_bytes);
     const cb = m.queue.commandBuffer();
     const x = Enc{ .e = cb.compute(.serial), .m = m, .s = s };
+    m.useWeights(x.e);
     const W = m.weights;
     embed(x, out.ids orelse b(s.ids), n);
     if (out.images.len > 0) {
@@ -251,7 +287,18 @@ fn pick(x: Enc, logits: mtl.Buffer, d: Draw) void {
 /// Embeddings of the token ids at `ids` (n of them) into the residual.
 fn embed(x: Enc, ids: B, n: usize) void {
     const c = &x.m.config;
-    const E = x.m.weights.embed;
+    const E = switch (x.m.weights.embed) {
+        .affine => |a| a,
+        .bf16 => |table| {
+            x.e.setPipeline(x.m.embed_bf16.?);
+            x.e.setBuffer(ids.buf, ids.off, 0);
+            x.e.setBuffer(table.buffer, table.offset, 1);
+            x.e.setValue([2]u32{ c.hidden, @intCast(n) }, 2);
+            x.e.setBuffer(x.s.resid, 0, 3);
+            x.e.dispatchThreads(mtl.Size.of(c.hidden, n, 1), mtl.Size.of(256, 1, 1));
+            return;
+        },
+    };
     const args = Args{ .rows = @intCast(n), .width = c.hidden, .bits = E.bits, .group = @intCast(E.group) };
     x.glue(.embed, args, &.{ ids, bo(E.w, E.w_off), bo(E.scales, E.s_off), bo(E.biases, E.b_off), A, b(x.s.resid) }, .{ c.hidden, n, 1 }, .{ 256, 1, 1 }, false);
 }
@@ -265,6 +312,7 @@ fn layer(x: Enc, segments: []const Segment, l: wts.Layer, i: usize, n: usize, ne
     const nr: u32 = @intCast(n);
     const normed = Args{ .rows = nr, .width = c.hidden, .eps = c.eps };
     try x.project(l.attn.qkv, s.x, 0, s.q, 0, n);
+    if (l.attn.index) |ix| x.index(ix, n);
     var base: usize = 0;
     for (segments) |seg| {
         try attention(x, seg.cache, l.attn, i, base, seg.rows);
@@ -288,20 +336,30 @@ fn layer(x: Enc, segments: []const Segment, l: wts.Layer, i: usize, n: usize, ne
             const slots = n * c.topk;
             const inter: u32 = c.moe_intermediate;
             const act = Args{ .rows = @intCast(slots), .width = inter, .stride = 2 * inter, .alpha = c.swiglu_alpha, .limit = c.swiglu_limit };
+            // the shared expert's rows: its own MLP, or (an EXL3 decode window) slots after the routed ones in s.ey
+            var shared = b(s.shared);
             if (n > st.batch_rows) {
-                try expertsByExpert(x, e, n, act);
+                if (e.gu == .affine) try expertsByExpert(x, e, n, act) else expertsByExpertExl3(x, e, n, act);
+                try mlp(x, e.shared, s.shared, n, c.shared_intermediate);
+            } else if (e.gu == .exl3) {
+                x.routedShared(e.gu.exl3, s.x, s.egu, slots, n, c.topk, slots);
+                var all = act;
+                all.rows = @intCast(slots + n);
+                x.glue(.swiglu, all, &.{ b(s.egu), A, b(s.ea) }, .{ inter, slots + n, 1 }, .{ 256, 1, 1 }, false);
+                x.routedShared(e.down.exl3, s.ea, s.ey, slots, n, 1, 0);
+                shared = bo(s.ey, slots * h * 2);
             } else {
-                var gu = e.gu;
+                var gu = e.gu.affine;
                 gu.repeat = c.topk;
-                try x.experts(gu, s.x, s.egu, s.pick, slots);
+                try x.experts(gu, s.x, s.egu, slots);
                 x.glue(.swiglu, act, &.{ b(s.egu), A, b(s.ea) }, .{ inter, slots, 1 }, .{ 256, 1, 1 }, false);
-                try x.experts(e.down, s.ea, s.ey, s.pick, slots);
+                try x.experts(e.down.affine, s.ea, s.ey, slots);
+                try mlp(x, e.shared, s.shared, n, c.shared_intermediate);
             }
-            try mlp(x, e.shared, s.shared, n, c.shared_intermediate);
             const madd = Args{ .rows = nr, .width = c.hidden, .heads = c.topk, .eps = c.eps, .scale = c.routed_scale };
             if (next) |w| {
-                x.glue(.moe_add_norm, madd, &.{ b(s.resid), b(s.ey), b(s.pick), b(s.wts), b(s.shared), t(w), A, b(s.x) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
-            } else x.glue(.moe_add, madd, &.{ b(s.resid), b(s.ey), b(s.pick), b(s.wts), b(s.shared), A }, .{ h, n, 1 }, .{ 256, 1, 1 }, false);
+                x.glue(.moe_add_norm, madd, &.{ b(s.resid), b(s.ey), b(s.pick), b(s.wts), shared, t(w), A, b(s.x) }, .{ n, 1, 1 }, .{ 1024, 1, 1 }, true);
+            } else x.glue(.moe_add, madd, &.{ b(s.resid), b(s.ey), b(s.pick), b(s.wts), shared, A }, .{ h, n, 1 }, .{ 256, 1, 1 }, false);
         },
     }
 }
@@ -311,16 +369,36 @@ fn expertsByExpert(x: Enc, e: wts.Moe, n: usize, act: Args) !void {
     const c = &x.m.config;
     const s = x.s;
     const slots: u32 = @intCast(n * c.topk);
-    const p = x.m.mmFor(e.gu.one) orelse return error.UnsupportedMiniMaxExperts;
-    const pd = x.m.mmFor(e.down.one) orelse return error.UnsupportedMiniMaxExperts;
+    const gu = e.gu.affine;
+    const down = e.down.affine;
+    const p = x.m.mmFor(gu.one) orelse return error.UnsupportedMiniMaxExperts;
+    const pd = x.m.mmFor(down.one) orelse return error.UnsupportedMiniMaxExperts;
     const ex: u32 = c.experts;
     x.glue(.sort, Args{ .rows = slots, .width = ex }, &.{ b(s.pick), A, b(s.offsets), b(s.order) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, true);
     x.glue(.rows_by_order, Args{ .rows = slots, .width = c.hidden, .heads = c.topk }, &.{ b(s.x), b(s.order), A, b(s.xs) }, .{ c.hidden, slots, 1 }, .{ 256, 1, 1 }, false);
-    affine_mm.rowSums(x.e, p, @intCast(e.gu.one.group), b(s.xs), b(s.sums), slots, c.hidden);
-    affine_mm.gather(x.e, p, b(s.xs), b(s.sums), mat(e.gu.one), b(s.offsets), b(s.egu), slots, ex);
+    affine_mm.rowSums(x.e, p, @intCast(gu.one.group), b(s.xs), b(s.sums), slots, c.hidden);
+    affine_mm.gather(x.e, p, b(s.xs), b(s.sums), mat(gu.one), b(s.offsets), b(s.egu), slots, ex);
     x.glue(.swiglu, act, &.{ b(s.egu), A, b(s.ea) }, .{ c.moe_intermediate, slots, 1 }, .{ 256, 1, 1 }, false);
-    affine_mm.rowSums(x.e, pd, @intCast(e.down.one.group), b(s.ea), b(s.sums), slots, c.moe_intermediate);
-    affine_mm.gatherTo(x.e, pd, b(s.ea), b(s.sums), mat(e.down.one), b(s.offsets), b(s.ey), b(s.order), slots, ex);
+    affine_mm.rowSums(x.e, pd, @intCast(down.one.group), b(s.ea), b(s.sums), slots, c.moe_intermediate);
+    affine_mm.gatherTo(x.e, pd, b(s.ea), b(s.sums), mat(down.one), b(s.offsets), b(s.ey), b(s.order), slots, ex);
+}
+
+fn routedOf(r: exl3.Routed) xr.Routed {
+    return .{ .jobs = r.jobs, .experts = r.experts, .kinds = r.kinds, .n = r.n, .k = r.k };
+}
+
+/// expertsByExpert for an EXL3 pack: the same sort, each expert's gate | up and down on the tensor units.
+fn expertsByExpertExl3(x: Enc, e: wts.Moe, n: usize, act: Args) void {
+    const c = &x.m.config;
+    const s = x.s;
+    const slots: u32 = @intCast(n * c.topk);
+    const gu = e.gu.exl3;
+    const down = e.down.exl3;
+    x.glue(.sort, Args{ .rows = slots, .width = c.experts }, &.{ b(s.pick), A, b(s.offsets), b(s.order) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, true);
+    x.glue(.rows_by_order, Args{ .rows = slots, .width = c.hidden, .heads = c.topk }, &.{ b(s.x), b(s.order), A, b(s.xs) }, .{ c.hidden, slots, 1 }, .{ 256, 1, 1 }, false);
+    xr.encodeMmGather(&x.m.xm.?, x.e, routedOf(gu), .{ .buffer = s.xs }, gu.k, .{ .buffer = s.offsets }, null, .{ .buffer = s.egu }, gu.kinds * gu.n, slots);
+    x.glue(.swiglu, act, &.{ b(s.egu), A, b(s.ea) }, .{ c.moe_intermediate, slots, 1 }, .{ 256, 1, 1 }, false);
+    xr.encodeMmGather(&x.m.xm.?, x.e, routedOf(down), .{ .buffer = s.ea }, down.k, .{ .buffer = s.offsets }, .{ .buffer = s.order }, .{ .buffer = s.ey }, down.n, slots);
 }
 
 /// gate|up from s.x, SwiGLU, down into `out`.

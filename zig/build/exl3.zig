@@ -3,8 +3,11 @@ const std = @import("std");
 pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, metal: *std.Build.Module, host_tests: *std.Build.Step) void {
     const files = b.addWriteFiles();
     _ = files.addCopyFile(b.path("zig/kernels/metal/core/exl3_projection.metal"), "exl3_projection.metal");
+    _ = files.addCopyFile(b.path("zig/kernels/metal/core/exl3_rows.metal"), "exl3_rows.metal");
+    _ = files.addCopyFile(b.path("zig/kernels/metal/core/exl3_mm.metal"), "exl3_mm.metal");
+    _ = files.addCopyFile(b.path("zig/kernels/metal/nax.h"), "nax.h");
     const sources = b.createModule(.{
-        .root_source_file = files.add("sources.zig", "pub const core_exl3_projection = @embedFile(\"exl3_projection.metal\");\n"),
+        .root_source_file = files.add("sources.zig", "pub const core_exl3_projection = @embedFile(\"exl3_projection.metal\");\npub const core_exl3_rows = @embedFile(\"exl3_rows.metal\");\npub const core_exl3_mm = @embedFile(\"exl3_mm.metal\");\npub const nax = @embedFile(\"nax.h\");\n"),
     });
     const imports: []const std.Build.Module.Import =
         &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } };
@@ -22,6 +25,22 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .link_libc = true,
         .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources }, .{ .name = "exl3_projection", .module = projection } },
     }) });
+    const rows = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/exl3_rows.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = imports,
+    });
+    const rows_bench = b.addExecutable(.{ .name = "tf-exl3-rows-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/exl3_rows_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "exl3_rows", .module = rows } },
+    }) });
+    b.step("tf-exl3-rows-bench", "EXL3 rows against the reference projection at MiniMax-M3.1-Flash's shapes, with DRAM speeds")
+        .dependOn(&b.addInstallArtifact(rows_bench, .{}).step);
     b.step("tf-exl3-bench", "Standalone deterministic EXL3 FP64 oracle and relative operator benchmark")
         .dependOn(&b.addInstallArtifact(bench, .{}).step);
     const host = b.addRunArtifact(b.addTest(.{ .root_module = projection }));
@@ -37,6 +56,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     }) });
     host_step.dependOn(&load_check.step);
     host_step.dependOn(&host.step);
+    const rows_host = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
+    rows_host.setCwd(b.path("."));
+    host_step.dependOn(&rows_host.step);
     host_step.dependOn(&oracle_tests.step);
     host_tests.dependOn(host_step);
     const gpu = b.addTest(.{ .root_module = b.createModule(.{

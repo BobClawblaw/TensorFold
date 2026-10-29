@@ -29,6 +29,10 @@ pub const core_row_projection = @embedFile("core/row_projection.metal");
 pub const core_tile_qmm = @embedFile("core/tile_qmm.metal") ++ @embedFile("core/tile_qmv.metal") ++
     @embedFile("core/tile_qmv_rows.metal");
 pub const core_exl3_projection = @embedFile("core/exl3_projection.metal");
+/// EXL3 rows: a window's rows through resident mul1 projections, both rotations folded in.
+pub const core_exl3_rows = @embedFile("core/exl3_rows.metal");
+/// EXL3 prompt chunks on the tensor units: rows rotated once a K block, weights decoded into the right operand.
+pub const core_exl3_mm = @embedFile("core/exl3_mm.metal");
 pub const core_exlr8_projection = @embedFile("core/exlr8_projection.metal");
 pub const core_exlr8_dense = @embedFile("core/exlr8_dense.metal");
 pub const core_exlr8_prompt = @embedFile("core/exlr8_prompt.metal");
@@ -176,6 +180,8 @@ pub const minimax_m3_experts = @embedFile("minimax_m3/experts.metal");
 pub const minimax_m3_dflash2 = @embedFile("minimax_m3/dflash2.metal");
 /// MiniMax-M3's indexer block scores on the tensor units (a prompt chunk's).
 pub const minimax_m3_index_nax = @embedFile("minimax_m3/index_nax.metal");
+/// MiniMax-M3's EXL3 pack around its EXL3 projections: the bf16 embedding rows and the fp16 index pair.
+pub const minimax_m3_exl3_glue = @embedFile("minimax_m3/exl3_glue.metal");
 /// Step-5's sparse indexer (summaries, scores, top-k) and its sliding, sparse and dense attention.
 pub const step5_sparse = @embedFile("step5/sparse.metal");
 /// Step-5's prompt attention on the tensor units (a KV group's 16 heads one operand; nax.h inlined at load).

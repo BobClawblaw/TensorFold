@@ -11,6 +11,8 @@ const frags = @import("../../core/frags.zig");
 const st = @import("state.zig");
 const weights = @import("weights.zig");
 const vision = @import("vision.zig");
+const exl3 = @import("exl3.zig");
+const exl3_rows = @import("../../core/exl3_rows.zig");
 
 /// Nemotron's generated keyed sampler (its vocabulary compiled in; this model's replaces it).
 fn sampler() ?ks.nemotron.Kernel {
@@ -61,6 +63,11 @@ pub const Model = struct {
     taps: u32 = 0,
     /// The image tower (--vision), its shard added to the checkpoint by loadVision.
     vision: ?*vision.Vision = null,
+    /// An EXL3 pack's projections, bf16 embedding rows and fp16 index pair (exl3_glue.metal).
+    xr: ?exl3_rows.Pipelines = null,
+    xm: ?exl3_rows.MmPipelines = null,
+    embed_bf16: ?mtl.Pipeline = null,
+    half_rows: ?mtl.Pipeline = null,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !*Model {
         const pool = mtl.objc.Pool.push();
@@ -70,6 +77,10 @@ pub const Model = struct {
         m.gpa = gpa;
         m.mms = 0;
         m.vision = null;
+        m.xr = null;
+        m.xm = null;
+        m.embed_bf16 = null;
+        m.half_rows = null;
         m.config = try cfg.Config.read(gpa, io, dir);
         const c = &m.config;
         m.device = try mtl.Device.init();
@@ -82,9 +93,19 @@ pub const Model = struct {
         defer shards.freeShardFiles(gpa, files);
         // the vision tower's shard stays on disk until loadVision, and the drafter not in use
         const skip = if (drafterKind() == DrafterKind.dspark) "model-dflash2.safetensors" else "model-dspark.safetensors";
-        for (files) |path| if (!std.mem.endsWith(u8, path, "model-vision.safetensors") and !std.mem.endsWith(u8, path, skip)) try m.checkpoint.addFile(m.device, path, "");
-        m.weights = try weights.load(gpa, &m.checkpoint, c);
+        for (files) |path| if (std.mem.indexOf(u8, std.fs.path.basename(path), vision.shard_stem) == null and !std.mem.endsWith(u8, path, skip)) try m.checkpoint.addFile(m.device, path, "");
+        const packed_exl3 = try exl3.isExl3(gpa, io, dir);
+        m.weights = if (packed_exl3) try weights.loadExl3(gpa, m.device, &m.checkpoint, c, st.batch_rows) else try weights.load(gpa, &m.checkpoint, c);
         errdefer m.weights.deinit(gpa);
+        errdefer m.deinitExl3();
+        if (packed_exl3) {
+            m.xr = try exl3_rows.Pipelines.load(m.device);
+            m.xm = try exl3_rows.MmPipelines.load(m.device, gpa);
+            const lib = try mtl.Library.fromSource(m.device, ks.minimax_m3_exl3_glue, mtl.CompileOptions.mlx());
+            defer lib.deinit();
+            m.embed_bf16 = try mtl.Pipeline.init(m.device, lib, "mm_embed_bf16", false);
+            m.half_rows = try mtl.Pipeline.init(m.device, lib, "mm_half_rows", false);
+        }
         {
             const lib = try mtl.Library.fromSource(m.device, ks.minimax_m3_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
             defer lib.deinit();
@@ -156,19 +177,33 @@ pub const Model = struct {
         }
         errdefer for (m.grouped) |p| p.deinit();
         errdefer for (m.mm[0..m.mms]) |f| for (f.pipes) |p| p.deinit();
-        try m.addMm(m.weights.head);
+        if (packed_exl3) return m;
+        try m.addMm(m.weights.head.affine);
         for (m.weights.layers) |l| {
-            try m.addMm(l.attn.qkv);
+            try m.addMm(l.attn.qkv.affine);
             switch (l.ffn) {
-                .dense => |d| try m.addMm(d.gu),
+                .dense => |d| try m.addMm(d.gu.affine),
                 .moe => |e| {
-                    try m.addMm(e.gu.one);
-                    try m.addMm(e.down.one);
-                    try m.addMm(e.shared.gu);
+                    try m.addMm(e.gu.affine.one);
+                    try m.addMm(e.down.affine.one);
+                    try m.addMm(e.shared.gu.affine);
                 },
             }
         }
         return m;
+    }
+
+    fn deinitExl3(m: *Model) void {
+        if (m.xr) |*p| p.deinit();
+        if (m.xm) |*p| p.deinit();
+        if (m.embed_bf16) |p| p.deinit();
+        if (m.half_rows) |p| p.deinit();
+    }
+
+    /// An encoder's indirect reads: every shard an EXL3 job points into (no-op for affine checkpoints).
+    pub fn useWeights(m: *const Model, e: mtl.ComputeEncoder) void {
+        if (m.weights.jobs == null) return;
+        for (m.checkpoint.shards.items) |sh| e.useResource(sh.buffer, mtl.ResourceUsage.read);
     }
 
     /// Pipelines for `w`'s format, compiled once per format (at most 4).
@@ -209,9 +244,8 @@ pub const Model = struct {
     /// The checkpoint's image tower (--vision): its shard into the checkpoint, then the tower over it.
     pub fn loadVision(m: *Model, io: std.Io, dir: []const u8) !void {
         if (m.vision != null) return;
-        const path = try std.fs.path.joinZ(m.gpa, &.{ dir, vision.shard });
+        const path = try vision.shardPath(m.gpa, io, dir);
         defer m.gpa.free(path);
-        std.Io.Dir.cwd().access(io, path, .{}) catch return error.NoMiniMaxVisionShard;
         try m.checkpoint.addFile(m.device, path, "");
         m.vision = try vision.Vision.load(m.gpa, m.device, &m.checkpoint, m.pipe(.widen), m.pipe(.narrow));
     }
@@ -221,6 +255,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(m: *Model) void {
+        m.deinitExl3();
         for (m.mm[0..m.mms]) |f| for (f.pipes) |p| p.deinit();
         m.prompt_attn.deinit();
         m.index_nax.deinit();

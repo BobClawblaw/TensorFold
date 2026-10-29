@@ -101,6 +101,7 @@ fn sizes(c: *const cfg.Config, rows: usize, context: usize) [fields.len]usize {
     const prompt = rows > batch_rows;
     const h: usize = c.hidden;
     const slots_ = r * c.topk;
+    const wide = slots_ + r; // and a shared-expert slot a row (an EXL3 pack's decode windows)
     const qw = r * c.heads * c.head_dim * 2;
     const inter: usize = @max(c.dense_intermediate, c.shared_intermediate);
     // a prompt chunk's fp32 group sums: groups of 32 at the finest, over the widest input a projection reads
@@ -111,12 +112,12 @@ fn sizes(c: *const cfg.Config, rows: usize, context: usize) [fields.len]usize {
     const nb = c.blocks(context);
     const sel_rows = r * c.kv_heads;
     var out: [fields.len]usize = .{
-        r * 4,                                      r * h * 4,                           r * h * 2,                                               r * c.qkvRows() * 2,          qw,
-        (r + 32) * c.index_heads * c.index_dim * 2, qw,                                  r * h * 2,                                               r * h * 2,                    r * 2 * inter * 2,
-        r * inter * 2,                              slots_ * 2 * c.moe_intermediate * 2, slots_ * c.moe_intermediate * 2,                         slots_ * h * 2,               r * c.experts * 4,
-        slots_ * 4,                                 slots_ * 4,                          if (prompt) slots_ * h * 2 else 16,                      sums,                         c.experts * 4,
-        slots_ * 4,                                 decode * @as(usize, c.vocab) * 2,    if (prompt) 16 else partials,                            if (prompt) 16 else partials, if (prompt) 16 else partials * c.head_dim,
-        sel_rows * nb * 4,                          sel_rows * c.topk_blocks * 4,        if (r > window_rows) sel_rows * selWords(c) * 4 else 16, (1 + 2 * slots_) * 4,         slots_ * 4,
+        r * 4,                                      r * h * 4,                         r * h * 2,                                               r * c.qkvRows() * 2,          qw,
+        (r + 32) * c.index_heads * c.index_dim * 2, qw,                                r * h * 2,                                               r * h * 2,                    r * 2 * inter * 2,
+        r * inter * 2,                              wide * 2 * c.moe_intermediate * 2, wide * c.moe_intermediate * 2,                           wide * h * 2,                 r * c.experts * 4,
+        slots_ * 4,                                 slots_ * 4,                        if (prompt) slots_ * h * 2 else 16,                      sums,                         c.experts * 4,
+        slots_ * 4,                                 decode * @as(usize, c.vocab) * 2,  if (prompt) 16 else partials,                            if (prompt) 16 else partials, if (prompt) 16 else partials * c.head_dim,
+        sel_rows * nb * 4,                          sel_rows * c.topk_blocks * 4,      if (r > window_rows) sel_rows * selWords(c) * 4 else 16, (1 + 2 * slots_) * 4,         slots_ * 4,
     };
     if (prompt) inline for (shares) |pair| {
         out[index(pair[1])] = @max(out[index(pair[1])], out[index(pair[0])]);
@@ -167,6 +168,9 @@ pub const Scratch = struct {
     context: usize,
     /// The drafter's tapped rows [rows, taps x hidden] bf16, once a drafter asked for them.
     taps: ?mtl.Buffer = null,
+    /// An EXL3 pack's K-range partials and arrival counters (zeroed, left zeroed), at its first forward.
+    partial: ?mtl.Buffer = null,
+    counts: ?mtl.Buffer = null,
 
     /// Buffers for `rows` rows at once (batch_rows for decode, prompt_rows for prompt chunks) over `context` positions.
     pub fn init(device: mtl.Device, c: *const cfg.Config, rows: usize, context: usize) !Scratch {
@@ -185,6 +189,8 @@ pub const Scratch = struct {
         };
         s.context = context;
         s.taps = null;
+        s.partial = null;
+        s.counts = null;
         return s;
     }
 
@@ -196,6 +202,18 @@ pub const Scratch = struct {
     pub fn deinit(s: *Scratch) void {
         inline for (fields) |f| if (!(s.sharing() and comptime shared(f))) @field(s, f).deinit();
         if (s.taps) |x| x.deinit();
+        if (s.partial) |x| x.deinit();
+        if (s.counts) |x| x.deinit();
+    }
+
+    pub fn exl3Scratch(s: *Scratch, device: mtl.Device, partial: usize, counts: usize) !void {
+        if (s.partial != null) return;
+        const p = try device.buffer(partial, mtl.ResourceOptions.shared);
+        errdefer p.deinit();
+        const k = try device.buffer(counts, mtl.ResourceOptions.shared);
+        @memset(k.contents()[0..counts], 0);
+        s.partial = p;
+        s.counts = k;
     }
 };
 

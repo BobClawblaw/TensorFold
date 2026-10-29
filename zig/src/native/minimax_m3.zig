@@ -85,6 +85,11 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.io = io;
     h.model = model;
     h.resident = null;
+    if (o.drafts and model.weights.jobs != null) {
+        problem.* = "drafts: an EXL3 pack's DSpark head (MXFP8 under dspark/) has no Metal path; serve it with --no-drafts";
+        model.deinit();
+        return null;
+    }
     const df2 = if (o.drafts and kind == .dflash2) fl.dflash2.Config.read(gpa, io, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's DFlash2 config cannot be read ({s})", .{@errorName(err)});
         model.deinit();

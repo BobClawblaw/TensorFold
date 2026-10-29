@@ -23,6 +23,21 @@ const eps: f32 = 1e-5;
 pub const max_tokens: u32 = 576; // the processor's max_pixels, 672 x 672: 48 x 48 patches
 const max_patches: u32 = max_tokens * merge * merge;
 pub const shard = "model-vision.safetensors";
+/// Every vision shard's name starts so: ours (`shard`) or a pack's numbered one (model-vision-00001-of-00001).
+pub const shard_stem = "model-vision";
+
+/// The vision shard in `dir`: `shard`, else the one numbered shard of that stem.
+pub fn shardPath(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![:0]u8 {
+    for ([_][]const u8{ shard, shard_stem ++ "-00001-of-00001.safetensors" }) |n| {
+        const path = try std.fs.path.joinZ(gpa, &.{ dir, n });
+        std.Io.Dir.cwd().access(io, path, .{}) catch {
+            gpa.free(path);
+            continue;
+        };
+        return path;
+    }
+    return error.NoMiniMaxVisionShard;
+}
 /// The tokenizer's image markers: the processor writes start, the image's tokens, end (the template the token alone).
 pub const image_start: u32 = 200029;
 pub const image_end: u32 = 200030;

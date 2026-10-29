@@ -408,7 +408,7 @@ pub const Drafter = struct {
         ids[0] = pending;
         @memset(ids[1..n], c.noise);
         d.buf("seq").slice(u32, 16)[0] = pending;
-        const E = m.weights.embed;
+        const E = m.weights.embed.affine;
         glue(e, m.pipe(.embed), MArgs{ .rows = @intCast(n), .width = c.hidden, .bits = E.bits, .group = @intCast(E.group) }, &.{ b(d.buf("ids")), bo(E.w, E.w_off), bo(E.scales, E.s_off), bo(E.biases, E.b_off), A, b(d.buf("resid")) }, .{ (h + 255) / 256, n, 1 }, .{ 256, 1, 1 });
         const nm = MArgs{ .rows = @intCast(n), .width = c.hidden, .eps = c.eps };
         glue(e, m.pipe(.norm), nm, &.{ b(d.buf("resid")), t(d.w.layers[0].in_norm), A, b(d.buf("x")) }, .{ n, 1, 1 }, .{ 256, 1, 1 });
@@ -438,7 +438,7 @@ pub const Drafter = struct {
             const next = if (i + 1 < c.layers) d.w.layers[i + 1].in_norm else d.w.norm;
             glue(e, m.pipe(.add_norm), nm, &.{ b(d.buf("resid")), b(d.buf("y")), t(next), A, b(d.buf("x")) }, .{ n, 1, 1 }, .{ 256, 1, 1 });
         }
-        try d.project(e, m.weights.head, b(d.buf("x")), b(d.buf("logits")), n);
+        try d.project(e, m.weights.head.affine, b(d.buf("x")), b(d.buf("logits")), n);
         const vocab: u32 = m.config.vocab;
         const groups: u32 = (vocab + 255) / 256;
         const w2 = d.w.w2;
