@@ -75,6 +75,18 @@ inline void tf_xr_finish(const device TfExl3Job& j, device uchar* y, constant Tf
   }
 }
 
+// Row `row` of x (live or not) at K block kb rotated into `out`: x * su, the Hadamard, / sqrt(128), fp16.
+inline void tf_xr_rotate(const device bfloat* x, const device TfExl3Job& j, constant TfExl3RowsArgs& a, uint row,
+                         bool live, uint kb, uint lane, threadgroup float* out) {
+  float v[4];
+  for (uint q = 0; q < 4; ++q) {
+    const uint k = kb + lane + 32 * q;
+    v[q] = live ? float(x[ulong(row) * a.x_stride + k]) * float(j.su[k]) : 0.0f;
+  }
+  tf_xr_hadamard(v, lane);
+  for (uint q = 0; q < 4; ++q) out[lane + 32 * q] = float(half(v[q] * 0.08838834764831845f));
+}
+
 // 16 bits of the MSB-first stream A:B:C from bit S (a constant): an extract in a word, extract and insert across.
 template <uint S>
 inline uint tf_xr_window(uint A, uint B, uint C) {
@@ -100,20 +112,15 @@ inline void tf_xr_block(const device bfloat* x, const device TfExl3Job& j, devic
   for (uint i = 0; i < R; ++i) acc[i][0] = acc[i][1] = 0.0f;
   const device uint* col = j.trellis + ulong(cb * 8 + ct) * j.tile_n_stride;
   const uint step = KS * a.ranges * 128;
-  for (uint kb = (range * KS + ks) * 128; kb < a.k; kb += step) {
-    // the block's rows rotated once: simdgroup i takes row i (x * su, Hadamard, fp16) for every simdgroup to read
+  // rows rotated once a block by simdgroup i (row i), the next block's while this one's decode: one barrier
+  const uint kb0 = (range * KS + ks) * 128;
+  if (sg < R && kb0 < a.k) tf_xr_rotate(x, j, a, src[sg], sg < live, kb0, lane, xs + sg * 128);
+  uint buf = 0;
+  for (uint kb = kb0; kb < a.k; kb += step) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg < R) {
-      const uint i = sg;
-      float v[4];
-      for (uint q = 0; q < 4; ++q) {
-        const uint k = kb + lane + 32 * q;
-        v[q] = i < live ? float(x[ulong(src[i]) * a.x_stride + k]) * float(j.su[k]) : 0.0f;
-      }
-      tf_xr_hadamard(v, lane);
-      for (uint q = 0; q < 4; ++q) xs[i * 128 + lane + 32 * q] = float(half(v[q] * 0.08838834764831845f));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg < R && kb + step < a.k) tf_xr_rotate(x, j, a, src[sg], sg < live, kb + step, lane, xs + ((buf ^ 1u) * R + sg) * 128);
+    threadgroup const float* rows = xs + buf * R * 128;
+    buf ^= 1u;
     for (uint t = 0; t < 8; ++t) {
       const device uint* tile = col + ulong(kb / 16 + t) * j.tile_k_stride;
       const uint u0 = tile[i0], u1 = tile[i1], u2 = tile[i2], u3 = tile[i3];
@@ -132,7 +139,7 @@ inline void tf_xr_block(const device bfloat* x, const device TfExl3Job& j, devic
       w[7] = tf_xr_book(book, tf_xr_window<7 * K>(A, B, C));
       const uint from = 16 * t + r0;
       for (uint i = 0; i < R; ++i) {
-        threadgroup const float* xr = xs + i * 128 + from;
+        threadgroup const float* xr = rows + i * 128 + from;
         const float x0 = xr[0], x1 = xr[1], x8 = xr[8], x9 = xr[9];
         acc[i][0] = fma(x9, w[3], fma(x8, w[2], fma(x1, w[1], fma(x0, w[0], acc[i][0]))));
         acc[i][1] = fma(x9, w[7], fma(x8, w[6], fma(x1, w[5], fma(x0, w[4], acc[i][1]))));
@@ -220,7 +227,7 @@ kernel void tf_exl3_rows(const device bfloat* x [[buffer(0)]],
                          uint3 groups [[threadgroups_per_grid]]) {
   threadgroup float part[KS * R * 128];
   threadgroup float book[1024];
-  threadgroup float xs[R * 128];
+  threadgroup float xs[2 * R * 128];
   tf_xr_fill(book, sg * 32 + lane, KS * 8 * 32);
   const device TfExl3Job& j = jobs[tf_xr_job(jobs, a, tg.x)];
   const uint r0 = tg.y * R;
@@ -245,7 +252,7 @@ kernel void tf_exl3_rows_routed(const device bfloat* x [[buffer(0)]],
                                 uint3 tg [[threadgroup_position_in_grid]]) {
   threadgroup float part[KS * 128];
   threadgroup float book[1024];
-  threadgroup float xs[128];
+  threadgroup float xs[2 * 128];
   const bool shared = tg.y >= a.routed_slots;
   const uint e = shared ? a.experts : routes[tg.y];
   if (!shared && e >= a.experts) return;
