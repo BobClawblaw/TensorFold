@@ -59,13 +59,31 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
         return null;
     };
     // refusals that return null free what they hold themselves: errdefer runs only for errors
+
+    // an EXL3 pack's DSpark head lives in dspark/ (the release's MXFP8): its shard now, its widened copy in the budget
+    var pack_head: u64 = 0;
+    if (o.drafts and model.weights.jobs != null) {
+        const pc = fl.dspark.Config.read(gpa, io, o.dir) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "the pack's DSpark config (dspark/config.json) cannot be read ({s})", .{@errorName(err)});
+            model.deinit();
+            return null;
+        };
+        if (pc) |dc| {
+            model.loadPackDSpark(io, o.dir) catch |err| {
+                problem.* = try std.fmt.allocPrint(a, "the pack's DSpark head (dspark/) cannot load ({s})", .{@errorName(err)});
+                model.deinit();
+                return null;
+            };
+            pack_head = fl.dspark_pack.widenedBytes(&dc);
+        }
+    }
     var ram: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (std.c.sysctlbyname("hw.memsize", &ram, &len, null, 0) != 0) ram = 0;
     const text: ?[]const u8 = if (std.c.getenv("MINIMAX_LOAD_LIMIT_GB")) |v| std.mem.span(v) else null;
     const c = &model.config; // the decode window's and the prompt chunk's buffers
     const tower: u64 = if (model.vision) |v| v.bytes() else 0;
-    const scratch: u64 = fl.state.scratchBytes(c, fl.state.batch_rows, c.context) + fl.state.scratchBytes(c, fl.state.prompt_rows, c.context) + tower;
+    const scratch: u64 = fl.state.scratchBytes(c, fl.state.batch_rows, c.context) + fl.state.scratchBytes(c, fl.state.prompt_rows, c.context) + tower + pack_head;
     const budget = fl.budget.caches(ram, model.device.maxWorkingSet(), text, model.checkpoint.residentBytes() + scratch) catch {
         model.deinit();
         problem.* = "MINIMAX_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0, or unset it for 75% of RAM";
@@ -85,11 +103,6 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.io = io;
     h.model = model;
     h.resident = null;
-    if (o.drafts and model.weights.jobs != null) {
-        problem.* = "drafts: an EXL3 pack's DSpark head (MXFP8 under dspark/) has no Metal path; serve it with --no-drafts";
-        model.deinit();
-        return null;
-    }
     const df2 = if (o.drafts and kind == .dflash2) fl.dflash2.Config.read(gpa, io, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's DFlash2 config cannot be read ({s})", .{@errorName(err)});
         model.deinit();

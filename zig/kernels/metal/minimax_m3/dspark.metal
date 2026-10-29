@@ -195,3 +195,40 @@ struct mm_markov_args { uint vocab, rank, step; };
   }
   if (lane == 0) seq[a.y + 1] = bi;
 }
+
+// mm_markov_step with the release's bf16 W2 [vocab, rank] (an EXL3 pack's DSpark head).
+[[kernel]] void mm_markov_step_bf16(const device bfloat* L [[buffer(0)]], const device bfloat* W1 [[buffer(1)]],
+    const device bfloat* W2 [[buffer(2)]], const device uint* seq [[buffer(3)]], constant mm_markov_args& a [[buffer(4)]],
+    device float* best [[buffer(5)]], device uint* best_id [[buffer(6)]], uint group [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float e[256];
+  threadgroup float vals[8];
+  threadgroup uint ids[8];
+  const uint prev = seq[a.step];
+  for (uint i = t; i < a.rank; i += 256) e[i] = float(W1[(size_t)prev * a.rank + i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint v = group * 256 + t;
+  float score = -INFINITY;
+  if (v < a.vocab) {
+    const device bfloat* w = W2 + (size_t)v * a.rank;
+    float sum = 0.0f;
+    for (uint i = 0; i < a.rank; ++i) sum = fma(float(w[i]), e[i], sum);
+    score = float(L[(size_t)a.step * a.vocab + v]) + sum;
+  }
+  uint at = v;
+  for (ushort d = 16; d > 0; d >>= 1) {
+    const float o = simd_shuffle_xor(score, d);
+    const uint oi = simd_shuffle_xor(at, d);
+    if (o > score || (o == score && oi < at)) { score = o; at = oi; }
+  }
+  if (lane == 0) { vals[sg] = score; ids[sg] = at; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (t == 0) {
+    float b = vals[0];
+    uint bi = ids[0];
+    for (uint k = 1; k < 8; ++k) if (vals[k] > b || (vals[k] == b && ids[k] < bi)) { b = vals[k]; bi = ids[k]; }
+    best[group] = b;
+    best_id[group] = bi;
+  }
+}

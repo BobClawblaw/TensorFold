@@ -68,6 +68,8 @@ pub const Model = struct {
     xm: ?exl3_rows.MmPipelines = null,
     embed_bf16: ?mtl.Pipeline = null,
     half_rows: ?mtl.Pipeline = null,
+    /// The pack's DSpark head's widened bf16 projections (exl3_glue.metal's mm_bf16_rows).
+    bf16_rows: ?mtl.Pipeline = null,
 
     pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !*Model {
         const pool = mtl.objc.Pool.push();
@@ -81,6 +83,7 @@ pub const Model = struct {
         m.xm = null;
         m.embed_bf16 = null;
         m.half_rows = null;
+        m.bf16_rows = null;
         m.config = try cfg.Config.read(gpa, io, dir);
         const c = &m.config;
         m.device = try mtl.Device.init();
@@ -105,6 +108,7 @@ pub const Model = struct {
             defer lib.deinit();
             m.embed_bf16 = try mtl.Pipeline.init(m.device, lib, "mm_embed_bf16", false);
             m.half_rows = try mtl.Pipeline.init(m.device, lib, "mm_half_rows", false);
+            m.bf16_rows = try mtl.Pipeline.init(m.device, lib, "mm_bf16_rows", false);
         }
         {
             const lib = try mtl.Library.fromSource(m.device, ks.minimax_m3_glue, .{ .language = mtl.CompileOptions.mlx().language, .math_functions = .precise });
@@ -198,6 +202,7 @@ pub const Model = struct {
         if (m.xm) |*p| p.deinit();
         if (m.embed_bf16) |p| p.deinit();
         if (m.half_rows) |p| p.deinit();
+        if (m.bf16_rows) |p| p.deinit();
     }
 
     /// An encoder's indirect reads: every shard an EXL3 job points into (no-op for affine checkpoints).
@@ -248,6 +253,15 @@ pub const Model = struct {
         defer m.gpa.free(path);
         try m.checkpoint.addFile(m.device, path, "");
         m.vision = try vision.Vision.load(m.gpa, m.device, &m.checkpoint, m.pipe(.widen), m.pipe(.narrow));
+    }
+
+    /// An EXL3 pack's DSpark head (dspark/, the release's): its shard into the checkpoint, for dspark.Drafter.
+    pub fn loadPackDSpark(m: *Model, io: std.Io, dir: []const u8) !void {
+        const sub = try std.fs.path.join(m.gpa, &.{ dir, "dspark" });
+        defer m.gpa.free(sub);
+        const files = try shards.shardFiles(m.gpa, io, sub);
+        defer shards.freeShardFiles(m.gpa, files);
+        for (files) |path| try m.checkpoint.addFile(m.device, path, "");
     }
 
     pub fn pipe(m: *const Model, g: Glue) mtl.Pipeline {

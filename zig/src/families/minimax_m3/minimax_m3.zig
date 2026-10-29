@@ -10,6 +10,7 @@ pub const budget = @import("budget.zig");
 pub const residency = @import("residency.zig");
 pub const snapshot = @import("snapshot.zig");
 pub const dspark = @import("dspark.zig");
+pub const dspark_pack = @import("dspark_pack.zig");
 pub const dflash2 = @import("dflash2.zig");
 pub const vision = @import("vision.zig");
 
@@ -19,4 +20,5 @@ test {
     _ = budget;
     _ = snapshot;
     _ = vision;
+    _ = dspark_pack;
 }

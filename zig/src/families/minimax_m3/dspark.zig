@@ -6,6 +6,8 @@ const ks = @import("kernel_sources");
 const ck = @import("../../core/checkpoint_metal.zig");
 const wts = @import("weights.zig");
 const fwd = @import("forward.zig");
+const xr = @import("../../core/exl3_rows.zig");
+const pack = @import("dspark_pack.zig");
 const Model = @import("model.zig").Model;
 
 const dr = lanes.drafter;
@@ -46,9 +48,25 @@ pub const Config = struct {
         defer gpa.free(bytes);
         var doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
         defer doc.deinit();
-        const d = doc.value.object.get("dspark") orelse return null;
+        const d = doc.value.object.get("dspark") orelse return readPack(gpa, io, dir);
         if (d != .object) return error.BadDSparkConfig;
-        const o = d.object;
+        return try parse(d.object);
+    }
+
+    /// An EXL3 pack's DSpark head: dspark/config.json's text_config (the release's own), if the folder is there.
+    fn readPack(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !?Config {
+        const path = try std.fs.path.join(gpa, &.{ dir, "dspark", "config.json" });
+        defer gpa.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22)) catch |e| return if (e == error.FileNotFound) null else e;
+        defer gpa.free(bytes);
+        var doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
+        defer doc.deinit();
+        const text = doc.value.object.get("text_config") orelse return error.BadDSparkConfig;
+        if (text != .object) return error.BadDSparkConfig;
+        return try parse(text.object);
+    }
+
+    fn parse(o: std.json.ObjectMap) !Config {
         const int = struct {
             fn of(x: std.json.ObjectMap, k: []const u8) !u32 {
                 const v = x.get(k) orelse return error.BadDSparkConfig;
@@ -96,15 +114,21 @@ pub const max_block = 8;
 /// Context rows one absorb pass projects at most (a prompt chunk's).
 const absorb_rows = 2048;
 
-const Layer = struct { in_norm: wts.Tensor, post_norm: wts.Tensor, q_norm: wts.Tensor, k_norm: wts.Tensor, qkv: wts.Linear, o: wts.Linear, gu: wts.Linear, down: wts.Linear };
+/// A projection: affine (a converted checkpoint's), or bf16 [n, k] rows (an EXL3 pack's head, widened at load).
+pub const Lin = union(enum) {
+    affine: wts.Linear,
+    bf16: struct { buffer: mtl.Buffer, offset: usize, n: usize, k: usize },
+};
 
-const Weights = struct {
-    fc: wts.Linear,
+pub const Layer = struct { in_norm: wts.Tensor, post_norm: wts.Tensor, q_norm: wts.Tensor, k_norm: wts.Tensor, qkv: Lin, o: Lin, gu: Lin, down: Lin };
+
+pub const Weights = struct {
+    fc: Lin,
     hidden_norm: wts.Tensor,
     norm: wts.Tensor,
-    ctx_kv: wts.Linear,
+    ctx_kv: Lin,
     w1: wts.Tensor,
-    w2: wts.Linear,
+    w2: union(enum) { affine: wts.Linear, bf16: wts.Tensor },
     layers: [8]Layer,
 };
 
@@ -126,15 +150,15 @@ fn load(ckp: *const ck.Checkpoint, c: *const Config, vocab: usize) !Weights {
     const h: usize = c.hidden;
     const kvw: usize = c.kv_heads * 128;
     var w: Weights = .{
-        .fc = try affine(ckp, "dspark.fc", h, h * c.taps.len),
+        .fc = .{ .affine = try affine(ckp, "dspark.fc", h, h * c.taps.len) },
         .hidden_norm = try tensor(ckp, "dspark.hidden_norm.weight"),
         .norm = try tensor(ckp, "dspark.norm.weight"),
-        .ctx_kv = try affine(ckp, "dspark.ctx_kv_proj", c.layers * 2 * kvw, h),
+        .ctx_kv = .{ .affine = try affine(ckp, "dspark.ctx_kv_proj", c.layers * 2 * kvw, h) },
         .w1 = try tensor(ckp, "dspark.markov_w1.weight"),
-        .w2 = try affine(ckp, "dspark.markov_w2", vocab, c.rank),
+        .w2 = .{ .affine = try affine(ckp, "dspark.markov_w2", vocab, c.rank) },
         .layers = undefined,
     };
-    if (w.w1.count() != vocab * c.rank or w.w2.bits != 8 or w.w2.group != 64) return error.UnexpectedDSparkTensor;
+    if (w.w1.count() != vocab * c.rank or w.w2.affine.bits != 8 or w.w2.affine.group != 64) return error.UnexpectedDSparkTensor;
     for (w.layers[0..c.layers], 0..) |*l, i| {
         var pb: [64]u8 = undefined;
         var nb: [128]u8 = undefined;
@@ -149,10 +173,10 @@ fn load(ckp: *const ck.Checkpoint, c: *const Config, vocab: usize) !Weights {
             .post_norm = try tensor(ckp, try name(&nb, p, "post_attention_layernorm.weight")),
             .q_norm = try tensor(ckp, try name(&nb, p, "self_attn.q_norm.weight")),
             .k_norm = try tensor(ckp, try name(&nb, p, "self_attn.k_norm.weight")),
-            .qkv = try affine(ckp, try name(&nb, p, "self_attn.qkv_proj"), (c.heads + 2 * c.kv_heads) * 128, h),
-            .o = try affine(ckp, try name(&nb, p, "self_attn.o_proj"), h, c.heads * 128),
-            .gu = try affine(ckp, try name(&nb, p, "mlp.gate_up_proj"), 2 * @as(usize, c.ffn), h),
-            .down = try affine(ckp, try name(&nb, p, "mlp.down_proj"), h, c.ffn),
+            .qkv = .{ .affine = try affine(ckp, try name(&nb, p, "self_attn.qkv_proj"), (c.heads + 2 * c.kv_heads) * 128, h) },
+            .o = .{ .affine = try affine(ckp, try name(&nb, p, "self_attn.o_proj"), h, c.heads * 128) },
+            .gu = .{ .affine = try affine(ckp, try name(&nb, p, "mlp.gate_up_proj"), 2 * @as(usize, c.ffn), h) },
+            .down = .{ .affine = try affine(ckp, try name(&nb, p, "mlp.down_proj"), h, c.ffn) },
         };
     }
     return w;
@@ -168,8 +192,8 @@ const Lane = struct {
     held_len: u32 = 0,
 };
 
-const names = [_][:0]const u8{ "mm_norm16", "mm_draft_prep", "mm_draft_vec", "mm_markov_step", "mm_markov_pick" };
-const Kernel = enum { norm16, prep, vec, markov_step, markov_pick };
+const names = [_][:0]const u8{ "mm_norm16", "mm_draft_prep", "mm_draft_vec", "mm_markov_step", "mm_markov_pick", "mm_markov_step_bf16" };
+const Kernel = enum { norm16, prep, vec, markov_step, markov_pick, markov_step_bf16 };
 
 /// The drafter's scratch, fields in init's order.
 const fields = [_][]const u8{ "ids", "resid", "x", "qkv", "q", "attn", "y", "gu", "act", "logits", "pm", "pl", "po", "best", "best_id", "seq", "fcx", "hctx", "kv", "sums" };
@@ -184,13 +208,17 @@ pub const Drafter = struct {
     follow: ?mtl.ResidencySet.Follow = null,
     step_ms: f64 = 0,
     s: [fields.len]mtl.Buffer = undefined,
+    /// An EXL3 pack's widened matrices.
+    owned: std.ArrayList(mtl.Buffer) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, target: *Model, config: Config) !*Drafter {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const d = try gpa.create(Drafter);
         errdefer gpa.destroy(d);
-        d.* = .{ .gpa = gpa, .target = target, .config = config, .w = try load(&target.checkpoint, &config, target.config.vocab), .pipes = undefined };
+        d.* = .{ .gpa = gpa, .target = target, .config = config, .w = undefined, .pipes = undefined };
+        errdefer d.freeOwned();
+        d.w = if (target.weights.jobs != null) try pack.load(gpa, target.device, &target.checkpoint, &d.config, target.config.vocab, &d.owned) else try load(&target.checkpoint, &config, target.config.vocab);
         const c = &d.config;
         if (c.hidden != target.config.hidden) return error.DSparkForAnotherTarget;
         for (c.taps) |l| if (l >= target.config.layers) return error.DSparkForAnotherTarget;
@@ -229,7 +257,13 @@ pub const Drafter = struct {
         d.lanes.deinit(d.gpa);
         for (d.s) |x| x.deinit();
         for (d.pipes) |p| p.deinit();
+        d.freeOwned();
         d.gpa.destroy(d);
+    }
+
+    fn freeOwned(d: *Drafter) void {
+        for (d.owned.items) |x| x.deinit();
+        d.owned.deinit(d.gpa);
     }
 
     fn buf(d: *const Drafter, comptime f: []const u8) mtl.Buffer {
@@ -341,9 +375,31 @@ pub const Drafter = struct {
         e.dispatchGroups(mtl.Size.of(grid[0], grid[1], grid[2]), mtl.Size.of(group[0], group[1], group[2]));
     }
 
-    fn project(d: *const Drafter, e: mtl.ComputeEncoder, w: wts.Linear, in: B, out: B, rows: usize) !void {
-        // a block's rows on the tensor units: each weight (the target head's too) read once for all of them
-        return fwd.projectRows(e, d.target, d.buf("sums"), w, in, out, rows, 3);
+    fn project(d: *const Drafter, e: mtl.ComputeEncoder, w: Lin, in: B, out: B, rows: usize) !void {
+        switch (w) {
+            // a block's rows on the tensor units: each weight (the target head's too) read once for all of them
+            .affine => |a| return fwd.projectRows(e, d.target, d.buf("sums"), a, in, out, rows, 3),
+            .bf16 => |x| {
+                e.setPipeline(d.target.bf16_rows.?);
+                e.setBuffer(in.buf, in.off, 0);
+                e.setBuffer(x.buffer, x.offset, 1);
+                e.setValue([5]u32{ @intCast(rows), @intCast(x.n), @intCast(x.k), @intCast(x.k), @intCast(x.n) }, 2);
+                e.setBuffer(out.buf, out.off, 3);
+                e.dispatchGroups(mtl.Size.of((x.n + 7) / 8, (rows + 7) / 8, 1), mtl.Size.of(256, 1, 1));
+            },
+        }
+    }
+
+    /// The target's head on the block's rows: its affine matrix, or an EXL3 pack's (one K range at its width).
+    fn head(d: *const Drafter, e: mtl.ComputeEncoder, in: B, out: B, rows: usize) !void {
+        const m = d.target;
+        switch (m.weights.head) {
+            .affine => |a| return d.project(e, .{ .affine = a }, in, out, rows),
+            .exl3 => |set| {
+                const dummy = xr.View{ .buffer = d.buf("sums") };
+                xr.encode(&m.xr.?, e, .{ .jobs = set.jobs, .count = set.count, .blocks = set.blocks, .k = set.k }, .{ .buffer = in.buf, .offset = in.off }, set.k, .{ .buffer = out.buf, .offset = out.off }, set.stride, rows, .bf16, xr.ranges(set.blocks, set.k), .{ .partial = dummy, .counts = dummy });
+            },
+        }
     }
 
     /// The context rows [p0, p0 + rows) from `src` (taps x hidden bf16 each) into every layer's ring.
@@ -408,8 +464,10 @@ pub const Drafter = struct {
         ids[0] = pending;
         @memset(ids[1..n], c.noise);
         d.buf("seq").slice(u32, 16)[0] = pending;
-        const E = m.weights.embed.affine;
-        glue(e, m.pipe(.embed), MArgs{ .rows = @intCast(n), .width = c.hidden, .bits = E.bits, .group = @intCast(E.group) }, &.{ b(d.buf("ids")), bo(E.w, E.w_off), bo(E.scales, E.s_off), bo(E.biases, E.b_off), A, b(d.buf("resid")) }, .{ (h + 255) / 256, n, 1 }, .{ 256, 1, 1 });
+        switch (m.weights.embed) {
+            .affine => |E| glue(e, m.pipe(.embed), MArgs{ .rows = @intCast(n), .width = c.hidden, .bits = E.bits, .group = @intCast(E.group) }, &.{ b(d.buf("ids")), bo(E.w, E.w_off), bo(E.scales, E.s_off), bo(E.biases, E.b_off), A, b(d.buf("resid")) }, .{ (h + 255) / 256, n, 1 }, .{ 256, 1, 1 }),
+            .bf16 => |table| glue(e, m.embed_bf16.?, [2]u32{ c.hidden, @intCast(n) }, &.{ b(d.buf("ids")), t(table), A, b(d.buf("resid")) }, .{ (h + 255) / 256, n, 1 }, .{ 256, 1, 1 }),
+        }
         const nm = MArgs{ .rows = @intCast(n), .width = c.hidden, .eps = c.eps };
         glue(e, m.pipe(.norm), nm, &.{ b(d.buf("resid")), t(d.w.layers[0].in_norm), A, b(d.buf("x")) }, .{ n, 1, 1 }, .{ 256, 1, 1 });
         const lo = @max((anchor + 1) -| c.window, l.from);
@@ -438,13 +496,15 @@ pub const Drafter = struct {
             const next = if (i + 1 < c.layers) d.w.layers[i + 1].in_norm else d.w.norm;
             glue(e, m.pipe(.add_norm), nm, &.{ b(d.buf("resid")), b(d.buf("y")), t(next), A, b(d.buf("x")) }, .{ n, 1, 1 }, .{ 256, 1, 1 });
         }
-        try d.project(e, m.weights.head.affine, b(d.buf("x")), b(d.buf("logits")), n);
+        try d.head(e, b(d.buf("x")), b(d.buf("logits")), n);
         const vocab: u32 = m.config.vocab;
         const groups: u32 = (vocab + 255) / 256;
-        const w2 = d.w.w2;
         for (0..n) |j| {
             const sa = extern struct { vocab: u32, rank: u32, step: u32 }{ .vocab = vocab, .rank = c.rank, .step = @intCast(j) };
-            glue(e, d.pipe(.markov_step), sa, &.{ b(d.buf("logits")), t(d.w.w1), bo(w2.w, w2.w_off), bo(w2.scales, w2.s_off), bo(w2.biases, w2.b_off), b(d.buf("seq")), A, b(d.buf("best")), b(d.buf("best_id")) }, .{ groups, 1, 1 }, .{ 256, 1, 1 });
+            switch (d.w.w2) {
+                .affine => |w2| glue(e, d.pipe(.markov_step), sa, &.{ b(d.buf("logits")), t(d.w.w1), bo(w2.w, w2.w_off), bo(w2.scales, w2.s_off), bo(w2.biases, w2.b_off), b(d.buf("seq")), A, b(d.buf("best")), b(d.buf("best_id")) }, .{ groups, 1, 1 }, .{ 256, 1, 1 }),
+                .bf16 => |w2| glue(e, d.pipe(.markov_step_bf16), sa, &.{ b(d.buf("logits")), t(d.w.w1), t(w2), b(d.buf("seq")), A, b(d.buf("best")), b(d.buf("best_id")) }, .{ groups, 1, 1 }, .{ 256, 1, 1 }),
+            }
             glue(e, d.pipe(.markov_pick), [2]u32{ groups, @intCast(j) }, &.{ b(d.buf("best")), b(d.buf("best_id")), A, b(d.buf("seq")) }, .{ 1, 1, 1 }, .{ 1024, 1, 1 });
         }
     }

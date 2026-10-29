@@ -1,4 +1,4 @@
-// MiniMax-M3.1-Flash's EXL3 pack around the EXL3 projections: its bf16 embedding rows and its fp16 index projections.
+// MiniMax-M3.1-Flash's EXL3 pack beside its EXL3 projections: bf16 embedding rows, fp16 index pair, bf16 DSpark rows.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -38,5 +38,31 @@ struct mm_half_args { uint rows, k, jobs, x_stride, y_stride; };
   for (uint i = 0; i < live; ++i) {
     const float s = simd_sum(acc[i]);
     if (lane == 0) y[(size_t)(r0 + i) * a.y_stride + j.y_col + n] = bfloat(s);
+  }
+}
+
+struct mm_bf16_args { uint rows, n, k, x_stride, y_stride; };
+
+// A bf16 [n, k] matrix (the pack's DSpark head, widened from MXFP8) on rows of x: eight rows, a column a simdgroup.
+[[kernel]] void mm_bf16_rows(const device bfloat* x [[buffer(0)]], const device bfloat* W [[buffer(1)]],
+    constant mm_bf16_args& a [[buffer(2)]], device bfloat* y [[buffer(3)]],
+    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {
+  const uint n = tg.x * 8 + sg;
+  if (n >= a.n) return;
+  const uint r0 = tg.y * 8;
+  const uint live = min(8u, a.rows - r0);
+  const device packed_bfloat4* w = reinterpret_cast<const device packed_bfloat4*>(W + (size_t)n * a.k);
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (uint k4 = lane; k4 < a.k / 4; k4 += 32) {
+    const float4 wv = float4(w[k4]);
+    for (uint i = 0; i < 8; ++i) {
+      if (i >= live) break;
+      const device bfloat* xr = x + (size_t)(r0 + i) * a.x_stride + 4 * k4;
+      acc[i] = fma(float(xr[0]), wv.x, fma(float(xr[1]), wv.y, fma(float(xr[2]), wv.z, fma(float(xr[3]), wv.w, acc[i]))));
+    }
+  }
+  for (uint i = 0; i < live; ++i) {
+    const float s = simd_sum(acc[i]);
+    if (lane == 0) y[(size_t)(r0 + i) * a.y_stride + n] = bfloat(s);
   }
 }
