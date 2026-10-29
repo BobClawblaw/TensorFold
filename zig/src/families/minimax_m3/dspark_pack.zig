@@ -138,7 +138,7 @@ test "e4m3 widening is exact on every code" {
         if (i & 0x7f == 0x7f) continue;
         const bits: u32 = @as(u32, lut[i]) << 16;
         const want: f32 = blk: {
-            const e: u32 = (i >> 3) & 0xF;
+            const e: u32 = @intCast((i >> 3) & 0xF);
             const m: f32 = @floatFromInt(i & 7);
             const mag: f32 = if (e == 0) m / 8.0 * 0x1p-6 else (1.0 + m / 8.0) * std.math.pow(f32, 2.0, @as(f32, @floatFromInt(e)) - 7.0);
             break :blk if (i & 0x80 != 0) -mag else mag;
