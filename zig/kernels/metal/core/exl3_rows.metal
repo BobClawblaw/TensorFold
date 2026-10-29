@@ -121,6 +121,7 @@ inline void tf_xr_block(const device bfloat* x, const device TfExl3Job& j, devic
     if (sg < R && kb + step < a.k) tf_xr_rotate(x, j, a, src[sg], sg < live, kb + step, lane, xs + ((buf ^ 1u) * R + sg) * 128);
     threadgroup const float* rows = xs + buf * R * 128;
     buf ^= 1u;
+    _Pragma("clang loop unroll_count(2)")
     for (uint t = 0; t < 8; ++t) {
       const device uint* tile = col + ulong(kb / 16 + t) * j.tile_k_stride;
       const uint u0 = tile[i0], u1 = tile[i1], u2 = tile[i2], u3 = tile[i3];
