@@ -26,6 +26,10 @@ USAGE = """\
   encode MODEL_DIR OUT_DIR [--prompt-file F]  the prompt encoder alone: token ids, embedding rows, and every layer's
                                            output and the final rows in bf16 and in float32, and
                                            each step alone in bf16 on the float32 run's input
+  blocks MODEL_DIR CASE_DIR --step N --branch B  one step of a `case` in float32, the stream into every block
+                                           kept, and torch bf16's embedding, each block and the final layer
+                                           alone on that stream in bf16: CASE_DIR/blocks-N-B.safetensors,
+                                           for tf-moss-image-blocks
   compare A.png B.png [SIDE.png]           PSNR and mean absolute difference of two pictures, optionally side by side
   noise OUT.json                           torch.randn's starting latents for many seeds and sizes, as sha256s (x86)
   schedule MODEL_DIR OUT.json              MOSSImageScheduler's timesteps and sigmas for many step counts and configs
@@ -143,7 +147,7 @@ def case(args) -> int:
         sys.exit("the pipeline's calls are not (prompt, negative skipping 22) pairs")
     sched = pipe.scheduler
     tensors = {"prompt": positive[0].cpu().contiguous(), "negative": negative[0].cpu().contiguous(),
-               "timesteps": sched.timesteps.float().cpu().contiguous(), "sigmas": sched.sigmas.float().cpu().contiguous(),
+               "steps": torch.tensor([args.steps], dtype=torch.int64), "timesteps": sched.timesteps.float().cpu().contiguous(), "sigmas": sched.sigmas.float().cpu().contiguous(),
                "latents": noise[0].permute(1, 2, 0).contiguous(), "inputs": torch.stack([c["input"] for c in cond]),
                "velocity": torch.stack([c["velocity"] for c in cond]),
                "velocity_negative": torch.stack([u["velocity"] for u in uncond])}
@@ -185,7 +189,8 @@ def start(args) -> int:
     h, w = args.height // 16, args.width // 16
     noise = torch.randn((1, 128, h, w), generator=torch.Generator("cpu").manual_seed(args.seed), dtype=torch.float32)
     pipe.scheduler.set_timesteps(args.steps)
-    tensors = {"timesteps": pipe.scheduler.timesteps.float().cpu().contiguous(),
+    tensors = {"steps": torch.tensor([args.steps], dtype=torch.int64),
+               "timesteps": pipe.scheduler.timesteps.float().cpu().contiguous(),
                "sigmas": pipe.scheduler.sigmas.float().cpu().contiguous(),
                "latents": noise[0].permute(1, 2, 0).contiguous()}
     meta = {"width": args.width, "height": args.height, "seed": args.seed, "steps": args.steps}
@@ -256,6 +261,68 @@ def vae(args) -> int:
     out.astype(np.float64).tofile(args.out)
     print(json.dumps({"out": args.out, "torch_out": args.torch_out, "shape": list(out.shape),
                       "decode_s": round(time.perf_counter() - mark, 1)}))
+    return 0
+
+
+def blocks(args) -> int:
+    """One step's branch of a `case` in float32, the stream into each block kept; then each step alone in bf16 on it."""
+    import torch
+    from safetensors.torch import load_file, save_file
+
+    case = load_file(str(Path(args.case_dir) / "case.safetensors"))
+    if "inputs" not in case:
+        sys.exit("blocks needs a case made by `case`, which holds each step's input")
+    latents = case["inputs"][args.step - 1].permute(2, 0, 1)[None].to(args.device)
+    timestep = case["timesteps"][args.step - 1]
+    text = case[args.branch][None]
+    skip = [22] if args.branch == "negative" else []
+    pipe, _ = pipeline(args.model_dir, args.device, text=False)
+    tr = pipe.transformer
+    kept = [layer for i, layer in enumerate(tr.layers) if i not in skip]
+    image = latents.shape[2] * latents.shape[3]
+
+    def forward(dtype, pre, post):
+        handles = [m.register_forward_pre_hook(fn, with_kwargs=True) for m, fn in pre]
+        handles += [m.register_forward_hook(fn) for m, fn in post]
+        with torch.no_grad():
+            out = tr(latents, timestep, text.to(device=args.device, dtype=dtype), skip_layers=skip).sample
+        for h in handles:
+            h.remove()
+        return rows(out)
+
+    def record(into):
+        def hook(module, a, kw):
+            into.append(a[0][0].float().cpu())
+        return hook
+
+    def output(into):
+        return lambda module, a, out: into.append(out[0].float().cpu())
+
+    # float32 throughout: the stream into each block kept, then the last block's output
+    tr.float()
+    stream = []
+    velocity_fp32 = forward(torch.float32, [(m, record(stream)) for m in kept], [(kept[-1], output(stream))])
+    # bf16, each step alone: every block, and the final layer on the image rows, given the float32 stream in bf16
+    tr.to(torch.bfloat16)
+    embedded, alone = [], []
+
+    def feed(k):
+        def hook(module, a, kw):
+            if k == 0:
+                embedded.append(a[0][0].float().cpu())
+            x = stream[k].to(device=args.device, dtype=torch.bfloat16)[None]
+            return (x[:, :image] if k == len(kept) else x,) + tuple(a[1:]), kw
+        return hook
+
+    velocity_alone = forward(torch.bfloat16, [(m, feed(k)) for k, m in enumerate(kept + [tr.final_norm_video])],
+                             [(m, output(alone)) for m in kept])
+    out = Path(args.case_dir) / f"blocks-{args.step}-{args.branch}.safetensors"
+    save_file({"step": torch.tensor([args.step], dtype=torch.int64), "skip": torch.tensor(skip or [-1], dtype=torch.int64),
+               "timestep": timestep.reshape(1).float(), "latents": case["inputs"][args.step - 1].contiguous(),
+               "prompt": text[0].contiguous(), "stream": torch.stack(stream).contiguous(),
+               "alone": torch.stack(embedded + alone).to(torch.bfloat16).contiguous(),
+               "velocity_fp32": velocity_fp32, "velocity_alone": velocity_alone}, str(out))
+    print(json.dumps({"out": str(out), "blocks": len(kept), "rows": int(stream[0].shape[0])}))
     return 0
 
 
@@ -464,6 +531,12 @@ def main() -> int:
     v.add_argument("--device", default="mps", help="where the float32 decode runs, as the pipeline would")
     v.add_argument("--width", type=int, default=1024)
     v.add_argument("--height", type=int, default=1024)
+    b = sub.add_parser("blocks")
+    b.add_argument("model_dir")
+    b.add_argument("case_dir")
+    b.add_argument("--step", type=int, required=True, help="the step, from 1")
+    b.add_argument("--branch", choices=("prompt", "negative"), required=True)
+    b.add_argument("--device", default="mps")
     p = sub.add_parser("compare")
     p.add_argument("a")
     p.add_argument("b")
@@ -475,7 +548,7 @@ def main() -> int:
     q.add_argument("out")
     args = parser.parse_args()
     modes = {"case": case, "start": start, "exact": exact, "decode": decode, "encode": encode, "vae": vae,
-             "compare": compare, "noise": noise, "schedule": schedule}
+             "blocks": blocks, "compare": compare, "noise": noise, "schedule": schedule}
     return modes[args.mode](args)
 
 
