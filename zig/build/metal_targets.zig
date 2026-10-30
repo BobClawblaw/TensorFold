@@ -320,6 +320,7 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
         .{ .name = "tf-moss-image-encoder", .path = "zig/tests/moss_image_encoder.zig", .about = "MOSS-Image's prompt encoder on a reference case: the ids checked, each step gated against float32, then timed" },
         .{ .name = "tf-moss-image-decoder", .path = "zig/tests/moss_image_decoder.zig", .about = "MOSS-Image's image decoder on latents, gated against float64 beside torch float32, then timed" },
         .{ .name = "tf-moss-image-blocks", .path = "zig/tests/moss_image_blocks.zig", .about = "MOSS-Image's transformer on one step, each block alone gated against float32, repeated byte for byte" },
+        .{ .name = "tf-moss-image-generate", .path = "zig/tests/moss_image_generate.zig", .about = "MOSS-Image: a picture from a prompt and options alone, every stage native" },
         .{ .name = "tf-moss-image-noise", .path = "zig/tests/moss_image_noise.zig", .about = "MOSS-Image's starting latents against torch.randn's on the CPU, bit for bit" },
         .{ .name = "tf-moss-image-schedule", .path = "zig/tests/moss_image_schedule.zig", .about = "MOSS-Image's denoising schedule against the publisher's scheduler, bit for bit" },
         .{ .name = "tf-glm-attn-probe", .path = "zig/tests/glm_attn_probe.zig", .about = "GLM-5.3-Flash's dense latent attention kernels on given inputs (scores, probabilities, outputs)" },

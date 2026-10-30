@@ -181,6 +181,24 @@ caught at the gate it names. Gate 5 holds its nine launches.
 SUMMARY 37 kernels: 37 pass gates 1-4, 0 fail, 0 known findings; 25 controls: 25 red as planted, 0 missed; 0 limit problems
 ```
 
+## Make a picture
+
+`tf-moss-image-generate` makes a picture from a prompt and options alone, every stage native: both prompts through the
+encoder, the schedule, the starting noise from the seed, the guided steps (`pipeline.step`, which `tf-moss-image` runs
+too) and the decoder. No Python or torch is involved.
+
+```sh
+zig build tf-moss-image-generate -Dcpu=apple_m1
+zig-out/bin/tf-moss-image-generate MODEL_DIR fox.png --prompt "A red fox sitting in fresh snow at dawn"
+zig-out/bin/tf-moss-image-generate MODEL_DIR sign.png --prompt-file sign.txt --negative "blurry, low quality" \
+    --width 1024 --height 768 --steps 30 --seed 5 --guidance 3
+```
+
+Its options and defaults are the pipeline's: the empty negative prompt, 1024 x 1024 (positive multiples of 16), 50
+steps, seed 42, guidance 3 (0 or more; at 1 the negative branch is not run, as the pipeline skips it). The negative
+branch skips block 22. The pipeline's optional skip-layer guidance (`slg_layers`, off by default) is not supported.
+Batches of pictures are not either.
+
 ## Run a case
 
 `moss_image_case.py` imports and runs the checkpoint's own `pipeline_moss_image.py`, the publisher's Python. It does so
@@ -293,6 +311,13 @@ Results:
 - **Each whole forward**, over the sticky note's 100: our cosine error from float32 is 1.01 times torch bf16's on
   average (0.76 to 1.26), and our worst row 1.03 times (0.37 to 2.55). torch's own bf16 run on the CPU of step 23's
   negative branch has a worst row 1.37 times its MPS run's, so the worst row of 42 blocks in bf16 is not gated.
+- **Pictures from options alone** (`tf-moss-image-generate`):
+  - The fox at the defaults is byte for byte `tf-moss-image`'s picture from a case of the same seed.
+  - The valley at 1344x768, seed 3, is within 1 of the gallery's, whose decode was torch's (96.05 dB).
+  - Two paths `tf-moss-image` does not take, against a float32 run of the whole pipeline on the same settings:
+    guidance 1 (the fox, 20 steps), ours 32.06 dB and torch bf16's 30.48 dB; a negative prompt (the sign, 1024x768, 30
+    steps, seed 5), ours 31.97 dB and torch bf16's 31.41 dB.
+  - A width of 1000, zero steps or no prompt is refused (exit 2).
 - **Starting noise:** equal bit for bit to `torch.randn`'s for seeds 0, 1, 2, 3, 7, 42, 123456789, 2^32 - 1 and 2^40 +
   5 at 1024x1024, 1200x880, 1344x768, 768x1344 and 16x16 (45 draws, 18,761,472 values), in release and Debug builds.
   Both cases' recorded latents are those of their seeds, 42 and 7.
