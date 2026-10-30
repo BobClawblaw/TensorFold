@@ -53,4 +53,5 @@ test {
     _ = @import("pending_132_test.zig");
     _ = @import("proposal_sampling_records.zig");
     _ = @import("pocket_records.zig");
+    _ = @import("experts_bf16_records.zig");
 }
