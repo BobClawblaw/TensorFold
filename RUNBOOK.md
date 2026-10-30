@@ -162,6 +162,10 @@ request with the cache off. `--prompt-cache-gib` sizes the kept states (16 GiB b
 them off. A state kept inside a prompt chunk costs no extra prompt call. A Nemotron 3.5 Lightning state takes 48 MiB plus
 7 KiB a prompt token, in whole 2 MiB pages (62 MiB at 2,048 tokens), and the cache keeps four 48 MiB buffers of its
 budget free for the next states.
+Prompts fill a chunk at a time between decode rounds, so requests that arrive together on a new system prompt would each
+compute it. A request whose prompt shares a cut another prompt is still filling, which its own lookup would resume, waits
+in the queue until that fill stands there, then resumes the cut. `TENSORFOLD_PREFIX_WAIT_MS` bounds the wait (60000 by
+default; 0 turns it off).
 `TF_HEAT_HIGH` and `TF_HEAT_LOW`, in degrees Celsius and set together, make each prompt chunk wait while the hottest
 thermal zone (under `/sys/class/thermal`, or `TF_HEAT_ROOT`) is above the high band, until it is at or under the low one.
 The server logs `heat_wait_s`, a cancel ends the wait, and the reply's tokens do not change.
@@ -225,6 +229,29 @@ That guide's two-Mac Flash Next commands load the checkpoint directly, as one Ma
 On one Mac, GLM loads only when its weights and caches fit in 70% of RAM, 179.2 GB on a 256 GB Mac, and leaves the MTP head on disk when only the head is over.
 `GLM_LOAD_LIMIT_GB=N` sets that limit in GB, up to the GPU's recommended working set; a value that isn't a number above 0 stops the server.
 Past 70% of RAM the server warns at startup: a load that wires most of the RAM can stall macOS until its watchdog restarts the Mac, so run nothing else large beside it.
+
+### Memory pressure on a shared Mac
+
+Engines served through the shared lane host, including DeepSeek-V4.1, Flash Next with `--parallel` above one, Qwen3.8-27B and GLM, read the macOS memory pressure level (`kern.memorystatus_vm_pressure_level`).
+The engine thread reads it at most four times a second and acts on the level:
+
+- Warning: a queued request starts only when no other stream runs, so the server serves one stream at a time.
+  New prompt states are not kept, and disk or learned states are not read back into new cache entries.
+  The prompt cache gives back kept states, least valuable first and one per round, until it holds no more than its soft watermark.
+  A state that a request is restoring is never dropped.
+- Critical: as warning, and new requests get 503 with a message saying the Mac is under critical memory pressure.
+  Requests already queued or running continue.
+- Normal: admission and kept states behave as before.
+
+A rise takes effect at the next reading; a fall waits for five seconds of lower readings, so admission does not flap near a threshold.
+Each change of level is logged once.
+At normal pressure the server behaves exactly as it does without the governor.
+Under pressure only admission and kept states change: every request served returns the same tokens, and a resumed request equals a fresh one.
+
+`TENSORFOLD_PRESSURE_CACHE_PERCENT=N` sets the soft watermark to N% of the prompt cache budget (default 50; 0 sheds every state not being restored).
+`TENSORFOLD_MEMORY_PRESSURE=0` (or `off`) disables the governor.
+Flash Next's single-reply driver (`--parallel 1` or `auto`) does not read pressure yet, and Linux and Windows builds never do.
+
 
 ## Access, context and updates
 

@@ -139,6 +139,8 @@ pub const Store = struct {
     disk: ?*rows.Rows = null, // --learn-conversations: every kept state written behind to disk, read back where it pays
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
 
+    hold: bool = false, // memory pressure: lookups plan no marks and keeps refuse new states
+
     const SHARED_KEYS = 64;
 
     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
@@ -232,6 +234,13 @@ pub const Store = struct {
             if (best == null or e.at > best.?) best = e.at;
         }
         return best;
+    }
+
+    /// Whether the state another pass keeps at `at` of `kept` (`kept_spans`) would serve `prompt` as `find` does.
+    pub fn wouldServe(s: *const Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, kept: []const u32, kept_spans: []const modes.Span, at: u32) bool {
+        const n = @as(usize, at) + s.rules.lookahead;
+        if (at >= prompt.len or n > prompt.len or n > kept.len or !s.usable(at, starts)) return false;
+        return std.mem.eql(u32, prompt[0..n], kept[0..n]) and modes.equal(kept_spans, spans, at);
     }
 
     /// Find a kept token prefix with matching canonical spans through its position, leaving at least one row.
@@ -351,6 +360,7 @@ pub const Store = struct {
         defer a.free(marks_);
         var out: std.ArrayList(u32) = .empty;
         for (marks_) |at| {
+            if (s.hold) break;
             const bytes = s.family.vtable.bytes(s.family.ptr, at);
             if (bytes <= s.budget) try out.append(a, at) else {
                 s.counts.refused += 1;
@@ -454,7 +464,7 @@ pub const Store = struct {
     pub fn keepBorn(s: *Store, prompt: []const u32, born: u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span) bool {
         s.collectExpired();
         const n = @as(usize, at) + s.rules.lookahead;
-        if (at == 0 or n > prompt.len) return false;
+        if (at == 0 or n > prompt.len or s.hold) return false;
         s.clock += 1;
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
         for (s.entries.items) |e| if (!e.expired and e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) {
@@ -517,6 +527,7 @@ pub const Store = struct {
 
     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
     fn recall(s: *Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
+        if (s.hold) return have;
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;

@@ -330,7 +330,7 @@ const Run = struct {
     /// ``ToolCallPolicy.finish``: the reply's calls parsed out of its content.
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
-        if (tools.len == 0) return null;
+        if (reply.loop_stop != null or tools.len == 0) return null;
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
         const calls = (if (r.turn != null) cortheon.clientCalls(parsed.calls) else parsed.calls) orelse {
             if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
@@ -426,6 +426,7 @@ const Run = struct {
         try o.put(a, "choices", .{ .array = list });
         try o.put(a, "usage", try r.usage(reply));
         try r.extras(o, reply);
+        if (reply.loop_stop) |period| try o.put(a, "error", try @import("loop_stop.zig").errorBody(a, period));
     }
 
     const StreamSink = struct {
@@ -573,6 +574,7 @@ const Run = struct {
             u.object.put(a, "usage", use) catch return;
             r.emit(u) catch return;
         }
+        if (reply.loop_stop) |period| r.emit(wrapError(a, @import("loop_stop.zig").errorBody(a, period) catch return) catch return) catch return;
         r.out.vt.event(r.out.ctx, null) catch {};
         r.warmNext(&reply, calls);
     }

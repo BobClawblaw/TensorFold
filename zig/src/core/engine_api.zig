@@ -85,6 +85,8 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// With ``loop_guard``: the reply ends where the guard fires, with no forced close and no answer after it.
+    loop_stop: bool = false,
     /// The prompt row (the assistant header's last) where routed lessons decide whether they act (null: none acts).
     decide: ?u32 = null,
     /// The model as shipped: no learned neuron acts on its rows, no prompt state is kept or reused (a lesson's writer).
@@ -335,7 +337,10 @@ pub const MemorySource = struct {
 pub const HealthSource = @import("engine_status.zig").HealthSource;
 pub const Status = @import("engine_status.zig").Status;
 
-pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale }; // Stale: a learner's put-back has not reached the device
+pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale, MemoryPressure }; // Stale: a learner's put-back has not reached the device
+
+/// What a request refused under critical memory pressure says (a 503).
+pub const pressure_message = "this Mac is under critical memory pressure: the server takes no new requests until it eases; retry shortly";
 
 /// What a reply refused or ended for `Stale` says, a submit's error and a queued job's failure alike.
 pub const stale_message = "a Living Weights delete could not be put back on the device: send the delete again to retry it, or restart the server";
