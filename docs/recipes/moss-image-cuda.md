@@ -16,7 +16,8 @@ Metal. It is a denoiser, not a token family: it does not register with the lane 
 The config, the rotary tables and the timestep's modulation (`config.zig`, `host.zig`) are shared with Metal. The
 weights are checked as on Metal: the released geometry only, and no tensor left unread.
 
-It runs on the two GPUs it was checked on, sm_120 (RTX 5090) and sm_121 (GB10): `Model.load` refuses any other.
+It runs on the three GPUs it was checked on, sm_89 (RTX 4090), sm_120 (RTX 5090) and sm_121 (GB10): `Model.load`
+refuses any other.
 
 ## Precision
 
@@ -69,7 +70,7 @@ SUMMARY moss image: 8 kernels, 8 pass gates 1-4, 0 fail; 5 controls: 5 red as pl
 ```sh
 hf download OpenMOSS-Team/MOSS-Image-Base --revision 85975793d8b3d432f1b6e27f352abaa4c2a4c0d3 --local-dir MODEL_DIR
 python3 tools/zig/moss_image_case.py case MODEL_DIR case/ --prompt-file prompt.txt --device cuda
-zig build install -Doptimize=ReleaseFast -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121   # -Dsm=120 for an RTX 5090
+zig build install -Doptimize=ReleaseFast -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121   # 120: RTX 5090, 89: RTX 4090
 zig-out/bin/tf-moss-image MODEL_DIR/transformer case/case.safetensors case/
 python3 tools/zig/moss_image_case.py decode MODEL_DIR case/latents.f32 case/zig.png --device cuda
 python3 tools/zig/moss_image_case.py compare case/reference.png case/zig.png case/side.png
@@ -121,3 +122,23 @@ velocities and float32 runs as recorded on the GB10):
 - **Memory:** the transformer's bf16 weights (9.5 GB) on the device, plus scratch sized at load for one image and the
   longest prompt: 0.51 GB at 1024x1024 with a 34-row prompt (from the allocations, not measured), and cuBLASLt's
   32 MiB workspace.
+
+Results on an RTX 4090 (sm_89, 24 GB, Windows 11, driver 616.56, nvcc 13.3), with the cases made on the same card
+(torch 2.12.0, diffusers 0.42.1, transformers 5.22.1) from the recipe's fox and sticky-note prompts and seeds:
+
+- **Contract:** `tf-cuda-test moss-contract` gives the same summary line as above (8 kernels pass gates 1-4, 5 controls
+  red as planted).
+- **Velocity:** against torch bf16, cosine 0.99972 to 0.99998 (fox) and 0.99978 to 0.99998 (sticky note). Against the
+  float32 run, mean 1 - cosine: fox prompt 1.600e-4 (torch bf16's own 1.609e-4), negative 1.702e-4 (1.696e-4); sticky
+  note prompt 1.652e-4 (1.638e-4), negative 1.791e-4 (1.791e-4). Ours is the closer at 25 and 20 of the fox's steps,
+  22 and 23 of the sticky note's.
+- **Image:** 46.54 dB PSNR from the pipeline's picture for the fox, 29.85 dB for the sticky note (its handwritten text
+  the same). Against a float32 run of the whole schedule, over the 8 cases (both prompts, seeds 42/7, 1, 2, 3), ours is
+  the closer in 5, at a mean of 31.62 dB against torch bf16's 31.35 dB.
+- **Repeat:** identical bytes, the same step twice and two runs of the fox case.
+- **Speed**, the GPU otherwise idle:
+  - torch bf16: 0.490 s a forward for the fox, 0.499 s for the sticky note (the median of its 100).
+  - Ours: 0.352 s and 0.358 s, 1.39x torch's (35.2 s and 35.8 s for 50 guided steps). Load 4.6 to 5.0 s.
+- **Memory:** as on the 5090. The case tool's own pipeline holds the 16 GB encoder and the transformer at once, which
+  does not fit in 24 GB: the cases above were made with the encoder and transformer taking turns on the card (the
+  float32 transformer converted on the host), the publisher's code otherwise unchanged.

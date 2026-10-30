@@ -114,12 +114,12 @@ pub const Model = struct {
     /// The timestep `mods` holds, if any.
     timestep: ?f32 = null,
 
-    /// The transformer of `dir` for prompts of up to `max_text` rows and one image size, on sm_120 or sm_121 only.
+    /// The transformer of `dir` for prompts of up to `max_text` rows and one image size, on sm_89, sm_120 or sm_121 only.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, max_text: usize, width: usize, height: usize) !*Model {
         const d = ctx.d;
         const sm = try ctx.capability();
-        if (sm != 120 and sm != 121) {
-            std.log.err("moss image: sm_{d} is not a GPU this family was checked on (sm_120, sm_121)", .{sm});
+        if (sm != 89 and sm != 120 and sm != 121) {
+            std.log.err("moss image: sm_{d} is not a GPU this family was checked on (sm_89, sm_120, sm_121)", .{sm});
             return error.UncheckedGpu;
         }
         const g = try cfg.grid(width, height);
