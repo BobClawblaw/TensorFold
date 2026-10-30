@@ -209,7 +209,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = why;
         return null;
     }
-    const native = modelContext(a, io, o.dir);
+    // a family whose config.json names no trained window (or a wider one) declares its own
+    const native = if (@hasDecl(F, "trained_context")) F.trained_context else modelContext(a, io, o.dir);
     const window = contextWindow(o.context, native, F.default_context) catch |e| {
         problem.* = switch (e) {
             error.Negative => try std.fmt.allocPrint(a, "--context {d}: a token count, or 0 for the model's window", .{o.context.?}),
