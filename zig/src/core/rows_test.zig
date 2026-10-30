@@ -421,3 +421,43 @@ test "a learn dir that is a regular file is refused, and open frees what it made
     var f: Fake = .{ .gpa = gpa };
     try std.testing.expectError(error.RowsDir, rows.Rows.open(gpa, f.snapshots(), options(path)));
 }
+
+test "memory pressure: a held store reads no new disk state and resumes it after recovery" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const dir = root(&buf, "pressure");
+    defer rmTree(dir);
+    const first = try prompt(a, 0, 1, 1500);
+    {
+        var f: Fake = .{ .gpa = gpa };
+        const disk = try rows.Rows.open(gpa, f.snapshots(), options(dir));
+        defer disk.deinit();
+        var s = pc.Store.init(gpa, f.snapshots(), rules, 1 << 30);
+        defer s.deinit();
+        s.disk = disk;
+        _ = try request(a, &s, &f, first, 1400);
+        drain(disk);
+    }
+    var f: Fake = .{ .gpa = gpa };
+    const disk = try rows.Rows.open(gpa, f.snapshots(), options(dir));
+    defer disk.deinit();
+    var s = pc.Store.init(gpa, f.snapshots(), rules, 1 << 30);
+    defer s.deinit();
+    s.disk = disk;
+    s.hold = true;
+    const next = try std.mem.concat(a, u32, &.{ first[0..1401], &[_]u32{ 9, 8, 7, 6 } });
+    const cold = try request(a, &s, &f, next, 1404);
+    try std.testing.expectEqual(@as(u32, 0), cold.from);
+    try std.testing.expectEqual(fresh(next), cold.sum);
+    try std.testing.expectEqual(@as(u64, 0), disk.counts.reads);
+    try std.testing.expectEqual(@as(u64, 0), s.held);
+    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
+    s.hold = false;
+    const warm = try request(a, &s, &f, next, 1404);
+    try std.testing.expectEqual(@as(u32, 1400), warm.from);
+    try std.testing.expectEqual(fresh(next), warm.sum);
+    try std.testing.expectEqual(@as(u64, 1), disk.counts.reads);
+}

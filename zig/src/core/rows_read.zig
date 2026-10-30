@@ -80,6 +80,7 @@ fn bad(r: *Rows, name: Name, ext: []const u8, err: anyerror) anyerror {
 
 /// A disk state reaching further than `have`, read back into a new RAM entry where that costs less than prefilling.
 pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry) ?*pc.Entry {
+    if (s.hold) return have;
     const r = s.disk orelse return have;
     const from = if (have) |x| x.at else 0;
     const i = r.best(prompt, starts, spans, from) orelse return have;

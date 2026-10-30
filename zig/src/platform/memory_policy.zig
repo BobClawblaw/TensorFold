@@ -9,4 +9,3 @@ pub fn pressure() ?u32 {
     if (sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &len, null, 0) != 0 or len != @sizeOf(u32)) return null;
     return level;
 }
-

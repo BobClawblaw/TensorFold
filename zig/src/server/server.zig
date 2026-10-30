@@ -46,6 +46,8 @@ pub const Config = struct {
     /// With thinking on, reply tokens the reasoning may use beyond the request's max_tokens (0: none).
     thinking_reserve: i64 = 0,
     loop_guard: bool = false,
+    /// --loop-guard-stop: a guarded reply ends where the guard fires, with a loop error and no answer or calls.
+    loop_stop: bool = false,
     /// Seconds the idle keepalive runs after the last request ends (0: off).
     keep_warm_s: i64 = 900,
     dashboard: bool = false,

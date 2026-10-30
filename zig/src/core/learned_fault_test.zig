@@ -453,3 +453,31 @@ test "Store learns after old zero-byte and torn used stamps under cap pressure" 
         try std.testing.expectEqual(@as(u64, 0), try dirs.otherBytes(r, im.dir, 1));
     }
 }
+
+test "memory pressure: a held store reads no new imprint state and resumes it after recovery" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const dir = try root(&buf, "pressure");
+    defer @import("prompt_imprint_test.zig").rmTree(dir);
+    var im = try Imprint.open(gpa, dir, 1, 1 << 20);
+    defer im.deinit();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try learnOne(&im, &prompt);
+    var f: Fake = .{ .gpa = gpa };
+    var s = pc.Store.init(gpa, f.learned(), .{ .min_prompt = 0, .min_gap = 1, .lookahead = 1 }, 1 << 20);
+    defer s.deinit();
+    s.imprint = &im;
+    s.hold = true;
+    const cold = try s.begin(a, &prompt, 7, &.{5}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), cold.from);
+    try std.testing.expectEqual(prefixSum(&prompt), f.pass(&s, &prompt, cold));
+    try std.testing.expectEqual(@as(u64, 0), s.held);
+    try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
+    s.hold = false;
+    const warm = try s.begin(a, &prompt, 7, &.{5}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 5), warm.from);
+    try std.testing.expectEqual(prefixSum(&prompt), f.pass(&s, &prompt, warm));
+}
