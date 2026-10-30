@@ -224,6 +224,10 @@ ARM torch (a Mac, a GB10) calls its libm instead. For seed 42 at 1024x1024, a Ma
 200,873 of 524,288 values, by at most 2.2e-6. The native generator matches x86 torch byte for byte on any CPU.
 `moss_image_case.py noise` records sha256s of x86 torch's latents (torch 2.13.0) for 24 seeds and 9 sizes, and
 `zig build test` checks them. A case made on a Mac holds the Mac's noise, not these.
+`moss_image_case.py latents` draws one seed's latents with x86 torch; `case` and `start` take them with `--latents` and
+then record the seed, as they do when they run on x86 themselves. `tf-moss-image` draws the latents natively from a
+recorded seed and fails unless they equal the case's. A case made on a Mac without `--latents` records no seed, and
+its latents are used as given.
 
 `moss_image.schedule` computes the timesteps and noise levels from `scheduler/scheduler_config.json`, as the
 pipeline's `MOSSImageScheduler` does: a float32 grid shifted by `shift`, snapped to the nearest of the

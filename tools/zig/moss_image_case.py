@@ -32,6 +32,7 @@ USAGE = """\
                                            for tf-moss-image-blocks
   compare A.png B.png [SIDE.png]           PSNR and mean absolute difference of two pictures, optionally side by side
   noise OUT.json                           torch.randn's starting latents for many seeds and sizes, as sha256s (x86)
+  latents OUT.safetensors                  one seed's starting latents from x86 torch, for case/start --latents
   schedule MODEL_DIR OUT.json              MOSSImageScheduler's timesteps and sigmas for many step counts and configs
 MODEL_DIR is the OpenMOSS-Team/MOSS-Image-Base folder. The case runs the card's defaults: 50 Euler steps, CFG 3, an
 empty negative prompt whose branch skips block 22, the bf16 transformer and text encoder, the float32 decoder.
@@ -107,6 +108,28 @@ def to_png(pipe, latents, path: str) -> None:
     pipe.image_processor.postprocess(image, output_type="pil")[0].save(path)
 
 
+X86 = ("AVX2", "AVX512")
+
+
+def starting_noise(args, h: int, w: int):
+    """The starting latents (1, 128, h, w), and the seed to record: only for x86 torch's, which moss_image.noise draws."""
+    import torch
+    from safetensors.torch import load_file
+
+    if args.latents:
+        given = load_file(args.latents)
+        if int(given["seed"][0]) != args.seed or tuple(given["latents"].shape) != (h, w, 128):
+            sys.exit(f"{args.latents} holds another seed or size than --seed {args.seed} at {args.width}x{args.height}")
+        return given["latents"].permute(2, 0, 1)[None].contiguous(), args.seed
+    noise = torch.randn((1, 128, h, w), generator=torch.Generator("cpu").manual_seed(args.seed), dtype=torch.float32)
+    return noise, args.seed if torch.backends.cpu.get_cpu_capability() in X86 else None
+
+
+def seeded(seed) -> dict:
+    import torch
+    return {} if seed is None else {"seed": torch.tensor([seed], dtype=torch.int64)}
+
+
 def case(args) -> int:
     import torch
     from safetensors.torch import save_file
@@ -123,7 +146,7 @@ def case(args) -> int:
     if args.device == "mps":
         torch.mps.empty_cache()
     h, w = args.height // 16, args.width // 16
-    noise = torch.randn((1, 128, h, w), generator=torch.Generator("cpu").manual_seed(args.seed), dtype=torch.float32)
+    noise, seed = starting_noise(args, h, w)
     calls = []
     forward = pipe.transformer.forward
 
@@ -150,7 +173,7 @@ def case(args) -> int:
                "steps": torch.tensor([args.steps], dtype=torch.int64), "timesteps": sched.timesteps.float().cpu().contiguous(), "sigmas": sched.sigmas.float().cpu().contiguous(),
                "latents": noise[0].permute(1, 2, 0).contiguous(), "inputs": torch.stack([c["input"] for c in cond]),
                "velocity": torch.stack([c["velocity"] for c in cond]),
-               "velocity_negative": torch.stack([u["velocity"] for u in uncond])}
+               "velocity_negative": torch.stack([u["velocity"] for u in uncond]), **seeded(seed)}
     if args.fp32_steps:
         # the same transformer and inputs in float32 throughout: the bf16 reference's own distance from exact arithmetic
         pipe.transformer.float()
@@ -187,12 +210,12 @@ def start(args) -> int:
         sys.exit("start needs --prompt-file unless --no-encoder")
     pipe, _ = pipeline(args.model_dir, args.device, text=not args.no_encoder, dit=False)
     h, w = args.height // 16, args.width // 16
-    noise = torch.randn((1, 128, h, w), generator=torch.Generator("cpu").manual_seed(args.seed), dtype=torch.float32)
+    noise, seed = starting_noise(args, h, w)
     pipe.scheduler.set_timesteps(args.steps)
     tensors = {"steps": torch.tensor([args.steps], dtype=torch.int64),
                "timesteps": pipe.scheduler.timesteps.float().cpu().contiguous(),
                "sigmas": pipe.scheduler.sigmas.float().cpu().contiguous(),
-               "latents": noise[0].permute(1, 2, 0).contiguous()}
+               "latents": noise[0].permute(1, 2, 0).contiguous(), **seeded(seed)}
     meta = {"width": args.width, "height": args.height, "seed": args.seed, "steps": args.steps}
     if not args.no_encoder:
         positive, _ = pipe.encode_prompt(Path(args.prompt_file).read_text().strip())
@@ -352,7 +375,7 @@ def noise(args) -> int:
     """sha256 of the starting latents (rows x columns x 128, float32) the pipeline's seeded CPU generator gives."""
     import torch
     cpu = torch.backends.cpu.get_cpu_capability()
-    if cpu not in ("AVX2", "AVX512"):
+    if cpu not in X86:
         sys.exit(f"torch's CPU capability here is {cpu}: only x86 torch (AVX2 or AVX512) takes the path moss_image matches")
     cases = []
     for i, seed in enumerate(NOISE_SEEDS):
@@ -363,6 +386,20 @@ def noise(args) -> int:
             cases.append({"seed": seed, "width": width, "height": height, "sha256": hashlib.sha256(data).hexdigest()})
     Path(args.out).write_text(json.dumps({"torch": torch.__version__, "cpu": cpu, "cases": cases}, indent=1) + "\n")
     print(f"{len(cases)} cases from torch {torch.__version__} ({cpu}) in {args.out}")
+    return 0
+
+
+def latents(args) -> int:
+    """One seed's starting latents (rows x columns x 128) from x86 torch, for case and start --latents on another CPU."""
+    import torch
+    from safetensors.torch import save_file
+    cpu = torch.backends.cpu.get_cpu_capability()
+    if cpu not in X86:
+        sys.exit(f"torch's CPU capability here is {cpu}: only x86 torch (AVX2 or AVX512) takes the path moss_image matches")
+    x = torch.randn((1, 128, args.height // 16, args.width // 16), generator=torch.Generator("cpu").manual_seed(args.seed),
+                    dtype=torch.float32)
+    save_file({"latents": x[0].permute(1, 2, 0).contiguous(), "seed": torch.tensor([args.seed], dtype=torch.int64)}, args.out)
+    print(json.dumps({"out": args.out, "seed": args.seed, "torch": torch.__version__, "cpu": cpu}))
     return 0
 
 
@@ -491,6 +528,7 @@ def main() -> int:
     c.add_argument("--width", type=int, default=1024)
     c.add_argument("--height", type=int, default=1024)
     c.add_argument("--seed", type=int, default=42)
+    c.add_argument("--latents", help="the seed's latents from `latents` on x86 (else torch.randn here)")
     c.add_argument("--steps", type=int, default=50)
     c.add_argument("--fp32-steps", type=int, default=1, help="steps also run in float32 (0: none)")
     c.add_argument("--device", default="mps")
@@ -503,6 +541,7 @@ def main() -> int:
     s.add_argument("--width", type=int, default=1024)
     s.add_argument("--height", type=int, default=1024)
     s.add_argument("--seed", type=int, default=42)
+    s.add_argument("--latents", help="the seed's latents from `latents` on x86 (else torch.randn here)")
     s.add_argument("--steps", type=int, default=50)
     s.add_argument("--device", default="mps")
     x = sub.add_parser("exact")
@@ -543,12 +582,18 @@ def main() -> int:
     p.add_argument("side", nargs="?")
     n = sub.add_parser("noise")
     n.add_argument("out")
+    r = sub.add_parser("latents")
+    r.add_argument("out")
+    r.add_argument("--seed", type=int, default=42)
+    r.add_argument("--width", type=int, default=1024)
+    r.add_argument("--height", type=int, default=1024)
     q = sub.add_parser("schedule")
     q.add_argument("model_dir")
     q.add_argument("out")
     args = parser.parse_args()
     modes = {"case": case, "start": start, "exact": exact, "decode": decode, "encode": encode, "vae": vae,
-             "blocks": blocks, "compare": compare, "noise": noise, "schedule": schedule}
+             "blocks": blocks, "compare": compare, "noise": noise, "latents": latents,
+             "schedule": schedule}
     return modes[args.mode](args)
 
 

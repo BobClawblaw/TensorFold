@@ -9,15 +9,16 @@ const usage =
     \\tf-moss-image TRANSFORMER_DIR CASE OUT_DIR [--prompt FILE [--negative FILE]]
     \\CASE (tools/zig/moss_image_case.py) holds the prompt's and the empty negative prompt's encoder rows, the timesteps
     \\and noise levels and the starting latents. The schedule is made natively from the checkpoint's scheduler config and
-    \\must equal the case's bit for bit. A `case` also holds a reference run (each step's input and both branches'
-    \\velocities, in bf16 and for its first steps in float32): each step then runs both branches on the reference's input
-    \\and compares them, beside torch bf16's own distance from float32 where the case has it (tf-moss-image-blocks gates
-    \\each block alone); a step run twice must repeat byte for byte, or the run fails. Then the whole schedule runs from
-    \\the starting latents with the card's guidance (scale 3, the negative branch skipping block 22), timed. The
-    \\transformer is then freed and the checkpoint's image decoder (the vae/ folder beside TRANSFORMER_DIR) turns the
-    \\latents into the picture. OUT_DIR gets latents.f32 (rows x columns x 128), picture.png and run.json. With --prompt,
-    \\the encoder in TRANSFORMER_DIR's checkpoint folder makes both prompts' rows (the negative from --negative's file,
-    \\else empty) in place of the case's.
+    \\must equal the case's bit for bit. When the case records its seed (its latents are x86 torch's), the starting
+    \\latents are drawn natively too and must equal the case's bit for bit. A `case` also holds a reference run (each
+    \\step's input and both branches' velocities, in bf16 and for its first steps in float32): each step then runs both
+    \\branches on the reference's input and compares them, beside torch bf16's own distance from float32 where the case
+    \\has it (tf-moss-image-blocks gates each block alone); a step run twice must repeat byte for byte, or the run fails.
+    \\Then the whole schedule runs from the starting latents with the card's guidance (scale 3, the negative branch
+    \\skipping block 22), timed. The transformer is then freed and the checkpoint's image decoder (the vae/ folder beside
+    \\TRANSFORMER_DIR) turns the latents into the picture. OUT_DIR gets latents.f32 (rows x columns x 128), picture.png
+    \\and run.json. With --prompt, the encoder in TRANSFORMER_DIR's checkpoint folder makes both prompts' rows (the
+    \\negative from --negative's file, else empty) in place of the case's.
 ;
 
 /// The card's sampling defaults: the guidance scale, and the block the negative branch skips.
@@ -177,6 +178,14 @@ fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8
     const negative_rows = negative.len / mi.config.context;
     const start = try take(f32, a, case, "latents", .f32);
     if (start.len != count) return error.BadCaseTensor;
+    var noise_equal = true;
+    if (case.get("seed") != null) {
+        const seed: u64 = @bitCast((try take(i64, a, case, "seed", .i64))[0]);
+        const ours = try a.alloc(f32, count);
+        try mi.noise.latents(a, seed, grid[0], grid[1], ours);
+        noise_equal = std.mem.eql(u8, std.mem.sliceAsBytes(ours), std.mem.sliceAsBytes(start));
+        std.debug.print("starting latents: drawn natively from seed {d}, the same bits as the case's: {}\n", .{ seed, noise_equal });
+    } else std.debug.print("starting latents: the case's (it records no seed: not x86 torch's)\n", .{});
     const plan = try schedule(a, io, std.fs.path.dirname(dir) orelse ".", case);
     const timesteps = plan.timesteps;
     const sigmas = plan.sigmas;
@@ -198,8 +207,8 @@ fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8
     std.debug.print("both prompts refined: {d:.3} s\n", .{refine_s});
     try print(out, a, "{{\"device\": \"{s}\", \"image_rows\": {d}, \"prompt_rows\": {d}, \"negative_rows\": {d}, \"load_s\": {d:.2}, \"refine_s\": {d:.4}", .{ device.name(), rows, text, negative_rows, load_s, refine_s });
     if (prompts.encode_s) |s| try print(out, a, ", \"native_encoder\": true, \"encode_s\": {d:.4}", .{s});
-    try print(out, a, ", \"schedule_equal\": {}", .{plan.equal});
-    var pass = plan.equal;
+    try print(out, a, ", \"schedule_equal\": {}, \"noise_equal\": {}", .{ plan.equal, noise_equal });
+    var pass = plan.equal and noise_equal;
     if (case.get("inputs") != null) pass = try teacher(a, case, model, &branches, timesteps, count, out) and pass;
     try print(out, a, ", \"run\": [", .{});
 
