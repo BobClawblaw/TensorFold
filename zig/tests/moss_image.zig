@@ -3,7 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const tf = @import("tensorfold");
 const mi = tf.moss_image;
-const tokenizer = @import("tokenizer");
+const prompting = @import("moss_image_prompts.zig");
 
 const usage =
     \\tf-moss-image TRANSFORMER_DIR CASE OUT_DIR [--prompt FILE [--negative FILE]]
@@ -21,9 +21,7 @@ const usage =
     \\negative from --negative's file, else empty) in place of the case's.
 ;
 
-/// The card's sampling defaults: the guidance scale, and the block the negative branch skips.
-const guidance: f32 = 3.0;
-const negative_skip: usize = 22;
+const negative_skip = mi.pipeline.negative_skip;
 
 const check = mi.reference;
 
@@ -96,11 +94,6 @@ fn teacher(a: std.mem.Allocator, case: *const tf.safetensors.File, model: *mi.Mo
     return repeat;
 }
 
-/// A prompt file's text, trimmed as the case tool trims it.
-fn read(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
-    return std.mem.trim(u8, try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)), " \t\r\n");
-}
-
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const io = init.io;
@@ -147,19 +140,9 @@ const Prompts = struct { rows: [2][]u16, encode_s: ?f64 };
 
 /// Both prompts' rows from the checkpoint's own encoder, which is freed before this returns.
 fn encode(a: std.mem.Allocator, io: std.Io, device: mtl.Device, checkpoint: []const u8, prompt_file: []const u8, negative_file: ?[]const u8) !Prompts {
-    const texts = [2][]const u8{ try read(a, io, prompt_file), if (negative_file) |n| try read(a, io, n) else "" };
-    const enc = try mi.Encoder.load(std.heap.page_allocator, io, device, checkpoint);
-    defer enc.deinit();
-    var tok = try tokenizer.loadTokenizer(io, a, try std.fs.path.join(a, &.{ checkpoint, "tokenizer", "tokenizer.json" }));
-    defer tok.deinit();
-    const encoding = mtl.clock.seconds();
+    const texts = [2][]const u8{ try prompting.read(a, io, prompt_file), if (negative_file) |n| try prompting.read(a, io, n) else "" };
     var made: [2][]u16 = undefined;
-    for (texts, &made) |t, *m| {
-        const ids = try mi.encoder.ids(&tok, a, t);
-        m.* = try a.alloc(u16, ids.len * mi.encoder_config.hidden);
-        try enc.rows(ids, m.*, null);
-    }
-    const encode_s = mtl.clock.seconds() - encoding;
+    const encode_s = try prompting.encode(a, io, device, checkpoint, &texts, &made);
     std.debug.print("both prompts encoded natively: {d:.3} s\n", .{encode_s});
     return .{ .rows = made, .encode_s = encode_s };
 }
@@ -217,14 +200,10 @@ fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8
     const uncond = try a.alloc(f32, count);
     var total: f64 = 0;
     for (0..steps) |s| {
-        const c = try model.forward(&branches[0], x, timesteps[s], null, cond);
-        const u = try model.forward(&branches[1], x, timesteps[s], negative_skip, uncond);
-        const by = sigmas[s + 1] - sigmas[s];
-        for (x, cond, uncond) |*o, pc, pu| o.* += (pu + guidance * (pc - pu)) * by;
-        const wall = c.wall + u.wall;
-        total += wall;
-        std.debug.print("step {d}/{d}: {d:.3} s ({d:.3} s on the GPU, {d:.3} s modulation on the host)\n", .{ s + 1, steps, wall, c.gpu + u.gpu, c.host + u.host });
-        try print(out, a, "{s}{{\"wall_s\": {d:.4}, \"gpu_s\": {d:.4}, \"host_s\": {d:.4}}}", .{ if (s == 0) "" else ", ", wall, c.gpu + u.gpu, c.host + u.host });
+        const t = try mi.pipeline.step(model, &branches[0], &branches[1], x, timesteps[s], sigmas[s], sigmas[s + 1], mi.pipeline.guidance, cond, uncond);
+        total += t.wall;
+        std.debug.print("step {d}/{d}: {d:.3} s ({d:.3} s on the GPU, {d:.3} s modulation on the host)\n", .{ s + 1, steps, t.wall, t.gpu, t.host });
+        try print(out, a, "{s}{{\"wall_s\": {d:.4}, \"gpu_s\": {d:.4}, \"host_s\": {d:.4}}}", .{ if (s == 0) "" else ", ", t.wall, t.gpu, t.host });
     }
     try print(out, a, "], \"denoise_s\": {d:.3}", .{total});
     std.debug.print("denoise: {d:.2} s for {d} steps ({d} forwards)\n", .{ total, steps, 2 * steps });

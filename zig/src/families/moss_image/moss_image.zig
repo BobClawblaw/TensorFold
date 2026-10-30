@@ -13,6 +13,7 @@ pub const Encoder = encoder.Encoder;
 pub const reference = @import("reference.zig");
 pub const decoder = @import("decoder.zig");
 pub const png = @import("png.zig");
+pub const pipeline = @import("pipeline.zig");
 pub const Model = model.Model;
 pub const Prompt = model.Prompt;
 pub const Timing = model.Timing;
@@ -32,4 +33,5 @@ test {
     _ = reference;
     _ = decoder;
     _ = png;
+    _ = pipeline;
 }
