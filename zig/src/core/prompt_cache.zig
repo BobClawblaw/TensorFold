@@ -527,6 +527,7 @@ pub const Store = struct {
 
     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
     fn recall(s: *Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
+        if (s.hold) return have;
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;

@@ -232,11 +232,11 @@ Past 70% of RAM the server warns at startup: a load that wires most of the RAM c
 
 ### Memory pressure on a shared Mac
 
-Engines served through the shared lane host, including Flash Next with `--parallel` above one, Qwen3.8-27B and GLM, read the macOS memory pressure level (`kern.memorystatus_vm_pressure_level`).
+Engines served through the shared lane host, including DeepSeek-V4.1, Flash Next with `--parallel` above one, Qwen3.8-27B and GLM, read the macOS memory pressure level (`kern.memorystatus_vm_pressure_level`).
 The engine thread reads it at most four times a second and acts on the level:
 
 - Warning: a queued request starts only when no other stream runs, so the server serves one stream at a time.
-  New prompt states are not kept.
+  New prompt states are not kept, and disk or learned states are not read back into new cache entries.
   The prompt cache gives back kept states, least valuable first and one per round, until it holds no more than its soft watermark.
   A state that a request is restoring is never dropped.
 - Critical: as warning, and new requests get 503 with a message saying the Mac is under critical memory pressure.

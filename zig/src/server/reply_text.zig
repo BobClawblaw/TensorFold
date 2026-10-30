@@ -94,6 +94,17 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
     return .{ .reasoning = text[0 .. text.len - held], .answer = "" };
 }
 
+/// Reasoning retained after the engine stops inside its think block; tool examples are never promoted to an answer.
+pub fn stoppedReasoning(full: []const u8, m: Markers) []const u8 {
+    var text = full;
+    if (m.open.len > 0) {
+        if (find(text, m.open)) |start| text = text[start + m.open.len ..];
+    } else if (std.mem.startsWith(u8, text, think_open)) {
+        text = text[think_open.len..];
+    }
+    return pyStrip(text);
+}
+
 /// Hides tool-call blocks and partial opening tags while streaming, so calls arrive as deltas instead.
 pub fn hideToolCalls(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;

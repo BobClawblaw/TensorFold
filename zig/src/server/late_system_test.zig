@@ -137,7 +137,7 @@ const Capture = struct {
 
 const Reply = struct { status: u16, body: []u8 };
 
-fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
+pub fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
     return exchangeAs(srv, "POST", path, body);
 }
 

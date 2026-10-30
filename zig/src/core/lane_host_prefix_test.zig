@@ -220,3 +220,45 @@ test "prefix wait: TENSORFOLD_PREFIX_WAIT_MS is whole milliseconds, 0 off, anyth
     try std.testing.expectEqual(@as(i96, 0), prefix.Wait.fromText("0").ns);
     try std.testing.expectEqual(@as(i96, 250) * std.time.ns_per_ms, prefix.Wait.fromText("250").ns);
 }
+
+test "prefix wait: a removed or reused leader releases waiters, including a cut not kept under pressure" {
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    host.prefix = .{};
+    defer host.queued.deinit(gpa);
+    defer host.filling.deinit(gpa);
+    const request: Request = .{ .prompt = &.{1}, .max_tokens = 1 };
+    var box: Box = .{};
+    var leader: LaneHost.Job = .{ .host = &host, .started = true, .id = 1, .request = &request, .sink = .{ .ctx = &box, .event = Box.event } };
+    var waiter: LaneHost.Job = .{ .host = &host, .id = 2, .request = &request, .sink = .{ .ctx = &box, .event = Box.event } };
+    try host.queued.append(gpa, &waiter);
+    try host.filling.append(gpa, &leader);
+    const waiting: prefix.Waiting = .{ .leader = &leader, .id = 1, .at = 512, .since = std.Io.Clock.awake.now(std.testing.io).toNanoseconds(), .waited = true };
+    waiter.prefix = waiting;
+    prefix.release(&host);
+    try std.testing.expect(prefix.waiting(&waiter));
+    host.filling.clearRetainingCapacity(); // a failed or requeued fill no longer owns its old admission
+    prefix.release(&host);
+    try std.testing.expect(!prefix.waiting(&waiter));
+    try host.filling.append(gpa, &leader);
+    leader.id = 3; // the same address now belongs to another request
+    waiter.prefix = waiting;
+    prefix.release(&host);
+    try std.testing.expect(!prefix.waiting(&waiter));
+    leader.id = 1;
+    waiter.prefix = waiting;
+    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{}, 1 << 20);
+    defer store.deinit();
+    store.hold = true;
+    host.cache = &store;
+    leader.reached = 512; // pressure refused the keep, but the leader passed the awaited cut
+    prefix.release(&host);
+    try std.testing.expect(!prefix.waiting(&waiter));
+    try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+}
