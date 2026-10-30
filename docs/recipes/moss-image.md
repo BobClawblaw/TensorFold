@@ -48,6 +48,22 @@ direct one gives an infinity; the contract checks the classes against the Winogr
 The bf16 projections are the Qwen-VL tower's `tfp::gemm_nax`. Attention is the prefill `tfp::attention_nax` template's
 full (non-causal) form. The time MLP and both modulation projections run on the host, once a timestep.
 
+## Schedule
+
+`schedule.zig` makes the timesteps and noise levels as the publisher's `MOSSImageScheduler` does, from
+`scheduler/scheduler_config.json`: `num_train_timesteps`, `shift` and `training_shift`, at the class's defaults when
+absent. The keys it inherits from diffusers and ignores are ignored here too, and another `_class_name` is refused.
+
+- `steps` sigmas from 1 down to the lowest training sigma, shifted by `shift`, and the 1,000 training sigmas the same
+  way by `training_shift`;
+- each sigma snapped to the nearest training sigma (a tie to the smaller), and repeats dropped: from 219 steps on, a
+  schedule has fewer steps than asked;
+- the timesteps the sigmas times 1,000, and the sigmas ending in 0.
+
+It is float32 as torch's is. `torch.linspace` on the CPU computes each half with a fused multiply-add from its own
+end, and so does `schedule.zig`. It equals the scheduler's bit for bit at every step count from 1 to 1,000
+(`tf-moss-image-schedule`).
+
 ## Prompt encoder
 
 `encoder.zig` runs the checkpoint's `text_encoder/` (Qwen3.5's text model: 32 layers, three Gated DeltaNet layers to
@@ -174,17 +190,19 @@ zig-out/bin/tf-moss-image MODEL_DIR/transformer pic/case.safetensors pic/ --prom
 The case holds:
 
 - both prompts' encoder rows;
-- the timesteps and noise levels;
+- the step count asked for, and the scheduler's timesteps and noise levels;
 - the starting latents;
 - the publisher's pipeline's input and both velocities at every step;
 - with `--fp32-steps N`, a float32 run of the same transformer for the first N steps.
 
-`tf-moss-image` first runs both branches of each step on the pipeline's own input and compares the velocities. It then
-runs the whole guided schedule from the starting latents, times it, frees the transformer, and decodes the final
-latents with the checkpoint's `vae/` decoder into `picture.png`. A case made by `start` holds only the prompts, the
-schedule and the noise; `tf-moss-image` then just makes the picture. With `--prompt` (and `--negative`, else the empty
-negative prompt), it encodes both prompts natively in place of the case's rows; `start --no-encoder` leaves them out of
-the case, and torch never loads the encoder.
+`tf-moss-image` makes the schedule natively and fails unless it equals the case's bit for bit. It runs both branches
+of each step on the pipeline's own input and compares the velocities, beside torch bf16's own distance from the case's
+float32 ones; a step run twice must repeat byte for byte, or it fails. It then runs the whole guided schedule from the
+starting latents, times it, frees the transformer, and decodes the final latents with the checkpoint's `vae/` decoder
+into `picture.png`. A case made by `start` holds only the prompts, the schedule and the noise; `tf-moss-image` then
+just makes the picture. With `--prompt` (and `--negative`, else the empty negative prompt), it encodes both prompts
+natively in place of the case's rows; `start --no-encoder` leaves them out of the case, and torch never loads the
+encoder.
 
 To check the decoder alone against a float64 decode of the same latents:
 
@@ -197,6 +215,29 @@ zig-out/bin/tf-moss-image-decoder MODEL_DIR case/latents.f32 1024 1024 case/deco
 
 Ours must be within twice torch float32's distance from float64, in cosine error and in its worst row of pixels, and a
 second decode must repeat the first byte for byte; it fails otherwise.
+
+To gate one step's transformer block by block (as the encoder's are), from a `case`:
+
+```sh
+python3 tools/zig/moss_image_case.py blocks MODEL_DIR case/ --step 23 --branch negative
+zig build tf-moss-image-blocks -Dcpu=apple_m1
+zig-out/bin/tf-moss-image-blocks MODEL_DIR/transformer case/blocks-23-negative.safetensors
+```
+
+The case tool runs that step's branch in float32, keeping the stream into each block and after the last, then in bf16
+with every block and the final layer handed the float32 stream rounded to bf16. `Model.steps` runs ours the same way:
+the embedding, each block but the skipped one alone, and the final layer alone. Each must be within twice torch bf16's
+distance from float32 (or bf16 rounding's, when larger), in cosine error and in its worst row, and a second run must
+repeat the first byte for byte; it fails otherwise. A whole forward of 42 bf16 blocks is reported but not gated, for
+the reason the encoder's whole prompt is not (see Measured).
+
+To check the schedule alone against the publisher's scheduler, for 1 to 1,000 steps:
+
+```sh
+python3 tools/zig/moss_image_case.py schedule MODEL_DIR schedule.safetensors
+zig build tf-moss-image-schedule -Dcpu=apple_m1
+zig-out/bin/tf-moss-image-schedule MODEL_DIR schedule.safetensors
+```
 
 On MPS, which has no float64, the case tool computes the time sinusoid on the host in float64 and moves its float32
 result to the GPU; every other step of the publisher's code runs unchanged.
@@ -219,6 +260,18 @@ Results:
   - Against a float32 run of the same transformer on the same inputs (the second case, every step): mean 1 - cosine
     1.602e-4 for the prompt branch, as for torch bf16's own (1.602e-4); 1.735e-4 against torch's 1.715e-4 for the
     negative branch. Ours is the closer of the two at 25 and 27 of the 50 steps.
+- **Each block alone** (`tf-moss-image-blocks`), on seven steps' branches: the fox's steps 1 and 25 and the sticky
+  note's step 23, both branches each, and the sticky note's step 50, the prompt's. Each gives the embedding, every
+  block but the skipped one and the final layer the float32 run's stream in bf16:
+  - All 305 gates pass, at a mean of 0.50 of the limit (torch bf16's own distance) and at most 0.57. Our worst row is
+    1.00 times torch bf16's on average in each of the seven.
+  - A row planted 5% off in block 20's output, in the float32 stream and in torch's, fails at blocks 20 and 21, with
+    an identical repeat.
+- **Each whole forward**, over the sticky note's 100: our cosine error from float32 is 1.01 times torch bf16's on
+  average (0.76 to 1.26), and our worst row 1.03 times (0.37 to 2.55). torch's own bf16 run on the CPU of step 23's
+  negative branch has a worst row 1.37 times its MPS run's, so the worst row of 42 blocks in bf16 is not gated.
+- **Schedule:** equal bit for bit to the scheduler's at every step count from 1 to 1,000 (782 of them with repeats
+  dropped).
 - **Image:** our latents through the pipeline's decoder are 48.52 dB PSNR from the pipeline's own picture for the fox
   and 28.93 dB for the sticky note. Fifty guided steps magnify bf16 rounding into different fine detail, so the ruler
   is a float32 run of the whole schedule. There are two rulers, over the same 8 cases (both prompts, 4 seeds each):

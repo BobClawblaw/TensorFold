@@ -8,45 +8,23 @@ const tokenizer = @import("tokenizer");
 const usage =
     \\tf-moss-image TRANSFORMER_DIR CASE OUT_DIR [--prompt FILE [--negative FILE]]
     \\CASE (tools/zig/moss_image_case.py) holds the prompt's and the empty negative prompt's encoder rows, the timesteps
-    \\and noise levels and the starting latents. A `case` also holds a reference run (each step's input and both
-    \\branches' velocities): each step then runs both branches on the reference's input and compares them (max |diff|,
-    \\cosine, worst row). Then the whole schedule runs from the starting latents with the card's guidance (scale 3, the
-    \\negative branch skipping block 22), timed. The transformer is then freed and the checkpoint's image decoder (the
-    \\vae/ folder beside TRANSFORMER_DIR) turns the latents into the picture. OUT_DIR gets latents.f32 (rows x columns x
-    \\128), picture.png and run.json. With --prompt, the encoder in TRANSFORMER_DIR's checkpoint folder makes both
-    \\prompts' rows (the negative from --negative's file, else empty) in place of the case's.
+    \\and noise levels and the starting latents. The schedule is made natively from the checkpoint's scheduler config and
+    \\must equal the case's bit for bit. A `case` also holds a reference run (each step's input and both branches'
+    \\velocities, in bf16 and for its first steps in float32): each step then runs both branches on the reference's input
+    \\and compares them, beside torch bf16's own distance from float32 where the case has it (tf-moss-image-blocks gates
+    \\each block alone); a step run twice must repeat byte for byte, or the run fails. Then the whole schedule runs from
+    \\the starting latents with the card's guidance (scale 3, the negative branch skipping block 22), timed. The
+    \\transformer is then freed and the checkpoint's image decoder (the vae/ folder beside TRANSFORMER_DIR) turns the
+    \\latents into the picture. OUT_DIR gets latents.f32 (rows x columns x 128), picture.png and run.json. With --prompt,
+    \\the encoder in TRANSFORMER_DIR's checkpoint folder makes both prompts' rows (the negative from --negative's file,
+    \\else empty) in place of the case's.
 ;
 
 /// The card's sampling defaults: the guidance scale, and the block the negative branch skips.
 const guidance: f32 = 3.0;
 const negative_skip: usize = 22;
 
-const Match = struct { max_abs: f64, cosine: f64, worst_row: f64 };
-
-/// Largest absolute difference, cosine, and the largest relative L2 error of one row of `width`.
-fn match(ours: []const f32, theirs: []const f32, width: usize) Match {
-    var dot: f64 = 0;
-    var aa: f64 = 0;
-    var bb: f64 = 0;
-    var most: f64 = 0;
-    var worst: f64 = 0;
-    var row: usize = 0;
-    while (row < ours.len) : (row += width) {
-        var rd: f64 = 0;
-        var rb: f64 = 0;
-        for (ours[row..][0..width], theirs[row..][0..width]) |a, b| {
-            const d = @as(f64, a) - b;
-            dot += @as(f64, a) * b;
-            aa += @as(f64, a) * a;
-            bb += @as(f64, b) * b;
-            rd += d * d;
-            rb += @as(f64, b) * b;
-            most = @max(most, @abs(d));
-        }
-        worst = @max(worst, @sqrt(rd / @max(rb, 1e-30)));
-    }
-    return .{ .max_abs = most, .cosine = dot / @sqrt(aa * bb), .worst_row = worst };
-}
+const check = mi.reference;
 
 /// The case tensor `name` of `dtype`, copied out as T values.
 fn take(comptime T: type, a: std.mem.Allocator, f: *const tf.safetensors.File, name: []const u8, dtype: tf.safetensors.DType) ![]T {
@@ -69,7 +47,7 @@ fn print(list: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u
     try list.appendSlice(a, try std.fmt.allocPrint(a, fmt, args));
 }
 
-fn json(list: *std.ArrayList(u8), a: std.mem.Allocator, key: []const u8, m: Match) !void {
+fn json(list: *std.ArrayList(u8), a: std.mem.Allocator, key: []const u8, m: check.Match) !void {
     try print(list, a, ", \"{s}\": {{\"max_abs\": {d:.6}, \"cosine\": {d:.8}, \"worst_row\": {d:.6}}}", .{ key, m.max_abs, m.cosine, m.worst_row });
 }
 
@@ -94,14 +72,14 @@ fn teacher(a: std.mem.Allocator, case: *const tf.safetensors.File, model: *mi.Mo
         for (0..2) |b| {
             _ = try model.forward(&branches[b], inputs[s * count ..][0..count], timesteps[s], skips[b], velocity);
             const theirs = reference[b][s * count ..][0..count];
-            const m = match(velocity, theirs, mi.config.channels);
+            const m = check.match(f32, velocity, theirs, mi.config.channels);
             std.debug.print("step {d} {s}: against the bf16 reference max |diff| {d:.5}, cosine {d:.7}, worst row {d:.5}\n", .{ s + 1, labels[b], m.max_abs, m.cosine, m.worst_row });
             try json(out, a, try std.fmt.allocPrint(a, "{s}_bf16", .{labels[b]}), m);
             if (exact[b]) |f| if (f.len >= (s + 1) * count) {
                 const want = f[s * count ..][0..count];
-                const e = match(velocity, want, mi.config.channels);
-                const r = match(theirs, want, mi.config.channels);
-                std.debug.print("        against the fp32 reference max |diff| {d:.5}, cosine {d:.7}; the bf16 reference's own: {d:.5}, {d:.7}\n", .{ e.max_abs, e.cosine, r.max_abs, r.cosine });
+                const e = check.match(f32, velocity, want, mi.config.channels);
+                const r = check.match(f32, theirs, want, mi.config.channels);
+                std.debug.print("        against the fp32 reference max |diff| {d:.5}, cosine {d:.7}, worst row {d:.5}; the bf16 reference's own: {d:.5}, {d:.7}, {d:.5}\n", .{ e.max_abs, e.cosine, e.worst_row, r.max_abs, r.cosine, r.worst_row });
                 try json(out, a, try std.fmt.allocPrint(a, "{s}_fp32", .{labels[b]}), e);
                 try json(out, a, try std.fmt.allocPrint(a, "{s}_bf16_ref_vs_fp32", .{labels[b]}), r);
             };
@@ -160,7 +138,8 @@ pub fn main(init: std.process.Init) !u8 {
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/latents.f32", .{args[3]}), .data = std.mem.sliceAsBytes(run.latents) });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/picture.png", .{args[3]}), .data = try mi.png.encode(a, rgb, width, height) });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}/run.json", .{args[3]}), .data = out.items });
-    return if (run.repeat) 0 else 1;
+    std.debug.print("{s}\n", .{if (run.pass) "PASS" else "FAIL"});
+    return if (run.pass) 0 else 1;
 }
 
 const Prompts = struct { rows: [2][]u16, encode_s: ?f64 };
@@ -184,7 +163,7 @@ fn encode(a: std.mem.Allocator, io: std.Io, device: mtl.Device, checkpoint: []co
     return .{ .rows = made, .encode_s = encode_s };
 }
 
-const Run = struct { latents: []f32, rows: usize, columns: usize, repeat: bool };
+const Run = struct { latents: []f32, rows: usize, columns: usize, pass: bool };
 
 /// The case's schedule on `prompts` through the transformer of `dir`, freed before this returns; timings into `out`.
 fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8, case: *const tf.safetensors.File, prompts: Prompts, out: *std.ArrayList(u8)) !Run {
@@ -196,11 +175,12 @@ fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8
     const negative = prompts.rows[1];
     const text = prompt.len / mi.config.context;
     const negative_rows = negative.len / mi.config.context;
-    const timesteps = try take(f32, a, case, "timesteps", .f32);
-    const sigmas = try take(f32, a, case, "sigmas", .f32);
     const start = try take(f32, a, case, "latents", .f32);
+    if (start.len != count) return error.BadCaseTensor;
+    const plan = try schedule(a, io, std.fs.path.dirname(dir) orelse ".", case);
+    const timesteps = plan.timesteps;
+    const sigmas = plan.sigmas;
     const steps = timesteps.len;
-    if (sigmas.len != steps + 1 or start.len != count) return error.BadCaseTensor;
 
     const loading = mtl.clock.seconds();
     const model = try mi.Model.load(std.heap.page_allocator, io, device, dir, @max(text, negative_rows), grid[1] * 16, grid[0] * 16);
@@ -218,7 +198,9 @@ fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8
     std.debug.print("both prompts refined: {d:.3} s\n", .{refine_s});
     try print(out, a, "{{\"device\": \"{s}\", \"image_rows\": {d}, \"prompt_rows\": {d}, \"negative_rows\": {d}, \"load_s\": {d:.2}, \"refine_s\": {d:.4}", .{ device.name(), rows, text, negative_rows, load_s, refine_s });
     if (prompts.encode_s) |s| try print(out, a, ", \"native_encoder\": true, \"encode_s\": {d:.4}", .{s});
-    const repeat = if (case.get("inputs") == null) true else try teacher(a, case, model, &branches, timesteps, count, out);
+    try print(out, a, ", \"schedule_equal\": {}", .{plan.equal});
+    var pass = plan.equal;
+    if (case.get("inputs") != null) pass = try teacher(a, case, model, &branches, timesteps, count, out) and pass;
     try print(out, a, ", \"run\": [", .{});
 
     const x = try a.dupe(f32, start);
@@ -237,5 +219,16 @@ fn denoise(a: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8
     }
     try print(out, a, "], \"denoise_s\": {d:.3}", .{total});
     std.debug.print("denoise: {d:.2} s for {d} steps ({d} forwards)\n", .{ total, steps, 2 * steps });
-    return .{ .latents = x, .rows = grid[0], .columns = grid[1], .repeat = repeat };
+    return .{ .latents = x, .rows = grid[0], .columns = grid[1], .pass = pass };
+}
+
+/// The native schedule for the case's step count, and whether it equals the case's own bit for bit.
+fn schedule(a: std.mem.Allocator, io: std.Io, checkpoint: []const u8, case: *const tf.safetensors.File) !struct { timesteps: []f32, sigmas: []f32, equal: bool } {
+    const theirs = .{ try take(f32, a, case, "timesteps", .f32), try take(f32, a, case, "sigmas", .f32) };
+    const steps: usize = if (case.get("steps") != null) std.math.cast(usize, (try take(i64, a, case, "steps", .i64))[0]) orelse return error.BadCaseTensor else theirs[0].len;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ checkpoint, "scheduler", "scheduler_config.json" }), a, .limited(1 << 20));
+    const ours = try mi.schedule.make(a, try mi.schedule.parse(a, text), steps);
+    const equal = std.mem.eql(u8, std.mem.sliceAsBytes(ours.timesteps), std.mem.sliceAsBytes(theirs[0])) and std.mem.eql(u8, std.mem.sliceAsBytes(ours.sigmas), std.mem.sliceAsBytes(theirs[1]));
+    std.debug.print("schedule: {d} steps from scheduler_config.json, the same bits as the case's: {}\n", .{ ours.timesteps.len, equal });
+    return .{ .timesteps = ours.timesteps, .sigmas = ours.sigmas, .equal = equal };
 }
