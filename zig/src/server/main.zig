@@ -131,7 +131,9 @@ pub fn main(init: std.process.Init) !u8 {
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
-    const up = startup.both(io, loadText, .{ gpa, io, dir, args.chat_template, text_arena.allocator(), &text_problem }, engines.open, .{ a, gpa, io, dir, model_type, args, &problem }) catch |e| {
+    // a diffusers pipeline keeps its tokenizer in a folder of its own
+    const text_dir = if (std.mem.eql(u8, model_type, "moss_image")) try std.fs.path.join(a, &.{ dir, "tokenizer" }) else dir;
+    const up = startup.both(io, loadText, .{ gpa, io, text_dir, args.chat_template, text_arena.allocator(), &text_problem }, engines.open, .{ a, gpa, io, dir, model_type, args, &problem }) catch |e| {
         if (text_problem.len > 0) return fail(text_problem);
         if (problem.len > 0) return fail(problem); // an engine that failed after saying why
         return e;
@@ -200,11 +202,21 @@ fn fail(message: []const u8) u8 {
 }
 
 fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]const u8) ![]const u8 {
-    const bytes = (try @import("checkpoint_config").read(a, io, dir, problem)) orelse return "unknown";
+    const bytes = (try @import("checkpoint_config").read(a, io, dir, problem)) orelse return pipelineType(a, io, dir);
     const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return "unknown";
     if (doc != .object) return "unknown";
     const t = doc.object.get("model_type") orelse return "unknown";
     return if (t == .string) t.string else "unknown";
+}
+
+/// A diffusers pipeline folder's type from its model_index.json (no config.json): MOSS-Image's alone is served.
+fn pipelineType(a: std.mem.Allocator, io: std.Io, dir: []const u8) ![]const u8 {
+    const path = try std.fs.path.join(a, &.{ dir, "model_index.json" });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return "unknown";
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return "unknown";
+    if (doc != .object) return "unknown";
+    const name = doc.object.get("_class_name") orelse return "unknown";
+    return if (name == .string and std.mem.eql(u8, name.string, "MOSSImagePipeline")) "moss_image" else "unknown";
 }
 
 /// generation_config.json's sampling (``do_sample`` false is greedy), then the serve flags over it.

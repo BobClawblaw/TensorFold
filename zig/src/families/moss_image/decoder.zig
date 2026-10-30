@@ -90,6 +90,8 @@ pub const Decoder = struct {
     width: usize,
     height: usize,
     scratch: mtl.Buffer,
+    /// Bytes `scratch` holds (0 before the first plan); a smaller picture's views fit inside it.
+    capacity: usize,
     lat: Ref,
     t: [5]Ref,
     qkv_rows: Ref,
@@ -124,6 +126,7 @@ pub const Decoder = struct {
         d.device = device;
         d.width = width;
         d.height = height;
+        d.capacity = 0;
         d.queue = try device.queue();
         errdefer d.queue.deinit();
         const src = try frags.source(device, gpa, sources.moss_image_decoder);
@@ -204,6 +207,14 @@ pub const Decoder = struct {
         d.conv_out = try p.conv("decoder.conv_out", widths[3], 3, 9);
     }
 
+    /// Scratch for a width x height picture from now on: the buffer kept when the picture fits, zeroed either way.
+    pub fn resize(d: *Decoder, width: usize, height: usize) !void {
+        const g = try cfg.grid(width, height);
+        try d.plan(g.rows, g.columns);
+        d.width = width;
+        d.height = height;
+    }
+
     /// Scratch for a rows x columns latent grid: five picture tensors at the widest stage, the attention's rows.
     fn plan(d: *Decoder, rows: usize, columns: usize) !void {
         const R = rows * 2;
@@ -222,7 +233,12 @@ pub const Decoder = struct {
         const parts = [_]usize{ rows * columns * cfg.channels * 4, most * 4, most * 4, most * 4, most * 4, most * 4, attn_rows * 3 * widths[0] * 4, attn_rows * widths[0] * 4, 64 * 4, groups * chunks(picture) * 4, picture * 3 * 4, picture * 3 };
         var total: usize = 0;
         for (parts) |n| total += std.mem.alignForward(usize, n, 256);
-        d.scratch = try d.device.buffer(total, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        if (total > d.capacity) {
+            const grown = try d.device.buffer(total, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            if (d.capacity > 0) d.scratch.deinit();
+            d.scratch = grown;
+            d.capacity = total;
+        }
         @memset(d.scratch.contents()[0..total], 0);
         var at: usize = 0;
         const views = [_]*Ref{ &d.lat, &d.t[0], &d.t[1], &d.t[2], &d.t[3], &d.t[4], &d.qkv_rows, &d.att, &d.stats, &d.part, &d.out, &d.rgb };

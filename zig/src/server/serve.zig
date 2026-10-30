@@ -231,20 +231,21 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     };
     installSignals(store.enabled());
     const port = lis.port();
-    platform.optional_libraries.warnMissing(.grammar, a, io, platform);
+    // structured output and thinking are chat's: an image model's startup names neither
+    if (srv.info.images == null) platform.optional_libraries.warnMissing(.grammar, a, io, platform);
     if (s.on_listen) |f| f(port);
     const window = srv.info.context_window;
     if (srv.info.startup.len > 0) log.line("{s}", .{srv.info.startup});
     const now = std.Io.Clock.awake.now(io).toNanoseconds();
     const loaded = if (s.started > 0) @as(f64, @floatFromInt(now - s.started)) / 1e9 else 0;
     var window_text: [24]u8 = undefined;
-    log.line("serving {s} at http://{s}:{d}/v1 (sampling: {s}; drafts: {f}; context: {s}; loaded in {d:.1}s)", .{
+    if (srv.info.images != null) log.line("serving {s} at http://{s}:{d}/v1/images/generations (loaded in {d:.1}s)", .{ s.served, args.host, port, loaded }) else log.line("serving {s} at http://{s}:{d}/v1 (sampling: {s}; drafts: {f}; context: {s}; loaded in {d:.1}s)", .{
         s.served,                                                  args.host,                                                                                   port,   shownSampling(a, s.sampling),
         @import("draft_line.zig").shown(args.no_drafts, srv.info), if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
     const reserved = args.thinking_reserve > 0 and srv.info.answer_limit;
     if (args.thinking_reserve > 0 and !srv.info.answer_limit) log.line("--thinking-reserve is not applied: this engine cannot limit the answer apart from the reasoning", .{});
-    if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
+    if (srv.info.images == null and args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens {s}. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{if (reserved) "limits the answer, the reasoning taking up to --thinking-reserve tokens more" else "counts both"});
     if (s.recall) |r| recall_routes.line(r);
     if (srv.idle_manager != null) log.line("idle unload on: the engine closes after {d} s idle and the next request reloads it (a full model load)", .{args.idle_unload});

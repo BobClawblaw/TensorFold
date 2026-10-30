@@ -164,7 +164,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = prompt_int8_refusal;
         return null;
     }
-    if (std.mem.eql(u8, o.model_type, "fish_omni")) return @import("drama_open.zig").openMetal(a, gpa, io, o, problem);
+    if (@import("media_open.zig").handles(o.model_type)) return @import("media_open.zig").open(a, gpa, io, o, problem);
     if (o.cfg_enabled or o.cfg_batched) {
         problem.* = "--cfg-* guidance requires a Drama 3 speech model";
         return null;

@@ -59,11 +59,12 @@ fn validLabel(label: []const u8) bool {
 const listing = [_][]const u8{ "/models", "/v1/models", "/v1/voices" };
 const reading = [_][]const u8{ "/memory", "/v1/memory", "/metrics", "/v1/metrics", "/stats", "/dashboard", "/v1/benchmark/manifest" };
 const inferring = [_][]const u8{
-    "/chat/completions", "/v1/chat/completions", "/completions",           "/v1/completions",
-    "/messages",         "/v1/messages",         "/messages/count_tokens", "/v1/messages/count_tokens",
-    "/responses",        "/v1/responses",        "/tokenize",              "/v1/tokenize",
-    "/detokenize",       "/v1/detokenize",       "/v1/audio/speech",       "/v1/embeddings",
-    "/decisions",        "/v1/decisions",        "/systemone",             "/v1/systemone",
+    "/chat/completions",      "/v1/chat/completions", "/completions",           "/v1/completions",
+    "/messages",              "/v1/messages",         "/messages/count_tokens", "/v1/messages/count_tokens",
+    "/responses",             "/v1/responses",        "/tokenize",              "/v1/tokenize",
+    "/detokenize",            "/v1/detokenize",       "/v1/audio/speech",       "/v1/embeddings",
+    "/decisions",             "/v1/decisions",        "/systemone",             "/v1/systemone",
+    "/v1/images/generations",
 };
 
 /// A gated request a key may make: the route as the dispatcher reads it, matched exactly, never by suffix.

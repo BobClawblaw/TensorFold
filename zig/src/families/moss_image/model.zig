@@ -81,6 +81,8 @@ pub const Model = struct {
     rows: usize,
     columns: usize,
     scratch: mtl.Buffer,
+    /// Bytes `scratch` holds; a smaller picture's views fit inside it.
+    capacity: usize,
     // bf16 rows: the stream, a norm's output, q k v, the heads side by side, a projection's output
     x: Ref,
     xn: Ref,
@@ -119,7 +121,7 @@ pub const Model = struct {
         }
         const t = try gpa.create(Model);
         errdefer gpa.destroy(t);
-        t.* = .{ .gpa = gpa, .device = device, .queue = undefined, .k = undefined, .w = undefined, .max_text = max_text, .image = image, .rows = g.rows, .columns = g.columns, .scratch = undefined, .x = undefined, .xn = undefined, .qr = undefined, .kr = undefined, .vr = undefined, .att = undefined, .y = undefined, .ug = undefined, .s = undefined, .q = undefined, .k_ = undefined, .v = undefined, .sums = undefined, .lat = undefined, .vel = undefined, .ctx = undefined, .mods = undefined };
+        t.* = .{ .gpa = gpa, .device = device, .queue = undefined, .k = undefined, .w = undefined, .max_text = max_text, .image = image, .rows = g.rows, .columns = g.columns, .scratch = undefined, .capacity = scratch_bytes, .x = undefined, .xn = undefined, .qr = undefined, .kr = undefined, .vr = undefined, .att = undefined, .y = undefined, .ug = undefined, .s = undefined, .q = undefined, .k_ = undefined, .v = undefined, .sums = undefined, .lat = undefined, .vel = undefined, .ctx = undefined, .mods = undefined };
         t.queue = try device.queue();
         errdefer t.queue.deinit();
         t.k = try ks.Kernels.load(gpa, device);
@@ -127,13 +129,37 @@ pub const Model = struct {
         t.w = try wts.load(gpa, io, device, dir);
         errdefer t.w.deinit();
         t.scratch = try device.buffer(scratch_bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+        t.place(plan);
+        return t;
+    }
+
+    /// Scratch for a width x height image from now on: the buffer kept, zeroed as a new one is, when the image fits.
+    pub fn resize(t: *Model, width: usize, height: usize) !void {
+        const g = try cfg.grid(width, height);
+        const image = try Scratch.mul(g.rows, g.columns);
+        const plan = try Scratch.of(t.max_text, image);
+        const need = try plan.bytes();
+        if (need > t.capacity) {
+            const grown = try t.device.buffer(need, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
+            t.scratch.deinit();
+            t.scratch = grown;
+            t.capacity = need;
+        } else @memset(t.scratch.contents()[0..need], 0);
+        t.image = image;
+        t.rows = g.rows;
+        t.columns = g.columns;
+        // the modulation's vectors live in the scratch, which has moved
+        t.timestep = null;
+        t.place(plan);
+    }
+
+    fn place(t: *Model, plan: Scratch) void {
         var at: usize = 0;
         const views = [_]*Ref{ &t.x, &t.xn, &t.qr, &t.kr, &t.vr, &t.att, &t.y, &t.ug, &t.s, &t.q, &t.k_, &t.v, &t.sums, &t.lat, &t.vel, &t.ctx, &t.mods };
         for (views, plan.parts) |view, n| {
             view.* = .{ .buf = t.scratch, .off = at };
             at += std.mem.alignForward(usize, n, 256);
         }
-        return t;
     }
 
     pub fn deinit(t: *Model) void {

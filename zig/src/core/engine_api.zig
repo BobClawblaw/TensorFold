@@ -144,6 +144,9 @@ pub const SpeechRequest = @import("speech_api.zig").SpeechRequest;
 pub const SpeechResult = @import("speech_api.zig").SpeechResult;
 pub const SpeechInfo = @import("speech_api.zig").SpeechInfo;
 pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported };
+pub const ImageRequest = @import("image_api.zig").ImageRequest;
+pub const ImageInfo = @import("image_api.zig").ImageInfo;
+pub const ImageSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported };
 
 pub const Reason = enum { stop, length, cancelled, failed, silence };
 pub const speech_guard = @import("speech_guard.zig");
@@ -195,6 +198,7 @@ pub const Info = struct {
     text_generation: bool = true,
     embeddings: ?lanes.embedding.Info = null,
     speech: ?SpeechInfo = null,
+    images: ?ImageInfo = null,
     lanes: u32 = 1,
     /// Prompt plus reply tokens one request may use (0: no limit).
     context_window: u32 = 0,
@@ -427,6 +431,7 @@ pub const Engine = struct {
         info: *const fn (ctx: *anyopaque) Info,
         submit: *const fn (ctx: *anyopaque, id: Id, request: *const Request, sink: Sink) SubmitError!void,
         submit_speech: ?*const fn (*anyopaque, Id, *const SpeechRequest, Sink) SpeechSubmitError!void = null,
+        submit_image: ?*const fn (*anyopaque, Id, *const ImageRequest, Sink) ImageSubmitError!void = null,
         /// Ends a request between rounds; its ``finished`` (cancelled) still arrives. Unknown ids are ignored.
         cancel: *const fn (ctx: *anyopaque, id: Id) void,
         status: *const fn (ctx: *anyopaque, out: *Status, stream_tokens: []u32) void,
@@ -465,6 +470,10 @@ pub const Engine = struct {
     }
     pub fn submitSpeech(e: Engine, id: Id, request: *const SpeechRequest, sink: Sink) SpeechSubmitError!void {
         const f = e.vtable.submit_speech orelse return error.Unsupported;
+        return f(e.ctx, id, request, sink);
+    }
+    pub fn submitImage(e: Engine, id: Id, request: *const ImageRequest, sink: Sink) ImageSubmitError!void {
+        const f = e.vtable.submit_image orelse return error.Unsupported;
         return f(e.ctx, id, request, sink);
     }
     pub fn cancel(e: Engine, id: Id) void {

@@ -199,6 +199,37 @@ steps, seed 42, guidance 3 (0 or more; at 1 the negative branch is not run, as t
 branch skips block 22. The pipeline's optional skip-layer guidance (`slg_layers`, off by default) is not supported.
 Batches of pictures are not either.
 
+## Serve pictures
+
+`tensorfold-native serve MODEL_DIR` serves the checkpoint as an image model: it recognizes the folder by
+`model_index.json` (`MOSSImagePipeline`), reads its text from `tokenizer/`, and keeps the encoder, transformer and
+decoder resident (`zig/src/native/moss_image_host.zig`). Each request runs the code `tf-moss-image-generate` runs, so
+a seed gives the same PNG bytes from either.
+
+```sh
+zig build native -Dcpu=apple_m1
+zig-out/native/bin/tensorfold-native serve MODEL_DIR --name moss-image-base --port 8899
+curl -s http://127.0.0.1:8899/v1/images/generations -H 'Content-Type: application/json' \
+    -d '{"model": "moss-image-base", "prompt": "A red fox sitting in fresh snow at dawn", "size": "1024x1024"}'
+```
+
+`POST /v1/images/generations` takes OpenAI's images request and gives its reply, `{"created": ..., "data":
+[{"b64_json": PNG}]}`:
+
+- `prompt`; `n`, 1 only; `size` as `"WIDTHxHEIGHT"`, positive multiples of 16; `response_format`, `b64_json` only;
+  `model`, the served name;
+- the pipeline's own options at its defaults: `negative_prompt` (empty), `seed` (42), `steps` (50), `guidance` (3; at
+  1 the negative branch is not run);
+- any other field is refused by name (400), as are a size past the limits, `n` above 1 and a format other than
+  `b64_json`.
+
+Pictures run one at a time in arrival order; eight more may wait, and a ninth waiting is refused with 503. A request
+whose client leaves is cancelled: a waiting one leaves the queue, the running one stops before its next step. The
+limits are the sizes checked: up to 1,572,864 pixels (1536 x 1024, the publisher's 1.5M target) and 1536 on a side,
+and up to 200 steps. The transformer's and decoder's scratch is sized for 1024 x 1024 at load and grows for a larger
+picture (`Model.resize`, `Decoder.resize`). Every text-model option (context, lanes, drafts, caches, vision, learning,
+TP) is refused at startup. Batches, edits, variations, URLs and progress streaming are not supported.
+
 ## Run a case
 
 `moss_image_case.py` imports and runs the checkpoint's own `pipeline_moss_image.py`, the publisher's Python. It does so
@@ -318,6 +349,9 @@ Results:
     guidance 1 (the fox, 20 steps), ours 32.06 dB and torch bf16's 30.48 dB; a negative prompt (the sign, 1024x768, 30
     steps, seed 5), ours 31.97 dB and torch bf16's 31.41 dB.
   - A width of 1000, zero steps or no prompt is refused (exit 2).
+  - At 1536x1024 and 1024x1536 (the largest served): the starting noise equals `torch.randn`'s bit for bit for the nine
+    seeds; the sign with its negative prompt at 1536x1024, 30 steps, seed 5, against float32: ours 19.55 dB, torch
+    bf16's 19.56 dB. Peak memory 16.6 GB.
 - **Starting noise:** equal bit for bit to `torch.randn`'s for seeds 0, 1, 2, 3, 7, 42, 123456789, 2^32 - 1 and 2^40 +
   5 at 1024x1024, 1200x880, 1344x768, 768x1344 and 16x16 (45 draws, 18,761,472 values), in release and Debug builds.
   Both cases' recorded latents are those of their seeds, 42 and 7.
@@ -337,6 +371,13 @@ Results:
   - torch bf16 on MPS: 0.744 s a forward for the fox, 0.760 s for the sticky note (the median of its 100).
   - Ours: 0.489 s and 0.486 s a forward, 1.52x and 1.56x torch's (the median of three runs of 50 guided steps;
     0.472 to 0.544 s over all six). 0.08 s for both prompts' refiner once.
+  - Where a forward's time goes, each kernel of one pass timed in its own command buffer (the totals within 2.3% of
+    the one-buffer pass): at 1024x1024 (the fox, 4,130 rows), the projections take 74% (q, k and v 18.8%, up and
+    gate 31.0%, down 17.8%, out 6.3%) at 101 to 116 TFLOP/s, attention 20.8% at 87.6 TFLOP/s, and the norms,
+    rotary, gates and SiLU 5.2%. At 1536x1024 (6,178 rows) attention grows to 28.9%, at 88.9 TFLOP/s.
+  - MLX 0.32.3 on the same Mac, bf16: 113.2 and 101.9 TFLOP/s for the up-and-gate and down shapes at 4,130 rows
+    (120.3 and 107.6 at 6,178), and 91.6 and 95.9 for its fused attention. Ours is within a few percent of each,
+    so without changing the arithmetic what is left is attention's 4 to 7% and the small kernels' 5%.
 - **Memory:** 11.3 GB peak process footprint (10.6 GiB), with the transformer's bf16 weights (9.5 GB) in shared Metal
   buffers.
 - **Prompt encoder**, both the prompt and the empty negative prompt (10, 34 and 63 tokens):
