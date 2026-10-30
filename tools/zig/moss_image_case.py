@@ -30,6 +30,8 @@ USAGE = """\
                                            kept, and torch bf16's embedding, each block and the final layer
                                            alone on that stream in bf16: CASE_DIR/blocks-N-B.safetensors,
                                            for tf-moss-image-blocks
+  noise OUT.safetensors                    torch.randn's starting latents for several seeds and sizes, for
+                                           tf-moss-image-noise
   schedule MODEL_DIR OUT.safetensors       the scheduler's timesteps and sigmas for 1 to 1000 steps (--most N),
                                            for tf-moss-image-schedule
   compare A.png B.png [SIDE.png]           PSNR and mean absolute difference of two pictures, optionally side by side
@@ -147,7 +149,8 @@ def case(args) -> int:
         sys.exit("the pipeline's calls are not (prompt, negative skipping 22) pairs")
     sched = pipe.scheduler
     tensors = {"prompt": positive[0].cpu().contiguous(), "negative": negative[0].cpu().contiguous(),
-               "steps": torch.tensor([args.steps], dtype=torch.int64), "timesteps": sched.timesteps.float().cpu().contiguous(), "sigmas": sched.sigmas.float().cpu().contiguous(),
+               "steps": torch.tensor([args.steps], dtype=torch.int64), "seed": torch.tensor([args.seed], dtype=torch.int64),
+               "timesteps": sched.timesteps.float().cpu().contiguous(), "sigmas": sched.sigmas.float().cpu().contiguous(),
                "latents": noise[0].permute(1, 2, 0).contiguous(), "inputs": torch.stack([c["input"] for c in cond]),
                "velocity": torch.stack([c["velocity"] for c in cond]),
                "velocity_negative": torch.stack([u["velocity"] for u in uncond])}
@@ -189,7 +192,7 @@ def start(args) -> int:
     h, w = args.height // 16, args.width // 16
     noise = torch.randn((1, 128, h, w), generator=torch.Generator("cpu").manual_seed(args.seed), dtype=torch.float32)
     pipe.scheduler.set_timesteps(args.steps)
-    tensors = {"steps": torch.tensor([args.steps], dtype=torch.int64),
+    tensors = {"steps": torch.tensor([args.steps], dtype=torch.int64), "seed": torch.tensor([args.seed], dtype=torch.int64),
                "timesteps": pipe.scheduler.timesteps.float().cpu().contiguous(),
                "sigmas": pipe.scheduler.sigmas.float().cpu().contiguous(),
                "latents": noise[0].permute(1, 2, 0).contiguous()}
@@ -323,6 +326,22 @@ def blocks(args) -> int:
                "alone": torch.stack(embedded + alone).to(torch.bfloat16).contiguous(),
                "velocity_fp32": velocity_fp32, "velocity_alone": velocity_alone}, str(out))
     print(json.dumps({"out": str(out), "blocks": len(kept), "rows": int(stream[0].shape[0])}))
+    return 0
+
+
+def noise(args) -> int:
+    """The pipeline's starting latents, torch.randn on the CPU in float32, for each seed and size."""
+    import torch
+    from safetensors.torch import save_file
+
+    tensors = {}
+    for size in args.sizes.split(","):
+        w, h = (int(v) for v in size.split("x"))
+        for seed in (int(v) for v in args.seeds.split(",")):
+            drawn = torch.randn((1, 128, h // 16, w // 16), generator=torch.Generator("cpu").manual_seed(seed), dtype=torch.float32)
+            tensors[f"latents.{seed}.{w}x{h}"] = drawn[0].permute(1, 2, 0).contiguous()
+    save_file(tensors, args.out)
+    print(json.dumps({"out": args.out, "tensors": len(tensors), "torch": torch.__version__}))
     return 0
 
 
@@ -502,6 +521,10 @@ def main() -> int:
     b.add_argument("--step", type=int, required=True, help="the step, from 1")
     b.add_argument("--branch", choices=("prompt", "negative"), required=True)
     b.add_argument("--device", default="mps")
+    z = sub.add_parser("noise")
+    z.add_argument("out")
+    z.add_argument("--seeds", default="0,1,2,3,7,42,123456789,4294967295,1099511627781")
+    z.add_argument("--sizes", default="1024x1024,1200x880,1344x768,768x1344,16x16")
     t = sub.add_parser("schedule")
     t.add_argument("model_dir")
     t.add_argument("out")
@@ -511,7 +534,7 @@ def main() -> int:
     p.add_argument("b")
     p.add_argument("side", nargs="?")
     args = parser.parse_args()
-    return {"case": case, "start": start, "exact": exact, "decode": decode, "encode": encode, "vae": vae, "blocks": blocks, "schedule": schedule, "compare": compare}[args.mode](args)
+    return {"case": case, "start": start, "exact": exact, "decode": decode, "encode": encode, "vae": vae, "blocks": blocks, "noise": noise, "schedule": schedule, "compare": compare}[args.mode](args)
 
 
 if __name__ == "__main__":

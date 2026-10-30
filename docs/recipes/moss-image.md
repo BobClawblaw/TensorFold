@@ -64,6 +64,21 @@ It is float32 as torch's is. `torch.linspace` on the CPU computes each half with
 end, and so does `schedule.zig`. It equals the scheduler's bit for bit at every step count from 1 to 1,000
 (`tf-moss-image-schedule`).
 
+## Starting noise
+
+`noise.zig` draws the starting latents as the pipeline does, `torch.randn((1, 128, height / 16, width / 16))` in
+float32 on the CPU under `manual_seed(seed)`, the way torch's macOS build computes it:
+
+- the Mersenne Twister torch's CPU generator runs, seeded with the seed's low 32 bits as `manual_seed` seeds it;
+- a float uniform from each output's low 24 bits, for every value;
+- Box-Muller over each 16 values: a radius from the first 8 with Apple libm's `logf`, an angle from the last 8 (2π
+  times the uniform in double, rounded to float32) through its `__sincosf_stret`; a ragged end draws its last 16 again
+  from fresh uniforms.
+
+Both libm functions are looked up in libSystem itself: Zig's runtime defines its own `logf`, which differs in the last
+bit. The draw is torch's on macOS, the only platform the family runs on. It equals `torch.randn`'s bit for bit for
+nine seeds (0 to 2^40 + 5) at five sizes (`tf-moss-image-noise`).
+
 ## Prompt encoder
 
 `encoder.zig` runs the checkpoint's `text_encoder/` (Qwen3.5's text model: 32 layers, three Gated DeltaNet layers to
@@ -191,18 +206,18 @@ The case holds:
 
 - both prompts' encoder rows;
 - the step count asked for, and the scheduler's timesteps and noise levels;
-- the starting latents;
+- the seed, and the starting latents it draws;
 - the publisher's pipeline's input and both velocities at every step;
 - with `--fp32-steps N`, a float32 run of the same transformer for the first N steps.
 
-`tf-moss-image` makes the schedule natively and fails unless it equals the case's bit for bit. It runs both branches
-of each step on the pipeline's own input and compares the velocities, beside torch bf16's own distance from the case's
-float32 ones; a step run twice must repeat byte for byte, or it fails. It then runs the whole guided schedule from the
-starting latents, times it, frees the transformer, and decodes the final latents with the checkpoint's `vae/` decoder
-into `picture.png`. A case made by `start` holds only the prompts, the schedule and the noise; `tf-moss-image` then
-just makes the picture. With `--prompt` (and `--negative`, else the empty negative prompt), it encodes both prompts
-natively in place of the case's rows; `start --no-encoder` leaves them out of the case, and torch never loads the
-encoder.
+`tf-moss-image` makes the schedule natively, and the starting latents from the case's seed when it records one, and
+fails unless each equals the case's bit for bit. It runs both branches of each step on the pipeline's own input and
+compares the velocities, beside torch bf16's own distance from the case's float32 ones; a step run twice must repeat
+byte for byte, or it fails. It then runs the whole guided schedule from the starting latents, times it, frees the
+transformer, and decodes the final latents with the checkpoint's `vae/` decoder into `picture.png`. A case made by
+`start` holds only the prompts, the schedule and the noise; `tf-moss-image` then just makes the picture. With
+`--prompt` (and `--negative`, else the empty negative prompt), it encodes both prompts natively in place of the case's
+rows; `start --no-encoder` leaves them out of the case, and torch never loads the encoder.
 
 To check the decoder alone against a float64 decode of the same latents:
 
@@ -230,6 +245,14 @@ the embedding, each block but the skipped one alone, and the final layer alone. 
 distance from float32 (or bf16 rounding's, when larger), in cosine error and in its worst row, and a second run must
 repeat the first byte for byte; it fails otherwise. A whole forward of 42 bf16 blocks is reported but not gated, for
 the reason the encoder's whole prompt is not (see Measured).
+
+To check the starting noise alone against `torch.randn`, for several seeds and sizes:
+
+```sh
+python3 tools/zig/moss_image_case.py noise noise.safetensors
+zig build tf-moss-image-noise -Dcpu=apple_m1
+zig-out/bin/tf-moss-image-noise noise.safetensors
+```
 
 To check the schedule alone against the publisher's scheduler, for 1 to 1,000 steps:
 
@@ -270,6 +293,9 @@ Results:
 - **Each whole forward**, over the sticky note's 100: our cosine error from float32 is 1.01 times torch bf16's on
   average (0.76 to 1.26), and our worst row 1.03 times (0.37 to 2.55). torch's own bf16 run on the CPU of step 23's
   negative branch has a worst row 1.37 times its MPS run's, so the worst row of 42 blocks in bf16 is not gated.
+- **Starting noise:** equal bit for bit to `torch.randn`'s for seeds 0, 1, 2, 3, 7, 42, 123456789, 2^32 - 1 and 2^40 +
+  5 at 1024x1024, 1200x880, 1344x768, 768x1344 and 16x16 (45 draws, 18,761,472 values), in release and Debug builds.
+  Both cases' recorded latents are those of their seeds, 42 and 7.
 - **Schedule:** equal bit for bit to the scheduler's at every step count from 1 to 1,000 (782 of them with repeats
   dropped).
 - **Image:** our latents through the pipeline's decoder are 48.52 dB PSNR from the pipeline's own picture for the fox

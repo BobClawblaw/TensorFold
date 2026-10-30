@@ -12,6 +12,7 @@ pub const reference = @import("reference.zig");
 pub const decoder = @import("decoder.zig");
 pub const png = @import("png.zig");
 pub const schedule = @import("schedule.zig");
+pub const noise = @import("noise.zig");
 pub const Model = model.Model;
 pub const Prompt = model.Prompt;
 pub const Timing = model.Timing;
@@ -30,4 +31,5 @@ test {
     _ = decoder;
     _ = png;
     _ = schedule;
+    _ = noise;
 }
