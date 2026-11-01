@@ -369,6 +369,20 @@ pub fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
         .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "h3", .module = h3_mod } },
     }) });
     b.step("tf-h3-dit", "FastH3's Metal transformer against a case file: velocities, every step, timings").dependOn(&b.addInstallArtifact(h3_dit, .{}).step);
+    // FastH3's int8 Metal transformer (the Imagination Studio's engine): int8 projections and attention, LoRAs merged
+    // into the int8 weights. Its own folders (zig/src/families/h3_int8, zig/kernels/metal/h3_int8); h3 is untouched.
+    const h3i_qi_kernels = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/h3_int8/qwen_image_kernels.zig") });
+    const h3i_kernels = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/h3_int8/kernels.zig"), .imports = &.{.{ .name = "qwen_image_kernels", .module = h3i_qi_kernels }} });
+    const h3i_qi = b.createModule(.{ .root_source_file = b.path("zig/src/families/h3_int8/qwen_image.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "safetensors", .module = h3_safetensors }, .{ .name = "qwen_image_kernels", .module = h3i_qi_kernels } } });
+    const h3i_mod = b.createModule(.{ .root_source_file = b.path("zig/src/families/h3_int8/h3.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "safetensors", .module = h3_safetensors }, .{ .name = "qwen_image", .module = h3i_qi }, .{ .name = "h3_kernels", .module = h3i_kernels } } });
+    const h3i_dit = b.addExecutable(.{ .name = "tf-h3-int8-dit", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/h3_int8_dit.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "h3", .module = h3i_mod } },
+    }) });
+    b.step("tf-h3-int8-dit", "FastH3's int8 Metal transformer against a case file (the Studio's engine)").dependOn(&b.addInstallArtifact(h3i_dit, .{}).step);
     // The core row projection (chips without tensor units) on synthetic matrices; runs on any Mac's GPU
     const row_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/row_projection.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = metal }, .{ .name = "kernel_sources", .module = sources } } });
     const row_check = b.addExecutable(.{ .name = "tf-row-check", .root_module = b.createModule(.{
