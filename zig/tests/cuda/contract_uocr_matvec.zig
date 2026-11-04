@@ -76,7 +76,7 @@ pub fn input(rig: *rig_.Rig, x: anytype) !u64 {
 
 pub const Matvec = struct {
     pub const Variant = enum { plain, short_k, half_sums };
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     v: Variant,
     shape: c.Shape = undefined,
@@ -122,7 +122,6 @@ pub const Matvec = struct {
 
     pub fn deinit(t: *Matvec) void {
         t.free();
-        t.rig.deinit();
     }
     fn free(t: *Matvec) void {
         const a = t.rig.gpu.gpa;
@@ -170,8 +169,8 @@ pub const Matvec = struct {
                 t.w[p[0] * k + p[1]] = c.toBf16(planted[p[2]]);
             };
         }
-        t.xs = try input(&t.rig, t.x);
-        t.ws = try input(&t.rig, t.w);
+        t.xs = try input(t.rig, t.x);
+        t.ws = try input(t.rig, t.w);
         t.out = try t.rig.output(shape.rows * n * 2);
         return true;
     }
@@ -217,7 +216,7 @@ pub const Group = struct {
 
     /// The group's tests, appended to `list` (each control after the kernel it breaks).
     pub fn init(group: *Group, ctx: u.Ctx, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
-        const rig: rig_.Rig = .{ .gpu = ctx.gpu, .s = ctx.s };
+        const rig = ctx.rig;
         for (&group.mv, std.enums.values(Matvec.Variant)) |*t, v| t.* = .{ .rig = rig, .k = try kernelsFor(ctx, "matvec", Matvec.symbol(v)), .v = v };
         for (&group.ex, std.enums.values(ex.Experts.Variant)) |*t, v| {
             const k = if (ex.Experts.up(v)) try kernelsFor(ctx, "expert_gu", ex.Experts.symbol(v)) else try kernelsFor(ctx, "expert_down", ex.Experts.symbol(v));

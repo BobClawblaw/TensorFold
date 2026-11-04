@@ -70,7 +70,7 @@ const pick = [8]usize{ 0, 1, 2, 1, 3, 0, 2, 3 };
 
 pub const Experts = struct {
     pub const Variant = enum { gu, gu_slot0, gu_no_point, down, down_slot0 };
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: mv.Kernels,
     v: Variant,
     fill: g.Fill = .random,
@@ -120,7 +120,6 @@ pub const Experts = struct {
 
     pub fn deinit(t: *Experts) void {
         t.free();
-        t.rig.deinit();
     }
     fn free(t: *Experts) void {
         const a = t.rig.gpu.gpa;
@@ -183,19 +182,19 @@ pub const Experts = struct {
         }
         if (fill == .nonfinite) t.plant();
         var at: [distinct]u64 = undefined;
-        for (t.w, &at) |w, *p| p.* = try mv.input(&t.rig, w);
+        for (t.w, &at) |w, *p| p.* = try mv.input(t.rig, w);
         // every table entry the slots do not pick points at NaN rows, so a wrong pick shows
         const nans = try a.alloc(u16, mats * n * k);
         defer a.free(nans);
         @memset(nans, c.toBf16(mv.planted[0]));
-        const bad = try mv.input(&t.rig, nans);
+        const bad = try mv.input(t.rig, nans);
         var tab: [table_len]UdExpert = @splat(.{ .gate = bad, .up = bad, .down = bad });
         for (chosen, at) |id, p| {
             tab[id] = if (up(t.v)) .{ .gate = p, .up = p + @as(u64, n * k * 2), .down = bad } else .{ .gate = bad, .up = bad, .down = p };
         }
-        t.xs = try mv.input(&t.rig, t.x);
-        t.tab = try mv.input(&t.rig, &tab);
-        t.idbuf = try mv.input(&t.rig, t.ids[0..shape.rows]);
+        t.xs = try mv.input(t.rig, t.x);
+        t.tab = try mv.input(t.rig, &tab);
+        t.idbuf = try mv.input(t.rig, t.ids[0..shape.rows]);
         t.out = try t.rig.output(shape.rows * n * 2);
         return true;
     }

@@ -27,7 +27,7 @@ fn sixtyFour(_: c.Shape) usize {
 }
 
 pub const RelPos = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -51,7 +51,6 @@ pub const RelPos = struct {
     }
     pub fn deinit(t: *RelPos) void {
         release(t.rig.gpu.gpa, t, .{ "qkv", "th", "tw" });
-        t.rig.deinit();
     }
     pub fn kernel(t: *RelPos) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -106,9 +105,9 @@ pub const RelPos = struct {
             }
             t.th[(trows - 1) * sam_head_dim + 9] = bits(planted[2]);
         }
-        t.ins[0] = try upload(&t.rig, t.qkv);
-        t.ins[1] = try upload(&t.rig, t.th);
-        t.ins[2] = try upload(&t.rig, t.tw);
+        t.ins[0] = try upload(t.rig, t.qkv);
+        t.ins[1] = try upload(t.rig, t.th);
+        t.ins[2] = try upload(t.rig, t.tw);
         t.outs[0] = try t.rig.output(t.each() * 2);
         t.outs[1] = try t.rig.output(t.each() * 2);
         return true;
@@ -178,7 +177,7 @@ pub const RelPos = struct {
 // --- tf_uocr_concat: y [rows, left + right] = [a row | b row] -------------------------------------------------------
 
 pub const Concat = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -201,7 +200,6 @@ pub const Concat = struct {
     }
     pub fn deinit(t: *Concat) void {
         release(t.rig.gpu.gpa, t, .{ "l", "r" });
-        t.rig.deinit();
     }
     pub fn kernel(t: *Concat) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -227,8 +225,8 @@ pub const Concat = struct {
             t.l[3 * shape.n + shape.n - 1] = bits(planted[1]);
             t.r[3 * shape.k] = bits(planted[2]);
         }
-        t.ins[0] = try upload(&t.rig, t.l);
-        t.ins[1] = try upload(&t.rig, t.r);
+        t.ins[0] = try upload(t.rig, t.l);
+        t.ins[1] = try upload(t.rig, t.r);
         t.out = try t.rig.output(t.count() * 2);
         return true;
     }
@@ -257,7 +255,7 @@ pub const Concat = struct {
 // --- tf_uocr_clip_embed: y[0] = bf16(cls + pos[0]), y[r] = bf16(sam[r - 1] + pos[r]) -----------------------------
 
 pub const ClipEmbed = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -281,7 +279,6 @@ pub const ClipEmbed = struct {
     }
     pub fn deinit(t: *ClipEmbed) void {
         release(t.rig.gpu.gpa, t, .{ "cls", "sam", "pos" });
-        t.rig.deinit();
     }
     pub fn kernel(t: *ClipEmbed) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -310,9 +307,9 @@ pub const ClipEmbed = struct {
             t.sam[2 * n + 9] = bits(planted[1]); // row 3, both infinities
             t.pos[3 * n + 9] = bits(planted[2]);
         }
-        t.ins[0] = try upload(&t.rig, t.cls);
-        t.ins[1] = try upload(&t.rig, t.sam);
-        t.ins[2] = try upload(&t.rig, t.pos);
+        t.ins[0] = try upload(t.rig, t.cls);
+        t.ins[1] = try upload(t.rig, t.sam);
+        t.ins[2] = try upload(t.rig, t.pos);
         t.out = try t.rig.output(t.count() * 2);
         return true;
     }

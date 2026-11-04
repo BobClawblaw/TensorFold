@@ -18,7 +18,7 @@ const chunk = kit.chunk;
 // --- tf_uocr_gather and tf_uocr_scatter: an expert's rows by index, y[i] = x[rows[i]], slots[dest[i]] = y[i] ---
 
 pub const Rows = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     scatter: bool,
     name: []const u8,
@@ -47,7 +47,6 @@ pub const Rows = struct {
     }
     pub fn deinit(t: *Rows) void {
         release(t.rig.gpu.gpa, t, .{ "src", "ids", "bg" });
-        t.rig.deinit();
     }
     pub fn kernel(t: *Rows) g.Kernel {
         return .{ .spec = t.spec(), .ctx = t, .vt = &vt, .control = t.control };
@@ -89,9 +88,9 @@ pub const Rows = struct {
                 t.src[free_row * n] = bits(planted[0]);
             }
         }
-        t.ins[0] = try upload(&t.rig, t.src);
-        t.ins[1] = try upload(&t.rig, t.ids);
-        if (t.scatter) t.ins[2] = try upload(&t.rig, t.bg);
+        t.ins[0] = try upload(t.rig, t.src);
+        t.ins[1] = try upload(t.rig, t.ids);
+        if (t.scatter) t.ins[2] = try upload(t.rig, t.bg);
         t.out = try t.rig.output(t.count() * 2);
         return true;
     }
@@ -100,7 +99,7 @@ pub const Rows = struct {
         const grid = .{ t.shape.rows, blocks(hidden), 1 };
         if (t.scatter) {
             // the slots' rows before the launch go back before each independent run
-            try kit.preset(&t.rig, t.out, t.ins[2], t.bg.len * 2);
+            try kit.preset(t.rig, t.out, t.ins[2], t.bg.len * 2);
             try t.k.run("scatter", t.rig.s, grid, 256, .{ t.ins[0], t.ins[1], t.out });
         } else {
             try t.k.run("gather", t.rig.s, grid, 256, .{ t.ins[0], t.ins[1], t.out });

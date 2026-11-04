@@ -99,7 +99,7 @@ fn uni(r: std.Random, lo: f32, hi: f32) u16 {
 const planted = [_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) };
 
 pub const Rows = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: uocr.kernels.Kernels,
     v: Case,
     shape: c.Shape = undefined,
@@ -117,7 +117,6 @@ pub const Rows = struct {
 
     pub fn deinit(t: *Rows) void {
         t.free();
-        t.rig.deinit();
     }
     fn free(t: *Rows) void {
         const a = t.rig.gpu.gpa;
@@ -324,7 +323,7 @@ pub const Group = struct {
                 };
             }
             const x = try group.gpa.create(Rows);
-            x.* = .{ .rig = .{ .gpu = ctx.gpu, .s = ctx.s }, .k = k, .v = v };
+            x.* = .{ .rig = ctx.rig, .k = k, .v = v };
             group.tests.append(group.gpa, x) catch |err| {
                 group.gpa.destroy(x);
                 return err;

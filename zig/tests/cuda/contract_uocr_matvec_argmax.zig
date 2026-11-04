@@ -24,7 +24,7 @@ fn spiked(r: usize) bool {
 
 pub const Argmax = struct {
     pub const Variant = enum { plain, nan_as_inf, high_tie, eos_open };
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: mv.Kernels,
     v: Variant,
     shape: c.Shape = undefined,
@@ -63,7 +63,6 @@ pub const Argmax = struct {
 
     pub fn deinit(t: *Argmax) void {
         t.free();
-        t.rig.deinit();
     }
     fn free(t: *Argmax) void {
         t.rig.gpu.gpa.free(t.logits);
@@ -96,7 +95,7 @@ pub const Argmax = struct {
             t.logits[r * n + eos] = c.toBf16(64);
         };
         if (fill == .nonfinite) t.plant();
-        t.in = try mv.input(&t.rig, t.logits);
+        t.in = try mv.input(t.rig, t.logits);
         t.out = try t.rig.output(shape.rows * 4);
         return true;
     }

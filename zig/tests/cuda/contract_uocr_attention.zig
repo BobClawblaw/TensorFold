@@ -43,23 +43,20 @@ pub fn stressBase(a: std.mem.Allocator, rng: std.Random, width: usize) ![]f32 {
 }
 
 pub const Group = struct {
-    /// One rig for every probe: the gates run one call at a time, and the decoder's long caches are freed on the next.
-    rig: rig_.Rig = undefined,
     live: bool = false,
     towers: [tower.entries.len]tower.Probe = undefined,
     decoders: [decoder.cases.len]decoder.Probe = undefined,
 
     /// The group's tests, appended to `list` (each control after the kernel it breaks).
     pub fn init(group: *Group, ctx: u.Ctx, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
-        group.rig = .{ .gpu = ctx.gpu, .s = ctx.s };
         group.live = true;
         for (tower.entries, &group.towers) |e, *p| {
             const k = if (tower.control(e[1])) |name| ctx.k.with("attention", try ctx.ctl.function(name)) else ctx.k;
-            p.* = .{ .a = ctx.gpu.gpa, .rig = &group.rig, .k = k, .tower = e[0], .case = e[1] };
+            p.* = .{ .a = ctx.gpu.gpa, .rig = ctx.rig, .k = k, .tower = e[0], .case = e[1] };
         }
         for (decoder.cases, &group.decoders) |e, *p| {
             const k = if (decoder.control(e)) |name| ctx.k.with("attend", try ctx.ctl.function(name)) else ctx.k;
-            p.* = .{ .a = ctx.gpu.gpa, .rig = &group.rig, .k = k, .case = e };
+            p.* = .{ .a = ctx.gpu.gpa, .rig = ctx.rig, .k = k, .case = e };
         }
         for (&group.towers) |*p| try list.append(a, p.kernel());
         for (&group.decoders) |*p| try list.append(a, p.kernel());
@@ -69,7 +66,6 @@ pub const Group = struct {
         if (!group.live) return;
         for (&group.towers) |*p| p.free();
         for (&group.decoders) |*p| p.free();
-        group.rig.deinit();
         group.live = false;
     }
 };

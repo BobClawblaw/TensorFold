@@ -35,7 +35,7 @@ pub const Group = struct {
 
     /// One kernel's test and its controls, each a copy whose launches go to the control's function.
     fn fill(comptime T: type, comptime name: []const u8, ctx: u.Ctx, out: []T, label: []const u8, ctls: []const Control) !void {
-        const rig: rig_.Rig = .{ .gpu = ctx.gpu, .s = ctx.s };
+        const rig = ctx.rig;
         out[0] = .{ .rig = rig, .k = ctx.k, .name = label };
         for (ctls, out[1..]) |ctl, *x| x.* = .{ .rig = rig, .k = ctx.k.with(name, try ctx.ctl.function(ctl.sym)), .name = ctl.name, .control = ctl.gate };
     }

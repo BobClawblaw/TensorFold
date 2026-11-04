@@ -137,7 +137,7 @@ pub const geos = [_]Geo{
 };
 
 pub const Im2col = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     geo: Geo,
     name: []const u8,
@@ -152,7 +152,6 @@ pub const Im2col = struct {
     }
     pub fn deinit(t: *Im2col) void {
         release(t.rig.gpu.gpa, t, .{"x"});
-        t.rig.deinit();
     }
     pub fn kernel(t: *Im2col) g.Kernel {
         return .{ .spec = t.spec(), .ctx = t, .vt = &vt, .control = t.control };
@@ -181,7 +180,7 @@ pub const Im2col = struct {
                 t.x[t.index(p[0], p[1], p[2] % shape.n)] = bits(x);
             };
         }
-        t.in = try upload(&t.rig, t.x);
+        t.in = try upload(t.rig, t.x);
         t.out = try t.rig.output(t.count() * 2);
         return true;
     }
@@ -226,7 +225,7 @@ pub const Im2col = struct {
 // --- tf_uocr_window and tf_uocr_unwindow_add: SAM's 14x14 windows over a zero-padded grid, and back with the add ---
 
 pub const Window = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     back: bool,
     name: []const u8,
@@ -253,7 +252,6 @@ pub const Window = struct {
     }
     pub fn deinit(t: *Window) void {
         release(t.rig.gpu.gpa, t, .{ "x", "win" });
-        t.rig.deinit();
     }
     pub fn kernel(t: *Window) g.Kernel {
         return .{ .spec = t.spec(), .ctx = t, .vt = &vt, .control = t.control };
@@ -303,11 +301,11 @@ pub const Window = struct {
             if (t.back and t.padded() > side) t.win[t.winRow(side, 0) * n] = bits(planted[0]);
         }
         if (t.back) {
-            t.in = try upload(&t.rig, t.win);
-            t.old = try upload(&t.rig, t.x);
+            t.in = try upload(t.rig, t.win);
+            t.old = try upload(t.rig, t.x);
             t.out = try t.rig.output(t.x.len * 2);
         } else {
-            t.in = try upload(&t.rig, t.x);
+            t.in = try upload(t.rig, t.x);
             t.out = try t.rig.output(t.padded() * t.padded() * n * 2);
         }
         return true;
@@ -319,7 +317,7 @@ pub const Window = struct {
         const p = t.padded();
         if (t.back) {
             // in place: the residual goes back before each independent run
-            try preset(&t.rig, t.out, t.old, t.x.len * 2);
+            try preset(t.rig, t.out, t.old, t.x.len * 2);
             try t.k.run("unwindow_add", t.rig.s, .{ side * side, blocks(n), 1 }, 256, .{ t.out, t.in, side, p, sam_window, n });
         } else {
             try t.k.run("window", t.rig.s, .{ p * p, blocks(n), 1 }, 256, .{ t.in, t.out, side, p, sam_window, n });

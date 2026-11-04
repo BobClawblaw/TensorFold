@@ -15,11 +15,10 @@ pub const Group = struct {
     clip: [2]rel.ClipEmbed = undefined,
     rows: [4]rows.Rows = undefined,
     embed: [2]rows.Embed = undefined,
-    embed_rig: rig_.Rig = undefined,
 
     /// The group's tests, appended to `list` (each control after the kernel it breaks).
     pub fn init(group: *Group, ctx: u.Ctx, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel)) !void {
-        const rig: rig_.Rig = .{ .gpu = ctx.gpu, .s = ctx.s };
+        const rig = ctx.rig;
         const k = ctx.k;
         const ctl = ctx.ctl;
         const geos = kit.geos;
@@ -58,10 +57,9 @@ pub const Group = struct {
             .{ .rig = rig, .k = k, .scatter = true, .name = "cuda uocr moves scatter 1280 (slots[dest[i]] = y[i])" },
             .{ .rig = rig, .k = k.with("scatter", try ctl.function("tf_ctl_uocr_moves_scatter_even")), .scatter = true, .name = "control: uocr moves scatter odd rows written to the even row's slot", .control = .shapes },
         };
-        group.embed_rig = rig;
         group.embed = .{
-            .{ .rig = &group.embed_rig, .k = k, .name = "cuda uocr moves embed 1280 (token rows from the table, image rows left)" },
-            .{ .rig = &group.embed_rig, .k = k.with("embed", try ctl.function("tf_ctl_uocr_moves_embed_image")), .name = "control: uocr moves embed image rows overwritten from the table", .control = .shapes },
+            .{ .rig = rig, .k = k, .name = "cuda uocr moves embed 1280 (token rows from the table, image rows left)" },
+            .{ .rig = rig, .k = k.with("embed", try ctl.function("tf_ctl_uocr_moves_embed_image")), .name = "control: uocr moves embed image rows overwritten from the table", .control = .shapes },
         };
         for (&group.im2col) |*x| try list.append(a, x.kernel());
         for (&group.windows) |*x| try list.append(a, x.kernel());
@@ -76,6 +74,5 @@ pub const Group = struct {
         inline for (.{ "im2col", "windows", "rel", "concat", "clip", "rows", "embed" }) |f| {
             for (&@field(group, f)) |*x| x.deinit();
         }
-        group.embed_rig.deinit();
     }
 };

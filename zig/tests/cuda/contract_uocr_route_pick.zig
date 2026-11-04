@@ -26,7 +26,7 @@ const intIn = base.intIn;
 const route_rule = "candidates: complete blocks c <= floor(pos/32) - 4 holding an image token of the query's page (any such block when the page has none in range or the query has none; every remote block when that leaves none); x = clamp(q.kbar/sqrt(128), +-1e4) * sqrt(128) for a candidate, -1e4 for any other block, so a candidate below -1e4 ranks after them; clampf sends a NaN score to -1e4 (x = -113137.08) and an infinite one to its end; the top 16 by x descending, ties to the lower block, then entmax-1.5 over those 16 (tau from the sorted prefix sums, support the count of tau_k <= X_k, at least 1); the first 12 kept when candidates, bias log(max(p, 1e-4)) less the kept mean, 0 and block -1 otherwise, the bias rounded to bf16 at prefill; picks exact (the test's scores are exact in fp32), each bias within float64's range through the kernel's fp32 steps";
 
 pub const Route = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: base.Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -89,7 +89,6 @@ pub const Route = struct {
     }
     pub fn deinit(t: *Route) void {
         t.free();
-        t.rig.deinit();
     }
     pub fn kernel(t: *Route) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -193,12 +192,12 @@ pub const Route = struct {
         // the incomplete block's summary is never read: NaN
         if (t.complete < t.nblk) @memset(t.kb[t.complete * D ..][0..D], planted[0]);
 
-        t.ins[0] = try base.input(&t.rig, t.iq);
-        t.ins[1] = try base.input(&t.rig, t.kb);
-        t.ins[2] = try base.input(&t.rig, t.bmin);
-        t.ins[3] = try base.input(&t.rig, t.bmax);
-        t.ins[4] = try base.input(&t.rig, t.qpage);
-        t.ins[5] = try base.input(&t.rig, t.qpos);
+        t.ins[0] = try base.input(t.rig, t.iq);
+        t.ins[1] = try base.input(t.rig, t.kb);
+        t.ins[2] = try base.input(t.rig, t.bmin);
+        t.ins[3] = try base.input(t.rig, t.bmax);
+        t.ins[4] = try base.input(t.rig, t.qpage);
+        t.ins[5] = try base.input(t.rig, t.qpos);
         // the biases first: gate 4 reads the rig's outputs from the start as the counted fp32 values
         t.bias = try t.rig.output(t.rows * reads * 4);
         t.sel = try t.rig.output(t.rows * reads * 4);

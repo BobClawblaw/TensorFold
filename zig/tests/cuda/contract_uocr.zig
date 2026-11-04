@@ -3,14 +3,15 @@ const std = @import("std");
 const cuda = @import("cuda");
 const uocr = @import("uocr_cuda");
 const check = @import("check.zig");
+const rig_ = @import("contract_rig.zig");
 const g = @import("core").contract.gates;
 
 const controls = struct {
     pub const bytes align(16) = @embedFile("fatbin_contract_controls").*;
 };
 
-/// What a group's tests launch with: the family's kernels and the controls image they swap in.
-pub const Ctx = struct { gpu: check.Gpu, s: cuda.Stream, k: uocr.kernels.Kernels, ctl: cuda.Module };
+/// What a group's tests launch with: the family's kernels, the controls image, and the one rig every test shares.
+pub const Ctx = struct { gpu: check.Gpu, s: cuda.Stream, k: uocr.kernels.Kernels, ctl: cuda.Module, rig: *rig_.Rig };
 
 const Rows = @import("contract_uocr_rows.zig").Group;
 const Moves = @import("contract_uocr_moves.zig").Group;
@@ -23,6 +24,8 @@ pub const Set = struct {
     gpa: std.mem.Allocator,
     k: uocr.kernels.Kernels,
     ctl: cuda.Module,
+    /// Every test's buffers: a prepare frees the last test's, so the set holds one test's memory at a time.
+    rig: rig_.Rig,
     rows: Rows = .{},
     moves: Moves = .{},
     attention: Attention = .{},
@@ -37,8 +40,8 @@ pub const Set = struct {
         errdefer k.unload();
         var ctl = try cuda.Module.load(gpu.d, &controls.bytes);
         errdefer ctl.unload();
-        set.* = .{ .gpa = gpu.gpa, .k = k, .ctl = ctl };
-        const ctx: Ctx = .{ .gpu = gpu, .s = s, .k = k, .ctl = ctl };
+        set.* = .{ .gpa = gpu.gpa, .k = k, .ctl = ctl, .rig = .{ .gpu = gpu, .s = s } };
+        const ctx: Ctx = .{ .gpu = gpu, .s = s, .k = k, .ctl = ctl, .rig = &set.rig };
         try set.rows.init(ctx, a, list);
         try set.moves.init(ctx, a, list);
         try set.attention.init(ctx, a, list);
@@ -53,6 +56,7 @@ pub const Set = struct {
         set.attention.deinit();
         set.moves.deinit();
         set.rows.deinit();
+        set.rig.deinit();
         set.ctl.unload();
         set.k.unload();
         set.gpa.destroy(set);

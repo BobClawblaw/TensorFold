@@ -123,7 +123,7 @@ pub fn input(rig: *rig_.Rig, x: anytype) !u64 {
 const keys_rule = "a key's score clamps to [-1e4, 1e4] (clampf: a NaN score to -1e4, an infinite one to its end); kbar[d] is written 0 where the block's weighted sum is not finite, so a non-finite value at d in any of the block's keys gives 0 there; every other output lies within float64's bound, and blocks before `first` are never written";
 
 pub const BlockKeys = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -165,7 +165,6 @@ pub const BlockKeys = struct {
     }
     pub fn deinit(t: *BlockKeys) void {
         t.free();
-        t.rig.deinit();
     }
     pub fn kernel(t: *BlockKeys) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -215,8 +214,8 @@ pub const BlockKeys = struct {
                 };
             },
         }
-        t.k_ref = try input(&t.rig, t.keys);
-        t.hc_ref = try input(&t.rig, t.hc);
+        t.k_ref = try input(t.rig, t.keys);
+        t.hc_ref = try input(t.rig, t.hc);
         t.out = try t.rig.output(all * D * 4);
         return true;
     }

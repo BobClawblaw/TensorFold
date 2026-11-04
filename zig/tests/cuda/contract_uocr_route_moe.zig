@@ -23,7 +23,7 @@ const K = base.cfg.top_k;
 const gate_rule = "fp32 logits, softmax with IEEE rules (its max by fmaxf ignores a NaN): a NaN or +Inf logit makes every score NaN (the sum takes it) and a -Inf one scores 0; six rounds of strict > from -Inf over the scores not yet taken, so ties go to the lower expert and a NaN is never taken; a round with nothing above -Inf takes expert 0 with weight -Inf; picks exact (the test's logits are exact in fp32 and distinct ones stay distinct), each weight within float64's range through the fp32 steps";
 
 pub const MoeGate = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: base.Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -60,7 +60,6 @@ pub const MoeGate = struct {
     }
     pub fn deinit(t: *MoeGate) void {
         t.free();
-        t.rig.deinit();
     }
     pub fn kernel(t: *MoeGate) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -113,8 +112,8 @@ pub const MoeGate = struct {
                 t.x[p[0] * H + p[1]] = c.toBf16(planted[p[2]]);
             };
         }
-        t.ins[0] = try base.input(&t.rig, t.x);
-        t.ins[1] = try base.input(&t.rig, t.w);
+        t.ins[0] = try base.input(t.rig, t.x);
+        t.ins[1] = try base.input(t.rig, t.w);
         // the weights first: gate 4 reads the rig's outputs from the start as the counted fp32 values
         t.wts = try t.rig.output(t.rows * K * 4);
         t.ids = try t.rig.output(t.rows * K * 4);
@@ -245,7 +244,7 @@ pub const MoeGate = struct {
 // --- tf_uocr_moe_combine: y = bf16(bf16(sum_k w_k slot_k in fp32) + shared) ---------------------------------------
 
 pub const Combine = struct {
-    rig: rig_.Rig,
+    rig: *rig_.Rig,
     k: base.Kernels,
     name: []const u8,
     control: ?g.Gate = null,
@@ -284,7 +283,6 @@ pub const Combine = struct {
     }
     pub fn deinit(t: *Combine) void {
         t.free();
-        t.rig.deinit();
     }
     pub fn kernel(t: *Combine) g.Kernel {
         return .{ .spec = spec(t.name), .ctx = t, .vt = &vt, .control = t.control };
@@ -334,9 +332,9 @@ pub const Combine = struct {
                 t.shared[4 * H + 50] = c.toBf16(planted[1]);
             }
         }
-        t.ins[0] = try base.input(&t.rig, t.slots);
-        t.ins[1] = try base.input(&t.rig, t.wts);
-        t.ins[2] = try base.input(&t.rig, t.shared);
+        t.ins[0] = try base.input(t.rig, t.slots);
+        t.ins[1] = try base.input(t.rig, t.wts);
+        t.ins[2] = try base.input(t.rig, t.shared);
         t.out = try t.rig.output(t.rows * H * 2);
         return true;
     }
