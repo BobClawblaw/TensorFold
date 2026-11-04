@@ -55,9 +55,20 @@ pub const Kernels = struct {
         k.vision.unload();
     }
 
-    fn get(k: *const Kernels, comptime name: []const u8) cuda.Function {
-        inline for (names, 0..) |n, i| if (comptime std.mem.eql(u8, n, "tf_uocr_" ++ name)) return k.f[i];
+    /// A copy that launches `f` as kernel `name` (the contract's controls each stand in for one kernel).
+    pub fn with(k: Kernels, comptime name: []const u8, f: cuda.Function) Kernels {
+        var out = k;
+        out.f[comptime index(name)] = f;
+        return out;
+    }
+
+    fn index(comptime name: []const u8) usize {
+        inline for (names, 0..) |n, i| if (comptime std.mem.eql(u8, n, "tf_uocr_" ++ name)) return i;
         @compileError("no kernel tf_uocr_" ++ name);
+    }
+
+    fn get(k: *const Kernels, comptime name: []const u8) cuda.Function {
+        return k.f[comptime index(name)];
     }
 
     /// Launches `name` on `s` over `grid` blocks of `threads`, its arguments in order (usize goes as c_int).

@@ -86,5 +86,3 @@ __device__ __forceinline__ float erf_(float x) {
 }
 
 }  // namespace tf_uocr
-
-using namespace tf_uocr;

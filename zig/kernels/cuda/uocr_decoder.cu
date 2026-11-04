@@ -1,6 +1,8 @@
 // Unlimited-OCR-2's decoder steps (rotary, DASH router, sparse attention, MoE, page-guarded pick) as decoder.metal.
 #include "uocr_common.cuh"
 
+using namespace tf_uocr;
+
 // Token rows: x[i] = embed[ids[i]] (1280 wide), image tokens' rows left for their pictures. Grid (rows, 5).
 extern "C" __global__ void __launch_bounds__(256) tf_uocr_embed(const unsigned* __restrict__ ids, const bf16* __restrict__ embed,
                                                                 bf16* __restrict__ x, unsigned image_token) {

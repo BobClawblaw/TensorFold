@@ -1,6 +1,8 @@
 // Unlimited-OCR-2's image encoder steps (SAM, its neck, CLIP-L) op for op as vision.metal, rounded where torch rounds.
 #include "uocr_common.cuh"
 
+using namespace tf_uocr;
+
 // Convolution patches in the weight's (c, ky, kx) order, zero outside the input ([c, h, w] or [h, w, c] input).
 extern "C" __global__ void __launch_bounds__(256) tf_uocr_im2col(const bf16* __restrict__ x, bf16* __restrict__ y, int in_h,
                                                                  int in_w, int channels, int k, int stride, int pad,

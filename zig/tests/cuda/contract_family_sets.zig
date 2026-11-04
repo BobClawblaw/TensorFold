@@ -1,4 +1,4 @@
-//! The contract's family sets: pocket, MiniMax-M3, MOSS-Image, Flash Next NVFP4, grouped affine-4, Flash Next, EXL3.
+//! The contract's family sets: pocket, MiniMax-M3, MOSS-Image, Unlimited-OCR-2, NVFP4, affine-4, Flash Next, EXL3.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -11,6 +11,7 @@ pub const Sets = struct {
     pocket: *@import("contract_pocket.zig").Set,
     minimax: *@import("contract_minimax.zig").Set,
     moss: *@import("contract_moss_image.zig").Set,
+    uocr: *@import("contract_uocr.zig").Set,
     modelopt: *@import("contract_flashnext_modelopt.zig").Set,
     grouped: *Grouped,
     flashnext: *@import("contract_flashnext_more.zig").Set,
@@ -24,6 +25,8 @@ pub const Sets = struct {
         errdefer minimax.deinit();
         const moss = try @import("contract_moss_image.zig").Set.init(gpu, s, a, list);
         errdefer moss.deinit();
+        const uocr = try @import("contract_uocr.zig").Set.init(gpu, s, a, list);
+        errdefer uocr.deinit();
         const modelopt = try @import("contract_flashnext_modelopt.zig").Set.init(gpu, s, a, list);
         errdefer modelopt.deinit();
         const grouped = try gpu.gpa.create(Grouped);
@@ -45,6 +48,7 @@ pub const Sets = struct {
             .pocket = pocket,
             .minimax = minimax,
             .moss = moss,
+            .uocr = uocr,
             .modelopt = modelopt,
             .grouped = grouped,
             .flashnext = flashnext,
@@ -59,6 +63,7 @@ pub const Sets = struct {
         sets.grouped.deinit();
         sets.gpa.destroy(sets.grouped);
         sets.modelopt.deinit();
+        sets.uocr.deinit();
         sets.moss.deinit();
         sets.minimax.deinit();
         sets.pocket.deinit();
