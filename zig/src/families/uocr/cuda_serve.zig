@@ -113,7 +113,7 @@ pub const Model = struct {
     pub const Prepared = struct { pixels: []f32, gh: u32, gw: u32, tokens: u32, hash: u64 };
 
     /// Every image of the stream through the tower, laid out as its image tokens in prompt order.
-    fn encodeImages(m: *Model, a: std.mem.Allocator, images: []const lanes.stream.Image) ![]u16 {
+    pub fn encodeImages(m: *Model, a: std.mem.Allocator, images: []const lanes.stream.Image) ![]u16 {
         var total: usize = 0;
         for (images) |img| total += img.tokens;
         const rows = try a.alloc(u16, total * H);
