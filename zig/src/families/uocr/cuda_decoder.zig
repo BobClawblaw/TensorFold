@@ -1,6 +1,4 @@
-//! Unlimited-OCR-2's decoder on CUDA (decoder.zig's steps): 12 layers of page2d-rotary MHA under DASH's block-sparse
-//! reads (a 128-key local window plus 12 routed 32-key blocks) and a 64-expert MoE, over bf16 caches. A prompt's rows
-//! take cuBLASLt's GEMMs; one token's take the matvecs, its experts picked on the GPU.
+//! Unlimited-OCR-2's decoder on CUDA (decoder.zig's steps): DASH's sparse reads, a 64-expert MoE, bf16 caches.
 const std = @import("std");
 const cuda = @import("cuda");
 const cfg = @import("config.zig");
@@ -117,8 +115,7 @@ pub const Decoder = struct {
         try dec.s.synchronize();
     }
 
-    /// The prompt's prefill: its embeddings with the image rows spliced in at its image tokens, then every layer.
-    /// `image_rows` holds one 1280-wide bf16 row per image token, in order.
+    /// The prompt's prefill: its embeddings with `image_rows` (a bf16 row an image token) spliced in, then the layers.
     pub fn prefill(dec: *Decoder, p: prompt_mod.Prompt, image_rows: []const u16) !void {
         const n = p.len();
         if (n > dec.cap) return error.PromptTooLong;
@@ -250,8 +247,7 @@ pub const Decoder = struct {
         }
     }
 
-    /// The routed layer's FFN into `.tmp`: the gate on the GPU, the experts' row lists here (a prompt's) or on the GPU
-    /// (one token's), the shared expert, each expert on its gathered rows, and the combine in gate order.
+    /// The routed layer's FFN into `.tmp`: GPU gate, experts on their gathered rows, the shared expert, the combine.
     fn moe(dec: *Decoder, L: wts.Layer, l: usize, gate: T, n: usize, vec: bool) !void {
         const sc = dec.scratch;
         const k = dec.k;

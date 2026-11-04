@@ -1,5 +1,4 @@
-//! Unlimited-OCR-2 (baidu/Unlimited-OCR-2) on CUDA: document pages to text, the release's bf16 weights as published.
-//! Its host files (geometry, page preprocessing, prompt positions, the page guard) are the Metal family's.
+//! Unlimited-OCR-2 on CUDA: the release's bf16 weights as published; its host files are the Metal family's.
 pub const config = @import("families/uocr/config.zig");
 pub const preprocess = @import("families/uocr/preprocess.zig");
 pub const prompt = @import("families/uocr/prompt.zig");

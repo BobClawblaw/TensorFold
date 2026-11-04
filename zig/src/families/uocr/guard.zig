@@ -1,5 +1,4 @@
-//! The publisher's PageCountGuard over the logits: EOS barred until the reply has as many <PAGE> markers as the
-//! prompt, then forced; a page held to 20,000 tokens.
+//! The publisher's PageCountGuard: EOS barred until every page's <PAGE> marker, then forced; 20,000 tokens a page.
 const std = @import("std");
 const cfg = @import("config.zig");
 const prompt_mod = @import("prompt.zig");

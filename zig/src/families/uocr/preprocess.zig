@@ -91,13 +91,11 @@ const candidates = [_][2]usize{
     .{ 1, 15 }, .{ 5, 3 },  .{ 15, 1 }, .{ 3, 5 }, .{ 1, 16 }, .{ 2, 8 },  .{ 16, 1 }, .{ 8, 2 },  .{ 4, 4 },
 };
 
-/// The steps that read a page through a picture decoder (core/picture): the Metal family's own import of it, or the
-/// core module's on CUDA (a file belongs to one module).
+/// The steps that read a page through a picture decoder: the Metal family's import of it, or core's on CUDA.
 pub fn With(comptime picture: type) type {
     const resample = picture.resample;
     return struct {
-        /// RGB rows from decoded samples as Pillow's convert('RGB') gives them: alpha dropped, never composited, and the
-        /// stored orientation kept (the publisher's `infer` applies no EXIF transpose).
+        /// RGB rows as Pillow's convert('RGB') gives them: alpha dropped, never composited, no EXIF transpose.
         pub fn rgbOf(a: std.mem.Allocator, s: picture.Samples) ![]u8 {
             const out = try a.alloc(u8, s.width * s.height * 3);
             for (0..s.width * s.height) |i| @memcpy(out[i * 3 ..][0..3], s.data[i * s.channels ..][0..3]);

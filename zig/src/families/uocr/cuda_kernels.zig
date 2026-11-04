@@ -1,7 +1,9 @@
-//! Unlimited-OCR-2's own CUDA kernels (uocr.cu): the Metal family's steps beside cuBLASLt's projections.
+//! Unlimited-OCR-2's own CUDA kernels (uocr_vision.cu, uocr_decoder.cu): the Metal steps beside cuBLASLt's projections.
 const std = @import("std");
 const cuda = @import("cuda");
 
+/// The first `vision_count` live in uocr_vision's image, the rest in uocr_decoder's.
+const vision_count = 12;
 const names = [_][:0]const u8{
     "tf_uocr_im2col",
     "tf_uocr_add",
@@ -34,19 +36,23 @@ const names = [_][:0]const u8{
 };
 
 pub const Kernels = struct {
-    mod: cuda.Module,
+    vision: cuda.Module,
+    decoder: cuda.Module,
     f: [names.len]cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
-        var k: Kernels = .{ .mod = try cuda.Module.load(d, cuda.kernels.uocr), .f = undefined };
-        errdefer k.mod.unload();
-        for (names, &k.f) |n, *f| f.* = try k.mod.function(n);
+        var vision = try cuda.Module.load(d, cuda.kernels.uocr_vision);
+        errdefer vision.unload();
+        var k: Kernels = .{ .vision = vision, .decoder = try cuda.Module.load(d, cuda.kernels.uocr_decoder), .f = undefined };
+        errdefer k.decoder.unload();
+        for (names, &k.f, 0..) |n, *f, i| f.* = try (if (i < vision_count) k.vision else k.decoder).function(n);
         return k;
     }
 
     pub fn unload(k: *Kernels) void {
-        k.mod.unload();
+        k.decoder.unload();
+        k.vision.unload();
     }
 
     fn get(k: *const Kernels, comptime name: []const u8) cuda.Function {
@@ -54,8 +60,7 @@ pub const Kernels = struct {
         @compileError("no kernel tf_uocr_" ++ name);
     }
 
-    /// Launches kernel `name` on `s` over `grid` blocks of `threads`, its arguments in order (u64 addresses, usize
-    /// as c_int, i64, f32, extern structs).
+    /// Launches `name` on `s` over `grid` blocks of `threads`, its arguments in order (usize goes as c_int).
     pub fn run(k: *const Kernels, comptime name: []const u8, s: cuda.Stream, grid: [3]usize, threads: u32, args: anytype) !void {
         if (grid[0] == 0 or grid[1] == 0 or grid[2] == 0) return;
         var a: cuda.Args = .{};
