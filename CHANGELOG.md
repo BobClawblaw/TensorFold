@@ -94,7 +94,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 - GLM-5.3-Flash on CUDA reads block 32's scales only for a `csf0_v1` checkpoint, and every rank refuses a scale offset past 0x7E with a named error (#2091). Thanks to @Bizuayeu.
 - GLM on CUDA with `TF_GLM_PREFILL_REDUCE=ring` warms up only each rank's ring neighbours at startup; the default split and gather warm-up are unchanged (#1971).
 
-- Unlimited-OCR-2 on native Metal: Baidu's BF16 release as published serves page images through `tensorfold-native serve --vision`, its transcribed text identical to the release's own `infer` in torch bf16 on the recipe's pages; one stream, greedy, up to 131,072 tokens (#2074).
+- Unlimited-OCR-2 on native Metal (M5 GPUs): Baidu's BF16 release as published serves page images through `tensorfold-native serve --vision`. On the recipe's pages its transcribed text is identical to the release's own `infer` in torch bf16, while 10 of the 288 box coordinates in the replies differ (7 by 1, at most 10); one stream, greedy, up to 131,072 tokens (#2074).
 
 - Qwen3.5-MoE's prompt sorts its experts' rows in one threadgroup, a thread an expert, with the same order as the serial sort (#1799). Thanks to @BobClawblaw.
 - A batched `/v1/embeddings` request no longer hangs on a backend that prefills many prompts at once, and the lane core can score decision prompts in 1,024-row pieces (#2047). Thanks to @laudney.
