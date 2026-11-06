@@ -4,6 +4,11 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Unlimited-OCR-2 on native Metal (M5 GPUs): Baidu's BF16 release as published serves page images through
+  `tensorfold-native serve --vision`; one stream, greedy, up to 131,072 tokens. On three of the recipe's six cases its
+  text is identical to the release's own `infer` in torch bf16; on the other three the two pick differently where
+  candidate tokens tie within one bf16 step, as torch's own float32 run does (#2074). Thanks to @BobClawblaw.
+
 - Docs: the pull request pre-flight asks a PR that adds, finishes or drops a family's optimization to update that family's cell in the optimization ledger (#2243). Thanks to @jschmied.
 
 - Server: tool calls completed just before the thinking-close marker are returned when no answer follows, whole and
