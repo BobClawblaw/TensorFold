@@ -373,6 +373,18 @@ request fields: a `--min-p` outside 0 through 1 refuses every chat request, a ne
 `--temperature` and `--top-p` must be finite numbers. An engine that decodes greedily only refuses sampled
 requests while the server samples by default, and its refusal suggests serving with `--temperature 0`.
 
+A request with thinking off (a chat whose request or `--no-thinking` turns the reasoning block off, or a raw
+prompt completion) starts from the server's instruct defaults instead, where it has them. Qwen 3.5, Qwen3.8-27B
+and Qwen3.8-Flash-Next serve their model cards' instruct set, temperature 0.7, top_p 0.8, top_k 20 and
+presence_penalty 1.5, while thinking replies keep the cards' thinking set from `generation_config.json`. The
+instruct set sits between `generation_config.json` and the flags, so `--temperature`, `--top-p`, `--top-k` and
+`--min-p` still decide for both modes. `--instruct-sampling name=value,...` sets or changes `temperature`,
+`top_p`, `top_k`, `min_p`, `presence_penalty` and `frequency_penalty` for requests with thinking off only, over
+the family's set; `--instruct-sampling none` serves one default set for every request. On an engine that applies
+no penalties the card's presence_penalty is left out of the family's set, with a startup line saying so. The
+serving line prints the instruct defaults after the sampling defaults when they differ (`thinking off: ...`), and
+a request's own fields win over them as over the defaults.
+
 `--name-priority ID=background` gives one served id (`--name` or an `--alias`) a default priority: a request that
 asks for it and sends no `priority` of its own is treated as `priority: "background"`. The request's own `priority`
 field always wins over the default. This lets one server answer to several ids at their usual priority while a

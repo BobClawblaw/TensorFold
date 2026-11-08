@@ -90,6 +90,8 @@ pub const Setup = struct {
     reopen: ?idle_unload.Reopen = null,
     /// Sampling defaults from generation_config.json and the flags, as a JSON object; null: greedy.
     sampling: ?json.Value = null,
+    /// The defaults for requests with thinking off, when apart from `sampling` (family_sampling.resolveInstruct).
+    instruct: ?json.Value = null,
     environ: ?*const std.process.Environ.Map = null,
     started: i96 = 0,
     /// The release, backend and GPU the open /health names.
@@ -190,6 +192,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .idle_unload_s = args.idle_unload,
         .admission = args.admission,
         .default_sampling = s.sampling,
+        .instruct_sampling = s.instruct,
         .use_drafts = !args.no_drafts,
         .vision_urls = args.vision_urls,
         .vision_pdf = args.vision_pdf,
@@ -261,8 +264,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     const profile_line = @import("profile_line.zig").format(a, args.profile, s.model_type, s.identity.backend, ProfileEnvironment{}) catch
         "profile: stable; registered overrides: unavailable (out of memory)";
     log.line("{s}", .{profile_line});
-    log.line("serving {s} at http://{s}:{d}/v1 (sampling: {s}; drafts: {f}; context: {s}; loaded in {d:.1}s)", .{
-        s.served,                                                  args.host,                                                                                   port,   shownSampling(a, s.sampling),
+    log.line("serving {s} at http://{s}:{d}/v1 (sampling: {s}{s}; drafts: {f}; context: {s}; loaded in {d:.1}s)", .{
+        s.served,                                                  args.host,                                                                                   port,   shownSampling(a, s.sampling), shownInstruct(a, s.instruct),
         @import("draft_line.zig").shown(args.no_drafts, srv.info), if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
     const reserved = args.thinking_reserve > 0 and srv.info.capability(.answer_limit);
@@ -335,6 +338,12 @@ fn resolve(io: std.Io, host: []const u8, port: u16) ?std.Io.net.IpAddress {
     if (std.Io.net.IpAddress.parse(host, port)) |ip| return ip else |_| {}
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return .{ .ip4 = .loopback(port) };
     return std.Io.net.IpAddress.resolve(io, host, port) catch null;
+}
+
+/// The serving line's thinking-off defaults when they differ from the sampling defaults: ``; thinking off: ...``.
+fn shownInstruct(a: Allocator, instruct: ?json.Value) []const u8 {
+    const v = instruct orelse return "";
+    return std.fmt.allocPrint(a, "; thinking off: {s}", .{shownSampling(a, v)}) catch "";
 }
 
 /// The serving line's sampling: greedy, or each default as ``name value``.

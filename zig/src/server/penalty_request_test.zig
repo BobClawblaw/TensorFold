@@ -59,6 +59,11 @@ const Reply = struct {
 };
 
 fn check(supported: bool, defaults: ?[]const u8, extra: []const u8, status_code: u16, want: api.Penalties) !void {
+    try checkWith(supported, defaults, null, extra, status_code, want);
+}
+
+/// A raw prompt completion has thinking off: it starts from ``instruct`` where given, else from ``defaults``.
+fn checkWith(supported: bool, defaults: ?[]const u8, instruct: ?[]const u8, extra: []const u8, status_code: u16, want: api.Penalties) !void {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -75,6 +80,7 @@ fn check(supported: bool, defaults: ?[]const u8, extra: []const u8, status_code:
         .enable_thinking = false,
         .use_drafts = false,
         .default_sampling = if (defaults) |d| (try json.parse(a, d)).ok else null,
+        .instruct_sampling = if (instruct) |d| (try json.parse(a, d)).ok else null,
     }, null);
     defer srv.deinit();
     const body = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"prompt\":[0],\"max_tokens\":4{s}}}", .{extra}))).ok;
@@ -104,6 +110,49 @@ test "penalty request: presence_penalty zero, absent and null keep the same repl
     for ([_][]const u8{ "", ",\"presence_penalty\":0", ",\"frequency_penalty\":0", ",\"presence_penalty\":null,\"frequency_penalty\":null" }) |extra|
         try check(false, null, extra, 200, .{});
     try check(false, "{\"presence_penalty\":1,\"frequency_penalty\":-1}", ",\"presence_penalty\":0,\"frequency_penalty\":0", 200, .{});
+}
+
+test "penalty request: the instruct set serves a request with thinking off, under its own fields" {
+    try checkWith(true, "{\"presence_penalty\":0.5}", "{\"presence_penalty\":1.5}", "", 200, .{ .presence = 1.5 });
+    try checkWith(true, null, "{\"presence_penalty\":1.5,\"frequency_penalty\":0.5}", ",\"presence_penalty\":0", 200, .{ .frequency = 0.5 });
+    try checkWith(true, "{\"presence_penalty\":0.5}", null, "", 200, .{ .presence = 0.5 });
+}
+
+test "sampling defaults: thinking on keeps the defaults, thinking off takes the instruct set" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try fixture.Fixture.init(t.allocator, t.io, null);
+    defer f.deinit();
+    var problem: []const u8 = "";
+    const text = try HfText.load(t.allocator, t.io, f.path, null, a, &problem);
+    defer text.deinit();
+    var script: Script = .{ .supported = true };
+    const srv = try Server.init(t.allocator, t.io, script.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .use_drafts = false,
+        .default_sampling = (try json.parse(a, "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20}")).ok,
+        .instruct_sampling = (try json.parse(a, "{\"temperature\":0.7,\"top_p\":0.8,\"top_k\":20,\"presence_penalty\":1.5}")).ok,
+    }, null);
+    defer srv.deinit();
+    const none = (try json.parse(a, "{\"model\":\"m\",\"seed\":1}")).ok;
+    const own = (try json.parse(a, "{\"model\":\"m\",\"seed\":1,\"temperature\":0.2,\"presence_penalty\":0}")).ok;
+    var cx: @import("errors.zig").Cx = .{ .a = a };
+    const on = (try srv.resolveSampling(&cx, none, 0, &.{}, true)).?;
+    try t.expectApproxEqAbs(@as(f64, 1.0), @as(f64, on.temperature), 1e-6);
+    try t.expectApproxEqAbs(@as(f64, 0.95), @as(f64, on.top_p), 1e-6);
+    try t.expectEqualDeep(api.Penalties{}, try srv.resolvePenalties(&cx, none, true));
+    const off = (try srv.resolveSampling(&cx, none, 0, &.{}, false)).?;
+    try t.expectApproxEqAbs(@as(f64, 0.7), @as(f64, off.temperature), 1e-6);
+    try t.expectApproxEqAbs(@as(f64, 0.8), @as(f64, off.top_p), 1e-6);
+    try t.expectEqual(@as(u32, 20), off.top_k);
+    try t.expectEqualDeep(api.Penalties{ .presence = 1.5 }, try srv.resolvePenalties(&cx, none, false));
+    const chosen = (try srv.resolveSampling(&cx, own, 0, &.{}, false)).?;
+    try t.expectApproxEqAbs(@as(f64, 0.2), @as(f64, chosen.temperature), 1e-6);
+    try t.expectApproxEqAbs(@as(f64, 0.8), @as(f64, chosen.top_p), 1e-6);
+    try t.expectEqualDeep(api.Penalties{}, try srv.resolvePenalties(&cx, own, false));
 }
 
 test "penalty request: supported request values override defaults unchanged" {
