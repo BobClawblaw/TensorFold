@@ -202,7 +202,7 @@ test "done times: cached tokens above the prompt are clamped in the reply, log a
 
 fn seedSample(srv: *server.Server, a: std.mem.Allocator, body: []const u8) !?api.Sampling {
     var cx: Cx = .{ .a = a };
-    return srv.resolveSampling(&cx, (try json.parse(a, body)).ok, 0, &.{ 1, 2, 3 });
+    return srv.resolveSampling(&cx, (try json.parse(a, body)).ok, 0, &.{ 1, 2, 3 }, true);
 }
 
 fn seedControls(mode: enum { fresh, keyed, explicit, defaults, default_fresh, failed, log_drawn, log_given }) !void {
@@ -240,7 +240,7 @@ fn seedControls(mode: enum { fresh, keyed, explicit, defaults, default_fresh, fa
         Clock.no_entropy = true;
         try std.testing.expectEqual(@as(?api.Sampling, null), try seedSample(srv, a, "{\"temperature\":0}"));
         var cx: Cx = .{ .a = a };
-        try std.testing.expectError(error.Refused, srv.resolveSampling(&cx, (try json.parse(a, "{\"temperature\":0.7}")).ok, 0, &.{1}));
+        try std.testing.expectError(error.Refused, srv.resolveSampling(&cx, (try json.parse(a, "{\"temperature\":0.7}")).ok, 0, &.{1}, true));
         try std.testing.expectEqual(@import("errors.zig").Kind.server, cx.kind);
         try std.testing.expectEqual(@as(usize, 1), Clock.draws);
     } else if (mode == .log_drawn or mode == .log_given) {

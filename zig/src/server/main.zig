@@ -160,6 +160,7 @@ pub fn main(init: std.process.Init) !u8 {
         .model_type = model_type,
         .reopen = .{ .ctx = &closer, .open = Reopen.open, .close_held = Reopen.closeHeld, .halt_held = Closer.halt, .replace = Reopen.replace },
         .sampling = try sampling(a, io, dir, args, model_type),
+        .instruct = try instructSampling(a, io, dir, args, model_type, up.engine.engine.info().capability(.penalties)),
         .environ = init.environ_map,
         .started = started,
         .identity = engines.identity(a, args),
@@ -211,9 +212,24 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
 
 /// The family's defaults, generation_config.json's sampling, then the serve flags (family_sampling.resolve).
 fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args, model_type: []const u8) !?json.Value {
+    return @import("family_sampling.zig").resolve(a, model_type, try generationConfig(a, io, dir), samplingFlags(args));
+}
+
+/// The same with the family's instruct set and --instruct-sampling, for thinking off (family_sampling.resolveInstruct).
+fn instructSampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args, model_type: []const u8, penalties: bool) !?json.Value {
+    const family_sampling = @import("family_sampling.zig");
+    if (!penalties and args.instruct_sampling == null and family_sampling.hasInstruct(model_type))
+        log.line("presence_penalty 1.5 from the model card's instruct set is not served: this engine applies no penalties", .{});
+    return family_sampling.resolveInstruct(a, model_type, try generationConfig(a, io, dir), samplingFlags(args), penalties, args.instruct_sampling);
+}
+
+fn generationConfig(a: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
     const path = try std.fs.path.join(a, &.{ dir, "generation_config.json" });
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch null;
-    return @import("family_sampling.zig").resolve(a, model_type, bytes, .{ .temperature = args.temperature, .top_p = args.top_p, .top_k = args.top_k, .min_p = args.min_p });
+    return std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch null;
+}
+
+fn samplingFlags(args: cli.Args) @import("family_sampling.zig").Flags {
+    return .{ .temperature = args.temperature, .top_p = args.top_p, .top_k = args.top_k, .min_p = args.min_p };
 }
 
 const Closer = @import("idle_unload_closer.zig").Closer;
