@@ -373,6 +373,23 @@ request fields: a `--min-p` outside 0 through 1 refuses every chat request, a ne
 `--temperature` and `--top-p` must be finite numbers. An engine that decodes greedily only refuses sampled
 requests while the server samples by default, and its refusal suggests serving with `--temperature 0`.
 
+`--instruct-sampling` gives chat requests with thinking off (the request or `--no-thinking` turns the reasoning block
+off) their own sampling defaults, used when such a request samples. `card` serves the family's model-card instruct
+set: Qwen 3.5, Qwen 3.6, Qwen3.8-27B and Qwen3.8-Flash-Next give temperature 0.7, top_p 0.8, top_k 20 and
+presence_penalty 1.5, while their thinking set stays in `generation_config.json`. `name=value,...` sets or changes
+`temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty` and `frequency_penalty` over that set, or over the
+server's defaults for a family without one; `none` serves one set. The set sits between `generation_config.json` and
+the flags, so `--temperature`, `--top-p`, `--top-k` and `--min-p` still decide for both modes, and a request's own
+fields win over it as over the defaults. Without the flag the server has one default set for every request, as
+before. Greedy decoding never takes the set: a request's `temperature: 0`, a server's `--temperature 0`, or a
+checkpoint whose `generation_config.json` has `do_sample: false` decodes greedily with no penalty, and raw prompt
+completions and the server's own compaction requests never take it either. `card` refuses a model type whose family
+gives no card set; it cannot tell checkpoints apart within a type, so leave the flag off (or give pairs from the
+card) for a checkpoint whose card gives no non-thinking set, such as Ornith-1.5-122B served as `qwen3_5_moe`. On an
+engine that applies no penalties the card's presence_penalty is left out with a startup line saying so, and pairs
+naming a non-zero penalty are refused at startup. The serving line prints the set after the sampling defaults
+(`thinking off: ...`).
+
 `--name-priority ID=background` gives one served id (`--name` or an `--alias`) a default priority: a request that
 asks for it and sends no `priority` of its own is treated as `priority: "background"`. The request's own `priority`
 field always wins over the default. This lets one server answer to several ids at their usual priority while a

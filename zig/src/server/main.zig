@@ -150,6 +150,8 @@ pub fn main(init: std.process.Init) !u8 {
         return if (problem.len > 0) fail(problem) else e;
     };
     if (record) |r| if (!up.engine.engine.attachRecall(r)) return fail(not_lanes);
+    const instruct = try instructSampling(a, io, dir, args, model_type, up.engine.engine.info().capability(.penalties), &problem);
+    if (problem.len > 0) return fail(problem);
     return serve.run(gpa, io, args, .{
         .engine = up.engine.engine,
         .stop = .{ .ctx = &closer, .close = Closer.close, .halt = Closer.halt },
@@ -160,6 +162,7 @@ pub fn main(init: std.process.Init) !u8 {
         .model_type = model_type,
         .reopen = .{ .ctx = &closer, .open = Reopen.open, .close_held = Reopen.closeHeld, .halt_held = Closer.halt, .replace = Reopen.replace },
         .sampling = try sampling(a, io, dir, args, model_type),
+        .instruct = instruct,
         .environ = init.environ_map,
         .started = started,
         .identity = engines.identity(a, args),
@@ -211,9 +214,43 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
 
 /// The family's defaults, generation_config.json's sampling, then the serve flags (family_sampling.resolve).
 fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args, model_type: []const u8) !?json.Value {
+    return @import("family_sampling.zig").resolve(a, model_type, try generationConfig(a, io, dir), samplingFlags(args));
+}
+
+/// --instruct-sampling's set for sampled chats with thinking off (family_sampling.resolveInstruct); else ``problem``.
+fn instructSampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args, model_type: []const u8, penalties: bool, problem: *[]const u8) !?json.Value {
+    const family_sampling = @import("family_sampling.zig");
+    const text = args.instruct_sampling orelse return null;
+    const config = try generationConfig(a, io, dir);
+    if (try family_sampling.greedyConfig(a, config)) {
+        log.line("--instruct-sampling is not served: generation_config.json has do_sample false, so replies decode greedily", .{});
+        return null;
+    }
+    const set = family_sampling.resolveInstruct(a, model_type, config, samplingFlags(args), penalties, text) catch |e| switch (e) {
+        error.NoInstructSet => {
+            problem.* = try std.fmt.allocPrint(a, "--instruct-sampling card: model type {s} has no instruct set in its family defaults; give name=value pairs", .{model_type});
+            return null;
+        },
+        else => |x| return x,
+    } orelse return null;
+    if (!penalties) {
+        for ([_][]const u8{ "presence_penalty", "frequency_penalty" }) |k| if (set.get(k)) |v| if ((v.float64() orelse 0) != 0) {
+            problem.* = try std.fmt.allocPrint(a, "--instruct-sampling names {s} {d}, but this engine applies no penalties: name 0 or leave it out", .{ k, v.float64().? });
+            return null;
+        };
+        if (family_sampling.hasInstruct(model_type) and std.mem.indexOf(u8, text, "presence_penalty") == null)
+            log.line("presence_penalty 1.5 from the model card's instruct set is not served: this engine applies no penalties", .{});
+    }
+    return set;
+}
+
+fn generationConfig(a: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
     const path = try std.fs.path.join(a, &.{ dir, "generation_config.json" });
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch null;
-    return @import("family_sampling.zig").resolve(a, model_type, bytes, .{ .temperature = args.temperature, .top_p = args.top_p, .top_k = args.top_k, .min_p = args.min_p });
+    return std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch null;
+}
+
+fn samplingFlags(args: cli.Args) @import("family_sampling.zig").Flags {
+    return .{ .temperature = args.temperature, .top_p = args.top_p, .top_k = args.top_k, .min_p = args.min_p };
 }
 
 const Closer = @import("idle_unload_closer.zig").Closer;
