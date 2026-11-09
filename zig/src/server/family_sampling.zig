@@ -1,4 +1,4 @@
-//! Served sampling: the family's defaults, then generation_config.json, then the serve flags.
+//! Served sampling: family defaults, generation_config.json, the flags; and --instruct-sampling's thinking-off set.
 const std = @import("std");
 const json = @import("json");
 
@@ -10,6 +10,9 @@ pub const Flags = struct {
     min_p: ?f64 = null,
 };
 
+/// The request fields --instruct-sampling may name.
+pub const instruct_fields = [_][]const u8{ "temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty" };
+
 /// DeepSeek-V4.x: temperature 1.0, top_p 1.0, no top_k (the V4 and V4.1 model cards' recommended sampling).
 pub fn put(a: std.mem.Allocator, out: *json.Object, model_type: []const u8) !void {
     if (!std.mem.eql(u8, model_type, "deepseek_v41") and !std.mem.eql(u8, model_type, "deepseek_v4")) return;
@@ -17,9 +20,98 @@ pub fn put(a: std.mem.Allocator, out: *json.Object, model_type: []const u8) !voi
     try out.put(a, "top_p", .{ .float = 1.0 });
 }
 
+/// Qwen 3.5, 3.6, Qwen3.8-27B and Flash-Next cards: a thinking set (generation_config.json) and an instruct set.
+pub fn hasInstruct(model_type: []const u8) bool {
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp", "qwen4_exp_text" }) |t| {
+        if (std.mem.eql(u8, model_type, t)) return true;
+    }
+    return false;
+}
+
+/// The Qwen cards' instruct set: temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5 where penalties apply.
+pub fn putInstruct(a: std.mem.Allocator, out: *json.Object, model_type: []const u8, penalties: bool) !bool {
+    if (!hasInstruct(model_type)) return false;
+    try out.put(a, "temperature", .{ .float = 0.7 });
+    try out.put(a, "top_p", .{ .float = 0.8 });
+    try out.put(a, "top_k", try json.intValue(a, 20));
+    if (penalties) try out.put(a, "presence_penalty", .{ .float = 1.5 });
+    return true;
+}
+
 /// The three layers over each other (``do_sample`` false is greedy); null when none sets a value.
 pub fn resolve(a: std.mem.Allocator, model_type: []const u8, generation_config: ?[]const u8, flags: Flags) !?json.Value {
     const out = try json.newObject(a);
+    _ = try layers(a, out, model_type, generation_config, flags, null);
+    return if (out.count() > 0) json.Value{ .object = out } else null;
+}
+
+/// True when generation_config.json says ``do_sample: false``: the checkpoint decodes greedily.
+pub fn greedyConfig(a: std.mem.Allocator, generation_config: ?[]const u8) !bool {
+    const bytes = generation_config orelse return false;
+    const parsed = try json.parse(a, bytes);
+    if (parsed != .ok) return false;
+    const d = parsed.ok.get("do_sample") orelse return false;
+    return d == .bool and !d.bool;
+}
+
+/// --instruct-sampling's set: the layers with the card set (``card``, or under pairs) below the flags; ``none``: null.
+pub fn resolveInstruct(a: std.mem.Allocator, model_type: []const u8, generation_config: ?[]const u8, flags: Flags, penalties: bool, text: []const u8) !?json.Value {
+    const word = std.mem.trim(u8, text, " ");
+    if (std.mem.eql(u8, word, "none")) return null;
+    const card = std.mem.eql(u8, word, "card");
+    if (card and !hasInstruct(model_type)) return error.NoInstructSet;
+    const out = try json.newObject(a);
+    _ = try layers(a, out, model_type, generation_config, flags, penalties);
+    if (!card) try parsePairs(a, out, word);
+    return json.Value{ .object = out };
+}
+
+/// ``--instruct-sampling``'s text checked (`checkText`): null when it reads, else what it should have been.
+pub fn pairsProblem(a: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]const u8 {
+    checkText(a, text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidInstructSampling => return "expected none, card, or comma-separated name=value pairs naming temperature, top_p, top_k, min_p, presence_penalty or frequency_penalty",
+    };
+    return null;
+}
+
+/// ``--instruct-sampling``'s text, checked: ``none``, ``card``, or name=value pairs `parsePairs` reads.
+pub fn checkText(a: std.mem.Allocator, text: []const u8) error{ OutOfMemory, InvalidInstructSampling }!void {
+    const word = std.mem.trim(u8, text, " ");
+    if (std.mem.eql(u8, word, "none") or std.mem.eql(u8, word, "card")) return;
+    const out = try json.newObject(a);
+    try parsePairs(a, out, word);
+}
+
+/// Comma-separated ``name=value`` pairs of instruct fields (top_k an integer, the rest finite numbers) into ``out``.
+pub fn parsePairs(a: std.mem.Allocator, out: *json.Object, text: []const u8) error{ OutOfMemory, InvalidInstructSampling }!void {
+    var any = false;
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |raw| {
+        const pair = std.mem.trim(u8, raw, " ");
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse return error.InvalidInstructSampling;
+        const name = std.mem.trim(u8, pair[0..eq], " ");
+        const value = std.mem.trim(u8, pair[eq + 1 ..], " ");
+        const known = for (instruct_fields) |f| {
+            if (std.mem.eql(u8, f, name)) break true;
+        } else false;
+        if (!known) return error.InvalidInstructSampling;
+        if (std.mem.eql(u8, name, "top_k")) {
+            const k = std.fmt.parseInt(i64, value, 10) catch return error.InvalidInstructSampling;
+            try out.put(a, name, try json.intValue(a, k));
+        } else {
+            const x = std.fmt.parseFloat(f64, value) catch return error.InvalidInstructSampling;
+            if (!std.math.isFinite(x)) return error.InvalidInstructSampling;
+            try out.put(a, name, .{ .float = x });
+        }
+        any = true;
+    }
+    if (!any) return error.InvalidInstructSampling;
+}
+
+/// Family defaults, generation_config.json, the card set when ``instruct`` (its penalties flag), then the flags.
+fn layers(a: std.mem.Allocator, out: *json.Object, model_type: []const u8, generation_config: ?[]const u8, flags: Flags, instruct: ?bool) !bool {
     try put(a, out, model_type);
     if (generation_config) |bytes| if ((try json.parse(a, bytes)) == .ok) {
         const cfg = (try json.parse(a, bytes)).ok;
@@ -28,11 +120,12 @@ pub fn resolve(a: std.mem.Allocator, model_type: []const u8, generation_config: 
             if (!d.bool) try out.put(a, "temperature", .{ .float = 0 }) else if (out.get("temperature") == null) try out.put(a, "temperature", .{ .float = 1 });
         };
     };
+    const put_instruct = if (instruct) |penalties| try putInstruct(a, out, model_type, penalties) else false;
     if (flags.temperature) |t| try out.put(a, "temperature", .{ .float = t });
     if (flags.top_p) |t| try out.put(a, "top_p", .{ .float = t });
     if (flags.top_k) |t| try out.put(a, "top_k", try json.intValue(a, t));
     if (flags.min_p) |t| try out.put(a, "min_p", .{ .float = t });
-    return if (out.count() > 0) json.Value{ .object = out } else null;
+    return put_instruct;
 }
 
 test "DeepSeek-V4.x serves its cards' sampling defaults; other families keep none" {
@@ -61,4 +154,58 @@ test "family sampling defaults sit under generation_config.json and the serve fl
     try std.testing.expectEqual(@as(f64, 0.9), flag.?.get("top_p").?.float);
     const greedy = try resolve(a, "deepseek_v41", "{\"do_sample\": false}", .{});
     try std.testing.expectEqual(@as(f64, 0), greedy.?.get("temperature").?.float);
+}
+
+test "--instruct-sampling card serves the Qwen cards' instruct set under the flags; pairs edit it; none serves none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = "{\"do_sample\": true, \"temperature\": 1.0, \"top_k\": 20, \"top_p\": 0.95}";
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp", "qwen4_exp_text" }) |kind| {
+        const thinking = (try resolve(a, kind, cfg, .{})).?;
+        try std.testing.expectEqual(@as(f64, 1.0), thinking.get("temperature").?.float);
+        try std.testing.expect(thinking.get("presence_penalty") == null);
+        const out = (try resolveInstruct(a, kind, cfg, .{}, true, "card")).?;
+        try std.testing.expectEqual(@as(f64, 0.7), out.get("temperature").?.float);
+        try std.testing.expectEqual(@as(f64, 0.8), out.get("top_p").?.float);
+        try std.testing.expectEqual(@as(?i64, 20), out.get("top_k").?.int64());
+        try std.testing.expectEqual(@as(f64, 1.5), out.get("presence_penalty").?.float);
+        try std.testing.expect(out.get("frequency_penalty") == null);
+    }
+    // an engine without penalties gets the card set without presence_penalty
+    const plain = (try resolveInstruct(a, "qwen3_5", cfg, .{}, false, " card ")).?;
+    try std.testing.expectEqual(@as(f64, 0.7), plain.get("temperature").?.float);
+    try std.testing.expect(plain.get("presence_penalty") == null);
+    // the serve flags apply over the card set
+    const flagged = (try resolveInstruct(a, "qwen3_5", cfg, .{ .temperature = 0, .top_k = 40 }, true, "card")).?;
+    try std.testing.expectEqual(@as(f64, 0), flagged.get("temperature").?.float);
+    try std.testing.expectEqual(@as(?i64, 40), flagged.get("top_k").?.int64());
+    try std.testing.expectEqual(@as(f64, 1.5), flagged.get("presence_penalty").?.float);
+    // pairs edit the card set
+    const pairs = (try resolveInstruct(a, "qwen3_5", cfg, .{ .temperature = 0 }, true, "temperature=0.6, presence_penalty=0,top_k=10")).?;
+    try std.testing.expectEqual(@as(f64, 0.6), pairs.get("temperature").?.float);
+    try std.testing.expectEqual(@as(f64, 0), pairs.get("presence_penalty").?.float);
+    try std.testing.expectEqual(@as(?i64, 10), pairs.get("top_k").?.int64());
+    try std.testing.expectEqual(@as(f64, 0.8), pairs.get("top_p").?.float);
+    // none serves no set; a family without a card set refuses card but takes pairs over its defaults
+    try std.testing.expect((try resolveInstruct(a, "qwen3_5", cfg, .{}, true, "none")) == null);
+    try std.testing.expectError(error.NoInstructSet, resolveInstruct(a, "deepseek_v41", null, .{}, true, "card"));
+    try std.testing.expectError(error.NoInstructSet, resolveInstruct(a, "glm5_next", cfg, .{}, true, "card"));
+    const given = (try resolveInstruct(a, "glm5_next", cfg, .{}, true, "presence_penalty=1")).?;
+    try std.testing.expectEqual(@as(f64, 1.0), given.get("temperature").?.float);
+    try std.testing.expectEqual(@as(f64, 1.0), given.get("presence_penalty").?.float);
+    // a checkpoint that decodes greedily
+    try std.testing.expect(try greedyConfig(a, "{\"do_sample\": false}"));
+    try std.testing.expect(!try greedyConfig(a, cfg));
+    try std.testing.expect(!try greedyConfig(a, null));
+    // malformed text
+    for ([_][]const u8{ "", " ", "temperature", "temperature=x", "foo=1", "top_k=1.5", "temperature=inf", "=0.5", "cards" }) |bad| {
+        try std.testing.expectError(error.InvalidInstructSampling, resolveInstruct(a, "qwen3_5", cfg, .{}, true, bad));
+        try std.testing.expectError(error.InvalidInstructSampling, checkText(a, bad));
+        try std.testing.expect((try pairsProblem(a, bad)) != null);
+    }
+    for ([_][]const u8{ "none", "card", "top_k=0", "temperature=0.7,top_p=0.8,top_k=20,min_p=0,presence_penalty=1.5,frequency_penalty=0" }) |good| {
+        try checkText(a, good);
+        try std.testing.expect((try pairsProblem(a, good)) == null);
+    }
 }
