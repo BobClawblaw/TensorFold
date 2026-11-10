@@ -12,7 +12,7 @@ const family = llama.family;
 const G33 = family.nanbeige43;
 
 /// glue.metal's ll_mv_args, as forward.zig fills it for the dequant.
-const MArgs = extern struct { rows: u32, n: u32, k: u32, ldy: u32 };
+const MArgs = extern struct { rows: u32, n: u32, k: u32, ldy: u32, bias: u32 = 0 };
 /// glue.metal's ll_q4_args, as forward.zig fills it.
 const Q4Args = extern struct { rows: u32, n0: u32, n1: u32, n2: u32, k: u32, ldy: u32 };
 

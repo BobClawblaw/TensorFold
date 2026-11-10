@@ -132,7 +132,7 @@ pub fn open(a: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, o: api.Ope
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.config, h.metal.backend(), h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = fl.state.prompt_rows, .structures = true, .logprobs = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = fl.state.prompt_rows, .structures = true, .logprobs = true, .reasoning = q.reasoning });
     h.cache = null;
     h.cache_cap = if (o.prompt_cache_gib) |g| @intFromFloat(g * (1 << 30)) else budget;
     if (h.cache_cap > 0) {
@@ -168,10 +168,13 @@ fn qualifiedNames(comptime role: fl.config.Role) []const u8 {
     return names;
 }
 
-/// --drafter's refusal for a target its drafts were not measured to pay for (Nanbeige4.3-33B-INT4 on the M5 Ultra).
+/// --drafter's refusal: the target's drafts were measured not to pay (the INT4 release), or no drafter was checked.
 fn undrafted(a: std.mem.Allocator, q: *const fl.config.Qualified) !?[]const u8 {
-    if (q.drafted) return null;
-    return try std.fmt.allocPrint(a, "--drafter: {s} is served without a drafter: its drafts were measured slower than decoding without them; serve it without --drafter", .{q.name});
+    return switch (q.drafts) {
+        .pays => null,
+        .slower => try std.fmt.allocPrint(a, "--drafter: {s} is served without a drafter: its drafts were measured slower than decoding without them; serve it without --drafter", .{q.name}),
+        .unchecked => try std.fmt.allocPrint(a, "--drafter: {s} is served without a drafter: none has been checked with it (a smaller checkpoint on its tokens, its drafts measured to pay); serve it without --drafter", .{q.name}),
+    };
 }
 
 /// --drafter's directory when drafts are on; one width (bf16 as published), so --drafter-bits is unread, as in Gemma 4.
@@ -238,15 +241,16 @@ test "llama host: the default options serve the drafter, whatever --drafter-bits
     try std.testing.expectEqual(@as(?[]const u8, null), drafterDir(off));
 }
 
-test "llama host: --drafter is refused by name for Nanbeige4.3-33B-INT4 and served for the bf16 release" {
+test "llama host: --drafter is refused by name for Nanbeige4.3-33B-INT4 and Bimo-7B-CyberAgent, served for the bf16 release" {
     const a = std.testing.allocator;
     for (&fl.config.qualified) |*q| {
         if (q.role != .served) continue;
         const why = try undrafted(a, q);
         defer if (why) |w| a.free(w);
         if (std.mem.eql(u8, q.name, "Nanbeige4.3-33B-INT4")) {
-            try std.testing.expect(why != null);
-            try std.testing.expect(std.mem.indexOf(u8, why.?, "--drafter: Nanbeige4.3-33B-INT4 is served without a drafter") != null);
+            try std.testing.expect(std.mem.indexOf(u8, why.?, "--drafter: Nanbeige4.3-33B-INT4 is served without a drafter: its drafts were measured slower") != null);
+        } else if (std.mem.eql(u8, q.name, "Bimo-7B-CyberAgent")) {
+            try std.testing.expect(std.mem.indexOf(u8, why.?, "--drafter: Bimo-7B-CyberAgent is served without a drafter: none has been checked") != null);
         } else try std.testing.expectEqual(@as(?[]const u8, null), why);
     }
 }

@@ -1,4 +1,4 @@
-// Llama's glue at HF's rounding points (modeling_llama in bf16): bf16 residual and norm, rope with bf16 cos and sin.
+// Llama's and Qwen2's glue at HF's rounding points (bf16): residual, norm, rope with bf16 cos and sin, biased sums.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -105,9 +105,9 @@ inline void ll_norm_held(thread const bfloat* v, const device bfloat* w, constan
   ll_norm_row(x, w, a, out + (size_t)row * a.width, sum, t, n, part);
 }
 
-struct ll_prep_args { uint rows, heads, kv_heads, pos, stride; };
+struct ll_prep_args { uint rows, heads, kv_heads, pos, stride; float mscale; };
 
-// HF's apply_rotary_pos_emb, pairs (d, d + DH / 2): bf16(bf16(x * c) + bf16(o * s)), c and s the angle's cos and sin
+// HF's apply_rotary_pos_emb, pairs (d, d + DH / 2): bf16(bf16(x * c) + bf16(o * s)), c and s bf16(cos or sin * mscale)
 [[kernel]] void ll_prep(const device bfloat* X [[buffer(0)]], const device float* inv [[buffer(1)]],
     constant ll_prep_args& a [[buffer(2)]], device bfloat* QN [[buffer(3)]], device bfloat* KC [[buffer(4)]],
     device bfloat* VC [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
@@ -126,7 +126,7 @@ struct ll_prep_args { uint rows, heads, kv_heads, pos, stride; };
     const uint d = lane + 32 * j;
     const uint i = d % HALF;
     const float angle = position * inv[i];
-    const float c = float(bfloat(precise::cos(angle))), s = float(bfloat(precise::sin(angle)));
+    const float c = float(bfloat(precise::cos(angle) * a.mscale)), s = float(bfloat(precise::sin(angle) * a.mscale));
     const float x = float(src[d]);
     const float other = d < HALF ? -float(src[d + HALF]) : float(src[d - HALF]);
     y[d] = bfloat(float(bfloat(x * c)) + float(bfloat(other * s)));
@@ -266,12 +266,12 @@ inline bool ll_better(float a, uint ia, float b, uint ib) {
   if (lane == 0) ids[0] = at;
 }
 
-struct ll_mv_args { uint rows, n, k, ldy; };
+struct ll_mv_args { uint rows, n, k, ldy, bias; };
 
-// Y[r, j] = bf16(sum_i X[r, i] * W[j, i]) over bf16 W [n, k] in fp32 (torch's bf16 linear): a simdgroup a row j.
+// Y[r, j] = bf16(sum_i X[r, i] * W[j, i] + b[j]) over bf16 W [n, k] in fp32 (torch's bf16 linear): a simdgroup a row j.
 template <uint ROWS>
-inline void ll_matvec_t(const device bfloat* X, const device bfloat* W, constant ll_mv_args& a, device bfloat* Y,
-    uint3 tg, uint sg, uint lane) {
+inline void ll_matvec_t(const device bfloat* X, const device bfloat* W, const device bfloat* Bv, constant ll_mv_args& a,
+    device bfloat* Y, uint3 tg, uint sg, uint lane) {
   constexpr uint SG = 8;
   const uint j = tg.x * SG + sg;
   if (j >= a.n) return;
@@ -289,16 +289,18 @@ inline void ll_matvec_t(const device bfloat* X, const device bfloat* W, constant
   }
   TF_UNROLL_4
   for (uint r = 0; r < ROWS; ++r) {
-    const float s = simd_sum(acc[r]);
+    float s = simd_sum(acc[r]);
+    if (a.bias) s += float(Bv[j]);
     if (lane == 0 && r < a.rows) Y[(size_t)r * a.ldy + j] = bfloat(s);
   }
 }
 
 #define LL_MATVEC(ROWS)                                                                                            \
   [[kernel]] void ll_matvec_##ROWS(const device bfloat* X [[buffer(0)]], const device bfloat* W [[buffer(1)]],      \
-      constant ll_mv_args& a [[buffer(2)]], device bfloat* Y [[buffer(3)]], uint3 tg [[threadgroup_position_in_grid]], \
-      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {                      \
-    ll_matvec_t<ROWS>(X, W, a, Y, tg, sg, lane);                                                                   \
+      constant ll_mv_args& a [[buffer(2)]], device bfloat* Y [[buffer(3)]], const device bfloat* Bv [[buffer(4)]],   \
+      uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],                       \
+      uint lane [[thread_index_in_simdgroup]]) {                                                                   \
+    ll_matvec_t<ROWS>(X, W, Bv, a, Y, tg, sg, lane);                                                               \
   }
 LL_MATVEC(1)
 LL_MATVEC(2)
@@ -306,6 +308,13 @@ LL_MATVEC(4)
 LL_MATVEC(8)
 LL_MATVEC(16)
 LL_MATVEC(32)
+
+// Y[r, j] = bf16(C[r, j] + b[j]): a prompt chunk's fp32 sums (ll_gemm_f32) with the release's bias, rounded once.
+[[kernel]] void ll_bias_round(const device float* C [[buffer(0)]], const device bfloat* Bv [[buffer(1)]],
+    constant ll_mv_args& a [[buffer(2)]], device bfloat* Y [[buffer(3)]], uint2 p [[thread_position_in_grid]]) {
+  if (p.x >= a.n || p.y >= a.rows) return;
+  Y[(size_t)p.y * a.ldy + p.x] = bfloat(C[(size_t)p.y * a.n + p.x] + float(Bv[p.x]));
+}
 
 // Pack-quantized int4 (layout in weights.zig's Int4): nibble e of `word` is bf16((q - z) * s), as its decompressor.
 inline float ll_q4(uint word, uint e, float z, float s) { return float(bfloat((float((word >> (4 * e)) & 15u) - z) * s)); }

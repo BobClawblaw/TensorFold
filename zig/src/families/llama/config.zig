@@ -1,5 +1,6 @@
-//! Llama (model_type llama) admission: dense GQA, 128-wide heads, default RoPE; `qualified` checkpoints only.
+//! Llama and Qwen2 (q, k and v biases, static YaRN) admission: dense GQA, 128-wide heads; `qualified` checkpoints only.
 const std = @import("std");
+const rope_yarn = @import("core").rope_yarn;
 
 pub const head_dim = 128;
 pub const max_layers = 128;
@@ -20,15 +21,23 @@ pub const Error = error{
 /// What a qualified checkpoint was checked for: served on its own, or drafting for a served one.
 pub const Role = enum { served, drafter };
 
+/// --drafter on a served checkpoint: measured to pay on the device, measured slower, or no drafter checked with it yet.
+pub const Drafts = enum { pays, slower, unchecked };
+
 /// The projections' storage: bf16, or compressed-tensors' pack-quantized int4 in groups of 32 (weights.zig's Int4).
 pub const Weights = enum { bf16, int4_g32 };
+
+/// transformers' static YaRN: the trained window stretched by `factor`; the cosines and sines carry 0.1 ln(factor) + 1.
+pub const Yarn = struct { factor: f64, trained: usize };
 
 /// A checkpoint checked on the device, by the geometry and weights its config names.
 pub const Qualified = struct {
     name: []const u8,
     role: Role,
     weights: Weights,
-    drafted: bool, // served with --drafter: its drafts were measured to pay on the device; otherwise refused by name
+    drafts: Drafts,
+    /// The checkpoint's template opens a think block, which the server returns as reasoning_content.
+    reasoning: bool,
     hidden: usize,
     intermediate: usize,
     layers: usize,
@@ -37,14 +46,18 @@ pub const Qualified = struct {
     vocab: usize,
     theta: f64,
     context: usize,
+    bias: bool = false, // q, k and v biases (Qwen2)
+    yarn: ?Yarn = null,
 };
 
 /// The checkpoints the family serves; another `llama` checkpoint is refused until it has been checked the same way.
 pub const qualified = [_]Qualified{
-    .{ .name = "Nanbeige4.3-33B", .role = .served, .weights = .bf16, .drafted = true, .hidden = 7168, .intermediate = 22016, .layers = 52, .heads = 56, .kv_heads = 8, .vocab = 166912, .theta = 120000000, .context = 524288 },
-    .{ .name = "Nanbeige4.3-33B-INT4", .role = .served, .weights = .int4_g32, .drafted = false, .hidden = 7168, .intermediate = 22016, .layers = 52, .heads = 56, .kv_heads = 8, .vocab = 166912, .theta = 120000000, .context = 524288 },
+    .{ .name = "Nanbeige4.3-33B", .role = .served, .weights = .bf16, .drafts = .pays, .reasoning = true, .hidden = 7168, .intermediate = 22016, .layers = 52, .heads = 56, .kv_heads = 8, .vocab = 166912, .theta = 120000000, .context = 524288 },
+    .{ .name = "Nanbeige4.3-33B-INT4", .role = .served, .weights = .int4_g32, .drafts = .slower, .reasoning = true, .hidden = 7168, .intermediate = 22016, .layers = 52, .heads = 56, .kv_heads = 8, .vocab = 166912, .theta = 120000000, .context = 524288 },
+    // Qwen2 (a Qwen2.5-Coder-7B-Instruct fine-tune): q, k and v biases, YaRN 4x over its 8,192 trained window
+    .{ .name = "Bimo-7B-CyberAgent", .role = .served, .weights = .bf16, .drafts = .unchecked, .reasoning = false, .hidden = 3584, .intermediate = 18944, .layers = 28, .heads = 28, .kv_heads = 4, .vocab = 152064, .theta = 10000, .context = 32768, .bias = true, .yarn = .{ .factor = 4, .trained = 8192 } },
     // its drafts are checked by the served model's windows, its own logits not against HF
-    .{ .name = "Nanbeige4.1-3B", .role = .drafter, .weights = .bf16, .drafted = false, .hidden = 2560, .intermediate = 10496, .layers = 32, .heads = 20, .kv_heads = 4, .vocab = 166144, .theta = 70000000, .context = 262144 },
+    .{ .name = "Nanbeige4.1-3B", .role = .drafter, .weights = .bf16, .drafts = .unchecked, .reasoning = true, .hidden = 2560, .intermediate = 10496, .layers = 32, .heads = 20, .kv_heads = 4, .vocab = 166144, .theta = 70000000, .context = 262144 },
 };
 
 /// Weights a group of the int4 projections: one bf16 scale and one 4-bit zero point each.
@@ -66,6 +79,10 @@ pub const Config = struct {
     theta: f64,
     context: usize,
     weights: Weights = .bf16,
+    /// q, k and v carry biases (Qwen2); o and the MLP never do.
+    bias: bool = false,
+    /// Static YaRN over the trained window; null is HF's default rope.
+    yarn: ?Yarn = null,
     eos: [max_eos]u32 = @splat(0),
     eos_count: usize = 0,
 
@@ -83,7 +100,7 @@ pub const Config = struct {
     pub fn qualification(c: Config) Error!*const Qualified {
         for (&qualified) |*q| {
             if (c.weights == q.weights and c.hidden == q.hidden and c.intermediate == q.intermediate and c.layers == q.layers and c.heads == q.heads and
-                c.kv_heads == q.kv_heads and c.vocab == q.vocab and c.theta == q.theta and c.context == q.context) return q;
+                c.kv_heads == q.kv_heads and c.vocab == q.vocab and c.theta == q.theta and c.context == q.context and c.bias == q.bias and std.meta.eql(c.yarn, q.yarn)) return q;
         }
         return error.UnqualifiedLlamaCheckpoint;
     }
@@ -116,12 +133,22 @@ pub const Config = struct {
         return false;
     }
 
-    /// RoPE inverse frequencies [head_dim / 2] as fp32: HF's 1 / theta^(2i / head_dim).
+    /// RoPE inverse frequencies [head_dim / 2] as fp32: HF's 1 / theta^(2i / head_dim), or its static YaRN table.
     pub fn inverseFrequencies(c: Config, out: []f32) void {
+        if (c.yarn) |y| {
+            @memcpy(out, &rope_yarn.yarnOf(head_dim, c.theta, y.factor, y.trained).freq);
+            return;
+        }
         for (out, 0..) |*f, i| {
             const e: f64 = @as(f64, @floatFromInt(2 * i)) / @as(f64, head_dim);
             f.* = @floatCast(1.0 / std.math.pow(f64, c.theta, e));
         }
+    }
+
+    /// The factor the cosines and sines carry before their bf16 rounding: YaRN's 0.1 ln(factor) + 1, else 1.
+    pub fn ropeScale(c: Config) f32 {
+        const y = c.yarn orelse return 1.0;
+        return rope_yarn.yarnOf(head_dim, c.theta, y.factor, y.trained).scale;
     }
 };
 
@@ -165,13 +192,31 @@ fn size(o: std.json.ObjectMap, key: []const u8) Error!usize {
     return if (v > 0) @intCast(v) else error.UnsupportedLlamaGeometry;
 }
 
-/// rope_scaling: absent, null, or the default type by either name.
-fn rotary(o: std.json.ObjectMap) Error!void {
-    const v = o.get("rope_scaling") orelse return;
-    if (v == .null) return;
+/// rope_parameters or rope_scaling: absent, null, default, or YaRN by factor and trained window alone (no other keys).
+fn rotary(o: std.json.ObjectMap) Error!?Yarn {
+    const v = o.get("rope_parameters") orelse o.get("rope_scaling") orelse return null;
+    if (v == .null) return null;
     const r = try object(v);
     const kind = r.get("rope_type") orelse r.get("type") orelse return error.UnsupportedLlamaRotary;
-    if (!isString(kind, "default")) return error.UnsupportedLlamaRotary;
+    if (isString(kind, "default")) return null;
+    if (!isString(kind, "yarn")) return error.UnsupportedLlamaRotary;
+    var it = r.iterator();
+    while (it.next()) |e| {
+        for ([_][]const u8{ "rope_type", "type", "factor", "original_max_position_embeddings", "rope_theta" }) |known| {
+            if (std.mem.eql(u8, e.key_ptr.*, known)) break;
+        } else return error.UnsupportedLlamaRotary;
+    }
+    const factor = try number(r.get("factor") orelse return error.UnsupportedLlamaRotary);
+    const trained = try integer(r, "original_max_position_embeddings");
+    if (!(factor > 1) or trained < 1) return error.UnsupportedLlamaRotary;
+    return .{ .factor = factor, .trained = @intCast(trained) };
+}
+
+/// rope_theta at the root, or inside transformers 5's rope_parameters; HF's 10,000 when neither names it.
+fn theta(root: std.json.ObjectMap) Error!f64 {
+    if (root.get("rope_theta")) |t| return number(t);
+    if (root.get("rope_parameters")) |p| if (p == .object) if (p.object.get("rope_theta")) |t| return number(t);
+    return 10000.0;
 }
 
 fn eosIds(v: std.json.Value, c: *Config) Error!void {
@@ -228,8 +273,14 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer parsed.deinit();
     const root = try object(parsed.value);
-    if (!isString(root.get("model_type"), "llama")) return error.BadLlamaConfig;
-    if (isTrue(root, "attention_bias") or isTrue(root, "mlp_bias") or isTrue(root, "tie_word_embeddings")) return error.UnsupportedLlamaGeometry;
+    const qwen2 = isString(root.get("model_type"), "qwen2");
+    if (!qwen2 and !isString(root.get("model_type"), "llama")) return error.BadLlamaConfig;
+    if (isTrue(root, "mlp_bias") or isTrue(root, "tie_word_embeddings")) return error.UnsupportedLlamaGeometry;
+    // Qwen2's q, k and v projections carry biases (modeling_qwen2 builds them with bias=True), a Llama's none
+    if (qwen2) {
+        if (root.get("attention_bias")) |b| if (b != .bool or !b.bool) return error.UnsupportedLlamaGeometry;
+        if (isTrue(root, "use_sliding_window")) return error.UnsupportedLlamaGeometry;
+    } else if (isTrue(root, "attention_bias")) return error.UnsupportedLlamaGeometry;
     if (root.get("hidden_act")) |act| if (!isString(act, "silu")) return error.UnsupportedLlamaGeometry;
     for ([_][]const u8{ "torch_dtype", "dtype" }) |key| if (root.get(key)) |d| if (!isString(d, "bfloat16")) return error.UnsupportedLlamaPrecision;
     if (root.get("quantization") != null) return error.UnsupportedLlamaPrecision;
@@ -242,9 +293,10 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
         .kv_heads = 0,
         .vocab = try size(root, "vocab_size"),
         .eps = @floatCast(try number(root.get("rms_norm_eps") orelse return error.BadLlamaConfig)),
-        .theta = try number(root.get("rope_theta") orelse .{ .float = 10000.0 }),
+        .theta = try theta(root),
         .context = 0,
         .weights = weights,
+        .bias = qwen2,
     };
     const kv_heads = try integerOr(root, "num_key_value_heads", @intCast(c.heads));
     if (kv_heads < 1 or kv_heads > c.heads) return error.UnsupportedLlamaGeometry;
@@ -254,10 +306,12 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Config {
     // the tensor-unit GEMM steps k by 256s; the row kernels read eight values a lane over 256
     if (c.hidden % 256 != 0 or c.intermediate % 256 != 0 or c.layers > max_layers) return error.UnsupportedLlamaGeometry;
     if (!(c.eps > 0) or !(c.theta > 0)) return error.BadLlamaConfig;
-    try rotary(root);
+    c.yarn = try rotary(root);
     const context = try integer(root, "max_position_embeddings");
     if (context < 1 or context > 1 << 20) return error.BadLlamaContext;
     c.context = @intCast(context);
+    // YaRN stretches the trained window by its factor to the context: transformers' two spellings of one window
+    if (c.yarn) |y| if (@as(f64, @floatFromInt(c.context)) != y.factor * @as(f64, @floatFromInt(y.trained))) return error.UnsupportedLlamaRotary;
     try eosIds(root.get("eos_token_id") orelse return error.BadLlamaEos, &c);
     if (c.eos_count == 0) return error.BadLlamaEos;
     return c;
@@ -418,4 +472,54 @@ test "RoPE's inverse frequencies: 1 at the first pair, falling to theta^-(1 - 1/
     try std.testing.expectEqual(@as(f32, 1), f[0]);
     try std.testing.expect(f[1] < 1 and f[63] > 0 and f[63] < f[62]);
     try std.testing.expectApproxEqRel(@as(f32, @floatCast(std.math.pow(f64, 120000000.0, -126.0 / 128.0))), f[63], 1e-6);
+}
+
+const bimo = @embedFile("fixtures/bimo-config.json");
+
+test "Bimo-7B-CyberAgent's config (qwen2, q/k/v biases, YaRN 4x over 8,192) is admitted, its table transformers'" {
+    const c = try parse(std.testing.allocator, bimo);
+    try std.testing.expectEqualStrings("Bimo-7B-CyberAgent", (try c.qualification()).name);
+    try std.testing.expect(c.bias);
+    try std.testing.expectEqual(@as(f64, 10000), c.theta); // rope_theta inside rope_parameters
+    try std.testing.expectEqual(@as(usize, 32768), c.context);
+    try std.testing.expectEqual(@as(usize, 7), c.group());
+    try std.testing.expectEqual(@as(usize, 4608), c.qkvWidth());
+    try std.testing.expectEqual(@as(usize, 1), c.eos_count);
+    try std.testing.expectEqual(@as(u32, 151645), c.eos[0]);
+    var inv: [head_dim / 2]f32 = undefined;
+    c.inverseFrequencies(&inv);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), @as(u32, @bitCast(inv[0])));
+    try std.testing.expectEqual(@as(u32, 0x37f22ce2), @as(u32, @bitCast(inv[63])));
+    try std.testing.expectEqual(@as(u32, 0x3f91be9c), @as(u32, @bitCast(c.ropeScale())));
+    // the Llama release keeps the plain table and no factor
+    const plain = try parse(std.testing.allocator, fixture);
+    try std.testing.expect(!plain.bias and plain.yarn == null);
+    try std.testing.expectEqual(@as(f32, 1.0), plain.ropeScale());
+}
+
+test "qwen2 is refused by name: a sliding window, biases turned off, another rope, a stretched window that is not the context" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { []const u8, []const u8, Error }{
+        .{ "\"use_sliding_window\": false", "\"use_sliding_window\": true", error.UnsupportedLlamaGeometry },
+        .{ "\"model_type\": \"qwen2\"", "\"attention_bias\": false, \"model_type\": \"qwen2\"", error.UnsupportedLlamaGeometry },
+        .{ "\"rope_type\": \"yarn\"", "\"rope_type\": \"dynamic\"", error.UnsupportedLlamaRotary },
+        .{ "\"factor\": 4.0", "\"factor\": 4.0, \"attention_factor\": 1.0", error.UnsupportedLlamaRotary },
+        .{ "\"factor\": 4.0", "\"factor\": 4.0, \"beta_fast\": 32", error.UnsupportedLlamaRotary },
+        .{ "\"max_position_embeddings\": 32768", "\"max_position_embeddings\": 16384", error.UnsupportedLlamaRotary },
+        .{ "\"model_type\": \"qwen2\"", "\"model_type\": \"qwen3\"", error.BadLlamaConfig },
+    };
+    for (cases) |case| {
+        const text = try std.mem.replaceOwned(u8, a, bimo, case[0], case[1]);
+        defer a.free(text);
+        try std.testing.expect(!std.mem.eql(u8, text, bimo));
+        try std.testing.expectError(case[2], parse(a, text));
+    }
+    // a Llama with biases stays refused, and a Qwen2 of another geometry parses but is not qualified
+    const biased = try std.mem.replaceOwned(u8, a, fixture, "\"attention_bias\": false", "\"attention_bias\": true");
+    defer a.free(biased);
+    try std.testing.expectError(error.UnsupportedLlamaGeometry, parse(a, biased));
+    const other = try std.mem.replaceOwned(u8, a, bimo, "\"num_hidden_layers\": 28", "\"num_hidden_layers\": 24");
+    defer a.free(other);
+    const d = try parse(a, other);
+    try std.testing.expectError(error.UnqualifiedLlamaCheckpoint, d.qualification());
 }
