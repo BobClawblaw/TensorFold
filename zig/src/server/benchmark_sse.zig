@@ -39,6 +39,8 @@ pub const Stream = struct {
     done: bool = false,
     finished: bool = false,
     finish_reason: ?Value = null,
+    /// community-v2 counts a sampled stop past 128 tokens as complete; community-v1 counts it as early EOS.
+    natural_stops: bool = true,
 
     pub fn init(a: Allocator) Allocator.Error!Stream {
         return .{ .a = a, .runtime = try json.newObject(a) };
@@ -138,7 +140,7 @@ pub const Stream = struct {
         sample.cached_tokens = cached;
         if (s.first == null or completion == 0) return error.EmptyOutput;
         if (completion > tokens) return error.TokenCountMismatch;
-        const natural_sample = sample.temperature > 0 and std.mem.eql(u8, reason, "stop") and completion >= 128;
+        const natural_sample = s.natural_stops and sample.temperature > 0 and std.mem.eql(u8, reason, "stop") and completion >= 128;
         if (completion < tokens and !natural_sample) {
             sample.status = .early_eos;
         } else if (s.deliveries < 2 or s.last.? <= s.first.?) {

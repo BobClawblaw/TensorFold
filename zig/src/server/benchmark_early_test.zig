@@ -74,3 +74,27 @@ test "issue 969: sampled early stops keep counts and seeds, suppress aggregates 
         try std.testing.expectEqual(@as(usize, if (case == .full or case == .natural) 0 else 1), std.mem.count(u8, r.out.written(), explanation));
     }
 }
+
+test "issue 969 v1: community-v1 keeps a sampled stop past 128 tokens as early EOS, as the board's v1 rules do" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var r = try cli.Run.init(a, &tmp);
+    const ok = try fake.reply(a, false, 256, 15);
+    const f = try fake.Fake.start(std.testing.allocator, try a.dupe(fake.Route, &.{
+        .{ .method = "POST", .path = "/v1/completions", .replies = try a.dupe([]const fake.Write, &.{ ok, ok, try stopped(a, false, 177), ok }) },
+        .{ .method = "POST", .path = "/v1/chat/completions", .replies = try a.dupe([]const fake.Write, &.{try fake.reply(a, true, 256, 15)}) },
+    }));
+    defer f.stop();
+    const out = try r.path("run.json");
+    try std.testing.expectEqual(@as(u8, 2), try r.command(&.{ "example-org/test-model", "--server", try f.url(a, ""), "--backend", "cuda", "--tokens", "256", "--reps", "3", "--temperatures", "1", "--suite", "community-v1", "--output", out }));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, out, a, .limited(1 << 20));
+    const v = (try json.parse(a, bytes)).ok;
+    try std.testing.expectEqualStrings(suite.legacy_id, v.get("suite").?.get("id").?.string);
+    const failed = v.get("samples").?.array[1];
+    try std.testing.expectEqualStrings("early_eos", failed.get("status").?.string);
+    try std.testing.expect(failed.get("finish_reason") == null);
+    try std.testing.expect(!(try suite.cells(a, v.get("samples").?.array, 3))[0].complete);
+}

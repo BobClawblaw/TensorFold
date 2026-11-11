@@ -323,14 +323,14 @@ fn run(ctx: *const Context, args: Args) !u8 {
     if (!std.mem.eql(u8, backend, "mlx") and !std.mem.eql(u8, backend, "cuda") and !rocm)
         return fail(ctx, try std.fmt.allocPrint(a, "community-v2 runs cover mlx, cuda and rocm; this build serves {s}", .{backend}));
     if (rocm and args.publish) return fail(ctx, check.rocm_local);
-    if (args.publish and !upload.v2_submissions_enabled) return fail(ctx, upload.v2_disabled);
+    if (args.publish and std.mem.eql(u8, args.suite, suite.id) and !upload.v2_submissions_enabled) return fail(ctx, upload.v2_disabled);
     if (args.publish) {
         const api = upload.apiUrl(args.upload_url, &problem) orelse return fail(ctx, problem);
         _ = try ctx.publication.credential(a, ctx.io, options(ctx, api), &problem) orelse return fail(ctx, problem);
     }
     const run_id = receipt.runId(ctx.io);
     const bench_dir = try std.fs.path.join(a, &.{ ctx.home, ".tensorfold", "benchmarks" });
-    const settings: receipt.Settings = .{ .tokens = @intCast(args.tokens), .repetitions = @intCast(args.reps), .temperatures = args.temperatures, .serial = args.serial, .context_tokens = args.context, .managed = args.server == null, .kv_cache = if (args.server == null) (args.kv_cache orelse "bf16") else null };
+    const settings: receipt.Settings = .{ .tokens = @intCast(args.tokens), .repetitions = @intCast(args.reps), .temperatures = args.temperatures, .serial = args.serial, .context_tokens = args.context, .managed = args.server == null, .kv_cache = if (args.server == null) (args.kv_cache orelse "bf16") else null, .suite = args.suite };
     var facts: struct { model: receipt.Model, hardware: receipt.Hardware, runtime: receipt.Runtime } = undefined;
     var rank_count: ?u8 = null;
     var group: ?json.Value = null;
@@ -410,7 +410,7 @@ fn run(ctx: *const Context, args: Args) !u8 {
         break :blk try std.fmt.allocPrint(a, "{s}/{s}.json", .{ bench_dir, &run_id });
     };
     if (!try receipt.writable(a, ctx.io, dest, &problem)) return fail(ctx, try std.fmt.allocPrint(a, "{s}; choose another --output", .{problem}));
-    try say(ctx, "{s}: code and chat, {d} temperatures, {d} repeats after warm-up.", .{ suite.id, args.temperatures.len, args.reps });
+    try say(ctx, "{s}: code and chat, {d} temperatures, {d} repeats after warm-up.", .{ args.suite, args.temperatures.len, args.reps });
     try say(ctx, "This generates model replies; use Ctrl-C to cancel. Nothing is uploaded unless you publish.", .{});
     if (note) |n| try say(ctx, "{s}", .{n});
     if (wait) |w| try say(ctx, "{s}", .{w});
@@ -447,7 +447,7 @@ fn run(ctx: *const Context, args: Args) !u8 {
     target.thinking_applicable = thinking.applicable;
     try say(ctx, "Chat thinking: {s}", .{if (target.thinking_applicable == false) "not applicable" else if (target.thinking_switch == false) "server default (off unsupported; local only)" else if (target.thinking_switch == true) "off" else "off requested (unverified)"});
     var printer: Printer = .{ .ctx = ctx, .reps = args.reps };
-    const samples = stream.run(a, ctx.io, target, .{ .tokens = @intCast(args.tokens), .reps = @intCast(args.reps), .temperatures = args.temperatures, .serial = args.serial, .timeout_s = args.timeout, .chat_only = chat_only }, .{ .ctx = &printer, .call = Printer.call, .said = Printer.said }) catch |e| {
+    const samples = stream.run(a, ctx.io, target, .{ .tokens = @intCast(args.tokens), .reps = @intCast(args.reps), .temperatures = args.temperatures, .serial = args.serial, .timeout_s = args.timeout, .chat_only = chat_only, .protocol = args.suite }, .{ .ctx = &printer, .call = Printer.call, .said = Printer.said }) catch |e| {
         if (managed) |*m| _ = m.stop();
         return e;
     };

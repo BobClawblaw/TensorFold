@@ -94,11 +94,14 @@ Retries return the same saved submission without using another upload. Older man
 
 ### Existing CLI publishing credentials
 
-CLI installations that already have scoped upload credentials can continue to publish eligible community-v1 receipts directly:
+CLI installations that already have scoped upload credentials can continue to publish eligible community-v1 receipts directly. `--suite community-v1` runs that protocol with a current build: its manifest and digest, samples without `finish_reason` or `route`, a sampled stop short of the requested tokens counted as early EOS, and code on its raw route (`--chat-only` is v2 only).
 
 ```sh
 # Publish an eligible legacy receipt; --yes consents without the prompt.
 tensorfold benchmark publish legacy-v1-receipt.json --yes
+
+# Run the protocol the board accepts now (its suites endpoint lists community-v1) and publish the run.
+tensorfold benchmark TensorFold/Qwen3.8-27B-MLX-4bit --suite community-v1 --publish --yes
 
 # Remove locally stored CLI upload credentials.
 tensorfold benchmark logout

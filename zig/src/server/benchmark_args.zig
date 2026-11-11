@@ -2,6 +2,7 @@
 const std = @import("std");
 const fields = @import("fields.zig");
 const upload = @import("benchmark_upload.zig");
+const suite = @import("benchmark_suite.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Action = enum { run, publish, inspect, login, logout, suites, help };
@@ -15,6 +16,8 @@ pub const Args = struct {
     server: ?[]const u8 = null,
     model_id: ?[]const u8 = null,
     chat_only: bool = false,
+    /// The protocol a run follows: community-v2, or community-v1 for a receiver that accepts only it.
+    suite: []const u8 = suite.id,
     tokens: i64 = 256,
     reps: i64 = 5,
     temperatures: []const f64 = &.{ 1.0, 0.0 },
@@ -32,7 +35,7 @@ pub const Args = struct {
     token_stdin: bool = false,
 };
 
-pub const usage_line = "usage: tensorfold benchmark [-h] [--backend {auto,mlx,cuda,rocm}] [--server SERVER] [--model-id MODEL_ID] [--chat-only] [--tokens TOKENS] [--reps REPS] [--temperatures TEMPERATURES] [--serial] [--context CONTEXT] [--kv-cache {bf16,fp8}] [--drafter DRAFTER] [--timeout TIMEOUT] [--startup-timeout STARTUP_TIMEOUT] [--output OUTPUT] [--publish] [--yes] [--upload-url UPLOAD_URL] [--token-stdin] [target] [file]";
+pub const usage_line = "usage: tensorfold benchmark [-h] [--backend {auto,mlx,cuda,rocm}] [--server SERVER] [--model-id MODEL_ID] [--chat-only] [--suite SUITE] [--tokens TOKENS] [--reps REPS] [--temperatures TEMPERATURES] [--serial] [--context CONTEXT] [--kv-cache {bf16,fp8}] [--drafter DRAFTER] [--timeout TIMEOUT] [--startup-timeout STARTUP_TIMEOUT] [--output OUTPUT] [--publish] [--yes] [--upload-url UPLOAD_URL] [--token-stdin] [target] [file]";
 
 const Flag = struct { name: []const u8, value: bool = true, help: []const u8 };
 
@@ -40,6 +43,7 @@ pub const flags = [_]Flag{
     .{ .name = "--backend", .help = "auto, mlx, cuda or rocm (default: auto, this build's backend)" },
     .{ .name = "--server", .help = "attach to an existing server; result stays unranked without a server manifest" },
     .{ .name = "--chat-only", .value = false, .help = "declare an attached checkpoint has no raw-text mode; code uses one user chat message (v2 only)" },
+    .{ .name = "--suite", .help = "the protocol to run: community-v2 (default) or community-v1, the one the board accepts until it takes v2" },
     .{ .name = "--model-id", .help = "model alias to request from an attached server" },
     .{ .name = "--tokens", .help = "output tokens per request (default: 256)" },
     .{ .name = "--reps", .help = "measured repetitions per workload and temperature (default: 5)" },
@@ -120,6 +124,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, problem: *[]const u8) error
         if (is(name, "--server")) out.server = value;
         if (is(name, "--model-id")) out.model_id = value;
         if (is(name, "--chat-only")) out.chat_only = true;
+        if (is(name, "--suite")) out.suite = suite.named(value) orelse return usage(a, problem, "argument --suite: invalid choice: '{s}' (choose from community-v2, community-v1)", .{value});
         if (is(name, "--tokens")) out.tokens = try int(a, problem, name, value);
         if (is(name, "--reps")) out.reps = try int(a, problem, name, value);
         if (is(name, "--temperatures")) temperatures = value;
@@ -159,7 +164,7 @@ fn checks(a: Allocator, out: *Args, temperatures: []const u8, problem: *[]const 
     for ([_]Action{ .publish, .inspect, .login, .logout, .suites }) |act| if (std.mem.eql(u8, out.target, @tagName(act))) {
         out.action = act;
     };
-    if (out.chat_only and (out.action != .run or out.server == null)) return invalid(problem, "--chat-only applies only to a v2 run with --server; managed runs use the native family declaration");
+    if (out.chat_only and (out.action != .run or out.server == null or out.suite.ptr != suite.id.ptr)) return invalid(problem, "--chat-only applies only to a v2 run with --server; managed runs use the native family declaration");
     if (out.kv_cache != null and out.server != null) return invalid(problem, "--kv-cache applies only to a managed run; an attached server's cache format is its own");
     if (out.action == .publish or out.action == .inspect) {
         if (out.file == null) return invalid(problem, "This action needs a receipt JSON file");
@@ -188,7 +193,7 @@ fn checks(a: Allocator, out: *Args, temperatures: []const u8, problem: *[]const 
 
 /// ``-h``: the usage line and one line per flag.
 pub fn help(w: *std.Io.Writer) !void {
-    try w.print("{s}\n\nRun and save community-v2 locally. V2 publication is disabled until receiver support ships.\nPublish accepts eligible legacy community-v1 receipts.\n\npositional arguments:\n  target  model ID or checkpoint directory, or publish/inspect/login/logout/suites\n  file    receipt JSON for publish or inspect\n\noptions:\n", .{usage_line});
+    try w.print("{s}\n\nRun and save community-v2 locally. V2 publication is disabled until receiver support ships.\n--suite community-v1 runs the protocol the board accepts, and publish accepts eligible community-v1 receipts.\n\npositional arguments:\n  target  model ID or checkpoint directory, or publish/inspect/login/logout/suites\n  file    receipt JSON for publish or inspect\n\noptions:\n", .{usage_line});
     for (flags) |f| try w.print("  {s:<18} {s}\n", .{ f.name, f.help });
 }
 
