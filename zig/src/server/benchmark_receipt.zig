@@ -120,9 +120,9 @@ pub fn value(a: Allocator, run_id: []const u8, created_at: []const u8, model: Mo
     try st.int("rank_count", settings.rank_count);
     if (settings.thinking_mode) |mode| try st.str("thinking_mode", mode);
     try top.put("settings", st.value());
-    if (settings.group) |g| try top.put("group", g);
-    const rows = try a.alloc(Value, samples.len);
     const v2 = std.mem.eql(u8, settings.suite, suite.id);
+    if (settings.group) |g| if (v2) try top.put("group", g); // only a community-v2 receipt may hold the loaded group
+    const rows = try a.alloc(Value, samples.len);
     for (samples, rows) |x, *slot| slot.* = try sampleValue(a, x, v2);
     try top.put("samples", .{ .array = rows });
     const v = top.value();
