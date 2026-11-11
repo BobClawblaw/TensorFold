@@ -19,7 +19,9 @@ LLAMA_LOAD_LIMIT_GB=40 zig-out/native/bin/tensorfold-native serve models/bimo-7b
 and `tool_choice: required`. The release's `generation_config.json` names temperature 0.7, top_p 0.8 and top_k 20,
 which the flags above give requests that set none; its `repetition_penalty` 1.1 is not applied (the family has no
 penalties). The template has no think block, so every reply is `content`; `--drafter` is refused by name, since no
-drafter has been checked with this checkpoint (the lane core's copy drafts stay on).
+drafter has been checked with this checkpoint. The lane core's copy drafts land 1.05 tokens a round on the
+harness's ruler and cost 6% (49 against 52 tokens/s on its drafts check, replies equal 12/12), so the recipe serves
+with `--no-drafts`.
 
 ## What the Qwen2 path adds to the family
 
@@ -82,7 +84,22 @@ SUMMARY 34 kernels: 34 pass gates 1-4, 0 fail, 0 known findings; 18 controls: 18
 
 ## Measured
 
-MEASURED-TBD
+M5 Ultra (256 GB), the recipe harness's ruler, greedy 256-token replies, engine 7662e079, `--no-drafts`, no other
+model loaded (the recipe's `evidence/bf16-speed` and `evidence/bf16-prefill-32k`):
+
+| streams | prose | code | structured | list | first token |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 55.7 | 44.4 | 55.6 | 55.9 | 0.07-0.10 s |
+| 2 | 88.6 | 103.8 | 113.3 | 113.4 | 0.11-0.14 s |
+
+Tokens a second, all streams together: one stream reads the 14.7 GiB of weights each step (19.0 ms a round), two
+streams read them once for both rows (19.2 ms). Cold prompts: 2,288 tokens at 5,974 tokens/s, 8,838 at 6,163,
+17,567 at 5,654 and 27,633 at 4,850 (5.7 s). A chat's third turn resumed from 5,493 of its 5,583 kept tokens starts
+in 0.13 s against 1.06 s cold, with the same reply. The harness's serving checks: structured 18/18 (drafted == plain
+12/12), soak 60/60, concurrent 12/12, streaming 4/4, multi-turn 8/8, stop 3/3, copy 2/2, sampling 9/9; its tool
+cases 4/5 (the `auto` case with two tools gets a fabricated `<tool_response>` instead of a call, with the published
+template and with the base model's tool-rendering template alike); its thinking cases do not apply, and its
+33-token max-tokens case ends in 14 tokens because the model refuses the essay prompt as off-topic.
 
 ## Licence
 
