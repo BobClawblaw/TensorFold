@@ -115,7 +115,7 @@ pub fn value(a: Allocator, run_id: []const u8, created_at: []const u8, model: Mo
     try st.put("temperatures", .{ .array = temps });
     try st.put("serial", .{ .bool = settings.serial });
     try st.int("context_tokens", settings.context_tokens);
-    try st.str("kv_cache", settings.kv_cache);
+    if (std.mem.eql(u8, settings.suite, suite.id)) try st.str("kv_cache", settings.kv_cache); // a community-v1 receipt has no kv_cache field
     try st.put("managed", .{ .bool = settings.managed });
     try st.int("rank_count", settings.rank_count);
     if (settings.thinking_mode) |mode| try st.str("thinking_mode", mode);
