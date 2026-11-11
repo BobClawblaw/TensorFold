@@ -101,6 +101,15 @@ cases 4/5 (the `auto` case with two tools gets a fabricated `<tool_response>` in
 template and with the base model's tool-rendering template alike); its thinking cases do not apply, and its
 33-token max-tokens case ends in 14 tokens because the model refuses the essay prompt as off-topic.
 
+The recipe harness's quality suite, thinking off (greedy, its own prompts and graders, the recipe's
+`evidence/bf16-quality-off` and `evidence/bf16-humaneval-long-32k-off`): GSM8K 180/250, MATH-500 207/500, GPQA
+diamond 47/198, MMLU 182/342 (57 subjects x 6), MGSM 96/240, HumanEval 79/164 pass@1, IFEval 61/150 loose and
+57/150 strict, JSON 25/30, tool calls 9/60 (the published template renders no `tools`), repetition 0/8 (repeated
+4-grams 36.9% mean at greedy), needles 3/3 at 7k tokens, RULER-style long tasks 0/10 at 28k. The HumanEval
+failures are mostly a doubled closing parenthesis and the repetition replies loop; both are the model's: HF's bf16
+run teacher-forced over those replies gives the engine's token at every position of two 214- and 191-token
+HumanEval replies and of the 1,200-token worst repetition reply, and differs once at a near-tie in a third.
+
 ## Licence
 
 Bimo-7B-CyberAgent is published under Apache 2.0 on Hugging Face; TensorFold redistributes no weights, the server
