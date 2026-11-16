@@ -91,6 +91,36 @@ pub const Archive = struct {
         };
     }
 
+    /// name's elements as stored (row-major bytes, caller frees): dtype and shape as given, the member CRC-checked.
+    pub fn readRaw(self: *const Archive, gpa: Allocator, name: []const u8, dtype: DType, shape: []const u64) ![]u8 {
+        const t = try self.tensor(name);
+        if (t.dtype != dtype) return error.UnexpectedDType;
+        if (!std.mem.eql(u64, t.shape, shape)) {
+            std.log.err("tensor {s} has shape {any}, expected {any}", .{ name, t.shape, shape });
+            return error.ShapeMismatch;
+        }
+        var numel: u64 = 1;
+        var i = t.shape.len;
+        while (i > 0) {
+            i -= 1;
+            if (t.shape[i] != 1 and t.stride[i] != numel) return error.NonContiguousTensor;
+            numel *= t.shape[i];
+        }
+        if (t.offset > t.storage_numel or numel > t.storage_numel - t.offset) return error.BadArchive;
+        const width = elementBytes(dtype);
+        const key = try std.fmt.allocPrint(gpa, "{s}data/{s}", .{ self.prefix, t.storage });
+        defer gpa.free(key);
+        const m = self.members.get(key) orelse return error.MissingStorage;
+        if (m.size != std.math.mul(u64, t.storage_numel, width) catch return error.BadArchive) return error.BadArchive;
+        const all = try gpa.alloc(u8, @intCast(m.size));
+        errdefer gpa.free(all);
+        try readMember(self.io, self.file, m, all);
+        if (t.offset == 0 and numel == t.storage_numel) return all;
+        const out = try gpa.dupe(u8, all[@intCast(t.offset * width)..][0..@intCast(numel * width)]);
+        gpa.free(all);
+        return out;
+    }
+
     /// name's float32 elements row-major (caller frees), its shape and its storage member's CRC-32 checked.
     pub fn readF32(self: *const Archive, gpa: Allocator, name: []const u8, shape: []const u64) ![]f32 {
         const t = try self.tensor(name);
