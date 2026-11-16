@@ -46,7 +46,7 @@ pub const Format = enum {
     }
 };
 
-pub const Plan = struct { input: []const u8, prompt: []const u32, frames: ?[]const [11]i32 = null, refs: []const @import("drama_prompt").Reference = &.{}, reference_rows: u32 = 0, sampling: speech_sampling.Options, format: Format, stream: bool, budget_s: ?f64 = null };
+pub const Plan = struct { input: []const u8, prompt: []const u32, frames: ?[]const [11]i32 = null, speaker: []const f32 = &.{}, refs: []const @import("drama_prompt").Reference = &.{}, reference_rows: u32 = 0, sampling: speech_sampling.Options, format: Format, stream: bool, budget_s: ?f64 = null };
 
 /// One whole take: its audio, why it ended, and whether it ended in a mid-utterance silence.
 const Take = struct { pcm: []f32, reason: api.Reason, silence_mid: bool = false, trip: bool = false, jump: ?f64 = null };
@@ -111,7 +111,8 @@ fn responseFormat(cx: *Cx, value: []const u8) errors.Refused!Format {
 fn prepare(srv: *Server, cx: *Cx, sp: api.SpeechInfo, raw: Value) errors.Refused!Plan {
     if (raw != .object) return cx.refuse("speech request body must be a JSON object");
     try checkFields(cx, raw);
-    const sampling = try speech_sampling.parse(cx, raw);
+    const zonos = @import("zonos_speech.zig");
+    const sampling = if (srv.voices.zonos != null) try speech_sampling.parseFrom(cx, raw, .{ .temperature = zonos.temperature, .top_p = zonos.top_p, .top_k = zonos.top_k }, zonos.max_top_k) else try speech_sampling.parse(cx, raw);
     const model = raw.strField("model") orelse return cx.fail(.request, "model is required: send {s}", .{srv.config.served_name});
     if (!listed(srv.config.model_ids, model))
         return cx.fail(.request, "model {s} is not served here: send {s}", .{ try pyrepr.repr(cx.a, .{ .string = model }), srv.config.served_name });
@@ -124,7 +125,11 @@ fn prepare(srv: *Server, cx: *Cx, sp: api.SpeechInfo, raw: Value) errors.Refused
     const stream = if (raw.get("stream")) |s| s == .bool and s.bool else false;
     if (stream and format != .pcm) return cx.refuse("stream=true requires response_format='pcm'");
     const voice = raw.strField("voice") orelse raw.strField("speaker") orelse "default";
-    const refs = @import("drama_voice.zig").select(srv.voices, srv.config.default_voice, voice) catch {
+    if (srv.voices.zonos) |state| {
+        const made = try zonos.plan(state, cx, srv.text, sp, input, voice);
+        return .{ .input = input, .prompt = made.prompt, .frames = made.frames, .sampling = sampling, .format = format, .stream = stream };
+    }
+    const refs = @import("drama_voice.zig").select(srv.voices.drama, srv.config.default_voice, voice) catch {
         const name = try pyrepr.repr(cx.a, .{ .string = voice });
         if (srv.config.voices_dir != null)
             return cx.fail(.request, drama_prompt.error_prefix ++ " unknown voice {s}; see /v1/voices", .{name});
@@ -202,6 +207,7 @@ fn synthesize(srv: *Server, c: *Conn, cx: *Cx, id: []const u8, sp: api.SpeechInf
         .reference_rows = plan.reference_rows,
         .unconditioned = guided.rows,
         .cfg_gamma = guided.gamma,
+        .speaker = plan.speaker,
     };
     var box: Mailbox = .{ .io = srv.io, .gpa = srv.gpa };
     defer box.deinit();
