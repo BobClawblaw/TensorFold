@@ -48,6 +48,16 @@ pub const Archive = struct {
     prefix: []const u8,
 
     pub fn open(gpa: Allocator, io: std.Io, path: []const u8) !Archive {
+        return openAs(gpa, io, path, false);
+    }
+
+    /// A checkpoint whose root dict nests state dicts beside plain values (a step, a config): each tensor is named by
+    /// its keys joined with '/', e.g. "generator/quantizer.weight"; values that are not tensors are skipped.
+    pub fn openNested(gpa: Allocator, io: std.Io, path: []const u8) !Archive {
+        return openAs(gpa, io, path, true);
+    }
+
+    fn openAs(gpa: Allocator, io: std.Io, path: []const u8, nested: bool) !Archive {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -74,7 +84,7 @@ pub const Archive = struct {
         if (pm.size > 64 << 20) return error.BadArchive;
         const pickle = try a.alloc(u8, @intCast(pm.size));
         try readMember(io, file, pm, pickle);
-        const tensors = try unpickle(a, pickle);
+        const tensors = try unpickle(a, pickle, nested);
         return .{ .arena = arena, .io = io, .file = file, .members = members, .tensors = tensors, .prefix = prefix };
     }
 
@@ -274,7 +284,9 @@ const Value = union(enum) {
     none,
     boolean: bool,
     int: i64,
+    float: f64,
     str: []const u8,
+    list: *std.ArrayList(Value),
     tuple: []const Value,
     dict: *Dict,
     global: GlobalRef,
@@ -407,7 +419,25 @@ fn reduce(a: Allocator, f: Value, args: Value) !Value {
 }
 
 /// The state dict's tensors by name. Unknown opcodes and globals are refused, never run.
-fn unpickle(a: Allocator, data: []const u8) !std.StringHashMapUnmanaged(Tensor) {
+/// A nested root's tensors into `out` under `prefix`; plain values (numbers, strings, lists) are not weights.
+fn collect(a: Allocator, out: *std.StringHashMapUnmanaged(Tensor), prefix: []const u8, d: *const Dict, depth: usize) !void {
+    if (depth > 8) return error.BadPickle;
+    for (d.keys.items, d.values.items) |k, v| {
+        if (k != .str) continue;
+        const name = if (prefix.len == 0) k.str else try std.mem.concat(a, u8, &.{ prefix, "/", k.str });
+        switch (v) {
+            .tensor => |t| {
+                const gop = try out.getOrPut(a, name);
+                if (gop.found_existing) return error.BadPickle;
+                gop.value_ptr.* = t.*;
+            },
+            .dict => |sub| try collect(a, out, name, sub, depth + 1),
+            else => {},
+        }
+    }
+}
+
+fn unpickle(a: Allocator, data: []const u8, nested: bool) !std.StringHashMapUnmanaged(Tensor) {
     var stack: std.ArrayList(Value) = .empty;
     var marks: std.ArrayList(usize) = .empty;
     var memo: std.AutoHashMapUnmanaged(u32, Value) = .empty;
@@ -460,6 +490,23 @@ fn unpickle(a: Allocator, data: []const u8) !std.StringHashMapUnmanaged(Tensor) 
                 try stack.append(a, .{ .int = v });
             },
             'N' => try stack.append(a, .none),
+            'G' => try stack.append(a, .{ .float = @bitCast(std.mem.readInt(u64, (try r.bytes(8))[0..8], .big)) }), // BINFLOAT
+            ']' => { // EMPTY_LIST
+                const l = try a.create(std.ArrayList(Value));
+                l.* = .empty;
+                try stack.append(a, .{ .list = l });
+            },
+            'a' => { // APPEND
+                const v = try pop(&stack);
+                if (stack.items.len == 0 or stack.items[stack.items.len - 1] != .list) return error.BadPickle;
+                try stack.items[stack.items.len - 1].list.append(a, v);
+            },
+            'e' => { // APPENDS
+                const at = marks.pop() orelse return error.BadPickle;
+                if (at == 0 or at > stack.items.len or stack.items[at - 1] != .list) return error.BadPickle;
+                try stack.items[at - 1].list.appendSlice(a, stack.items[at..]);
+                stack.shrinkRetainingCapacity(at);
+            },
             0x88 => try stack.append(a, .{ .boolean = true }), // NEWTRUE
             0x89 => try stack.append(a, .{ .boolean = false }), // NEWFALSE
             'q', 'r' => { // BINPUT, LONG_BINPUT
@@ -508,6 +555,10 @@ fn unpickle(a: Allocator, data: []const u8) !std.StringHashMapUnmanaged(Tensor) 
                     else => return error.BadPickle,
                 };
                 var out: std.StringHashMapUnmanaged(Tensor) = .empty;
+                if (nested) {
+                    try collect(a, &out, "", root, 0);
+                    return out;
+                }
                 for (root.keys.items, root.values.items) |k, v| {
                     if (k != .str or v != .tensor) return error.BadPickle;
                     const gop = try out.getOrPut(a, k.str);
@@ -554,7 +605,7 @@ test "the state-dict VM reads torch.save's tensor records and their views" {
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const tensors = try unpickle(arena.allocator(), &fixture);
+    const tensors = try unpickle(arena.allocator(), &fixture, false);
     try std.testing.expectEqual(@as(u32, 3), tensors.count());
     const w = tensors.get("a.weight").?;
     try std.testing.expectEqual(DType.f32, w.dtype);
@@ -579,7 +630,7 @@ test "the state-dict VM refuses globals outside the allow-list" {
     const evil = "\x80\x02cos\nsystem\n.";
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    try std.testing.expectError(error.ForbiddenGlobal, unpickle(arena.allocator(), evil));
+    try std.testing.expectError(error.ForbiddenGlobal, unpickle(arena.allocator(), evil, false));
 }
 
 /// A float32 storage of 2^62 + 1 elements (an 8-byte LONG1 count): `numel * 4` wraps to the 4 bytes its member holds.
