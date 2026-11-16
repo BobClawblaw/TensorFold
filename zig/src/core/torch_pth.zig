@@ -1,4 +1,4 @@
-//! codec.pth read without Python: the zip's stored members and a pickle VM limited to weights_only's allow-list.
+//! torch.save checkpoints read without Python: stored zip members and a pickle VM limited to weights_only's allow-list.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -36,7 +36,7 @@ pub const Tensor = struct {
     stride: []const u64,
 };
 
-const zip = @import("zip_stored.zig");
+const zip = @import("torch_zip.zig");
 const Member = zip.Member;
 const readMember = zip.readMember;
 const readDirectory = zip.readDirectory;

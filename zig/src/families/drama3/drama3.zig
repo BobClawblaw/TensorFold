@@ -36,7 +36,6 @@ test {
     _ = @import("codec_schema.zig");
     _ = @import("cuda/stager.zig");
     _ = @import("cuda/reference_rows.zig");
-    _ = @import("codec_pth.zig");
     _ = prompt;
     _ = wav;
 }

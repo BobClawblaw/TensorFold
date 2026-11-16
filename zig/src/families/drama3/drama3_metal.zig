@@ -36,7 +36,6 @@ test {
     _ = reference_cache;
     _ = @import("codec_map.zig");
     _ = @import("codec_schema.zig");
-    _ = @import("codec_pth.zig");
     _ = prompt;
     _ = wav;
     _ = kernels;

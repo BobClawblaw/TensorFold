@@ -138,7 +138,7 @@ pub const Server = struct {
     info: api.Info,
     text: model_text.Text,
     config: Config,
-    voices: []const @import("drama_voice.zig").Voice = &.{},
+    voices: @import("speech_voices.zig").Voices = .{},
     keys: ?*auth.Store,
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
@@ -207,11 +207,7 @@ pub const Server = struct {
             return error.InvalidVisionMarkers;
         };
         srv.video_decoder = @import("input_types.zig").decodes(srv.info.vision); // no decoder: video parts are a 400, never a 500
-        if (config.voices_dir) |dir| {
-            if (srv.info.speech == null) return error.VoicesRequireSpeech;
-            srv.voices = try @import("drama_voice.zig").load(srv.arena.allocator(), io, dir);
-        }
-        _ = try @import("drama_voice.zig").select(srv.voices, config.default_voice, "default");
+        srv.voices = try @import("speech_voices.zig").load(srv.arena.allocator(), io, srv.info, config.model_dir, config.voices_dir, config.default_voice);
         if (!srv.info.capability(.text_generation)) {
             if (config.cortheon) return error.CortheonRequiresTextGeneration;
             return srv;
