@@ -536,6 +536,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer moss_image_decoder.destroy();
     var dsv41_suites = try @import("metal_dsv41_main.zig").Suites.create(a, device, queue, &kernels, o.only);
     defer dsv41_suites.destroy();
+    var zonos3: @import("metal_zonos3.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer zonos3.deinit();
+    try zonos3.collect(o.only);
     var t: g.Tally = .{};
     const t0 = std.Io.Clock.awake.now(init.io);
     if (o.gates) {
