@@ -51,6 +51,7 @@ pub const families: []const api.Family = &.{
     .{ .model_type = "qwen4", .formats = @import("qwen4").family.native_host.formats },
     .{ .model_type = "qwen4_text", .formats = @import("qwen4").family.native_host.formats },
     .{ .model_type = "fish_omni", .formats = &.{ "fp8-block128", "nvfp4" } },
+    .{ .model_type = "zonos3", .formats = &.{"bf16"} },
     .{ .model_type = "nemotron_h", .formats = affine_widths },
     .{ .model_type = "qwen4_exp", .formats = affine_widths },
     .{ .model_type = "glm5_next", .formats = &.{"mlx-q4g64"} },
@@ -138,6 +139,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return @import("drama_open.zig").openMetal(a, gpa, io, o, problem);
+    if (std.mem.eql(u8, o.model_type, "zonos3")) return @import("zonos_open.zig").openMetal(a, gpa, io, o, problem);
     if (o.cfg_enabled or o.cfg_batched) {
         problem.* = "--cfg-* guidance requires a Drama 3 speech model";
         return null;
