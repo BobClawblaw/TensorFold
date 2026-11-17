@@ -6,6 +6,7 @@ const errors = @import("errors.zig");
 const pyrepr = @import("pyrepr.zig");
 const text_mod = @import("model_text.zig");
 const req = @import("zonos_request");
+const textnorm = @import("zonos_textnorm.zig");
 const Allocator = std.mem.Allocator;
 
 pub const error_prefix = "ZONOS3 request:";
@@ -98,7 +99,10 @@ pub fn stockVoice(name: []const u8) bool {
 }
 
 /// The request's prompt: the voice's reference codes as a delayed prefix, the condition rows, the text, the silence.
-pub fn plan(st: *const State, cx: *errors.Cx, text: text_mod.Text, sp: api.SpeechInfo, input: []const u8, voice: []const u8, own: ?json.Value, clip: ?json.Value) errors.Refused!Made {
+pub fn plan(st: *const State, cx: *errors.Cx, text: text_mod.Text, sp: api.SpeechInfo, input: []const u8, voice: []const u8, own: ?json.Value, clip: ?json.Value, language: ?[]const u8, normalize: ?bool) errors.Refused!Made {
+    const lang = textnorm.language(language orelse textnorm.default_language) orelse
+        return cx.fail(.request, error_prefix ++ " unsupported language code {s}; supported: " ++ textnorm.codes, .{try pyrepr.repr(cx.a, .{ .string = language.? })});
+    if (normalize == true and !textnorm.available(cx.a)) return cx.refuse(textnorm.missing());
     if (own != null and clip != null) return cx.refuse(error_prefix ++ " send ref_audio or speaker_reference_codes, not both");
     const audio: []const f32 = if (clip) |value| try referenceAudio(cx, value) else &.{};
     const reference: []const [req.config.codebooks]i32 = if (clip != null) &.{} else if (own) |value| try referenceCodes(cx, value) else blk: {
@@ -109,10 +113,15 @@ pub fn plan(st: *const State, cx: *errors.Cx, text: text_mod.Text, sp: api.Speec
         };
         break :blk v.codes;
     };
-    const spoken = req.prompt.collapseLineBreaks(cx.a, input) catch |e| return switch (e) {
+    const typed = req.prompt.collapseLineBreaks(cx.a, input) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => cx.refuse("input must be valid UTF-8 text"),
     };
+    // left out, the text is normalized where the library loads and spoken as typed elsewhere
+    const spoken = if (normalize orelse textnorm.available(cx.a)) textnorm.normalize(cx.a, typed, lang) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NoLibrary => cx.refuse(textnorm.missing()),
+    } else typed;
     const ids = text.encode(cx.a, spoken, false) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => cx.other("the tokenizer cannot encode this prompt"),
