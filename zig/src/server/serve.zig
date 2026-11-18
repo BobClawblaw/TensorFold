@@ -188,6 +188,8 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .voices_dir = args.voices,
         .default_voice = args.default_voice,
         .steer_bundle = args.zonos.steer_bundle,
+        .laci_heads = args.zonos.laci_heads,
+        .short_text = args.zonos.short_text,
         .model_ids = ids.items,
         .background_ids = backgrounds,
         .default_max_tokens = args.max_tokens,
