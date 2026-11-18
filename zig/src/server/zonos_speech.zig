@@ -33,7 +33,7 @@ pub const fields = struct {
     pub const embedding = "speaker_embedding";
     pub const start = "start_immediately";
     pub const decoder = "decoder";
-    pub const all = [_][]const u8{ codes, clip, language, normalize, guidance, buckets, values, mode, embedding, laci.field, short.field, start, decoder } ++ steer.fields.all;
+    pub const all = [_][]const u8{ codes, clip, language, normalize, guidance, buckets, values, mode, embedding, laci.field, laci.duration_field, laci.adjust_field, short.field, start, decoder } ++ steer.fields.all;
 };
 
 pub const State = struct {
@@ -57,15 +57,15 @@ pub const State = struct {
     /// The release's speaker encoder, when its checkpoint is in the folder: a clip's embedding for the speaker row.
     speaker: ?*anyopaque = null,
 
-    /// A clip's speaker embedding, on this thread's cores; null without the encoder.
-    pub fn embed(st: *const State, audio: []const f32) !?[req.config.speaker_dim]f32 {
+    /// A clip's speaker embedding from its samples at their own rate, on this thread's cores; null without the encoder.
+    pub fn embed(st: *const State, clip: Clip) !?[req.config.speaker_dim]f32 {
         if (!@hasDecl(req, "speaker")) return null;
         const encoder: *const req.speaker.Encoder = @ptrCast(@alignCast(st.speaker orelse return null));
-        return try encoder.embed(std.heap.c_allocator, audio, null);
+        return try encoder.embed(std.heap.c_allocator, clip.source, clip.rate, null);
     }
 };
 
-pub const Made = struct { prompt: []const u32, frames: []const [11]i32, reference_audio: []const f32 = &.{}, conditions: []const u32 = &.{}, guidance: f32 = 1, speaker: []const f32 = &.{}, steering: ?*const api.SpeechSteering = null, laci: ?*const api.SpeechLaci = null, decoder: u8 = 0 };
+pub const Made = struct { prompt: []const u32, frames: []const [11]i32, reference_audio: []const f32 = &.{}, conditions: []const u32 = &.{}, guidance: f32 = 1, speaker: []const f32 = &.{}, steering: ?*const api.SpeechSteering = null, laci: ?*const api.SpeechLaci = null, decoder: u8 = 0, duration: ?laci.Duration = null };
 
 /// speech.resolve_decoder: the request's `decoder` among those served, as an index (0, the default, when null).
 pub fn decoderOf(cx: *errors.Cx, sp: api.SpeechInfo, raw: json.Value) errors.Refused!u8 {
@@ -134,13 +134,15 @@ fn referenceCodes(cx: *errors.Cx, value: json.Value) errors.Refused![]const [req
     return out;
 }
 
-/// `ref_audio` (a base64 WAV, or a data: URL of one) to mono 44.1 kHz as the release prepares a clip, cut to 60 s.
-fn referenceAudio(cx: *errors.Cx, value: json.Value) errors.Refused![]const f32 {
-    return clipAudio(cx, value, fields.clip, true);
-}
-
 /// A clip field (a base64 WAV, or a data: URL of one) to mono 44.1 kHz as the release prepares one; `cut`: to 60 s.
 pub fn clipAudio(cx: *errors.Cx, value: json.Value, comptime name: []const u8, cut: bool) errors.Refused![]const f32 {
+    return (try clipSourced(cx, value, name, cut)).audio;
+}
+
+/// A clip at 44.1 kHz for the codec, and as sent (`source` at `rate`) for the speaker encoder and aligner to resample.
+pub const Clip = struct { audio: []const f32, source: []const f32, rate: u32 };
+
+pub fn clipSourced(cx: *errors.Cx, value: json.Value, comptime name: []const u8, cut: bool) errors.Refused!Clip {
     const what = error_prefix ++ " " ++ name;
     const text = value.str() orelse return cx.refuse(what ++ " must be a base64 string holding a WAV file");
     const payload = if (std.mem.startsWith(u8, text, "data:")) text[(std.mem.indexOfScalar(u8, text, ',') orelse return cx.refuse(what ++ " is a data URL without a payload")) + 1 ..] else text;
@@ -164,7 +166,11 @@ pub fn clipAudio(cx: *errors.Cx, value: json.Value, comptime name: []const u8, c
     if (peak > 1) for (audio) |*x| {
         x.* /= peak;
     };
-    return if (cut) audio[0..@min(audio.len, max_clip)] else audio;
+    const kept = if (cut) audio[0..@min(audio.len, max_clip)] else audio;
+    if (clip.rate == rate) return .{ .audio = kept, .source = kept, .rate = rate };
+    for (clip.samples) |x| if (!std.math.isFinite(x)) return cx.refuse(what ++ " holds samples that are not finite");
+    const seconds = if (cut) max_clip / rate else clip.samples.len;
+    return .{ .audio = kept, .source = clip.samples[0..@min(clip.samples.len, seconds * clip.rate)], .rate = clip.rate };
 }
 
 fn number(v: json.Value) ?f64 {
@@ -266,10 +272,11 @@ pub fn plan(st: *const State, cx: *errors.Cx, text: text_mod.Text, sp: api.Speec
             if (!std.math.isFinite(x.*)) return cx.refuse(message);
         }
     }
-    var audio: []const f32 = if (clip) |value| try referenceAudio(cx, value) else &.{};
+    const uploaded: ?Clip = if (clip) |value| try clipSourced(cx, value, fields.clip, true) else null;
+    var audio: []const f32 = if (uploaded) |u| u.audio else &.{};
     if (by_embedding and clip != null) {
         // the clip's embedding fills the speaker row; its codes are not a prefix
-        vector = (st.embed(audio) catch return cx.other("the speaker encoder failed on this clip")) orelse
+        vector = (st.embed(uploaded.?) catch return cx.other("the speaker encoder failed on this clip")) orelse
             return cx.refuse(error_prefix ++ " a clip's embedding needs the release's speaker encoder (speaker_encoders/), which this folder lacks");
         audio = &.{};
     }
@@ -300,8 +307,10 @@ pub fn plan(st: *const State, cx: *errors.Cx, text: text_mod.Text, sp: api.Speec
     const opened = if (wants_start and !std.mem.startsWith(u8, spoken, tokens.start_marker)) try std.mem.concat(cx.a, u8, &.{ tokens.start_marker, spoken }) else spoken;
     // a short text runs under LACI with a pause and a filler sentence after it, cut where the filler starts
     const guided = guidance != 1 or controls_guided;
-    const brief = try short.plan(st.short, cx, raw, text, st.tokens, opened, lang.code, st.laci != null and !guided and raw.field(steer.fields.spans) == null);
+    // R17: a short text runs alone, unsteered by spans and with no duration target
+    const brief = try short.plan(st.short, cx, raw, text, st.tokens, opened, lang.code, st.laci != null and !guided and raw.field(steer.fields.spans) == null and raw.field(laci.duration_field) == null);
     var watched = try laci.plan(st.laci, cx, raw, lang, guided);
+    const held = try laci.duration(cx, raw, watched != null, sp.max_frames);
     if (brief) |sh| {
         const with = try cx.a.create(api.SpeechLaci);
         with.* = laci.of(st.laci.?, lang).*;
@@ -324,7 +333,7 @@ pub fn plan(st: *const State, cx: *errors.Cx, text: text_mod.Text, sp: api.Speec
     const rows = built.rows.len + if (audio.len > 0) (audio.len + 2939) / 2940 + req.config.codebooks - 1 else 0;
     if (rows > sp.max_prompt_tokens)
         return cx.fail(.request, error_prefix ++ " a prompt of {d} rows exceeds the maximum allowed length of {d} rows", .{ rows, sp.max_prompt_tokens });
-    return .{ .prompt = ids, .frames = built.rows, .reference_audio = audio, .conditions = buckets, .guidance = guidance, .speaker = if (by_embedding) try cx.a.dupe(f32, &vector) else &.{}, .steering = steered.steering, .laci = watched, .decoder = decoder };
+    return .{ .prompt = ids, .frames = built.rows, .reference_audio = audio, .conditions = buckets, .guidance = guidance, .speaker = if (by_embedding) try cx.a.dupe(f32, &vector) else &.{}, .steering = steered.steering, .laci = watched, .decoder = decoder, .duration = held };
 }
 
 pub fn listing(a: Allocator, st: *const State) !json.Value {

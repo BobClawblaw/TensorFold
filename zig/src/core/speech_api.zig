@@ -23,6 +23,8 @@ pub const SpeechRequest = struct {
     speaker: []const f32 = &.{},
     /// A reference clip to clone the voice from: mono samples at the family's rate; empty: none.
     reference_audio: []const f32 = &.{},
+    /// The rate of `reference_audio` when an edit's place step sends a clip as uploaded; 0: the family's rate.
+    reference_rate: u32 = 0,
     /// The family's condition rows by bucket, in prompt order; empty: every one unknown.
     conditions: []const u32 = &.{},
     /// What the request's steering controls add to its generated frames; null: nothing.
@@ -33,6 +35,9 @@ pub const SpeechRequest = struct {
     edit: ?*const SpeechEdit = null,
     /// The audio decoder: an index into the info's `decoders`, 0 its default.
     decoder: u8 = 0,
+    /// Under LACI, the take's target length in generated rows (0: none), and whether a miss is retaken at another rate.
+    duration_frames: f32 = 0,
+    duration_adjust_rate: bool = true,
 };
 
 /// A speech edit's steps on the engine: the server plans the edit between them.
