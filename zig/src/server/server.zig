@@ -45,6 +45,7 @@ pub const Config = struct {
     model_dir: []const u8 = "",
     voices_dir: ?[]const u8 = null,
     default_voice: []const u8 = "default",
+    steer_bundle: ?[]const u8 = null,
     /// The served name first, then aliases, without repeats.
     model_ids: []const []const u8,
     /// Ids a request may name for background priority by default (--name-priority); each is in model_ids.
@@ -206,7 +207,7 @@ pub const Server = struct {
             return error.InvalidVisionMarkers;
         };
         srv.video_decoder = @import("input_types.zig").decodes(srv.info.vision); // no decoder: video parts are a 400, never a 500
-        srv.voices = try @import("speech_voices.zig").load(srv.arena.allocator(), io, srv.info, config.model_dir, config.voices_dir, config.default_voice);
+        srv.voices = try @import("speech_voices.zig").load(srv.arena.allocator(), io, srv.info, config.model_dir, config.voices_dir, config.default_voice, config.steer_bundle);
         if (!srv.info.capability(.text_generation)) {
             if (config.cortheon) return error.CortheonRequiresTextGeneration;
             return srv;

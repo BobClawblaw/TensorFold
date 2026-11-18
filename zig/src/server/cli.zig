@@ -52,7 +52,7 @@ pub const flags = [_]Flag{
     .{ .name = "--chat-template", .path = true, .native = true },
     .{ .name = "--voices", .path = true, .native = true },
     .{ .name = "--default-voice", .native = true },
-} ++ @import("drama_cfg.zig").flags ++ @import("admission_cli.zig").flags ++ @import("connection_cli.zig").flags ++ [_]Flag{
+} ++ @import("zonos_steer.zig").flags ++ @import("drama_cfg.zig").flags ++ @import("admission_cli.zig").flags ++ @import("connection_cli.zig").flags ++ [_]Flag{
     .{ .name = "--alias", .kind = .append, .native = true },
     .{ .name = "--name-priority", .kind = .append, .native = true },
     .{ .name = "--api-key", .kind = .append, .native = true },
@@ -179,6 +179,7 @@ pub const Args = struct {
     chat_template: ?[]const u8 = null,
     voices: ?[]const u8 = null,
     default_voice: []const u8 = "default",
+    zonos: @import("zonos_steer.zig").Paths = .{},
     alias: []const []const u8 = &.{},
     name_priority: []const []const u8 = &.{},
     api_key: []const []const u8 = &.{},
@@ -430,6 +431,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         out.default_voice = v;
         return;
     }
+    if (@import("zonos_steer.zig").flag(out, name, v)) return;
     if (is(name, "--chat-template")) {
         out.chat_template = v;
         return;
