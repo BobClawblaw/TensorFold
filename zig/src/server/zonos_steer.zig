@@ -22,6 +22,18 @@ pub const fields = struct {
     pub const all = [_][]const u8{ controls, spans, rate, follow, hold, onset, ramp, guidance };
 };
 
+pub const flags = [_]@import("cli.zig").Flag{
+    .{ .name = "--steer-bundle", .path = true, .native = true },
+    .{ .name = "--laci-heads", .path = true, .native = true },
+    .{ .name = "--short-text", .path = true, .native = true },
+};
+
+/// The ZONOS3 files a server may be started with: the steering bundle, the LACI heads, the short-text registry.
+pub fn flag(out: anytype, name: []const u8, value: []const u8) bool {
+    if (std.mem.eql(u8, name, "--steer-bundle")) out.steer_bundle = value else if (std.mem.eql(u8, name, "--laci-heads")) out.laci_heads = value else if (std.mem.eql(u8, name, "--short-text")) out.short_text = value else return false;
+    return true;
+}
+
 pub const Made = struct {
     /// The speaker embedding after the raw controls; null: as it was.
     embedding: ?[req.config.speaker_dim]f32 = null,
@@ -172,11 +184,12 @@ test "without a bundle controls are refused, and a hold below 1; plain requests 
     try t.expect(std.mem.indexOf(u8, cx.message, "cannot be combined") != null);
 }
 
-test "--steer-bundle names the bundle file" {
+test "--steer-bundle and --laci-heads name their files" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const cli = @import("cli.zig");
     var u: cli.Usage = .{};
     try std.testing.expect((try cli.parse(arena.allocator(), &.{"m"}, &u)).steer_bundle == null);
     try std.testing.expectEqualStrings("b/bundle.json", (try cli.parse(arena.allocator(), &.{ "m", "--steer-bundle", "b/bundle.json" }, &u)).steer_bundle.?);
+    try std.testing.expectEqualStrings("heads", (try cli.parse(arena.allocator(), &.{ "m", "--laci-heads=heads" }, &u)).laci_heads.?);
 }

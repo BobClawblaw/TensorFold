@@ -51,8 +51,7 @@ pub const flags = [_]Flag{
     .{ .name = "--chat-template", .path = true, .native = true },
     .{ .name = "--voices", .path = true, .native = true },
     .{ .name = "--default-voice", .native = true },
-    .{ .name = "--steer-bundle", .path = true, .native = true },
-} ++ @import("drama_cfg.zig").flags ++ @import("admission_cli.zig").flags ++ @import("connection_cli.zig").flags ++ [_]Flag{
+} ++ @import("zonos_steer.zig").flags ++ @import("drama_cfg.zig").flags ++ @import("admission_cli.zig").flags ++ @import("connection_cli.zig").flags ++ [_]Flag{
     .{ .name = "--alias", .kind = .append, .native = true },
     .{ .name = "--name-priority", .kind = .append, .native = true },
     .{ .name = "--api-key", .kind = .append, .native = true },
@@ -180,6 +179,8 @@ pub const Args = struct {
     voices: ?[]const u8 = null,
     default_voice: []const u8 = "default",
     steer_bundle: ?[]const u8 = null,
+    laci_heads: ?[]const u8 = null,
+    short_text: ?[]const u8 = null,
     alias: []const []const u8 = &.{},
     name_priority: []const []const u8 = &.{},
     api_key: []const []const u8 = &.{},
@@ -429,10 +430,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         out.default_voice = v;
         return;
     }
-    if (is(name, "--steer-bundle")) {
-        out.steer_bundle = v;
-        return;
-    }
+    if (@import("zonos_steer.zig").flag(out, name, v)) return;
     if (is(name, "--chat-template")) {
         out.chat_template = v;
         return;
