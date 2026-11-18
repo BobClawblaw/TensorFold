@@ -94,6 +94,7 @@ test {
     _ = @import("speech.zig");
     _ = @import("speech_encode.zig");
     _ = @import("zonos_textnorm.zig");
+    _ = @import("zonos_steer.zig");
     _ = @import("images_generations.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("images_batch_test.zig"); // uses a socketpair test
     _ = @import("drama_cfg.zig");
