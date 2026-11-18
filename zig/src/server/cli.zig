@@ -180,6 +180,7 @@ pub const Args = struct {
     default_voice: []const u8 = "default",
     steer_bundle: ?[]const u8 = null,
     laci_heads: ?[]const u8 = null,
+    decoders: ?[]const u8 = null, // ZONOS3's --decoders: comma-separated ids; null: every one the release holds
     short_text: ?[]const u8 = null,
     alias: []const []const u8 = &.{},
     name_priority: []const []const u8 = &.{},
@@ -533,6 +534,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .model_type = model_type,
         .context = args.context,
         .max_frames = args.max_frames,
+        .decoders = args.decoders,
         .silence = args.silence,
         .lanes = parallel(args.parallel) orelse 8,
         .lanes_fixed = parallelFixed(args.parallel),

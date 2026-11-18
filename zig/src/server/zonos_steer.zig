@@ -28,11 +28,12 @@ pub const flags = [_]@import("cli.zig").Flag{
     .{ .name = "--steer-bundle", .path = true, .native = true },
     .{ .name = "--laci-heads", .path = true, .native = true },
     .{ .name = "--short-text", .path = true, .native = true },
+    .{ .name = "--decoders", .native = true },
 };
 
 /// The ZONOS3 files a server may be started with: the steering bundle, the LACI heads, the short-text registry.
 pub fn flag(out: anytype, name: []const u8, value: []const u8) bool {
-    if (std.mem.eql(u8, name, "--steer-bundle")) out.steer_bundle = value else if (std.mem.eql(u8, name, "--laci-heads")) out.laci_heads = value else if (std.mem.eql(u8, name, "--short-text")) out.short_text = value else return false;
+    if (std.mem.eql(u8, name, "--steer-bundle")) out.steer_bundle = value else if (std.mem.eql(u8, name, "--laci-heads")) out.laci_heads = value else if (std.mem.eql(u8, name, "--short-text")) out.short_text = value else if (std.mem.eql(u8, name, "--decoders")) out.decoders = value else return false;
     return true;
 }
 
