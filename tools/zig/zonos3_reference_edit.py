@@ -374,7 +374,7 @@ def aligner(args):
 
 
 def clips(args):
-    """The served checks' two clips: the reference's audio of two `rows` dumps as 16-bit WAVs, OUT/short.* and long.*."""
+    """The served checks' two clips: the audio of two `rows` dumps as 16-bit WAVs, OUT/short.* and OUT/long.*."""
     import wave
 
     out = Path(args.out)
@@ -393,7 +393,7 @@ def clips(args):
 
 
 def served_cases(args):
-    """The served checks' edits of those clips: OUT/<name>.json, `request` for the reference, `served` for the server."""
+    """The served checks' edits of those clips: OUT/<name>.json, `request` for the reference, `served` for us."""
     from zonos3.tts import textmatch
     from zonos3.tts.edit_align import aligned_words
 
